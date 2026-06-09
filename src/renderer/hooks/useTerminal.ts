@@ -857,13 +857,44 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       }
     };
 
+    // Coalesce live PTY writes within one frame before handing them to xterm.
+    //
+    // An in-pane TUI redraw (codex) can land its cursor on a trailing UI row
+    // mid-redraw and only reposition it to the input ~one tick later, in a
+    // SEPARATE PTY write (measured: a ~11ms gap, the cursor parked on the
+    // model/footer line in between). In daemon mode nothing coalesces those
+    // writes, so if an xterm render frame falls in that gap the user sees the
+    // cursor flash to the footer and back ("cursor fast-jump"). Buffering
+    // incoming chunks for one frame so the whole redraw is parsed before the
+    // next paint makes the transient frame un-paintable. Mirrors the main-side
+    // PTYBridge micro-batch (which only runs in local mode). Only live data is
+    // coalesced — scrollback restore, the pending-data replay, and the exit
+    // banner stay direct, and all of those run before any live write.
+    const PTY_WRITE_COALESCE_MS = 16;
+    let pendingPtyWrites: string[] = [];
+    let ptyWriteTimer: ReturnType<typeof setTimeout> | null = null;
+    const flushPtyWrites = () => {
+      ptyWriteTimer = null;
+      if (pendingPtyWrites.length === 0) return;
+      const joined = pendingPtyWrites.length === 1 ? pendingPtyWrites[0] : pendingPtyWrites.join('');
+      pendingPtyWrites = [];
+      terminal.write(joined);
+    };
+    const enqueuePtyWrite = (data: string) => {
+      pendingPtyWrites.push(data);
+      if (ptyWriteTimer === null) ptyWriteTimer = setTimeout(flushPtyWrites, PTY_WRITE_COALESCE_MS);
+    };
+
     // Restore scrollback from previous session, then connect PTY data listener.
     // Scrollback must be written BEFORE PTY data listener is connected so new
     // output appends after restored content rather than interleaving.
     const connectPty = () => {
       removeDataListener = window.electronAPI.pty.onData((id, data) => {
         if (id === ptyId) {
-          terminal.write(data);
+          enqueuePtyWrite(data);
+          // Burst detection feeds on arrival cadence; the repaint it schedules
+          // fires after BURST_QUIET_MS (300ms) of quiet, well past the 16ms
+          // coalesce window, so it always repaints post-flush state.
           glyphRepaint.onData(data.length);
           fireFirstData();
         }
@@ -871,6 +902,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
 
       removeExitListener = window.electronAPI.pty.onExit((id, exitCode) => {
         if (id === ptyId) {
+          // Drain any coalesced output first so the exit banner lands after the
+          // process's final lines rather than ahead of them.
+          flushPtyWrites();
           terminal.writeln(`\r\n${t('terminal.exitedBracket', { code: exitCode })}`);
         }
       });
@@ -883,6 +917,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // Instead, buffer incoming data and flush after scrollback is written.
       const pendingData: string[] = [];
       let scrollbackLoaded = false;
+      // If the PTY exits before scrollback.load() resolves, the pre-load output
+      // buffered in pendingData has not been replayed yet. Defer the exit banner
+      // until after that replay so it stays last instead of racing ahead of it.
+      let pendingExitCode: number | null = null;
 
       removeDataListener = window.electronAPI.pty.onData((id, data) => {
         if (id !== ptyId) return;
@@ -890,15 +928,23 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           pendingData.push(data);
           return;
         }
-        terminal.write(data);
+        enqueuePtyWrite(data);
+        // Same ordering invariant as the non-restore path: the 16ms coalesce
+        // always flushes before the 300ms-quiet burst repaint can fire.
         glyphRepaint.onData(data.length);
         fireFirstData();
       });
 
       removeExitListener = window.electronAPI.pty.onExit((id, exitCode) => {
-        if (id === ptyId) {
-          terminal.writeln(`\r\n${t('terminal.exitedBracket', { code: exitCode })}`);
-        }
+        if (id !== ptyId) return;
+        // Drain any coalesced output first so the exit banner lands after the
+        // process's final lines rather than ahead of them.
+        flushPtyWrites();
+        // Scrollback still loading → pre-load output (pendingData) is not on
+        // screen yet; defer the banner so it trails that replay (emitted in the
+        // scrollback.load then/catch below).
+        if (!scrollbackLoaded) { pendingExitCode = exitCode; return; }
+        terminal.writeln(`\r\n${t('terminal.exitedBracket', { code: exitCode })}`);
       });
 
       // Listen for the daemon's flush-complete signal. Two-way race:
@@ -980,6 +1026,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         }
         if (pendingData.length > 0) fireFirstData();
         pendingData.length = 0;
+        // Emit a banner deferred by an exit that fired mid-load, now that the
+        // pre-load output above is on screen.
+        if (pendingExitCode !== null) {
+          terminal.writeln(`\r\n${t('terminal.exitedBracket', { code: pendingExitCode })}`);
+          pendingExitCode = null;
+        }
         // Register with the scrollback autosave only after restore
         // completes. Setting it synchronously before the async load lets
         // the 5s autosave tick dump an empty/partial buffer over the
@@ -1006,6 +1058,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         }
         if (pendingData.length > 0) fireFirstData();
         pendingData.length = 0;
+        // Emit a banner deferred by an exit that fired mid-load, now that the
+        // pre-load output above is on screen.
+        if (pendingExitCode !== null) {
+          terminal.writeln(`\r\n${t('terminal.exitedBracket', { code: pendingExitCode })}`);
+          pendingExitCode = null;
+        }
         terminalRegistry.set(ptyId, terminal);
       });
     } else {
@@ -1093,6 +1151,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       glyphRepaint.dispose();
       glyphRepaintRef.current = null;
       imeResidueGuard?.dispose();
+      if (ptyWriteTimer !== null) { clearTimeout(ptyWriteTimer); ptyWriteTimer = null; }
       autoCopy.dispose();
       selectionDisposable.dispose();
       pathLinkDisposable.dispose();
