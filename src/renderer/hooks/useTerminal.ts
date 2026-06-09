@@ -298,6 +298,30 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     terminal.loadAddon(searchAddon);
     terminal.loadAddon(unicode11Addon);
     terminal.loadAddon(webLinksAddon);
+
+    // Track win32-input-mode (DECSET 9001). A crossterm-based TUI (codex) turns
+    // this on at startup on Windows to request keys as win32 input *records*.
+    // xterm.js doesn't implement that protocol, so once the mode is on codex
+    // can no longer tell Ctrl+J / Shift+Enter from a bare Enter and ignores the
+    // legacy LF / CSI-u we'd otherwise send — no newline gets inserted. We
+    // watch the toggle here and, while it's active, emit the matching win32
+    // record for those keys instead (see resolveNewlineKeyByte / newlineKeys).
+    // Returning false from the handlers lets xterm keep its own mode bookkeeping.
+    let win32InputMode = false;
+    const win32SetDisposable = terminal.parser.registerCsiHandler(
+      { prefix: '?', final: 'h' },
+      (params) => {
+        if (params.includes(9001)) win32InputMode = true;
+        return false;
+      },
+    );
+    const win32ResetDisposable = terminal.parser.registerCsiHandler(
+      { prefix: '?', final: 'l' },
+      (params) => {
+        if (params.includes(9001)) win32InputMode = false;
+        return false;
+      },
+    );
     // Path link provider — Ctrl+click an absolute filesystem path to open
     // it in Explorer / Finder. Coexists with WebLinksAddon (URLs); the two
     // detect disjoint token shapes so a single span never claims both.
@@ -512,6 +536,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         hasCustomCtrlJBinding: useStore.getState().customKeybindings.some(
           (kb) => kb.key === 'Ctrl+J',
         ),
+        win32InputMode,
       });
       if (newlineByte !== null) {
         e.preventDefault();
@@ -1071,6 +1096,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       autoCopy.dispose();
       selectionDisposable.dispose();
       pathLinkDisposable.dispose();
+      win32SetDisposable.dispose();
+      win32ResetDisposable.dispose();
       resizeObserver.disconnect();
       removeDataListener?.();
       removeExitListener?.();

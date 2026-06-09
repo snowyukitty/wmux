@@ -17,19 +17,39 @@
  *   the same approach to the newline keys so the encoding is deterministic
  *   regardless of IME state.
  *
- * Returned byte:
+ * Returned byte (legacy / non-win32 path):
  *   - Shift+Enter → CSI u (`ESC [ 13 ; 2 u`): Claude Code / kitty-protocol
  *     apps insert a newline instead of submitting. (Pre-existing behavior,
  *     moved here verbatim.)
  *   - Ctrl+J → LF (`\n`, U+000A): the canonical "insert newline, do not
- *     submit" byte that codex / Claude Code / readline editors expect. This
- *     is exactly what xterm would emit in its legacy path — we just emit it
- *     ourselves so an IME can't suppress it.
+ *     submit" byte that Claude Code / readline editors expect. This is exactly
+ *     what xterm would emit in its legacy path — we just emit it ourselves so
+ *     an IME can't suppress it.
+ *
+ * win32-input-mode path (`opts.win32InputMode === true`):
+ *   When an in-pane app turns on win32-input-mode (DECSET 9001 — codex does
+ *   this on Windows via crossterm), it asks the terminal to report keys as
+ *   win32 input *records* (`CSI Vk;Sc;Uc;Kd;Cs;Rc _`) rather than VT bytes.
+ *   xterm.js doesn't speak that protocol, so it keeps sending plain VT — and
+ *   codex then can't tell Ctrl+J / Shift+Enter apart from a bare Enter, so a
+ *   raw LF or the kitty CSI-u is simply ignored and no newline is inserted.
+ *   Empirically (codex 0.137, headless xterm v6): LF and `ESC[13;2u` do
+ *   nothing, but the matching win32 record inserts a newline. So when the mode
+ *   is active we emit the record (a key-down immediately followed by key-up,
+ *   as a real keypress would). See useTerminal's DECSET 9001 tracker.
  *
  * Returns `null` when the event is not a deterministic newline key (or when a
  * guard declines to take it over), in which case the caller defers to xterm's
  * normal handling.
  */
+
+// win32-input-mode key records (down + up), format `CSI Vk;Sc;Uc;Kd;Cs;Rc _`:
+//   Vk = virtual-key code, Sc = scan code, Uc = unicode code unit,
+//   Kd = key-down(1)/up(0), Cs = control-key-state bitmask, Rc = repeat count.
+// Ctrl+J: Vk 0x4A('J')=74, Sc 36, Uc 10(LF), Cs 0x0008 (LEFT_CTRL_PRESSED).
+const WIN32_CTRL_J = '\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_';
+// Shift+Enter: Vk 13(VK_RETURN), Sc 28, Uc 13(CR), Cs 0x0010 (SHIFT_PRESSED).
+const WIN32_SHIFT_ENTER = '\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_';
 export interface NewlineKeyEventLike {
   key: string;
   code: string;
@@ -50,6 +70,13 @@ export interface NewlineKeyOptions {
    * but we must not actively override it with an LF.)
    */
   hasCustomCtrlJBinding?: boolean;
+  /**
+   * Whether the in-pane app has win32-input-mode (DECSET 9001) active. When
+   * true the newline keys are emitted as win32 input records instead of the
+   * legacy LF / CSI-u bytes, which a crossterm-based TUI (codex) ignores once
+   * the mode is on. Tracked per-terminal in useTerminal.
+   */
+  win32InputMode?: boolean;
 }
 
 export function resolveNewlineKeyByte(
@@ -60,7 +87,7 @@ export function resolveNewlineKeyByte(
   // Kitty keyboard protocol: ESC [ 13 ; 2 u. (metaKey intentionally not
   // constrained — preserves the original inline handler's exact predicate.)
   if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.altKey) {
-    return '\x1b[13;2u';
+    return opts?.win32InputMode ? WIN32_SHIFT_ENTER : '\x1b[13;2u';
   }
 
   // Ctrl+J → LF. Match the physical key so it survives a CJK IME where
@@ -86,7 +113,7 @@ export function resolveNewlineKeyByte(
     !e.altKey &&
     !e.metaKey
   ) {
-    return '\n';
+    return opts?.win32InputMode ? WIN32_CTRL_J : '\n';
   }
 
   return null;

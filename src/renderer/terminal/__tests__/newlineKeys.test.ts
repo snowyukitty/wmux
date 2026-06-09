@@ -78,3 +78,42 @@ describe('resolveNewlineKeyByte — Shift+Enter (preserved behavior)', () => {
     expect(resolveNewlineKeyByte(ev({ key: 'Enter', shiftKey: true, ctrlKey: true }))).toBeNull();
   });
 });
+
+describe('resolveNewlineKeyByte — win32-input-mode (DECSET 9001 active)', () => {
+  // A crossterm TUI (codex 0.137) ignores raw LF and the kitty CSI-u once it
+  // has turned on win32-input-mode; only the matching win32 input record
+  // (key-down + key-up) inserts a newline. Verified against real codex via a
+  // headless xterm v6 harness.
+  const WIN32_CTRL_J = '\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_';
+  const WIN32_SHIFT_ENTER = '\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_';
+
+  it('emits the win32 Ctrl+J record instead of LF when the mode is active', () => {
+    expect(
+      resolveNewlineKeyByte(ev({ key: 'j', code: 'KeyJ', ctrlKey: true }), { win32InputMode: true }),
+    ).toBe(WIN32_CTRL_J);
+  });
+
+  it('emits the win32 Shift+Enter record instead of CSI u when the mode is active', () => {
+    expect(
+      resolveNewlineKeyByte(ev({ key: 'Enter', shiftKey: true }), { win32InputMode: true }),
+    ).toBe(WIN32_SHIFT_ENTER);
+  });
+
+  it('falls back to LF / CSI u when the mode is inactive', () => {
+    expect(
+      resolveNewlineKeyByte(ev({ key: 'j', code: 'KeyJ', ctrlKey: true }), { win32InputMode: false }),
+    ).toBe('\n');
+    expect(
+      resolveNewlineKeyByte(ev({ key: 'Enter', shiftKey: true }), { win32InputMode: false }),
+    ).toBe('\x1b[13;2u');
+  });
+
+  it('still respects the custom-binding guard under win32 mode', () => {
+    expect(
+      resolveNewlineKeyByte(ev({ key: 'j', code: 'KeyJ', ctrlKey: true }), {
+        win32InputMode: true,
+        hasCustomCtrlJBinding: true,
+      }),
+    ).toBeNull();
+  });
+});
