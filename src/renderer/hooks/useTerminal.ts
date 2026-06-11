@@ -128,6 +128,13 @@ export function copySelectionWithFeedback(
 ): Promise<void> {
   return runCopyWithFeedback(selection, {
     write: (text) => window.clipboardAPI.writeText(text),
+    // Dedupe against the clipboard's current text: by the time an explicit
+    // right-click / Ctrl+C copy runs, the debounced auto-copy-on-selection has
+    // usually written the very same selection already (autoCopy.dispose() in
+    // the contextmenu handler only cancels a still-PENDING debounce). Without
+    // this, every select→right-click copy lands the text in the Windows
+    // clipboard history twice. See runCopyWithFeedback for the fallback rules.
+    readCurrent: () => window.clipboardAPI.readText(),
     // `keepSelection` leaves the highlight in place after a successful copy.
     // The right-click copy path uses this so the selection survives the
     // gesture: the old async clearSelection() wiped it a tick later, and a

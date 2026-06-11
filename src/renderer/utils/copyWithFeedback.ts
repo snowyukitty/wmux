@@ -19,6 +19,17 @@
 export interface CopyWithFeedbackDeps {
   /** Bridge to `window.clipboardAPI.writeText` (or any equivalent). */
   write: (text: string) => Promise<void>;
+  /**
+   * Optional bridge to `window.clipboardAPI.readText`. When provided and the
+   * clipboard already holds exactly the selection, the write is skipped while
+   * the success UI (clearSelection/onSuccess) still runs. This dedupes the
+   * "copied twice" stacking: auto-copy-on-selection has usually already
+   * written the selection by the time an explicit right-click / Ctrl+C copy
+   * runs, and a second identical write only piles a duplicate entry onto the
+   * Windows clipboard history (Win+V) / clipboard managers. A failed read
+   * falls back to writing — never the other way around.
+   */
+  readCurrent?: () => Promise<string>;
   /** Called on success only — selection stays put on failure for retry. */
   clearSelection: () => void;
   /** Called on success — typically shows a green "Copied!" toast. */
@@ -36,6 +47,22 @@ export async function runCopyWithFeedback(
   deps: CopyWithFeedbackDeps,
 ): Promise<void> {
   try {
+    if (deps.readCurrent) {
+      let current: string | null = null;
+      try {
+        current = await deps.readCurrent();
+      } catch {
+        // Unreadable clipboard (image content, IPC hiccup) → just write.
+        current = null;
+      }
+      if (current !== null && current === selection) {
+        // Clipboard already holds this exact text — report success without
+        // stacking a duplicate clipboard-history entry.
+        deps.clearSelection();
+        deps.onSuccess();
+        return;
+      }
+    }
     await deps.write(selection);
     deps.clearSelection();
     deps.onSuccess();

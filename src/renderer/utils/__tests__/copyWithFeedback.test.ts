@@ -81,6 +81,55 @@ describe('runCopyWithFeedback — failure path', () => {
   });
 });
 
+describe('runCopyWithFeedback — duplicate-write dedupe (readCurrent)', () => {
+  it('skips write but still clears selection + toasts when clipboard already holds the selection', async () => {
+    const deps = makeDeps({ readCurrent: vi.fn(async () => 'same text') });
+    await runCopyWithFeedback('same text', deps);
+    expect(deps.write).not.toHaveBeenCalled();
+    expect(deps.clearSelection).toHaveBeenCalledTimes(1);
+    expect(deps.onSuccess).toHaveBeenCalledTimes(1);
+    expect(deps.onError).not.toHaveBeenCalled();
+  });
+
+  it('writes when the clipboard holds different text (external app changed it)', async () => {
+    const deps = makeDeps({ readCurrent: vi.fn(async () => 'something else') });
+    await runCopyWithFeedback('selection', deps);
+    expect(deps.write).toHaveBeenCalledTimes(1);
+    expect(deps.write).toHaveBeenCalledWith('selection');
+    expect(deps.onSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to writing when readCurrent rejects (image-only clipboard, IPC error)', async () => {
+    const deps = makeDeps({
+      readCurrent: vi.fn(async () => {
+        throw new Error('CLIPBOARD_READ_FAILED');
+      }),
+    });
+    await runCopyWithFeedback('selection', deps);
+    expect(deps.write).toHaveBeenCalledTimes(1);
+    expect(deps.onSuccess).toHaveBeenCalledTimes(1);
+    expect(deps.onError).not.toHaveBeenCalled();
+  });
+
+  it('still routes a write failure to onError after a non-matching read', async () => {
+    const deps = makeDeps({
+      readCurrent: vi.fn(async () => 'other'),
+      write: vi.fn(async () => {
+        throw new Error('CLIPBOARD_WRITE_FAILED');
+      }),
+    });
+    await runCopyWithFeedback('selection', deps);
+    expect(deps.onError).toHaveBeenCalledTimes(1);
+    expect(deps.clearSelection).not.toHaveBeenCalled();
+  });
+
+  it('keeps the legacy no-readCurrent behavior: always writes', async () => {
+    const deps = makeDeps();
+    await runCopyWithFeedback('hello', deps);
+    expect(deps.write).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('runCopyWithFeedback — ordering guarantees', () => {
   it('clears selection BEFORE showing success toast (no race for users who key-mash)', async () => {
     const order: string[] = [];
