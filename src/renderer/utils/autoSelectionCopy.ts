@@ -23,11 +23,12 @@ export interface AutoSelectionCopyDeps {
    * clipboard already holds exactly the selection, the debounced write is
    * skipped. This is the auto-copy half of the duplicate-entry fix: a kept
    * selection (right-click copy uses keepSelection) re-fires
-   * onSelectionChange whenever the buffer repaints or scrolls under it — a
-   * constantly redrawing TUI pane re-armed this debounce forever, stacking
-   * the same text into the Windows clipboard history (Win+V) on every
-   * repaint. Re-selecting the same word had the same effect. A failed read
-   * falls back to writing — never the other way around.
+   * onSelectionChange when the buffer shifts under it (scroll, trim — xterm
+   * fires on selection-coordinate change, not on paint alone), and
+   * re-selecting the same text fires it again outright. Each re-fire
+   * re-armed this debounce and rewrote the same text, stacking duplicate
+   * entries into the Windows clipboard history (Win+V). A failed read falls
+   * back to writing — never the other way around.
    */
   readCurrent?: () => Promise<string>;
   /** Debounce window in ms. Defaults to 150. */
@@ -43,7 +44,15 @@ export interface AutoSelectionCopyDeps {
 export interface AutoSelectionCopyHandle {
   /** Call from the terminal's onSelectionChange callback. */
   onSelection: (selection: string) => void;
-  /** Cancel any pending debounced write. Call on unmount. */
+  /**
+   * Cancel any pending debounced write AND invalidate a write whose
+   * `readCurrent()` is already in flight. The explicit copy paths call this
+   * before writing so theirs is the single authoritative write — without the
+   * in-flight half, an explicit copy landing during the auto-copy's clipboard
+   * read made both sides see the stale clipboard and both write, recreating
+   * the duplicate Win+V entry. The handle stays usable: a later onSelection
+   * re-arms it. Also call on unmount.
+   */
   dispose: () => void;
 }
 
@@ -55,19 +64,27 @@ export function createAutoSelectionCopy(deps: AutoSelectionCopyDeps): AutoSelect
   const clearT = deps.clearTimeoutFn ?? ((h) => clearTimeout(h));
 
   let pending: ReturnType<typeof setTimeout> | null = null;
+  // Bumped by dispose(). An async write captures the value at debounce-fire
+  // time and aborts after each await if it changed — clearTimeout alone can't
+  // stop a callback that is already parked on the readCurrent() IPC.
+  let epoch = 0;
 
   const onSelection = (selection: string): void => {
     if (pending) clearT(pending);
     pending = setT(() => {
       pending = null;
       if (!selection || selection.length === 0) return;
+      const myEpoch = epoch;
       void (async () => {
         if (deps.readCurrent) {
+          let current: string | null = null;
           try {
-            if ((await deps.readCurrent()) === selection) return;
+            current = await deps.readCurrent();
           } catch {
             // Unreadable clipboard (image content, IPC hiccup) → just write.
           }
+          if (myEpoch !== epoch) return; // cancelled while reading
+          if (current !== null && current === selection) return;
         }
         await deps.write(selection);
       })().catch(() => {
@@ -77,6 +94,7 @@ export function createAutoSelectionCopy(deps: AutoSelectionCopyDeps): AutoSelect
   };
 
   const dispose = (): void => {
+    epoch++;
     if (pending) {
       clearT(pending);
       pending = null;

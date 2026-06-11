@@ -33,6 +33,15 @@ export class SessionPipe {
     private readonly sessionId: string,
     private readonly ringBuffer: RingBuffer,
     private readonly authToken: string,
+    /**
+     * Authoritative win32-input-mode (DECSET 9001) state from the bridge.
+     * When provided, the matching set/reset sequence is appended after the
+     * ring-buffer flush so the renderer's mode flag is correct even when the
+     * toggle that produced the state has been evicted from the ring (long
+     * codex session) or when a recovered session's pre-filled scrollback
+     * still contains a stale `?9001h` from the previous run.
+     */
+    private readonly getWin32InputMode?: () => boolean,
   ) {}
 
   /** Get the platform-specific pipe name for this session. */
@@ -252,6 +261,16 @@ export class SessionPipe {
       );
       if (buffered.length > 0) {
         socket.write(buffered);
+      }
+
+      // Step 1b: Re-assert win32-input-mode. Last-wins, so appending the
+      // authoritative state after the replay is always correct: if the ring
+      // still contains the live toggle this is a no-op re-set, and if the
+      // toggle was evicted (or a recovered session replayed a stale ?9001h
+      // from its previous life) this corrects the renderer's flag. Deliberately
+      // NOT written to the ring — it describes state, it isn't session output.
+      if (this.getWin32InputMode) {
+        socket.write(this.getWin32InputMode() ? '\x1b[?9001h' : '\x1b[?9001l');
       }
 
       // Step 2: Send flush done marker

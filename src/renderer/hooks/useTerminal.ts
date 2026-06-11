@@ -329,6 +329,18 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         return false;
       },
     );
+    // RIS (ESC c) resets every terminal mode in xterm but only CSI ? 9001 h/l
+    // updated this closure — an app that hard-resets on the way out (or dies
+    // and the user runs `reset`) without an explicit ?9001l would leave the
+    // flag stuck true, injecting win32 records into a plain shell. Mirror
+    // xterm's bookkeeping here. (Codex review finding #2.)
+    const win32RisDisposable = terminal.parser.registerEscHandler(
+      { final: 'c' },
+      () => {
+        win32InputMode = false;
+        return false;
+      },
+    );
     // Path link provider — Ctrl+click an absolute filesystem path to open
     // it in Explorer / Finder. Coexists with WebLinksAddon (URLs); the two
     // detect disjoint token shapes so a single span never claims both.
@@ -628,6 +640,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       if (e.ctrlKey && !e.shiftKey && e.key === 'c') {
         const sel = terminal.getSelection();
         if (sel) {
+          // Cancel the debounced auto-copy — including one already awaiting
+          // its clipboard read — so this is the single write for the
+          // selection (same dedupe rationale as the right-click path).
+          autoCopy.dispose();
           // main now throws on clipboard failure — await + catch so the
           // user sees an error toast and the selection stays put for retry.
           void copySelectionWithFeedback(terminal, sel);
@@ -668,6 +684,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       if (e.ctrlKey && e.shiftKey && e.key === 'C') {
         const sel = terminal.getSelection();
         if (sel) {
+          // Same single-writer rule as Ctrl+C above.
+          autoCopy.dispose();
           // Note: original handler did NOT clearSelection here. Preserve that
           // behavior — the helper's clearSelection runs on success only,
           // matching the Ctrl+C path; users wanting to keep selection used
@@ -884,17 +902,31 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // coalesced — scrollback restore, the pending-data replay, and the exit
     // banner stay direct, and all of those run before any live write.
     const PTY_WRITE_COALESCE_MS = 16;
+    // Cap on the joined chunk handed to xterm. xterm's WriteBuffer yields
+    // BETWEEN queued chunks, never inside one, so joining 16ms of a fast
+    // stream into a single multi-hundred-KB chunk would remove its parse
+    // yield points and stall the renderer. 64KB ≈ a typical single PTY chunk;
+    // a TUI redraw (the flash this exists for) is far below it, so the cap
+    // only kicks in for bulk output where flashing isn't the failure mode.
+    const PTY_WRITE_COALESCE_MAX_BYTES = 64 * 1024;
     let pendingPtyWrites: string[] = [];
+    let pendingPtyBytes = 0;
     let ptyWriteTimer: ReturnType<typeof setTimeout> | null = null;
     const flushPtyWrites = () => {
-      ptyWriteTimer = null;
+      if (ptyWriteTimer !== null) { clearTimeout(ptyWriteTimer); ptyWriteTimer = null; }
       if (pendingPtyWrites.length === 0) return;
       const joined = pendingPtyWrites.length === 1 ? pendingPtyWrites[0] : pendingPtyWrites.join('');
       pendingPtyWrites = [];
+      pendingPtyBytes = 0;
       terminal.write(joined);
     };
     const enqueuePtyWrite = (data: string) => {
       pendingPtyWrites.push(data);
+      pendingPtyBytes += data.length;
+      if (pendingPtyBytes >= PTY_WRITE_COALESCE_MAX_BYTES) {
+        flushPtyWrites();
+        return;
+      }
       if (ptyWriteTimer === null) ptyWriteTimer = setTimeout(flushPtyWrites, PTY_WRITE_COALESCE_MS);
     };
 
@@ -1164,12 +1196,19 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       glyphRepaint.dispose();
       glyphRepaintRef.current = null;
       imeResidueGuard?.dispose();
-      if (ptyWriteTimer !== null) { clearTimeout(ptyWriteTimer); ptyWriteTimer = null; }
+      // Drain (don't discard) any coalesced output: a remount that isn't a
+      // daemon reattach (single↔multiview switch in local mode) has no replay,
+      // so dropping pendingPtyWrites here would silently widen the unmount
+      // data-loss window by up to 16ms. Handing the chunk to xterm restores
+      // the exact pre-coalescing semantics (xterm queues writes with a 0ms
+      // task itself — write-then-dispose was always best-effort).
+      flushPtyWrites();
       autoCopy.dispose();
       selectionDisposable.dispose();
       pathLinkDisposable.dispose();
       win32SetDisposable.dispose();
       win32ResetDisposable.dispose();
+      win32RisDisposable.dispose();
       resizeObserver.disconnect();
       removeDataListener?.();
       removeExitListener?.();

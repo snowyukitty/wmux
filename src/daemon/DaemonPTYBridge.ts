@@ -43,11 +43,50 @@ export class DaemonPTYBridge extends EventEmitter {
    */
   private muted = false;
 
+  /**
+   * win32-input-mode (DECSET 9001) state of the foreground app, tracked from
+   * the output stream. The renderer reconstructs this flag by replaying the
+   * ring buffer on attach, but the `CSI ? 9001 h` that turned it on is
+   * evicted once the session outgrows the ring (8 MB default) — reattaching
+   * to a long-running codex then silently breaks Ctrl+J / Shift+Enter. The
+   * daemon sees every byte, so it is the authority; SessionPipe re-emits the
+   * state after each ring replay. RIS (ESC c) resets it like every other
+   * mode. Scans only bytes that reach the ring (muted chunks are dropped
+   * before the renderer ever sees them).
+   */
+  private win32InputMode = false;
+  /** Tail of the previous chunk so a toggle split across chunks still matches. */
+  private win32ModeCarry = '';
+  private static readonly WIN32_MODE_SET = '\x1b[?9001h';
+  private static readonly WIN32_MODE_RESET = '\x1b[?9001l';
+  private static readonly RIS = '\x1bc';
+
   // Prompt-based CWD detection. Parsing is shared with the local PTYBridge via
   // ../main/pty/cwdDetect (parseOsc7Cwd / detectPromptCwd) so both spawn paths
   // stay in lockstep; this only owns the ANSI strip + buffering.
   // eslint-disable-next-line no-control-regex
   private static readonly ANSI_STRIP = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b\[[?]?[0-9;]*[hlm]/g;
+
+  /**
+   * Last-occurrence-wins scan for the win32-input-mode toggles. The carry is
+   * one byte shorter than the longest token, so a token already counted in a
+   * previous scan can only be re-seen in full if it is RIS — idempotent,
+   * because nothing in the carry can outrank a newer token in `data`.
+   */
+  private scanWin32InputMode(data: string): void {
+    const hay = this.win32ModeCarry + data;
+    const set = hay.lastIndexOf(DaemonPTYBridge.WIN32_MODE_SET);
+    const reset = hay.lastIndexOf(DaemonPTYBridge.WIN32_MODE_RESET);
+    const ris = hay.lastIndexOf(DaemonPTYBridge.RIS);
+    const last = Math.max(set, reset, ris);
+    if (last !== -1) this.win32InputMode = last === set;
+    this.win32ModeCarry = hay.slice(-(DaemonPTYBridge.WIN32_MODE_SET.length - 1));
+  }
+
+  /** Authoritative win32-input-mode state for SessionPipe's replay preamble. */
+  getWin32InputMode(): boolean {
+    return this.win32InputMode;
+  }
 
   setupDataForwarding(
     ptyProcess: IPty,
@@ -57,6 +96,11 @@ export class DaemonPTYBridge extends EventEmitter {
   ): void {
     const oscParser = new OscParser();
     this.oscParser = oscParser;
+
+    // Fresh PTY → fresh mode state (setupDataForwarding can be re-run on a
+    // recovered session; the new shell starts with win32-input-mode off).
+    this.win32InputMode = false;
+    this.win32ModeCarry = '';
 
     const agentDetector = new AgentDetector();
     this.agentDetector = agentDetector;
@@ -138,6 +182,7 @@ export class DaemonPTYBridge extends EventEmitter {
       try {
         const buf = Buffer.from(data);
         ringBuffer.write(buf);
+        this.scanWin32InputMode(data);
         activityMonitor.feed(sessionId, buf.length);
         oscParser.process(data);
 

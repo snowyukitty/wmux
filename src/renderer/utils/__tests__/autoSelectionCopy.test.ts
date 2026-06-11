@@ -150,10 +150,12 @@ describe('createAutoSelectionCopy', () => {
       expect(write).toHaveBeenCalledWith('selection');
     });
 
-    it('a repaint-driven re-fire of the same kept selection writes only once', async () => {
-      // The bug: right-click copy keeps the selection highlighted, and every
-      // buffer repaint/scroll under it re-fires onSelectionChange with the
-      // same text. Each re-fire used to write again — duplicate Win+V entry.
+    it('a re-fire of the same kept selection writes only once', async () => {
+      // The bug: right-click copy keeps the selection highlighted; when the
+      // buffer shifts under it (scroll/trim — xterm fires onSelectionChange
+      // on coordinate change) or the user re-selects the same text, the
+      // event re-fires with identical text. Each re-fire used to write
+      // again — duplicate Win+V entry.
       let clipboard = '';
       const write = vi.fn(async (text: string) => { clipboard = text; });
       const readCurrent = vi.fn(async () => clipboard);
@@ -181,6 +183,58 @@ describe('createAutoSelectionCopy', () => {
       await vi.advanceTimersByTimeAsync(50);
 
       expect(write).toHaveBeenCalledTimes(1);
+    });
+
+    it('dispose() during an in-flight readCurrent cancels the write', async () => {
+      // The race (codex review finding #4): once the debounce callback has
+      // entered `await readCurrent()`, clearTimeout can no longer stop it.
+      // An explicit copy landing in that window calls dispose(); without
+      // epoch invalidation both sides saw the stale clipboard and both
+      // wrote — recreating the duplicate Win+V entry.
+      let resolveRead!: (text: string) => void;
+      const write = vi.fn().mockResolvedValue(undefined);
+      const readCurrent = vi.fn(
+        () => new Promise<string>((resolve) => { resolveRead = resolve; }),
+      );
+      const handle = createAutoSelectionCopy({ write, readCurrent, debounceMs: 50 });
+
+      handle.onSelection('contested text');
+      await vi.advanceTimersByTimeAsync(50);
+      expect(readCurrent).toHaveBeenCalledTimes(1); // parked on the read
+
+      // Explicit copy takes over while the read is in flight.
+      handle.dispose();
+      resolveRead('old clipboard'); // read resolves with non-matching text…
+      await vi.runAllTimersAsync();
+
+      // …but the cancelled epoch must not write anyway.
+      expect(write).not.toHaveBeenCalled();
+    });
+
+    it('a write whose readCurrent was in flight survives an unrelated later selection', async () => {
+      // Sanity check of the epoch scope: dispose() invalidates, but a fresh
+      // onSelection after dispose re-arms with the new epoch and writes.
+      let resolveRead!: (text: string) => void;
+      const write = vi.fn().mockResolvedValue(undefined);
+      const readCurrent = vi.fn(
+        () => new Promise<string>((resolve) => { resolveRead = resolve; }),
+      );
+      const handle = createAutoSelectionCopy({ write, readCurrent, debounceMs: 50 });
+
+      handle.onSelection('first');
+      await vi.advanceTimersByTimeAsync(50);
+      handle.dispose();
+      resolveRead('whatever');
+      await vi.runAllTimersAsync();
+      expect(write).not.toHaveBeenCalled();
+
+      handle.onSelection('second');
+      await vi.advanceTimersByTimeAsync(50);
+      resolveRead('not-second');
+      await vi.runAllTimersAsync();
+
+      expect(write).toHaveBeenCalledTimes(1);
+      expect(write).toHaveBeenCalledWith('second');
     });
 
     it('still swallows a write error after a non-matching read', async () => {

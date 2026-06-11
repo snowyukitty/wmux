@@ -655,7 +655,12 @@ function registerRpcHandlers(
         sessionPipes.delete(p.id);
       }
 
-      const pipe = new SessionPipe(p.id, managed.ringBuffer, pipeServer.getAuthToken());
+      const pipe = new SessionPipe(
+        p.id,
+        managed.ringBuffer,
+        pipeServer.getAuthToken(),
+        () => managed.bridge.getWin32InputMode(),
+      );
       sessionPipes.set(p.id, pipe);
 
       // Forward PTY output to session pipe

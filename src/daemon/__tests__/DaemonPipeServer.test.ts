@@ -426,6 +426,65 @@ describe('SessionPipe', () => {
     expect(received.toString()).toBe('Hello from ring buffer!');
   });
 
+  // Shared helper: connect, auth, and capture everything up to the flush
+  // marker (the replay + any mode preamble).
+  const captureFlush = (pipeName: string): Promise<Buffer> =>
+    new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const client = net.createConnection(pipeName, () => {
+        client.write(SESSION_AUTH_TOKEN + '\n');
+      });
+      client.on('data', (chunk: Buffer) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        const combined = Buffer.concat(chunks);
+        const markerIndex = combined.indexOf(FLUSH_DONE_MARKER);
+        if (markerIndex !== -1) {
+          client.destroy();
+          resolve(combined.subarray(0, markerIndex));
+        }
+      });
+      client.on('error', reject);
+      setTimeout(() => reject(new Error('timeout')), 3000);
+    });
+
+  it('re-asserts active win32-input-mode after the ring replay', async () => {
+    // Ring no longer contains the ?9001h toggle (evicted), but the bridge
+    // says the mode is on — the flush must end with the set sequence.
+    ringBuffer.write(Buffer.from('codex output, toggle long since evicted'));
+    sessionPipe = new SessionPipe(
+      sessionId + '-w1', ringBuffer, SESSION_AUTH_TOKEN, () => true,
+    );
+    await sessionPipe.start();
+
+    const flushed = (await captureFlush(sessionPipe.getPipeName())).toString();
+    expect(flushed.endsWith('\x1b[?9001h')).toBe(true);
+    expect(flushed.startsWith('codex output')).toBe(true);
+  });
+
+  it('clears a stale win32-input-mode left in replayed scrollback', async () => {
+    // Recovered session: the pre-filled scrollback still contains the old
+    // shell's ?9001h, but the new shell never enabled the mode. The reset
+    // preamble must come AFTER the stale toggle so last-wins lands on off.
+    ringBuffer.write(Buffer.from('old life \x1b[?9001h more output'));
+    sessionPipe = new SessionPipe(
+      sessionId + '-w2', ringBuffer, SESSION_AUTH_TOKEN, () => false,
+    );
+    await sessionPipe.start();
+
+    const flushed = (await captureFlush(sessionPipe.getPipeName())).toString();
+    expect(flushed.endsWith('\x1b[?9001l')).toBe(true);
+    expect(flushed.indexOf('\x1b[?9001h')).toBeLessThan(flushed.indexOf('\x1b[?9001l'));
+  });
+
+  it('omits the mode preamble when no getter is provided (legacy ctor)', async () => {
+    ringBuffer.write(Buffer.from('plain'));
+    sessionPipe = new SessionPipe(sessionId + '-w3', ringBuffer, SESSION_AUTH_TOKEN);
+    await sessionPipe.start();
+
+    const flushed = (await captureFlush(sessionPipe.getPipeName())).toString();
+    expect(flushed).toBe('plain');
+  });
+
   it('should reject invalid auth token', async () => {
     sessionPipe = new SessionPipe(sessionId + '-auth', ringBuffer, SESSION_AUTH_TOKEN);
     await sessionPipe.start();
