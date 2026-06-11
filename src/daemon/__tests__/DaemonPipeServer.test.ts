@@ -426,54 +426,82 @@ describe('SessionPipe', () => {
     expect(received.toString()).toBe('Hello from ring buffer!');
   });
 
-  // Shared helper: connect, auth, and capture everything up to the flush
-  // marker (the replay + any mode preamble).
-  const captureFlush = (pipeName: string): Promise<Buffer> =>
-    new Promise<Buffer>((resolve, reject) => {
+  // Shared helper: connect, auth, and capture the flush split at the marker.
+  // `before` is what DaemonClient counts as recoveredBytes; `after` is the
+  // first live bytes (where the mode preamble must land). Resolves shortly
+  // after the marker so a missing preamble is observable as empty `after`.
+  const captureFlush = (pipeName: string): Promise<{ before: string; after: string }> =>
+    new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
+      let markerSeen = false;
       const client = net.createConnection(pipeName, () => {
         client.write(SESSION_AUTH_TOKEN + '\n');
       });
-      client.on('data', (chunk: Buffer) => {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const finish = () => {
         const combined = Buffer.concat(chunks);
         const markerIndex = combined.indexOf(FLUSH_DONE_MARKER);
-        if (markerIndex !== -1) {
-          client.destroy();
-          resolve(combined.subarray(0, markerIndex));
+        client.destroy();
+        resolve({
+          before: combined.subarray(0, markerIndex).toString(),
+          after: combined.subarray(markerIndex + FLUSH_DONE_MARKER.length).toString(),
+        });
+      };
+      client.on('data', (chunk: Buffer) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        if (!markerSeen && Buffer.concat(chunks).indexOf(FLUSH_DONE_MARKER) !== -1) {
+          markerSeen = true;
+          // Give the (synchronously written) post-marker preamble one tick
+          // to arrive in case the OS split the TCP frames.
+          setTimeout(finish, 150);
         }
       });
       client.on('error', reject);
       setTimeout(() => reject(new Error('timeout')), 3000);
     });
 
-  it('re-asserts active win32-input-mode after the ring replay', async () => {
+  it('re-asserts active win32-input-mode AFTER the marker (not as recovered bytes)', async () => {
     // Ring no longer contains the ?9001h toggle (evicted), but the bridge
-    // says the mode is on — the flush must end with the set sequence.
+    // says the mode is on. The preamble must arrive as the first LIVE bytes:
+    // anything before the marker is counted as recoveredBytes and a nonzero
+    // count makes the renderer reset its .txt-restored buffer.
     ringBuffer.write(Buffer.from('codex output, toggle long since evicted'));
     sessionPipe = new SessionPipe(
       sessionId + '-w1', ringBuffer, SESSION_AUTH_TOKEN, () => true,
     );
     await sessionPipe.start();
 
-    const flushed = (await captureFlush(sessionPipe.getPipeName())).toString();
-    expect(flushed.endsWith('\x1b[?9001h')).toBe(true);
-    expect(flushed.startsWith('codex output')).toBe(true);
+    const { before, after } = await captureFlush(sessionPipe.getPipeName());
+    expect(before).toBe('codex output, toggle long since evicted');
+    expect(after.startsWith('\x1b[?9001h')).toBe(true);
+  });
+
+  it('keeps recoveredBytes at zero for an empty ring with an active preamble', async () => {
+    // The codex round-2 blocker: an empty ring plus a pre-marker preamble
+    // reported recoveredBytes=8, wiping the renderer's .txt fallback.
+    sessionPipe = new SessionPipe(
+      sessionId + '-w1b', ringBuffer, SESSION_AUTH_TOKEN, () => true,
+    );
+    await sessionPipe.start();
+
+    const { before, after } = await captureFlush(sessionPipe.getPipeName());
+    expect(before).toBe(''); // recoveredBytes stays 0
+    expect(after.startsWith('\x1b[?9001h')).toBe(true);
   });
 
   it('clears a stale win32-input-mode left in replayed scrollback', async () => {
     // Recovered session: the pre-filled scrollback still contains the old
     // shell's ?9001h, but the new shell never enabled the mode. The reset
-    // preamble must come AFTER the stale toggle so last-wins lands on off.
+    // preamble comes after the marker, i.e. after the stale toggle —
+    // last-wins lands on off.
     ringBuffer.write(Buffer.from('old life \x1b[?9001h more output'));
     sessionPipe = new SessionPipe(
       sessionId + '-w2', ringBuffer, SESSION_AUTH_TOKEN, () => false,
     );
     await sessionPipe.start();
 
-    const flushed = (await captureFlush(sessionPipe.getPipeName())).toString();
-    expect(flushed.endsWith('\x1b[?9001l')).toBe(true);
-    expect(flushed.indexOf('\x1b[?9001h')).toBeLessThan(flushed.indexOf('\x1b[?9001l'));
+    const { before, after } = await captureFlush(sessionPipe.getPipeName());
+    expect(before).toContain('\x1b[?9001h');
+    expect(after.startsWith('\x1b[?9001l')).toBe(true);
   });
 
   it('omits the mode preamble when no getter is provided (legacy ctor)', async () => {
@@ -481,8 +509,9 @@ describe('SessionPipe', () => {
     sessionPipe = new SessionPipe(sessionId + '-w3', ringBuffer, SESSION_AUTH_TOKEN);
     await sessionPipe.start();
 
-    const flushed = (await captureFlush(sessionPipe.getPipeName())).toString();
-    expect(flushed).toBe('plain');
+    const { before, after } = await captureFlush(sessionPipe.getPipeName());
+    expect(before).toBe('plain');
+    expect(after).toBe('');
   });
 
   it('should reject invalid auth token', async () => {

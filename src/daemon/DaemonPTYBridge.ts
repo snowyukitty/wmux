@@ -51,15 +51,28 @@ export class DaemonPTYBridge extends EventEmitter {
    * to a long-running codex then silently breaks Ctrl+J / Shift+Enter. The
    * daemon sees every byte, so it is the authority; SessionPipe re-emits the
    * state after each ring replay. RIS (ESC c) resets it like every other
-   * mode. Scans only bytes that reach the ring (muted chunks are dropped
-   * before the renderer ever sees them).
+   * mode. Muted chunks ARE scanned: muting drops display bytes the renderer
+   * must never paint, but the app still negotiated the mode — the preamble
+   * is the only way the renderer can learn about a toggle that was muted.
    */
   private win32InputMode = false;
   /** Tail of the previous chunk so a toggle split across chunks still matches. */
   private win32ModeCarry = '';
-  private static readonly WIN32_MODE_SET = '\x1b[?9001h';
-  private static readonly WIN32_MODE_RESET = '\x1b[?9001l';
-  private static readonly RIS = '\x1bc';
+  /**
+   * RIS, or a private CSI set/reset whose param list may carry 9001 alongside
+   * other modes (`ESC [ ? 2004 ; 9001 h`) — the renderer's VT parser accepts
+   * the combined form, so a literal-token scan would diverge from it and the
+   * replay preamble would then force the renderer WRONG. (C1 CSI 0x9B needs
+   * no handling: node-pty decodes the stream as UTF-8, where a raw 0x9B is
+   * invalid and becomes U+FFFD on both sides.)
+   */
+  // eslint-disable-next-line no-control-regex
+  private static readonly WIN32_MODE_SCAN = /\x1b(?:c|\[\?([0-9;]*)([hl]))/g;
+  /** A carry must be a PREFIX of a potential match — never a completed one. */
+  // eslint-disable-next-line no-control-regex
+  private static readonly WIN32_MODE_CARRY_PREFIX = /^\x1b(?:\[\??[0-9;]*)?$/;
+  /** Longer than any sane DECSET param list; a split beyond this is dropped. */
+  private static readonly WIN32_MODE_CARRY_MAX = 64;
 
   // Prompt-based CWD detection. Parsing is shared with the local PTYBridge via
   // ../main/pty/cwdDetect (parseOsc7Cwd / detectPromptCwd) so both spawn paths
@@ -68,19 +81,32 @@ export class DaemonPTYBridge extends EventEmitter {
   private static readonly ANSI_STRIP = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b\[[?]?[0-9;]*[hlm]/g;
 
   /**
-   * Last-occurrence-wins scan for the win32-input-mode toggles. The carry is
-   * one byte shorter than the longest token, so a token already counted in a
-   * previous scan can only be re-seen in full if it is RIS — idempotent,
-   * because nothing in the carry can outrank a newer token in `data`.
+   * Parser-equivalent scan for the win32-input-mode toggles: every private
+   * CSI set/reset is parsed and its param list checked for 9001, mirroring
+   * xterm's `params.includes(9001)` in the renderer. Tokens are processed in
+   * stream order, so the final state is what a real parser would hold. The
+   * carry keeps an incomplete trailing sequence (and ONLY an incomplete one —
+   * a completed match never re-enters the next scan, so nothing is ever
+   * double-counted) up to WIN32_MODE_CARRY_MAX chars.
    */
   private scanWin32InputMode(data: string): void {
     const hay = this.win32ModeCarry + data;
-    const set = hay.lastIndexOf(DaemonPTYBridge.WIN32_MODE_SET);
-    const reset = hay.lastIndexOf(DaemonPTYBridge.WIN32_MODE_RESET);
-    const ris = hay.lastIndexOf(DaemonPTYBridge.RIS);
-    const last = Math.max(set, reset, ris);
-    if (last !== -1) this.win32InputMode = last === set;
-    this.win32ModeCarry = hay.slice(-(DaemonPTYBridge.WIN32_MODE_SET.length - 1));
+    DaemonPTYBridge.WIN32_MODE_SCAN.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = DaemonPTYBridge.WIN32_MODE_SCAN.exec(hay)) !== null) {
+      if (m[1] === undefined) {
+        this.win32InputMode = false; // RIS resets every mode
+      } else if (m[1].split(';').includes('9001')) {
+        this.win32InputMode = m[2] === 'h';
+      }
+    }
+    const lastEsc = hay.lastIndexOf('\x1b');
+    const tail = lastEsc === -1 ? '' : hay.slice(lastEsc);
+    this.win32ModeCarry =
+      tail.length <= DaemonPTYBridge.WIN32_MODE_CARRY_MAX &&
+      DaemonPTYBridge.WIN32_MODE_CARRY_PREFIX.test(tail)
+        ? tail
+        : '';
   }
 
   /** Authoritative win32-input-mode state for SessionPipe's replay preamble. */
@@ -175,6 +201,13 @@ export class DaemonPTYBridge extends EventEmitter {
         // detection 실패가 데이터 포워딩을 막아선 안 된다.
       }
 
+      // Mode tracking must see muted chunks too: muting protects the ring /
+      // renderer from geometry-mismatched DISPLAY bytes, but a mode the app
+      // negotiates during that window (shell profile enabling 9001 before the
+      // first resize) is real protocol state — the attach preamble is the
+      // only way the renderer ever learns about it. (Codex round-2 #3.)
+      this.scanWin32InputMode(data);
+
       // Muted: drop the chunk before any side effect. Recovery sessions
       // run muted until their first resize so the geometry mismatch
       // window (Bug 2 in v2.8.0) doesn't pollute the ring buffer.
@@ -182,7 +215,6 @@ export class DaemonPTYBridge extends EventEmitter {
       try {
         const buf = Buffer.from(data);
         ringBuffer.write(buf);
-        this.scanWin32InputMode(data);
         activityMonitor.feed(sessionId, buf.length);
         oscParser.process(data);
 

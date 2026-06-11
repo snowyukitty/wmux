@@ -263,19 +263,25 @@ export class SessionPipe {
         socket.write(buffered);
       }
 
-      // Step 1b: Re-assert win32-input-mode. Last-wins, so appending the
-      // authoritative state after the replay is always correct: if the ring
-      // still contains the live toggle this is a no-op re-set, and if the
-      // toggle was evicted (or a recovered session replayed a stale ?9001h
-      // from its previous life) this corrects the renderer's flag. Deliberately
-      // NOT written to the ring — it describes state, it isn't session output.
-      if (this.getWin32InputMode) {
-        socket.write(this.getWin32InputMode() ? '\x1b[?9001h' : '\x1b[?9001l');
-      }
-
       // Step 2: Send flush done marker
       socket.write(FLUSH_DONE_MARKER);
       this.flushed = true;
+
+      // Step 2b: Re-assert win32-input-mode as the first LIVE bytes, i.e.
+      // AFTER the marker. Bytes before the marker are counted by
+      // DaemonClient as `recoveredBytes` and recoveredBytes > 0 makes the
+      // renderer reset its .txt-restored buffer — an empty ring plus an
+      // 8-byte preamble would wipe the only scrollback the user had left
+      // (codex round-2 #1). Post-marker it parses invisibly with no
+      // accounting side effects. Last-wins keeps it correct: if the ring
+      // replay contained the live toggle this is a no-op re-set; if the
+      // toggle was evicted (or a recovered session replayed a stale ?9001h
+      // from its previous life) this corrects the renderer's flag.
+      // Deliberately NOT written to the ring — it describes protocol state,
+      // it isn't session output.
+      if (this.getWin32InputMode) {
+        socket.write(this.getWin32InputMode() ? '\x1b[?9001h' : '\x1b[?9001l');
+      }
 
       // Step 3: Forward client input to PTY via callback
       socket.on('data', (inputData: Buffer) => {

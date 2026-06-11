@@ -902,28 +902,32 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // coalesced — scrollback restore, the pending-data replay, and the exit
     // banner stay direct, and all of those run before any live write.
     const PTY_WRITE_COALESCE_MS = 16;
-    // Cap on the joined chunk handed to xterm. xterm's WriteBuffer yields
-    // BETWEEN queued chunks, never inside one, so joining 16ms of a fast
-    // stream into a single multi-hundred-KB chunk would remove its parse
-    // yield points and stall the renderer. 64KB ≈ a typical single PTY chunk;
-    // a TUI redraw (the flash this exists for) is far below it, so the cap
-    // only kicks in for bulk output where flashing isn't the failure mode.
-    const PTY_WRITE_COALESCE_MAX_BYTES = 64 * 1024;
+    // Cap on the joined chunk handed to xterm, in UTF-16 code units (what
+    // string.length measures and the unit xterm's parse cost scales with —
+    // NOT encoded bytes). xterm's WriteBuffer yields BETWEEN queued chunks,
+    // never inside one, so joining 16ms of a fast stream into a single
+    // multi-hundred-KB chunk would remove its parse yield points and stall
+    // the renderer. 64K units ≈ a typical single PTY chunk; a TUI redraw
+    // (the flash this exists for) is far below it, so the cap only kicks in
+    // for bulk output where flashing isn't the failure mode. A single
+    // arriving chunk larger than the cap flushes through unsplit — exactly
+    // what the pre-coalescing code handed xterm, so no regression there.
+    const PTY_WRITE_COALESCE_MAX_UNITS = 64 * 1024;
     let pendingPtyWrites: string[] = [];
-    let pendingPtyBytes = 0;
+    let pendingPtyUnits = 0;
     let ptyWriteTimer: ReturnType<typeof setTimeout> | null = null;
     const flushPtyWrites = () => {
       if (ptyWriteTimer !== null) { clearTimeout(ptyWriteTimer); ptyWriteTimer = null; }
       if (pendingPtyWrites.length === 0) return;
       const joined = pendingPtyWrites.length === 1 ? pendingPtyWrites[0] : pendingPtyWrites.join('');
       pendingPtyWrites = [];
-      pendingPtyBytes = 0;
+      pendingPtyUnits = 0;
       terminal.write(joined);
     };
     const enqueuePtyWrite = (data: string) => {
       pendingPtyWrites.push(data);
-      pendingPtyBytes += data.length;
-      if (pendingPtyBytes >= PTY_WRITE_COALESCE_MAX_BYTES) {
+      pendingPtyUnits += data.length;
+      if (pendingPtyUnits >= PTY_WRITE_COALESCE_MAX_UNITS) {
         flushPtyWrites();
         return;
       }
