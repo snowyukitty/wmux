@@ -185,6 +185,37 @@ describe('createAutoSelectionCopy', () => {
       expect(write).toHaveBeenCalledTimes(1);
     });
 
+    it('skips a transient capture whose selection changed before the debounce fired', async () => {
+      // Live TUI panes (Claude Code/Ink) erase-then-rewrite the region under
+      // a kept selection. A capture landing mid-repaint holds partial text;
+      // it must never reach the clipboard. getCurrent (the live selection)
+      // is re-read at fire time and the write is skipped on mismatch.
+      const write = vi.fn().mockResolvedValue(undefined);
+      const readCurrent = vi.fn(async () => '');
+      let liveSelection = 'full response text';
+      const getCurrent = vi.fn(() => liveSelection);
+      const handle = createAutoSelectionCopy({ write, readCurrent, getCurrent, debounceMs: 50 });
+
+      // Mid-repaint capture: the event delivered partial text, but by fire
+      // time the live selection holds the full rewrite.
+      handle.onSelection('full resp');
+      await vi.advanceTimersByTimeAsync(50);
+      expect(write).not.toHaveBeenCalled();
+
+      // A stable capture (event text === live text at fire time) writes.
+      handle.onSelection('full response text');
+      await vi.advanceTimersByTimeAsync(50);
+      expect(write).toHaveBeenCalledTimes(1);
+      expect(write).toHaveBeenCalledWith('full response text');
+
+      // And a capture that was full at event time but blanked by a repaint
+      // at fire time is also skipped.
+      liveSelection = '';
+      handle.onSelection('full response text');
+      await vi.advanceTimersByTimeAsync(50);
+      expect(write).toHaveBeenCalledTimes(1);
+    });
+
     it('dispose() during an in-flight readCurrent cancels the write', async () => {
       // The race (codex review finding #4): once the debounce callback has
       // entered `await readCurrent()`, clearTimeout can no longer stop it.

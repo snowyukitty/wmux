@@ -31,6 +31,19 @@ export interface AutoSelectionCopyDeps {
    * back to writing — never the other way around.
    */
   readCurrent?: () => Promise<string>;
+  /**
+   * Optional bridge to `terminal.getSelection()`. When provided, the debounced
+   * write re-reads the live selection as it fires and bails if the text no
+   * longer matches what was captured. This is the transient-capture guard for
+   * live TUI panes (Claude Code/Ink redraws erase-then-rewrite the region
+   * under a kept selection): an onSelectionChange that lands mid-repaint
+   * captures a partial/blank line, and without this check that garbage went
+   * to the clipboard 150ms later — then the next capture of the full text
+   * wrote AGAIN, stacking lookalike duplicates into Win+V. Requiring the
+   * same text at capture time and fire time filters repaint transients;
+   * a newer capture re-arms the debounce and owns the write.
+   */
+  getCurrent?: () => string;
   /** Debounce window in ms. Defaults to 150. */
   debounceMs?: number;
   /**
@@ -74,6 +87,9 @@ export function createAutoSelectionCopy(deps: AutoSelectionCopyDeps): AutoSelect
     pending = setT(() => {
       pending = null;
       if (!selection || selection.length === 0) return;
+      // Transient-capture guard: only write a selection that is still the
+      // same text now that the debounce has fired. See getCurrent docs.
+      if (deps.getCurrent && deps.getCurrent() !== selection) return;
       const myEpoch = epoch;
       void (async () => {
         if (deps.readCurrent) {

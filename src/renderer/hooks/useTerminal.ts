@@ -537,10 +537,15 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       write: (text) => window.clipboardAPI.writeText(text),
       // Dedupe against the clipboard's current text, mirroring the explicit
       // copy path: a kept selection (right-click copy) re-fires
-      // onSelectionChange on every repaint/scroll under it, and without this
+      // onSelectionChange when the buffer shifts under it, and without this
       // each re-fire wrote the same text again — the "copy A lands twice in
       // Win+V history" bug. See AutoSelectionCopyDeps.readCurrent.
       readCurrent: () => window.clipboardAPI.readText(),
+      // Transient-capture guard for live TUI panes (Claude Code): a capture
+      // that lands mid-repaint holds partial/blank text; only write a
+      // selection still identical when the debounce fires. See
+      // AutoSelectionCopyDeps.getCurrent.
+      getCurrent: () => terminal.getSelection(),
     });
     const selectionDisposable = terminal.onSelectionChange(() => {
       autoCopy.onSelection(terminal.getSelection());
