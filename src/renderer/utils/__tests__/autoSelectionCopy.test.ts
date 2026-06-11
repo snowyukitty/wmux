@@ -124,4 +124,76 @@ describe('createAutoSelectionCopy', () => {
 
     expect(write).toHaveBeenCalledWith('reborn');
   });
+
+  describe('duplicate-write dedupe (readCurrent)', () => {
+    it('skips the write when the clipboard already holds the selection', async () => {
+      const write = vi.fn().mockResolvedValue(undefined);
+      const readCurrent = vi.fn(async () => 'same text');
+      const handle = createAutoSelectionCopy({ write, readCurrent, debounceMs: 50 });
+
+      handle.onSelection('same text');
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(readCurrent).toHaveBeenCalledTimes(1);
+      expect(write).not.toHaveBeenCalled();
+    });
+
+    it('writes when the clipboard holds different text', async () => {
+      const write = vi.fn().mockResolvedValue(undefined);
+      const readCurrent = vi.fn(async () => 'something else');
+      const handle = createAutoSelectionCopy({ write, readCurrent, debounceMs: 50 });
+
+      handle.onSelection('selection');
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(write).toHaveBeenCalledTimes(1);
+      expect(write).toHaveBeenCalledWith('selection');
+    });
+
+    it('a repaint-driven re-fire of the same kept selection writes only once', async () => {
+      // The bug: right-click copy keeps the selection highlighted, and every
+      // buffer repaint/scroll under it re-fires onSelectionChange with the
+      // same text. Each re-fire used to write again — duplicate Win+V entry.
+      let clipboard = '';
+      const write = vi.fn(async (text: string) => { clipboard = text; });
+      const readCurrent = vi.fn(async () => clipboard);
+      const handle = createAutoSelectionCopy({ write, readCurrent, debounceMs: 50 });
+
+      handle.onSelection('held selection');
+      await vi.advanceTimersByTimeAsync(50);
+      expect(write).toHaveBeenCalledTimes(1);
+
+      // TUI repaints re-fire the unchanged selection.
+      handle.onSelection('held selection');
+      await vi.advanceTimersByTimeAsync(50);
+      handle.onSelection('held selection');
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(write).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls back to writing when readCurrent rejects', async () => {
+      const write = vi.fn().mockResolvedValue(undefined);
+      const readCurrent = vi.fn(async () => { throw new Error('CLIPBOARD_READ_FAILED'); });
+      const handle = createAutoSelectionCopy({ write, readCurrent, debounceMs: 50 });
+
+      handle.onSelection('selection');
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(write).toHaveBeenCalledTimes(1);
+    });
+
+    it('still swallows a write error after a non-matching read', async () => {
+      const write = vi.fn().mockRejectedValue(new Error('CLIPBOARD_WRITE_FAILED'));
+      const readCurrent = vi.fn(async () => 'other');
+      const handle = createAutoSelectionCopy({ write, readCurrent, debounceMs: 50 });
+
+      handle.onSelection('selection');
+      await vi.advanceTimersByTimeAsync(50);
+      await vi.runAllTimersAsync();
+
+      expect(write).toHaveBeenCalledTimes(1);
+      // No throw observed — failure is silent.
+    });
+  });
 });

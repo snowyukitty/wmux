@@ -523,6 +523,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // surfaces them on retry.
     const autoCopy = createAutoSelectionCopy({
       write: (text) => window.clipboardAPI.writeText(text),
+      // Dedupe against the clipboard's current text, mirroring the explicit
+      // copy path: a kept selection (right-click copy) re-fires
+      // onSelectionChange on every repaint/scroll under it, and without this
+      // each re-fire wrote the same text again — the "copy A lands twice in
+      // Win+V history" bug. See AutoSelectionCopyDeps.readCurrent.
+      readCurrent: () => window.clipboardAPI.readText(),
     });
     const selectionDisposable = terminal.onSelectionChange(() => {
       autoCopy.onSelection(terminal.getSelection());

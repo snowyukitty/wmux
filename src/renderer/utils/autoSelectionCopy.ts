@@ -18,6 +18,18 @@
 export interface AutoSelectionCopyDeps {
   /** Bridge to `window.clipboardAPI.writeText` (or any equivalent). */
   write: (text: string) => Promise<unknown>;
+  /**
+   * Optional bridge to `window.clipboardAPI.readText`. When provided and the
+   * clipboard already holds exactly the selection, the debounced write is
+   * skipped. This is the auto-copy half of the duplicate-entry fix: a kept
+   * selection (right-click copy uses keepSelection) re-fires
+   * onSelectionChange whenever the buffer repaints or scrolls under it — a
+   * constantly redrawing TUI pane re-armed this debounce forever, stacking
+   * the same text into the Windows clipboard history (Win+V) on every
+   * repaint. Re-selecting the same word had the same effect. A failed read
+   * falls back to writing — never the other way around.
+   */
+  readCurrent?: () => Promise<string>;
   /** Debounce window in ms. Defaults to 150. */
   debounceMs?: number;
   /**
@@ -49,7 +61,16 @@ export function createAutoSelectionCopy(deps: AutoSelectionCopyDeps): AutoSelect
     pending = setT(() => {
       pending = null;
       if (!selection || selection.length === 0) return;
-      void deps.write(selection).catch(() => {
+      void (async () => {
+        if (deps.readCurrent) {
+          try {
+            if ((await deps.readCurrent()) === selection) return;
+          } catch {
+            // Unreadable clipboard (image content, IPC hiccup) → just write.
+          }
+        }
+        await deps.write(selection);
+      })().catch(() => {
         // Silent — explicit copy paths still surface errors when retried.
       });
     }, debounceMs);
