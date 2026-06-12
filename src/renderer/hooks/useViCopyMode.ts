@@ -166,7 +166,12 @@ export function useViCopyMode(
   const copySelection = useCallback(async () => {
     if (!terminal) return;
     const text = terminal.getSelection() || getLineText(terminal, cursorRef.current.row);
-    if (text) await navigator.clipboard.writeText(text);
+    if (text) {
+      // Same IPC bridge as every other copy path (NOT navigator.clipboard).
+      // eslint-disable-next-line no-console
+      console.log(`[clipdiag] vi-copySelection WRITE len=${text.length}`);
+      await window.clipboardAPI.writeText(text).catch(() => undefined);
+    }
     exit();
   }, [terminal, exit]);
 
@@ -193,7 +198,12 @@ export function useViCopyMode(
         } else {
           text = getLineText(terminal, cur.row);
         }
-        navigator.clipboard.writeText(text).then(() => exit());
+        // Same IPC bridge as every other copy path (NOT navigator.clipboard):
+        // one writer pipeline keeps main-side error handling, dedupe
+        // diagnostics, and Win+V accounting consistent.
+        // eslint-disable-next-line no-console
+        console.log(`[clipdiag] vi-yank WRITE len=${text.length}`);
+        window.clipboardAPI.writeText(text).then(() => exit()).catch(() => exit());
         return;
       }
 

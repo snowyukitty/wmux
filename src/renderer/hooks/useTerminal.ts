@@ -533,6 +533,19 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // auto-copy wasn't keybind-triggered, so a flashing "Copied!" would be
     // UI noise. Errors are also silent: the explicit Ctrl+C path still
     // surfaces them on retry.
+    // Gesture state for the auto-copy gate below. Armed from pointerdown
+    // until one macrotask after pointerup: xterm emits its final
+    // onSelectionChange synchronously inside its own document-level mouseup
+    // handler, and the 0ms timeout orders our disarm after every mouseup
+    // listener has run, whichever registered first. pointerup listens on
+    // window because a drag can end outside the pane.
+    let selectionGestureArmed = false;
+    const onGesturePointerDown = (e: PointerEvent) => {
+      if (e.button === 0) selectionGestureArmed = true;
+    };
+    const onGesturePointerUp = () => {
+      setTimeout(() => { selectionGestureArmed = false; }, 0);
+    };
     const autoCopy = createAutoSelectionCopy({
       write: (text) => window.clipboardAPI.writeText(text),
       // Dedupe against the clipboard's current text, mirroring the explicit
@@ -546,7 +559,18 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // selection still identical when the debounce fires. See
       // AutoSelectionCopyDeps.getCurrent.
       getCurrent: () => terminal.getSelection(),
+      // Gesture gate: only mouse-driven selection events may auto-copy.
+      // Once the scrollback is full, a main-buffer TUI (Claude Code) trims a
+      // line per emitted line, dragging a kept selection until its start row
+      // falls off — the selection TEXT then genuinely changes and the
+      // truncated text passed every equality dedupe as a fresh write
+      // ("continuous copies", Claude-Code-only: alt-screen TUIs like codex
+      // never trim under a selection). Those re-fires are not user
+      // selections; gate them out entirely. See selectionGestureArmed below.
+      accept: () => selectionGestureArmed,
     });
+    terminal.element?.addEventListener('pointerdown', onGesturePointerDown);
+    window.addEventListener('pointerup', onGesturePointerUp);
     const selectionDisposable = terminal.onSelectionChange(() => {
       autoCopy.onSelection(terminal.getSelection());
     });
@@ -1215,6 +1239,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // task itself — write-then-dispose was always best-effort).
       flushPtyWrites();
       autoCopy.dispose();
+      terminal.element?.removeEventListener('pointerdown', onGesturePointerDown);
+      window.removeEventListener('pointerup', onGesturePointerUp);
       selectionDisposable.dispose();
       pathLinkDisposable.dispose();
       win32SetDisposable.dispose();

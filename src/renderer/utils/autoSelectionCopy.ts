@@ -44,6 +44,22 @@ export interface AutoSelectionCopyDeps {
    * a newer capture re-arms the debounce and owns the write.
    */
   getCurrent?: () => string;
+  /**
+   * Optional gesture gate. When provided, onSelection events are ignored
+   * outside a live user selection gesture (mouse down → shortly after
+   * release). This is what stops the buffer-shift storm: an in-pane TUI
+   * streaming to the MAIN buffer (Claude Code) trims a line for every line
+   * it emits once scrollback is full, dragging a kept selection's
+   * coordinates until its start row falls off — at which point the
+   * selection TEXT genuinely changes and every equality-based dedupe
+   * correctly lets the truncated text through as a brand-new write
+   * ("continuous copies"). Those events are not user selections and must
+   * not re-arm the debounce at all. Gated events also must not cancel a
+   * pending write from the real gesture, so the gate is checked first.
+   * (Alt-screen TUIs like codex never trim the main buffer under a
+   * selection, which is why they never exhibited the bug.)
+   */
+  accept?: () => boolean;
   /** Debounce window in ms. Defaults to 150. */
   debounceMs?: number;
   /**
@@ -88,6 +104,13 @@ export function createAutoSelectionCopy(deps: AutoSelectionCopyDeps): AutoSelect
     `len=${text.length} ${JSON.stringify(text.length > 24 ? text.slice(0, 24) + '…' : text)}`;
 
   const onSelection = (selection: string): void => {
+    // Gesture gate FIRST: a gated (non-gesture) event must neither arm the
+    // debounce nor cancel a pending write from the real gesture.
+    if (deps.accept && !deps.accept()) {
+      // eslint-disable-next-line no-console
+      console.log(`[clipdiag] auto gate-reject ${dbg(selection)}`);
+      return;
+    }
     if (pending) clearT(pending);
     // eslint-disable-next-line no-console
     console.log(`[clipdiag] auto arm ${dbg(selection)}`);

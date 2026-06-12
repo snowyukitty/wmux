@@ -185,6 +185,32 @@ describe('createAutoSelectionCopy', () => {
       expect(write).toHaveBeenCalledTimes(1);
     });
 
+    it('gate-rejected events neither arm the debounce nor cancel a pending gesture write', async () => {
+      // Buffer-shift storm (Claude Code main-buffer trim): selection events
+      // outside a mouse gesture must be ignored entirely — including ones
+      // that fire while the real gesture's debounce is still pending.
+      const write = vi.fn().mockResolvedValue(undefined);
+      const readCurrent = vi.fn(async () => '');
+      let inGesture = true;
+      const handle = createAutoSelectionCopy({
+        write, readCurrent, accept: () => inGesture, debounceMs: 50,
+      });
+
+      handle.onSelection('user selected this'); // real gesture
+      inGesture = false; // mouse released; trim re-fires begin
+      handle.onSelection('user selected thi'); // truncated by trim — rejected
+      await vi.advanceTimersByTimeAsync(50);
+
+      // The gesture's write survived; the trim event wrote nothing.
+      expect(write).toHaveBeenCalledTimes(1);
+      expect(write).toHaveBeenCalledWith('user selected this');
+
+      // Later trim drift (stable, differs from clipboard) is still rejected.
+      handle.onSelection('selected thi');
+      await vi.advanceTimersByTimeAsync(200);
+      expect(write).toHaveBeenCalledTimes(1);
+    });
+
     it('skips a transient capture whose selection changed before the debounce fired', async () => {
       // Live TUI panes (Claude Code/Ink) erase-then-rewrite the region under
       // a kept selection. A capture landing mid-repaint holds partial text;
