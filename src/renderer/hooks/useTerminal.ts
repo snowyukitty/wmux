@@ -759,6 +759,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     let lastRightClickCopyAt = 0;
     terminal.element?.addEventListener('contextmenu', (e) => {
       e.preventDefault();
+      // TEMP [pastediag]
+      // eslint-disable-next-line no-console
+      console.log(`[pastediag] contextmenu sel-len=${terminal.getSelection().length}`);
 
       // Detect if right-click target is a link element
       let linkUrl: string | null = null;
@@ -802,8 +805,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // clicks). Suppressing the paste here is what kills the reported
       // copy↔paste collision.
       if (Date.now() - lastRightClickCopyAt < RIGHT_CLICK_PASTE_SUPPRESS_MS) {
+        // TEMP [pastediag]
+        // eslint-disable-next-line no-console
+        console.log('[pastediag] right-click paste SUPPRESSED (recent copy)');
         return;
       }
+      // TEMP [pastediag]
+      // eslint-disable-next-line no-console
+      console.log('[pastediag] right-click paste branch firing');
       void (async () => {
         const modes = (terminal as unknown as { modes?: { bracketedPasteMode?: boolean } }).modes;
 
