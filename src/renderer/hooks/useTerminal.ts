@@ -157,14 +157,15 @@ const RIGHT_CLICK_PASTE_SUPPRESS_MS = 300;
 
 // Window after a buffer-churn selection kill in which a right-click is
 // treated as the COPY the user was about to perform rather than a paste.
-// Under a fast-streaming TUI (haiku-speed Claude Code) the scrollback trim
-// destroys a fresh selection within ~150ms — long before the right-click
-// lands — so "select → right-click = copy" silently became "paste". Three
-// seconds comfortably covers select-then-click while staying short enough
-// that a deliberate paste minutes later is unaffected; the timestamp only
-// moves on NON-gesture clears, so user-cleared selections never enter this
-// path. See the contextmenu handler's churn-copy rescue.
-const RIGHT_CLICK_CHURN_COPY_GRACE_MS = 3000;
+// Under a fast-streaming TUI (Claude Code) the scrollback trim destroys a
+// fresh selection within ~150ms — long before the right-click lands — so
+// "select → right-click = copy" silently became "paste". 15s covers the
+// realistic flow (select, READ for a while, then right-click — field
+// reports showed 3s expired on people who read before clicking). The
+// timestamp only moves on NON-gesture clears, so a selection the user
+// cleared by clicking never enters this path, and a deliberate paste in a
+// pane where nothing was churn-killed is unaffected.
+const RIGHT_CLICK_CHURN_COPY_GRACE_MS = 15000;
 
 export interface ContextMenuEvent {
   x: number;
@@ -844,14 +845,20 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // double right-click doesn't paste either.
       const nowTs = Date.now();
       if (
-        lastGestureSelection &&
+        lastGestureSelection.trim() &&
         nowTs - selectionChurnClearedAt < RIGHT_CLICK_CHURN_COPY_GRACE_MS &&
         nowTs - lastGestureSelectionAt < RIGHT_CLICK_CHURN_COPY_GRACE_MS
       ) {
         lastRightClickCopyAt = nowTs;
-        const rescued = lastGestureSelection;
-        lastGestureSelection = '';
-        void copySelectionWithFeedback(terminal, rescued, { keepSelection: true });
+        // Deliberately NOT cleared: a user who retries the right-click
+        // (the natural reaction when unsure the copy landed) must get the
+        // same idempotent "copied" outcome — the helper's read-compare-skip
+        // turns the repeat into a toast with no second write. Clearing it
+        // here made click #2 fall through to PASTE, re-creating the exact
+        // trap this branch exists to remove. The capture expires with the
+        // grace window or is replaced by the next selection gesture.
+        // Whitespace-only captures (accidental margin drags) don't qualify.
+        void copySelectionWithFeedback(terminal, lastGestureSelection, { keepSelection: true });
         return;
       }
 
