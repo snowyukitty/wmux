@@ -155,6 +155,17 @@ export function copySelectionWithFeedback(
 // selection is no longer present on the second click.
 const RIGHT_CLICK_PASTE_SUPPRESS_MS = 300;
 
+// Window after a buffer-churn selection kill in which a right-click is
+// treated as the COPY the user was about to perform rather than a paste.
+// Under a fast-streaming TUI (haiku-speed Claude Code) the scrollback trim
+// destroys a fresh selection within ~150ms — long before the right-click
+// lands — so "select → right-click = copy" silently became "paste". Three
+// seconds comfortably covers select-then-click while staying short enough
+// that a deliberate paste minutes later is unaffected; the timestamp only
+// moves on NON-gesture clears, so user-cleared selections never enter this
+// path. See the contextmenu handler's churn-copy rescue.
+const RIGHT_CLICK_CHURN_COPY_GRACE_MS = 3000;
+
 export interface ContextMenuEvent {
   x: number;
   y: number;
@@ -571,8 +582,29 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     });
     terminal.element?.addEventListener('pointerdown', onGesturePointerDown);
     window.addEventListener('pointerup', onGesturePointerUp);
+    // Churn-clear bookkeeping for the right-click copy-intent rescue (see the
+    // contextmenu handler): under a fast-streaming main-buffer TUI the
+    // scrollback trim kills a fresh selection within ~150ms — before the user
+    // can right-click to copy it. Remember the last text selected by a real
+    // gesture and whether a live selection was cleared by buffer churn
+    // (an empty selection event OUTSIDE any gesture) rather than by the
+    // user's own click, so the right-click can tell the two apart.
+    let lastGestureSelection = '';
+    let lastGestureSelectionAt = 0;
+    let selectionChurnClearedAt = 0;
+    let hadSelection = false;
     const selectionDisposable = terminal.onSelectionChange(() => {
-      autoCopy.onSelection(terminal.getSelection());
+      const sel = terminal.getSelection();
+      if (selectionGestureArmed) {
+        if (sel) {
+          lastGestureSelection = sel;
+          lastGestureSelectionAt = Date.now();
+        }
+      } else if (!sel && hadSelection) {
+        selectionChurnClearedAt = Date.now();
+      }
+      hadSelection = sel !== '';
+      autoCopy.onSelection(sel);
     });
 
     // Clipboard + shortcut handling
@@ -795,6 +827,34 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         lastRightClickCopyAt = Date.now();
         autoCopy.dispose();
         void copySelectionWithFeedback(terminal, sel, { keepSelection: true });
+        return;
+      }
+
+      // Copy-intent rescue: the user SELECTED text moments ago, the buffer
+      // churn of a fast-streaming TUI (haiku-speed Claude Code) killed the
+      // selection before this right-click landed, and the click would
+      // otherwise fall through to PASTE — the exact opposite of the intent,
+      // with no feedback, which is how "right-click pasted my copy twice"
+      // reports happen (the user retries the copy and each retry pastes).
+      // The churn timestamp only moves when a live selection empties OUTSIDE
+      // a mouse gesture, so the classic flow — select, click to clear,
+      // right-click to paste — is untouched (that clear happens inside a
+      // gesture). Fulfill the copy instead: write the text the gesture
+      // captured, show the copied toast, and arm the paste suppressor so a
+      // double right-click doesn't paste either.
+      const nowTs = Date.now();
+      if (
+        lastGestureSelection &&
+        nowTs - selectionChurnClearedAt < RIGHT_CLICK_CHURN_COPY_GRACE_MS &&
+        nowTs - lastGestureSelectionAt < RIGHT_CLICK_CHURN_COPY_GRACE_MS
+      ) {
+        // TEMP [pastediag]
+        // eslint-disable-next-line no-console
+        console.log(`[pastediag] right-click churn-copy rescue len=${lastGestureSelection.length}`);
+        lastRightClickCopyAt = nowTs;
+        const rescued = lastGestureSelection;
+        lastGestureSelection = '';
+        void copySelectionWithFeedback(terminal, rescued, { keepSelection: true });
         return;
       }
 
