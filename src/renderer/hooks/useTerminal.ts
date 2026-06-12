@@ -766,6 +766,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // time so the paste branch can reject an immediately-following click.
       if (sel) {
         lastRightClickCopyAt = Date.now();
+        // eslint-disable-next-line no-console
+        console.log(`[clipdiag] right-click copy len=${sel.length}`);
         autoCopy.dispose();
         void copySelectionWithFeedback(terminal, sel, { keepSelection: true });
         return;
