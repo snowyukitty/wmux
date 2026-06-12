@@ -165,6 +165,8 @@ export const en = {
   'settings.scrollbackDesc': 'Lines retained in terminal buffer',
   'settings.scrollbackRestore': 'Restore on launch',
   'settings.scrollbackRestoreDesc': 'Reattach to previous session output after restart. Turn off to start every pane fresh.',
+  'settings.copyOnSelect': 'Copy on select',
+  'settings.copyOnSelectDesc': 'Write every completed mouse selection to the clipboard. Off by default: with clipboard history (Win+V) every adjusted selection becomes its own entry. Right-click and Ctrl+C copies are unaffected.',
   'settings.startupDirectory': 'Starting directory',
   'settings.startupDirectoryDesc': 'New terminals start here. Empty = your home directory. Workspace profiles can override per workspace.',
   'settings.startupDirectoryPlaceholder': 'e.g. C:\\Projects',

@@ -910,6 +910,8 @@ function TabGeneral() {
   const setScrollbackLines = useStore((s) => s.setScrollbackLines);
   const scrollbackRestoreEnabled = useStore((s) => s.scrollbackRestoreEnabled);
   const setScrollbackRestoreEnabled = useStore((s) => s.setScrollbackRestoreEnabled);
+  const copyOnSelectEnabled = useStore((s) => s.copyOnSelectEnabled);
+  const setCopyOnSelectEnabled = useStore((s) => s.setCopyOnSelectEnabled);
   const splitInheritsCwd = useStore((s) => s.splitInheritsCwd);
   const setSplitInheritsCwd = useStore((s) => s.setSplitInheritsCwd);
   const startupDirectory = useStore((s) => s.startupDirectory);
@@ -1004,6 +1006,13 @@ function TabGeneral() {
             checked={scrollbackRestoreEnabled}
             onChange={setScrollbackRestoreEnabled}
             label={t('settings.scrollbackRestore')}
+          />
+        </SettingRow>
+        <SettingRow label={t('settings.copyOnSelect')} description={t('settings.copyOnSelectDesc')}>
+          <Toggle
+            checked={copyOnSelectEnabled}
+            onChange={setCopyOnSelectEnabled}
+            label={t('settings.copyOnSelect')}
           />
         </SettingRow>
       </div>

@@ -375,6 +375,8 @@ export interface SessionData {
   scrollbackRestoreEnabled?: boolean;
   sidebarPosition?: 'left' | 'right';
   notificationSoundEnabled?: boolean;
+  /** Copy-on-select toggle (default false). See uiSlice.copyOnSelectEnabled. */
+  copyOnSelectEnabled?: boolean;
   toastEnabled?: boolean;
   notificationRingEnabled?: boolean;
   customKeybindings?: CustomKeybinding[];

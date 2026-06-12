@@ -604,7 +604,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         selectionChurnClearedAt = Date.now();
       }
       hadSelection = sel !== '';
-      autoCopy.onSelection(sel);
+      // Copy-on-select is opt-in (Settings → Terminal). The gesture/churn
+      // bookkeeping above stays active regardless — the right-click copy
+      // rescue depends on it, not on the implicit writes.
+      if (useStore.getState().copyOnSelectEnabled) autoCopy.onSelection(sel);
     });
 
     // Clipboard + shortcut handling
@@ -791,9 +794,6 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     let lastRightClickCopyAt = 0;
     terminal.element?.addEventListener('contextmenu', (e) => {
       e.preventDefault();
-      // TEMP [pastediag]
-      // eslint-disable-next-line no-console
-      console.log(`[pastediag] contextmenu sel-len=${terminal.getSelection().length}`);
 
       // Detect if right-click target is a link element
       let linkUrl: string | null = null;
@@ -848,9 +848,6 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         nowTs - selectionChurnClearedAt < RIGHT_CLICK_CHURN_COPY_GRACE_MS &&
         nowTs - lastGestureSelectionAt < RIGHT_CLICK_CHURN_COPY_GRACE_MS
       ) {
-        // TEMP [pastediag]
-        // eslint-disable-next-line no-console
-        console.log(`[pastediag] right-click churn-copy rescue len=${lastGestureSelection.length}`);
         lastRightClickCopyAt = nowTs;
         const rescued = lastGestureSelection;
         lastGestureSelection = '';
@@ -865,14 +862,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // clicks). Suppressing the paste here is what kills the reported
       // copy↔paste collision.
       if (Date.now() - lastRightClickCopyAt < RIGHT_CLICK_PASTE_SUPPRESS_MS) {
-        // TEMP [pastediag]
-        // eslint-disable-next-line no-console
-        console.log('[pastediag] right-click paste SUPPRESSED (recent copy)');
         return;
       }
-      // TEMP [pastediag]
-      // eslint-disable-next-line no-console
-      console.log('[pastediag] right-click paste branch firing');
       void (async () => {
         const modes = (terminal as unknown as { modes?: { bracketedPasteMode?: boolean } }).modes;
 

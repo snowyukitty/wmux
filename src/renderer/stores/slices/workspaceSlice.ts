@@ -408,6 +408,7 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (data.scrollbackRestoreEnabled != null) state.scrollbackRestoreEnabled = data.scrollbackRestoreEnabled;
       if (data.sidebarPosition) state.sidebarPosition = data.sidebarPosition;
       if (data.notificationSoundEnabled != null) state.notificationSoundEnabled = data.notificationSoundEnabled;
+      if (data.copyOnSelectEnabled != null) state.copyOnSelectEnabled = data.copyOnSelectEnabled;
       if (data.toastEnabled != null) {
         state.toastEnabled = data.toastEnabled;
         window.electronAPI.settings.setToastEnabled(data.toastEnabled);

@@ -155,12 +155,6 @@ export async function pastePtyChunked(
   modes?: TerminalModesLike | null,
 ): Promise<void> {
   if (!text) return;
-  // TEMP [pastediag]: choke-point log — EVERY paste in the renderer flows
-  // through here, so a doubled paste either logs twice (two renderer calls)
-  // or once (doubling is downstream: PTY/conpty/app). Remove after the
-  // account-b double-paste diagnosis.
-  // eslint-disable-next-line no-console
-  console.log(`[pastediag] pastePtyChunked len=${text.length} bracketed=${!!modes?.bracketedPasteMode} ${JSON.stringify(text.length > 24 ? text.slice(0, 24) + '…' : text)}`);
 
   const bracketed = !!modes?.bracketedPasteMode;
   let normalized = normalizePasteText(text, bracketed);

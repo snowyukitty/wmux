@@ -130,6 +130,8 @@ export const zhTW = {
   'settings.scrollbackDesc': '終端機緩衝區保留的行數',
   'settings.scrollbackRestore': '啟動時還原',
   'settings.scrollbackRestoreDesc': '重新啟動後重新連接上一個工作階段的輸出。關閉時每個面板都從空白開始。',
+  'settings.copyOnSelect': '選取即複製',
+  'settings.copyOnSelectDesc': '滑鼠選取文字後自動寫入剪貼簿。預設關閉：開啟剪貼簿歷史（Win+V）時每次調整選取範圍都會多出一條記錄。右鍵與 Ctrl+C 複製不受影響。',
   'settings.updates': '更新',
   'settings.wmuxUpdates': 'wmux 更新',
   'settings.updateFailed': '檢查更新失敗',

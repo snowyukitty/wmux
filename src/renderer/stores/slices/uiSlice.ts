@@ -65,6 +65,17 @@ export interface UISlice {
   toggleNotificationSound: () => void;
   setNotificationSoundEnabled: (enabled: boolean) => void;
 
+  /**
+   * Copy-on-select: write every completed mouse selection to the system
+   * clipboard. Default OFF — with Windows clipboard history (Win+V) every
+   * adjusted/abandoned selection becomes a visible history entry, and under
+   * a fast-streaming TUI the selection churn made the implicit writes
+   * confusing far more often than helpful. Explicit copies (right-click /
+   * Ctrl+C / Ctrl+Shift+C) are unaffected.
+   */
+  copyOnSelectEnabled: boolean;
+  setCopyOnSelectEnabled: (enabled: boolean) => void;
+
   locale: Locale;
   setLocale: (locale: Locale) => void;
 
@@ -556,6 +567,13 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
 
   setNotificationSoundEnabled: (enabled) => set((state) => {
     state.notificationSoundEnabled = enabled;
+  }),
+
+  // ─── Copy on select ──────────────────────────────────────────────────────
+  copyOnSelectEnabled: false,
+
+  setCopyOnSelectEnabled: (enabled) => set((state) => {
+    state.copyOnSelectEnabled = enabled;
   }),
 
   // ─── Locale / i18n ───────────────────────────────────────────────────────

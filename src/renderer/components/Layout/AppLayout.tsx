@@ -200,6 +200,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     scrollbackRestoreEnabled: state.scrollbackRestoreEnabled,
     sidebarPosition: state.sidebarPosition,
     notificationSoundEnabled: state.notificationSoundEnabled,
+    copyOnSelectEnabled: state.copyOnSelectEnabled,
     toastEnabled: state.toastEnabled,
     notificationRingEnabled: state.notificationRingEnabled,
     customKeybindings: state.customKeybindings,

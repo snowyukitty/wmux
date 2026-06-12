@@ -132,6 +132,8 @@ export const ja = {
   'settings.scrollbackDesc': 'ターミナルバッファに保持する行数',
   'settings.scrollbackRestore': '起動時に復元',
   'settings.scrollbackRestoreDesc': '再起動後に前のセッション出力を再接続。オフにすると毎回すべてのペインが新規状態で起動。',
+  'settings.copyOnSelect': '選択時に自動コピー',
+  'settings.copyOnSelectDesc': 'マウス選択の完了時にクリップボードへ自動書き込み。既定はオフ：クリップボード履歴（Win+V）では選択を調整するたびに項目が増えるため。右クリック・Ctrl+C のコピーには影響しません。',
   'settings.updates': 'アップデート',
   'settings.wmuxUpdates': 'wmux アップデート',
   'settings.updateFailed': 'アップデート確認に失敗しました',
