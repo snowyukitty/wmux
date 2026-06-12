@@ -168,8 +168,6 @@ export function useViCopyMode(
     const text = terminal.getSelection() || getLineText(terminal, cursorRef.current.row);
     if (text) {
       // Same IPC bridge as every other copy path (NOT navigator.clipboard).
-      // eslint-disable-next-line no-console
-      console.log(`[clipdiag] vi-copySelection WRITE len=${text.length}`);
       await window.clipboardAPI.writeText(text).catch(() => undefined);
     }
     exit();
@@ -199,10 +197,8 @@ export function useViCopyMode(
           text = getLineText(terminal, cur.row);
         }
         // Same IPC bridge as every other copy path (NOT navigator.clipboard):
-        // one writer pipeline keeps main-side error handling, dedupe
-        // diagnostics, and Win+V accounting consistent.
-        // eslint-disable-next-line no-console
-        console.log(`[clipdiag] vi-yank WRITE len=${text.length}`);
+        // one writer pipeline keeps main-side error handling and Win+V
+        // accounting consistent.
         window.clipboardAPI.writeText(text).then(() => exit()).catch(() => exit());
         return;
       }

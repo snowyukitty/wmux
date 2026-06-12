@@ -98,35 +98,17 @@ export function createAutoSelectionCopy(deps: AutoSelectionCopyDeps): AutoSelect
   // stop a callback that is already parked on the readCurrent() IPC.
   let epoch = 0;
 
-  // TEMP [clipdiag]: compact preview for duplicate-copy diagnosis. Remove
-  // with the rest of the [clipdiag] lines once the field repro is solved.
-  const dbg = (text: string): string =>
-    `len=${text.length} ${JSON.stringify(text.length > 24 ? text.slice(0, 24) + '…' : text)}`;
-
   const onSelection = (selection: string): void => {
     // Gesture gate FIRST: a gated (non-gesture) event must neither arm the
     // debounce nor cancel a pending write from the real gesture.
-    if (deps.accept && !deps.accept()) {
-      // eslint-disable-next-line no-console
-      console.log(`[clipdiag] auto gate-reject ${dbg(selection)}`);
-      return;
-    }
+    if (deps.accept && !deps.accept()) return;
     if (pending) clearT(pending);
-    // eslint-disable-next-line no-console
-    console.log(`[clipdiag] auto arm ${dbg(selection)}`);
     pending = setT(() => {
       pending = null;
       if (!selection || selection.length === 0) return;
       // Transient-capture guard: only write a selection that is still the
       // same text now that the debounce has fired. See getCurrent docs.
-      if (deps.getCurrent) {
-        const live = deps.getCurrent();
-        if (live !== selection) {
-          // eslint-disable-next-line no-console
-          console.log(`[clipdiag] auto skip-transient captured ${dbg(selection)} live ${dbg(live)}`);
-          return;
-        }
-      }
+      if (deps.getCurrent && deps.getCurrent() !== selection) return;
       const myEpoch = epoch;
       void (async () => {
         if (deps.readCurrent) {
@@ -136,18 +118,8 @@ export function createAutoSelectionCopy(deps: AutoSelectionCopyDeps): AutoSelect
           } catch {
             // Unreadable clipboard (image content, IPC hiccup) → just write.
           }
-          if (myEpoch !== epoch) {
-            // eslint-disable-next-line no-console
-            console.log(`[clipdiag] auto skip-epoch ${dbg(selection)}`);
-            return; // cancelled while reading
-          }
-          if (current !== null && current === selection) {
-            // eslint-disable-next-line no-console
-            console.log(`[clipdiag] auto skip-equal ${dbg(selection)}`);
-            return;
-          }
-          // eslint-disable-next-line no-console
-          console.log(`[clipdiag] auto WRITE ${dbg(selection)} clipboard-was ${current === null ? '<unreadable>' : dbg(current)}`);
+          if (myEpoch !== epoch) return; // cancelled while reading
+          if (current !== null && current === selection) return;
         }
         await deps.write(selection);
       })().catch(() => {

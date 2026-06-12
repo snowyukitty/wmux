@@ -42,11 +42,6 @@ export interface CopyWithFeedbackDeps {
  * Run the copy flow. Always resolves; never throws (it converts a thrown
  * write into the `onError` UI path).
  */
-// TEMP [clipdiag]: compact preview for duplicate-copy diagnosis. Remove with
-// the rest of the [clipdiag] lines once the field repro is solved.
-const dbg = (text: string): string =>
-  `len=${text.length} ${JSON.stringify(text.length > 24 ? text.slice(0, 24) + '…' : text)}`;
-
 export async function runCopyWithFeedback(
   selection: string,
   deps: CopyWithFeedbackDeps,
@@ -63,14 +58,10 @@ export async function runCopyWithFeedback(
       if (current !== null && current === selection) {
         // Clipboard already holds this exact text — report success without
         // stacking a duplicate clipboard-history entry.
-        // eslint-disable-next-line no-console
-        console.log(`[clipdiag] explicit skip-equal ${dbg(selection)}`);
         deps.clearSelection();
         deps.onSuccess();
         return;
       }
-      // eslint-disable-next-line no-console
-      console.log(`[clipdiag] explicit WRITE ${dbg(selection)} clipboard-was ${current === null ? '<unreadable>' : dbg(current)}`);
     }
     await deps.write(selection);
     deps.clearSelection();
