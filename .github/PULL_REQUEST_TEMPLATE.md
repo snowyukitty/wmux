@@ -86,6 +86,11 @@ Write "n/a" if nothing here applies.
 - Unit tests added / updated: which paths.
 - Integration / dynamic tests: link the script or describe the harness.
 - Manual verification: what you did locally, especially for UI/UX changes.
+- Applicable failure-boundary checks from CONTRIBUTING.md: lifecycle, unknown
+  versus mismatched identity, persisted legacy data, workspace scope, or perf.
+- For a fix: the regression's result before and after the change.
+- Failed or skipped checks: exact revision and evidence; do not label a failure
+  pre-existing without a base-revision result or linked baseline run.
 
 CI must pass before merge — don't ship if you haven't run the full suite locally.
 -->
@@ -100,4 +105,5 @@ CI must pass before merge — don't ship if you haven't run the full suite local
 - [ ] Stability tier impact is correctly classified.
 - [ ] Substrate contract docs (PROTOCOL.md, inventory.md, stability.md) updated if the surface changed.
 - [ ] Tests cover the new behavior and the regression case (if a bug fix).
+- [ ] Valid review findings are fixed or explicitly tracked; false positives have supporting evidence.
 - [ ] No accidental commit of secrets, tokens, `.env`, or unrelated large binaries.
