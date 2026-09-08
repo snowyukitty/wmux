@@ -610,6 +610,25 @@ describe('browser_repl session', () => {
     expect(out.previousDeath).toContain('between runs');
   });
 
+  it('reports a non-Error worker failure and starts a fresh runtime', async () => {
+    const bridge = createBrowserBridge(harness().tools, {});
+    const session = newSession();
+    const out = await session.run(
+      // Bypass the snippet-level logger to exercise the host worker error event.
+      'process.removeAllListeners("uncaughtException"); setTimeout(() => { throw "background failure"; }, 0); await new Promise(() => {})',
+      10_000,
+      bridge,
+    );
+    expect(out.ok).toBe(false);
+    expect(out.error).toContain('background failure');
+    expect(out.timedOut).toBe(false);
+
+    const next = await session.run('1', 10_000, bridge);
+    expect(next.ok).toBe(true);
+    expect(next.freshRuntime).toBe(true);
+    expect(next.previousDeath).toContain('background failure');
+  });
+
   it('collects the hint blocks of a run once, deduped, and renders them as their own block', async () => {
     const hinted = async (): Promise<CallToolResult> => ({
       content: [
