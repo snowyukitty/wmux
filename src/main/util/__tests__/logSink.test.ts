@@ -204,6 +204,34 @@ describe('main log sink', () => {
     expect(fs.readFileSync(lockPath, 'utf8')).toBe('held-by-another-process');
   });
 
+  it('releases its own lock when path-based stat lacks the descriptor device id', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-log-lock-device-'));
+    tempDirs.push(dir);
+    const file = path.join(dir, 'main.log');
+    const lockPath = `${file}.lock`;
+    const stat = fs.statSync;
+    const pathStat = vi.spyOn(fs, 'statSync').mockImplementation((...args) => {
+      const result = stat(...args);
+      // Windows can report dev=0 by path, while fstat reports the volume id.
+      if (result && args[0] === lockPath) {
+        result.dev = typeof result.dev === 'bigint' ? 0n : 0;
+      }
+      return result;
+    });
+    try {
+      const writer = new BoundedLogWriter(8, 2);
+      writer.append(file, 'aaaaaaaa');
+      writer.append(file, 'bbbbbbbb');
+      expect(fs.existsSync(lockPath)).toBe(false);
+      writer.append(file, 'cccccccc');
+      expect(fs.readFileSync(`${file}.2`, 'utf8')).toBe('aaaaaaaa');
+      expect(fs.readFileSync(`${file}.1`, 'utf8')).toBe('bbbbbbbb');
+      expect(fs.readFileSync(file, 'utf8')).toBe('cccccccc');
+    } finally {
+      pathStat.mockRestore();
+    }
+  });
+
   it('breaks a rotation lock abandoned by a crashed process', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-log-stale-lock-'));
     tempDirs.push(dir);
