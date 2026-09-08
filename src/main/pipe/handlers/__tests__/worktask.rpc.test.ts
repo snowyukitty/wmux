@@ -533,7 +533,7 @@ describe('task.git.status / task.git.log without a taskId', () => {
     const real = path.join(dir, 'real');
     const link = path.join(dir, 'link');
     fs.mkdirSync(real);
-    fs.symlinkSync(real, link);
+    fs.symlinkSync(real, link, process.platform === 'win32' ? 'junction' : 'dir');
     try {
       const h = harness({
         callerCwd: async () => link,

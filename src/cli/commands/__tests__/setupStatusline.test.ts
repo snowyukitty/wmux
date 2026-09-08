@@ -519,7 +519,7 @@ describe('normalizedTargetKey', () => {
     const real = path.join(tmpDir, 'real-claude');
     const link = path.join(tmpDir, 'linked-claude');
     fs.mkdirSync(real, { recursive: true });
-    fs.symlinkSync(real, link);
+    fs.symlinkSync(real, link, process.platform === 'win32' ? 'junction' : 'dir');
     expect(normalizedTargetKey(path.join(link, 'settings.json')))
       .toBe(normalizedTargetKey(path.join(real, 'settings.json')));
   });
