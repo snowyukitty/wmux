@@ -108,15 +108,23 @@ export function createSessionPromptScheduleHandlers(deps: SessionPromptScheduleH
         }
 
         if (enabled) {
+          if (!deps.available) {
+            schedules[index] = { ...current, enabled: false };
+            return { schedules, result: { ok: false, code: 'daemon_required' } };
+          }
           let currentAgent: ScheduleAgentState = null;
           try {
             currentAgent = await deps.getAgentState(current.ptyId);
           } catch {
-            // A paused unattended-input target is safe to resume only when the
-            // daemon can positively prove that its original session still owns it.
+            // A failed lookup proves unavailability, not a changed session.
           }
-          if (!currentAgent ||
-            currentAgent.slug !== current.agentSlug ||
+          if (!currentAgent) {
+            // Keep the binding and any in-flight claim. A later explicit Resume
+            // must prove identity again; no unattended input is enabled here.
+            schedules[index] = { ...current, enabled: false };
+            return { schedules, result: { ok: false, code: 'agent_unavailable' } };
+          }
+          if (currentAgent.slug !== current.agentSlug ||
             currentAgent.incarnationId !== current.sessionIncarnationId) {
             schedules[index] = {
               ...current,
