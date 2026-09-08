@@ -24,6 +24,7 @@ import {
   linkNodeModules,
 } from '../mergeSession';
 
+// Real Git repositories and worktrees belong in the serial runtime suite.
 function g(cwd: string, args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' });
 }

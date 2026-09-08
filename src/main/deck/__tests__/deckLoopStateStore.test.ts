@@ -82,16 +82,22 @@ describe('deckLoopStateStore', () => {
   });
 
   it('appends progress and caps the log at the limit', async () => {
-    await startLoop('ws-1', { objective: 'o' }, dir);
-    for (let i = 0; i < LOOP_STATE_LIMITS.MAX_PROGRESS_ENTRIES + 10; i++) {
-      await appendProgress('ws-1', `note ${i}`, dir);
-    }
-    const s = loadWorkspaceLoopState('ws-1', dir)!;
-    expect(s.progressLog).toHaveLength(LOOP_STATE_LIMITS.MAX_PROGRESS_ENTRIES);
-    // Oldest dropped — the last note survives.
-    expect(s.progressLog[s.progressLog.length - 1].note).toBe(
-      `note ${LOOP_STATE_LIMITS.MAX_PROGRESS_ENTRIES + 9}`,
-    );
+    const initial = await startLoop('ws-1', { objective: 'o' }, dir);
+    const limit = LOOP_STATE_LIMITS.MAX_PROGRESS_ENTRIES;
+    const seeded = Array.from({ length: limit - 1 }, (_, i) => ({ ts: i + 1, note: `note ${i}` }));
+    const file = getDeckLoopStatePath(dir);
+    // Seed the boundary once; hundreds of atomic writes test disk throughput,
+    // not which entry survives overflow.
+    fs.writeFileSync(file, JSON.stringify({ 'ws-1': { ...initial, progressLog: seeded } }));
+    await appendProgress('ws-1', 'at limit', dir);
+    await appendProgress('ws-1', 'over limit', dir);
+
+    const expected = [...seeded.slice(1).map((entry) => entry.note), 'at limit', 'over limit'];
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    // Inspect disk as well as the sanitized view: load-time truncation must
+    // not hide a writer that persists an unbounded history.
+    expect(stored['ws-1'].progressLog.map((entry: { note: string }) => entry.note)).toEqual(expected);
+    expect(loadWorkspaceLoopState('ws-1', dir)!.progressLog.map((entry) => entry.note)).toEqual(expected);
   });
 
   it('completing every task flips status to done; un-passing re-opens the loop', async () => {
