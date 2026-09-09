@@ -1440,12 +1440,11 @@ export function killDaemonByPidFile(scriptCandidates: string[] = []): boolean {
  *    from daemon.pid. Between ack and backstop another app instance may have
  *    already spawned a replacement daemon and rewritten the pid file; a
  *    file-read here would SIGKILL the fresh daemon.
- *  - `definitiveOnly: true` refuses to kill when the image or cmdline lookup
- *    is indeterminate (null — AV blocking tasklist/ps/WMI). The replacement
- *    path deliberately waits up to ~5s after asking the daemon to die, which
- *    is long enough for PID reuse to stop being "near-impossible"; the
- *    before-quit relaxation does not transfer. A refused kill degrades to
- *    the respawn-budget machinery, never to a blind SIGKILL.
+ *  - Script identity is required in every mode, including before-quit cleanup.
+ *    A matching executable name is shared by unrelated Node/Electron processes.
+ *    `definitiveOnly: true` additionally requires a readable image lookup.
+ *    A refused kill degrades to the caller's recovery path, never to a blind
+ *    SIGKILL when tasklist/ps/WMI is unavailable.
  *
  * Best-effort: never throws. Returns true only when a verified daemon was
  * signalled.
@@ -1460,33 +1459,15 @@ export function killVerifiedDaemonPid(
     // proceeds to verification — the image/cmdline guards below decide.
     if (checkProcessLiveness(pid) === 'dead') return false;
 
-    // `expectedImage` is THIS caller's own image — a diagnostic pre-filter,
-    // not authoritative (see the comment on the equivalent check in
-    // `ensureDaemon` above). Since #1001 a daemon may have been spawned by a
-    // different host than the one asking to kill it here (Electron killing a
-    // CLI-spawned daemon, or vice versa), so a mismatch alone must not
-    // refuse the kill — only the cmdline check below is host-independent.
-    const expectedImage = path.basename(process.execPath);
+    // Since #1001 another host may have spawned the daemon (Electron vs CLI).
+    // Do not require the image to match this caller; script identity below is
+    // the host-independent gate. Strict mode also requires a readable image.
     const image = getProcessImageName(pid);
-    // A definite read that does NOT match is inconclusive on its own since
-    // #1001 (a different host may have spawned this daemon) — but it is
-    // still a real, negative signal. Recorded so a null cmdline right after
-    // it can be refused instead of silently combined into "proceed".
-    const imageDefinitivelyMismatched = image !== null && image.toLowerCase() !== expectedImage.toLowerCase();
     if (image === null) {
       if (opts.definitiveOnly) return false; // indeterminate — refuse
     }
     const argv = getProcessArgv(pid);
-    if (argv === null) {
-      // `definitiveOnly` already refuses on any indeterminate cmdline. Below
-      // that threshold, a null cmdline COMBINED with an already-confirmed
-      // image mismatch is refused too: neither signal alone proves the PID
-      // isn't ours (cross-host support needs that), but having both point
-      // away from "ours" restores the pre-#1001 guarantee that an image
-      // mismatch blocks the kill — it just needs the second, cmdline signal
-      // to also fail to clear it, rather than mismatch alone.
-      if (opts.definitiveOnly || imageDefinitivelyMismatched) return false;
-    } else if (!argvIdentifiesDaemonScript(argv, opts.scriptCandidates ?? [])) {
+    if (argv === null || !argvIdentifiesDaemonScript(argv, opts.scriptCandidates ?? [])) {
       return false; // definitive: same image but not our daemon script
     }
 
