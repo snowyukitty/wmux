@@ -232,6 +232,36 @@ describe('main log sink', () => {
     }
   });
 
+  it('compares full-width descriptor identities before releasing a rotation lock', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-log-lock-bigint-'));
+    tempDirs.push(dir);
+    const file = path.join(dir, 'main.log');
+    const writer = new BoundedLogWriter(8, 1) as unknown as {
+      withRotationLock(target: string, fn: () => void): boolean;
+    };
+    const fstat = fs.fstatSync;
+    let calls = 0;
+    // These distinct identities collapse to the same Number. A narrowed
+    // comparison would wrongly delete the replacement holder's lock.
+    const ownedIno = 9007199254740992n;
+    const replacementIno = ownedIno + 1n;
+    expect(Number(ownedIno)).toBe(Number(replacementIno));
+    const descriptorStat = vi.spyOn(fs, 'fstatSync').mockImplementation((...args) => {
+      const result = fstat(args[0], { bigint: true });
+      return { ...result, dev: 42n, ino: calls++ === 0 ? ownedIno : replacementIno };
+    });
+    try {
+      expect(writer.withRotationLock(file, () => undefined)).toBe(true);
+      expect(descriptorStat).toHaveBeenCalledTimes(2);
+      for (const call of descriptorStat.mock.calls) {
+        expect(call[1]).toEqual({ bigint: true });
+      }
+      expect(fs.existsSync(`${file}.lock`)).toBe(true);
+    } finally {
+      descriptorStat.mockRestore();
+    }
+  });
+
   it('breaks a rotation lock abandoned by a crashed process', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-log-stale-lock-'));
     tempDirs.push(dir);
