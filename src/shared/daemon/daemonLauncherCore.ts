@@ -1399,20 +1399,15 @@ export async function ensureDaemon(deps: DaemonLauncherDeps): Promise<DaemonInfo
 
 /**
  * Force-kill the daemon recorded in `daemon.pid` — but ONLY if the live
- * process at that PID verifiably still belongs to wmux (image basename +
- * cmdline carry the daemon script). This is the explicit-full-shutdown
+ * process at that PID has a verified daemon entry script. This is the explicit-full-shutdown
  * backstop for main's before-quit: when the user picks "Shut down wmux
  * completely" and the graceful `daemon.shutdown` RPC times out, this
- * guarantees a wedged daemon can't survive the teardown the user explicitly
- * asked for.
+ * attempts to stop a wedged daemon without signalling an unverified process.
  *
- * The PID-reuse guards mirror ensureDaemon()'s verify-before-kill logic so we
- * never SIGKILL an unrelated process that recycled the daemon's old PID. We
- * only abort the kill when a check returns a DEFINITIVE mismatch; an
- * indeterminate result (null image/cmdline, e.g. AV blocking tasklist) still
- * proceeds, because this path runs at most a few seconds after we were
- * actively talking to that PID, so reuse is near-impossible and leaving an
- * orphan is the worse outcome here.
+ * An unreadable or mismatched command line refuses the kill, even when an
+ * executable name matches. Missing image metadata alone may be tolerated if
+ * script identity is verified; another host can run the same daemon script.
+ * A refused kill can leave the daemon running for explicit recovery.
  *
  * Best-effort: never throws. Returns true only when a verified daemon was
  * signalled.
@@ -1422,9 +1417,7 @@ export function killDaemonByPidFile(scriptCandidates: string[] = []): boolean {
     const wmuxDir = getWmuxDir();
     const pidStr = fs.readFileSync(path.join(wmuxDir, 'daemon.pid'), 'utf8').trim();
     const pid = parseInt(pidStr, 10);
-    // Before-quit mode: indeterminate verification still proceeds — this
-    // path runs seconds after we were actively talking to that PID, so
-    // reuse is near-impossible and an orphan is the worse outcome.
+    // Before-quit mode tolerates missing image metadata, never missing script identity.
     return killVerifiedDaemonPid(pid, { definitiveOnly: false, scriptCandidates });
   } catch {
     return false;
@@ -1468,7 +1461,7 @@ export function killVerifiedDaemonPid(
     }
     const argv = getProcessArgv(pid);
     if (argv === null || !argvIdentifiesDaemonScript(argv, opts.scriptCandidates ?? [])) {
-      return false; // definitive: same image but not our daemon script
+      return false; // missing or mismatched script identity, regardless of image
     }
 
     process.kill(pid, 'SIGKILL');

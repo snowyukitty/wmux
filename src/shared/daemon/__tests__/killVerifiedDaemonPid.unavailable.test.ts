@@ -52,4 +52,16 @@ describe('killVerifiedDaemonPid — unavailable command line', () => {
     expect(killVerifiedDaemonPid(424242, { definitiveOnly })).toBe(true);
     expect(process.kill).toHaveBeenCalledWith(424242, 'SIGKILL');
   });
+
+  it.each([false, true])('requires script identity for a different host image (definitiveOnly=%s)', (definitiveOnly) => {
+    probes.image = 'other-host-node';
+    expect(killVerifiedDaemonPid(424242, { definitiveOnly })).toBe(false);
+    expect(process.kill).not.toHaveBeenCalledWith(424242, 'SIGKILL');
+
+    probes.argv = process.platform === 'linux'
+      ? `${process.execPath}\0/test/daemon-bundle/index.js\0`
+      : `"${process.execPath}" /test/daemon-bundle/index.js`;
+    expect(killVerifiedDaemonPid(424242, { definitiveOnly })).toBe(true);
+    expect(process.kill).toHaveBeenCalledWith(424242, 'SIGKILL');
+  });
 });
