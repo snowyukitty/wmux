@@ -49,3 +49,7 @@ Background and design rationale — why the substrate is shaped the way it is.
 - [`internal/m0-design.md`](./internal/m0-design.md) — the transaction-aware MetadataStore design (optimistic concurrency, snapshot envelope).
 - [`internal/path-D-inventory.md`](./internal/path-D-inventory.md) — the workspace-identity resolution paths and the non-deterministic fallback being removed.
 - [`internal/scrollback-restore-design.md`](./internal/scrollback-restore-design.md) — terminal scrollback persistence and restore.
+
+## Fork maintenance
+
+- [wmux 4.0.0 synchronization checkpoint](./upgrade-v4.0.0-checkpoint-2026-10-07.md) — retained changes, verification results, upstream contribution status, and follow-up work.
