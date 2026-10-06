@@ -1,6 +1,5 @@
 import { mkdtemp, mkdir, writeFile, rm, symlink } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import os from 'node:os';
+import os, { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { claudeSkills, codexSkills, skillMetadata } from '../chatSkills';

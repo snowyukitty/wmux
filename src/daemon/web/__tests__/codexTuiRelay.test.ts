@@ -1,6 +1,6 @@
 import {createServer} from 'node:http';
 import {spawn} from 'node:child_process';
-import {mkdtemp,mkdir,rm,stat,access,symlink,writeFile,unlink} from 'node:fs/promises';
+import {mkdtemp,mkdir,rm,stat,access,symlink,writeFile,unlink,rename} from 'node:fs/promises';
 import {readFileSync} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -815,6 +815,9 @@ describe.skipIf(process.platform === 'win32')('Codex relay reconnect after a los
       let ended:string|undefined='pending';
       void wait.ended.then(status=>{ended=status;});
       const gone=closed(client);
+      // Keep the old socket inode allocated so rapid rebinding cannot reuse
+      // its identity on filesystems with coarse creation timestamps.
+      await rename(f.upstreamPath,`${f.upstreamPath}.retired`);
       await f.down();await gone;
       expect(f.relay.retired()).toBe(false);
       expect(f.relay.disconnected()).toBe(true);
