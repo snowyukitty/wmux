@@ -20,7 +20,11 @@
 //      reason goes to stderr and the exit code is 2 (Claude Code's "do not let
 //      this hook's action proceed" contract). Only the terminal orchestrator's
 //      Stop hook is wired that way; every other invocation is byte-for-byte
-//      what it always was.
+//      what it always was. Likewise `--context` (the HQ brain's
+//      UserPromptSubmit) prints the endpoint's `additionalContext`, if any, as
+//      hook output — or, when the endpoint answers with a `block` (the brain's
+//      own prompt arrived incomplete, #1787), writes the reason to stderr and
+//      exits 2 so Claude Code discards the prompt instead of running it.
 //
 // THIS FILE IS SELF-CONTAINED. It runs from inside a Claude Code plugin
 // where TypeScript transpilation is NOT available. Do not import anything
@@ -41,7 +45,9 @@ const HOOK_TIMEOUT_MS = 2000; // hard cap so we never slow Claude
 // (setupHooks.refreshHookBridge, run at boot), never by this number.
 //   0.2.0 — daemon-first targeting (daemon.hooks.signal → hooks.signal).
 //   0.3.0 — suffix-isolated lifecycle routing and bridge state.
-const BRIDGE_VERSION = '0.4.0';
+//   0.5.0 — `--context` mode (HQ brain UserPromptSubmit additionalContext).
+//   0.6.0 — `--context` mode honors a `block` (exit 2 discards the prompt).
+const BRIDGE_VERSION = '0.6.0';
 
 // A2 (2026-05-29 user dogfood: 8 connect-errors during a brief main-process
 // restart / handler-swap window): retry a TRANSIENT connect failure a few
@@ -92,6 +98,12 @@ const HOOK_TO_KIND = {
   // turn dies that way, so without it a hook-governed pane keeps the amber dot
   // its UserPromptSubmit lit until the agent process exits.
   StopFailure: 'agent.stop_failure',
+  // Claude Code's own permission dialog ("Do you want to proceed?"). Fires once
+  // per dialog, measured on 2.1.281 at +54 ms after the prompt row is drawn —
+  // so the pane reads "needs you" even when the screen detector misses the
+  // row. Exit 0 with empty stdout is "no decision": the dialog stays up and the
+  // human answers it. Nothing on this path may ever write stdout.
+  PermissionRequest: 'agent.awaiting_input',
 };
 
 // Determine the signal kind for a PostToolUse hook. AskUserQuestion completing
@@ -107,6 +119,15 @@ const HOOK_TO_KIND = {
 // carry — the promotion could never fire and #770 stayed broken.) Callers only
 // invoke this for hookName === 'PostToolUse', so a PreToolUse AskUserQuestion
 // can never reach it and be mistaken for an answer.
+// #1111: the envelope-less `legacy` grandfather these hook RPCs used to ride
+// closes in the first release on or after 2026-09-30. `hooks.signal` on the
+// MAIN pipe is `wmux.internal`, so no declaration can ever grant it; the
+// enforcer instead recognises this exact clientName and allows that ONE method
+// (src/main/mcp/hookBridge.ts). Keep it in lockstep with
+// WMUX_HOOK_BRIDGE_CLIENT_NAME in src/shared/rpc.ts. Harmless on the daemon
+// control pipe, which has no enforcer and ignores the extra envelope field.
+const WMUX_CLIENT_NAME = 'wmux-hook-bridge';
+
 function getPostToolUseKind(payload) {
   if (payload && payload.tool_name === 'AskUserQuestion') {
     return 'agent.input_answered';
@@ -465,7 +486,7 @@ function extractUsageFromTranscript(transcriptPath) {
 // Mirrors extractUsageFromTranscript's parse-tolerant tail read (last 64KB).
 // Returns one of the four known modes, or null (file absent, no record yet, or
 // an unrecognized value).
-const VALID_PERMISSION_MODES = new Set(['bypassPermissions', 'acceptEdits', 'plan', 'default']);
+const VALID_PERMISSION_MODES = new Set(['bypassPermissions', 'acceptEdits', 'plan', 'auto', 'default']);
 function extractPermissionModeFromTranscript(transcriptPath) {
   try {
     if (!existsSync(transcriptPath)) return null;
@@ -855,6 +876,27 @@ async function sendToTargets(targets, buildRequest, timeoutMs = HOOK_TIMEOUT_MS)
   return { result, target };
 }
 
+// ----- `--context` — UserPromptSubmit additionalContext output -------------
+
+// Claude Code reads `hookSpecificOutput.additionalContext` from a
+// UserPromptSubmit hook's stdout and adds it to the prompt the model sees.
+// Only the HQ brain's profile passes `--context`, and only main's brain lane
+// ever answers with the field. Anything else — no field, an empty one, a
+// transport failure — writes nothing: the prompt goes through unchanged. The
+// one refusal is an explicit `block` from main (see the verdict in main()),
+// never a transport failure: a lost answer lets the prompt run.
+function outputPromptContext(text) {
+  if (typeof text !== 'string' || text.length === 0) return false;
+  const out = {
+    hookSpecificOutput: {
+      hookEventName: 'UserPromptSubmit',
+      additionalContext: text,
+    },
+  };
+  process.stdout.write(JSON.stringify(out) + '\n');
+  return true;
+}
+
 // ----- #783 — PreToolUse permission gate output --------------------------
 
 // The modern Claude Code PreToolUse hook contract reads JSON from stdout and
@@ -914,6 +956,8 @@ async function main() {
   // Anything else is ignored, so an older wmux running a newer profile behaves
   // as before.
   const gateMode = process.argv.slice(3).includes('--gate');
+  // `--context` is the HQ brain's UserPromptSubmit (prints additionalContext).
+  const contextMode = hookName === 'UserPromptSubmit' && process.argv.slice(3).includes('--context');
   const permissionGateMode = process.argv.slice(3).includes('--permission-gate');
   if (!hookName || !HOOK_TO_KIND[hookName]) {
     logEvent('unknown-hook-name', { argv: process.argv });
@@ -954,6 +998,19 @@ async function main() {
         reason: 'headless-or-outside-wmux',
         entrypoint: entrypoint ?? null,
       });
+      return;
+    }
+  }
+
+  // PermissionRequest fires under `claude -p` as well — measured on 2.1.281
+  // with entrypoint `sdk-cli` — where no dialog is shown and nobody is being
+  // waited on. A headless run nested in a pane inherits WMUX_PTY_ID, so it
+  // would mark the HOST pane "needs you". Only an interactive session can be
+  // blocked on a human.
+  if (hookName === 'PermissionRequest') {
+    const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT;
+    if (!entrypoint || !INTERACTIVE_ENTRYPOINTS.has(entrypoint)) {
+      logEvent('permission-request-skipped', { reason: 'headless', entrypoint: entrypoint ?? null });
       return;
     }
   }
@@ -1004,7 +1061,9 @@ async function main() {
 
   // Endpoints to try, daemon first (see resolveTargets). No token for either
   // endpoint means wmux has never run for this user — drop as before.
-  const targets = resolveTargets(gateMode);
+  // Context mode is MAIN-only like the gate: the daemon has no brain lane and
+  // would answer `ok` with no context, silently dropping the pointer.
+  const targets = resolveTargets(gateMode || contextMode);
   if (targets.length === 0) {
     logEvent('no-auth-token', { paths: [getDaemonAuthTokenPath(), getAuthTokenPath()] });
     return;
@@ -1084,6 +1143,16 @@ async function main() {
       ? process.env.WMUX_PTY_ID
       : undefined;
 
+  // #1727 — set only by the WSL hook (hook.sh): which Linux process the agent
+  // is. Opaque here; the daemon validates it and uses it only for the exact
+  // pane this hook names. Bounded so a bad value cannot bloat the envelope.
+  const wslAgentProcess =
+    typeof process.env.WMUX_WSL_AGENT_PROC === 'string' &&
+    process.env.WMUX_WSL_AGENT_PROC.length > 0 &&
+    process.env.WMUX_WSL_AGENT_PROC.length <= 8192
+      ? process.env.WMUX_WSL_AGENT_PROC
+      : undefined;
+
   // Build the AgentSignal envelope. Schema mirrors
   // integrations/shared/signal-types.ts (kept in sync manually because
   // this is JS-only).
@@ -1103,6 +1172,7 @@ async function main() {
     workspaceId: envWorkspaceId,
     surfaceId: envSurfaceId,
     ptyId: envPtyId,
+    ...(wslAgentProcess ? { wslAgentProcess } : {}),
     cwd: payloadCwd ?? process.cwd(),
     payload: {
       ...(payload ?? {}),
@@ -1140,6 +1210,7 @@ async function main() {
       method: t.method,
       params: envelope,
       token: t.token,
+      clientName: WMUX_CLIENT_NAME,
     }),
     permissionGateMode ? GATE_PERMISSION_TIMEOUT_MS : undefined,
   );
@@ -1201,6 +1272,18 @@ async function main() {
     );
     gateExitCode = 2;
     logEvent('gate-fail-closed', { hook: hookName, target: targetName, error: rpcResult?.error });
+  }
+
+  // The HQ brain's own prompt reported incomplete (#1787): exit 2 makes Claude
+  // Code discard it unrun, and main types it again. Only an explicit refusal —
+  // unlike the Stop gate, a lost answer fails OPEN here.
+  const promptBlock = contextMode && innerOk ? rpcResult.result.block : null;
+  if (promptBlock && typeof promptBlock.reason === 'string' && promptBlock.reason) {
+    process.stderr.write(`${promptBlock.reason}\n`);
+    gateExitCode = 2;
+    logEvent('prompt-blocked', { hook: hookName, target: targetName });
+  } else if (contextMode && innerOk && outputPromptContext(rpcResult.result.additionalContext)) {
+    logEvent('prompt-context', { hook: hookName, target: targetName });
   }
 
   // X6 ③: a session-lifecycle capture that did NOT durably reach wmux (anything

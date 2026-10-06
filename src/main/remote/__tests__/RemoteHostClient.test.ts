@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { resumeGrammarFor } from '../../../shared/agentResume';
 import { RemoteHostClient } from '../RemoteHostClient';
 import type { RemoteHost } from '../../../shared/remoteHosts';
 
@@ -269,6 +270,126 @@ describe('RemoteHostClient', () => {
         }) as unknown as Response);
         const client = new RemoteHostClient(host, fetchImpl as unknown as typeof fetch);
         await expect(client.listWorkspaces()).rejects.toThrow(/not JSON/);
+      });
+
+      // #1163 — agent metadata is additive-optional: an older host omits both
+      // fields, a same-age host fills them, and a NEWER host's unknown status
+      // degrades to name-only instead of entering the local union.
+      it('keeps valid agent fields, drops an unknown status, and omits absent ones', async () => {
+        const body = {
+          workspaces: [
+            {
+              id: 'w1',
+              name: 'proj',
+              panes: [
+                { sessionId: 's1', agentName: 'Claude Code', agentStatus: 'awaiting_input' },
+                { sessionId: 's2', agentName: 'claude-code' },
+                { sessionId: 's3', agentName: 'Codex', agentStatus: 'hypersleep' },
+                { sessionId: 's4', agentStatus: 'running' },
+                { sessionId: 's5' },
+              ],
+            },
+          ],
+        };
+        await expect(clientFor(body).listWorkspaces()).resolves.toEqual({
+          workspaces: [{
+            id: 'w1',
+            name: 'proj',
+            panes: [
+              { sessionId: 's1', agentName: 'Claude Code', agentStatus: 'awaiting_input' },
+              { sessionId: 's2', agentName: 'claude-code' },
+              // Unknown status dropped, name kept.
+              { sessionId: 's3', agentName: 'Codex' },
+              // A status without a name carries no row — dropped with it.
+              { sessionId: 's4' },
+              { sessionId: 's5' },
+            ],
+          }],
+        });
+      });
+
+      // #1342 — the resume block follows the same additive-optional rule: an
+      // older host omits it entirely, a half-formed one is dropped rather than
+      // half-read, and the two gate signals are kept only when boolean.
+      it('keeps a complete resume block, drops a half-formed one, tolerates an older host', async () => {
+        const body = {
+          workspaces: [
+            {
+              id: 'w1',
+              name: 'proj',
+              panes: [
+                {
+                  sessionId: 's1',
+                  resume: { agent: 'claude', sessionId: 'conv-1', cwdMatches: true, permissionMode: 'bypassPermissions' },
+                  commandRunning: false,
+                  agentProcessAlive: false,
+                },
+                // No conversation id → not a usable offer.
+                { sessionId: 's2', resume: { agent: 'claude', cwdMatches: true } },
+                // A NEWER host's unknown permission mode degrades to no mode.
+                { sessionId: 's3', resume: { agent: 'claude', sessionId: 'conv-3', permissionMode: 'telepathy' } },
+                // Non-boolean gate signals are not smuggled through.
+                { sessionId: 's4', commandRunning: 'yes', agentProcessAlive: 1 },
+                // An older host: no resume fields at all.
+                { sessionId: 's5' },
+              ],
+            },
+          ],
+        };
+        await expect(clientFor(body).listWorkspaces()).resolves.toEqual({
+          workspaces: [{
+            id: 'w1',
+            name: 'proj',
+            panes: [
+              {
+                sessionId: 's1',
+                resume: { agent: 'claude', sessionId: 'conv-1', cwdMatches: true, permissionMode: 'bypassPermissions' },
+                commandRunning: false,
+                agentProcessAlive: false,
+              },
+              { sessionId: 's2' },
+              // Absent cwdMatches reads as false — never guess an exact resume.
+              { sessionId: 's3', resume: { agent: 'claude', sessionId: 'conv-3', cwdMatches: false } },
+              { sessionId: 's4' },
+              { sessionId: 's5' },
+            ],
+          }],
+        });
+      });
+
+      // #1342 review (Claude+GLM) — the chip TYPES its command into a terminal,
+      // so a conversation id carrying a newline would submit itself the instant
+      // the operator clicked, defeating the no-auto-run rule. Nothing but a
+      // strict character set stands between a hostile or compromised host and
+      // that, so the parser rejects rather than sanitizes.
+      it('drops an offer whose agent or conversation id is not a plain token', async () => {
+        const evil = [
+          { sessionId: 'p1', resume: { agent: 'claude', sessionId: 'conv\r rm -rf ~\r', cwdMatches: true } },
+          { sessionId: 'p2', resume: { agent: 'claude', sessionId: 'conv\n:(){ :|:& };:', cwdMatches: true } },
+          { sessionId: 'p3', resume: { agent: 'claude', sessionId: 'conv 1 --dangerously-skip-permissions', cwdMatches: true } },
+          { sessionId: 'p4', resume: { agent: 'claude', sessionId: '$(id)', cwdMatches: true } },
+          { sessionId: 'p5', resume: { agent: 'claude; rm -rf ~', sessionId: 'conv-5', cwdMatches: true } },
+        ];
+        const got = await clientFor({ workspaces: [{ id: 'w1', name: '', panes: evil }] }).listWorkspaces();
+        expect(got.workspaces[0].panes).toEqual([
+          { sessionId: 'p1' }, { sessionId: 'p2' }, { sessionId: 'p3' },
+          { sessionId: 'p4' }, { sessionId: 'p5' },
+        ]);
+      });
+
+      // A prototype key IS a legal slug shape, so it survives the parser by
+      // design; the second layer (resumeGrammarFor's own-property check) is what
+      // keeps it from passing as a resumable agent. Asserted here so the two
+      // layers are never both removed at once.
+      it('passes a prototype-key slug through to the grammar check, which rejects it', async () => {
+        const got = await clientFor({
+          workspaces: [{ id: 'w1', name: '', panes: [
+            { sessionId: 'p1', resume: { agent: 'constructor', sessionId: 'conv-1', cwdMatches: true } },
+          ] }],
+        }).listWorkspaces();
+        const parsed = got.workspaces[0].panes[0].resume;
+        expect(parsed?.agent).toBe('constructor');
+        expect(resumeGrammarFor(parsed?.agent ?? '')).toBeUndefined();
       });
     });
   });
@@ -546,6 +667,45 @@ describe('RemoteHostClient', () => {
     });
   });
 
+  describe('refresh', () => {
+    it('re-opens the stream for a fresh meta, and the superseded stream stays silent', async () => {
+      vi.useFakeTimers();
+      try {
+        const streams: string[][] = [
+          [META_SNAPSHOT],
+          ['event: meta\ndata: {"cols":120,"rows":40}\n\n' + 'event: snapshot\ndata: c25hcHNob3Q=\n\n'],
+        ];
+        const fetchImpl = vi.fn(async () => sseResponse(streams.shift() ?? []));
+        const client = new RemoteHostClient(host, fetchImpl as unknown as typeof fetch);
+        const received: string[] = [];
+        client.onMeta((e) => received.push(`meta:${e.cols}x${e.rows}`));
+        const attachId = client.attach('sess-1');
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.waitFor(() => expect(received).toEqual(['meta:80x24']));
+
+        client.refresh(attachId);
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.waitFor(() => expect(received).toEqual(['meta:80x24', 'meta:120x40']));
+
+        // The aborted first stream must not schedule a reconnect of its own.
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(fetchImpl).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('is a no-op for an unknown or detached attach', () => {
+      const fetchImpl = vi.fn(async () => sseResponse([]));
+      const client = new RemoteHostClient(host, fetchImpl as unknown as typeof fetch);
+      client.refresh('nope');
+      const id = client.attach('sess-1');
+      client.detach(id);
+      client.refresh(id);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('reconnect', () => {
     it('schedules a jittered backoff reconnect on stream error and re-emits meta+snapshot', async () => {
       vi.useFakeTimers();
@@ -633,6 +793,108 @@ describe('RemoteHostClient', () => {
 
       await vi.advanceTimersByTimeAsync(20000);
       expect(fetchImpl.mock.calls.length).toBe(callsAtGiveUp); // no further retries after giving up
+    });
+  });
+
+  describe('resizeSession (#1322, reuses #766)', () => {
+    it('POSTs cols/rows to /api/sessions/:id/resize with the Bearer token', async () => {
+      const fetchImpl = vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ cols: 100, rows: 30, owner: 'phone' }),
+      }) as unknown as Response);
+      const client = new RemoteHostClient(host, fetchImpl as unknown as typeof fetch);
+
+      const result = await client.resizeSession('web-1', 100, 30);
+
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toBe(`${host.origin}/api/sessions/web-1/resize`);
+      expect(init.method).toBe('POST');
+      expect((init.headers as Record<string, string>)?.Authorization).toBe(`Bearer ${host.token}`);
+      expect(init.redirect).toBe('error');
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+      expect(JSON.parse(init.body as string)).toEqual({ cols: 100, rows: 30 });
+      expect(result).toEqual({ ok: true, cols: 100, rows: 30 });
+    });
+
+    it('percent-encodes the session id into the path', async () => {
+      const fetchImpl = vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ cols: 80, rows: 24 }),
+      }) as unknown as Response);
+      const client = new RemoteHostClient(host, fetchImpl as unknown as typeof fetch);
+
+      await client.resizeSession('a/../b', 80, 24);
+
+      expect((fetchImpl.mock.calls[0] as unknown as [string])[0])
+        .toBe(`${host.origin}/api/sessions/a%2F..%2Fb/resize`);
+    });
+
+    // The ownership rule this method is on the receiving end of
+    // (WebTerminalServer.ts's handleSessionResize): a desk viewer on the
+    // remote host owns the size right now. An EXPECTED refusal, not a
+    // transport failure — resolves `{ ok: false }` rather than throwing.
+    it('resolves ok:false, not a throw, on 409 desk-owns-size', async () => {
+      const fetchImpl = vi.fn(async () => ({
+        ok: false,
+        status: 409,
+        json: async () => ({ error: 'desk-owns-size', cols: 151, rows: 47, owner: 'desk' }),
+      }) as unknown as Response);
+      const client = new RemoteHostClient(host, fetchImpl as unknown as typeof fetch);
+
+      const result = await client.resizeSession('web-1', 100, 30);
+
+      expect(result).toEqual({ ok: false, reason: 'desk-owns-size' });
+    });
+
+    it('resolves ok:false on a rate-limited (429) response', async () => {
+      const fetchImpl = vi.fn(async () => ({
+        ok: false,
+        status: 429,
+        json: async () => ({ error: 'resize-too-often', cols: 80, rows: 24, retryAfterMs: 100 }),
+      }) as unknown as Response);
+      const client = new RemoteHostClient(host, fetchImpl as unknown as typeof fetch);
+
+      const result = await client.resizeSession('web-1', 100, 30);
+
+      expect(result).toEqual({ ok: false, reason: 'resize-too-often' });
+    });
+
+    it('resolves ok:false with a generic HTTP status when the error body is not JSON', async () => {
+      const fetchImpl = vi.fn(async () => ({
+        ok: false,
+        status: 500,
+        json: async () => { throw new Error('not json'); },
+      }) as unknown as Response);
+      const client = new RemoteHostClient(host, fetchImpl as unknown as typeof fetch);
+
+      const result = await client.resizeSession('web-1', 100, 30);
+
+      expect(result).toEqual({ ok: false, reason: 'HTTP 500' });
+    });
+
+    it('resolves ok:false rather than throwing when fetch itself rejects (host unreachable)', async () => {
+      const fetchImpl = vi.fn(async () => { throw new Error('ECONNREFUSED'); });
+      const client = new RemoteHostClient(host, fetchImpl as unknown as typeof fetch);
+
+      const result = await client.resizeSession('web-1', 100, 30);
+
+      expect(result).toEqual({ ok: false, reason: 'ECONNREFUSED' });
+    });
+
+    it('resolves ok:false when the 200 body carries no geometry', async () => {
+      const fetchImpl = vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+      }) as unknown as Response);
+      const client = new RemoteHostClient(host, fetchImpl as unknown as typeof fetch);
+
+      const result = await client.resizeSession('web-1', 100, 30);
+
+      expect(result.ok).toBe(false);
     });
   });
 });

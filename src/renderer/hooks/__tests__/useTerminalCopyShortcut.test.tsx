@@ -54,6 +54,8 @@ vi.mock('../useActivePaneFocus', () => ({
 // Imported AFTER the mocks so the hook binds to the stubbed modules.
 // eslint-disable-next-line import/first
 import { useTerminalCopyShortcut } from '../useTerminalCopyShortcut';
+// eslint-disable-next-line import/first
+import { useStore } from '../../stores';
 
 const act = React.act;
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -121,6 +123,7 @@ beforeEach(() => {
   mocks.terminalRegistry.clear();
   mocks.copySelectionWithFeedback.mockReset();
   mocks.activePtyId = null;
+  useStore.setState({ appRoute: 'workspaces' });
   mountHook();
 });
 
@@ -180,6 +183,46 @@ describe('useTerminalCopyShortcut — DOM glue', () => {
 
     expect(mocks.copySelectionWithFeedback).not.toHaveBeenCalled();
     expect(ev.defaultPrevented).toBe(false);
+  });
+
+  it('does nothing while another rail page covers the terminals', () => {
+    // An inert page still leaves its terminals "visible" to checkVisibility(),
+    // so without the route gate a stale selection behind Fleet or Settings
+    // would be copied over the field the user is copying from.
+    addTerminal('pty-term', 'stale selection behind the page', true);
+    mocks.activePtyId = 'pty-term';
+    focusComposer();
+    for (const route of ['fleet', 'schedules', 'remote', 'settings'] as const) {
+      useStore.setState({ appRoute: route });
+      const ev = pressCtrlC();
+      expect(ev.defaultPrevented).toBe(false);
+    }
+    expect(mocks.copySelectionWithFeedback).not.toHaveBeenCalled();
+  });
+
+  it('beside the Git page, copies a dock terminal\'s selection when focus is in the dock — never one behind the page', () => {
+    useStore.setState({ appRoute: 'git' });
+    // A workspace terminal under the page still holds a stale selection.
+    addTerminal('pty-ws', 'stale selection behind the page', true);
+    mocks.activePtyId = 'pty-ws';
+    const dock = document.createElement('div');
+    dock.setAttribute('data-dock-region', '');
+    document.body.appendChild(dock);
+    const moa = addTerminal('pty-moa', 'moa output', true);
+    dock.appendChild(moa.element!);
+    const composer = document.createElement('textarea');
+    dock.appendChild(composer);
+
+    // Focus outside the dock (the Git page): Ctrl+C is the page's.
+    focusComposer();
+    expect(pressCtrlC().defaultPrevented).toBe(false);
+    expect(mocks.copySelectionWithFeedback).not.toHaveBeenCalled();
+
+    // Focus in the dock: Moa's selection is copied, not sent as ^C.
+    composer.focus();
+    const ev = pressCtrlC();
+    expect(ev.defaultPrevented).toBe(true);
+    expect(mocks.copySelectionWithFeedback).toHaveBeenCalledWith(moa, 'moa output');
   });
 
   it('ignores OS auto-repeat keydowns (e.repeat) so a held Ctrl+C acts at most once', () => {

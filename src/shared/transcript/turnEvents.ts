@@ -19,6 +19,8 @@ export type TurnEventKind =
   | 'meta';
 
 interface TurnEventBase {
+  turnId?: string;
+  truncated?: boolean;
   /**
    * Transcript entry uuid when present, else `${offset}:${index}`. Stable
    * across re-reads so the renderer can key rows and dedup a re-snapshot.
@@ -27,12 +29,20 @@ interface TurnEventBase {
   kind: TurnEventKind;
   /** Epoch ms from entry.timestamp; absent when the entry carried none. */
   ts?: number;
+  /**
+   * Belongs in the folded activity, not the conversation: set by main on the
+   * Moa chat's mid-turn narration and its internal tool calls (failed ones
+   * included). Never set by the daemon projector.
+   */
+  folded?: true;
 }
 
 export interface UserTextEvent extends TurnEventBase {
   kind: 'user_text';
   text: string;
   hasImage?: boolean;
+  /** Absolute source paths Claude Code recorded for attached images, when it did. */
+  images?: string[];
 }
 
 /**
@@ -76,6 +86,8 @@ export interface AssistantTextEvent extends TurnEventBase {
   codeBlocks?: CodeBlockRef[];
   /** True when this entry's content was a `thinking` block. Collapsed by default. */
   thinking?: boolean;
+  /** Explicit end_turn recorded by Claude, never inferred from silence. */
+  turnComplete?: boolean;
 }
 
 /**
@@ -144,6 +156,7 @@ export interface ToolResultEvent extends TurnEventBase {
    * Renders as the workspace-diff chip, never inline.
    */
   diffLike?: boolean;
+  files?: { path: string; patch: string; additions?: number; deletions?: number; truncated?: boolean }[];
 }
 
 export interface MetaEvent extends TurnEventBase {
@@ -156,6 +169,9 @@ export interface MetaEvent extends TurnEventBase {
    * as if the operator had typed them.
    */
   subtype:
+    | 'turn_started'
+    | 'turn_complete'
+    | 'turn_aborted'
     | 'session_start'
     | 'slash_command'
     | 'caveat'
@@ -164,6 +180,11 @@ export interface MetaEvent extends TurnEventBase {
     | 'system_reminder'
     | 'unknown';
   label: string;
+  /**
+   * Claude Code records a pasted image's source path in its own `isMeta` entry
+   * right after the prompt that carried the image; clients fold it into that row.
+   */
+  images?: string[];
 }
 
 export type TurnEvent =
@@ -175,6 +196,8 @@ export type TurnEvent =
 
 /** Byte-offset cursor into a transcript file (see daemon readTail). */
 export interface TranscriptCursor {
+  /** Managed-history generation; changes when retained indices become invalid. */
+  historyEpoch?: string;
   /** Byte offset of the first COMPLETE line in the returned page. */
   headOffset: number;
   /** Byte offset just past the last complete line consumed (the tail mark). */
@@ -193,6 +216,11 @@ export interface TranscriptPage {
 }
 
 export interface TranscriptStatus {
+  terminal?: import('./terminalChat').TerminalChatBinding;
+  managed?: import('./chatSession').ManagedChatStatus;
+  /** Live daemon state, separate from whether saved history can be read. */
+  agentStatus?: import('../types').AgentStatus;
+  agentAlive?: boolean;
   available: boolean;
   /**
    * Closed set matching what the projector's `resolvePath` actually returns:
@@ -212,6 +240,7 @@ export interface TranscriptStatus {
 }
 
 export interface TranscriptAppendData {
+  status?: TranscriptStatus;
   seq: number;
   /** File shrank/rotated or a new session started — consumer must re-snapshot. */
   reset?: boolean;
@@ -231,7 +260,31 @@ export interface TranscriptAppendData {
  * pane whose agent publishes no transcript is a normal state that disables a
  * toggle, not an error the renderer has to catch.
  */
+export type ChatSendResult = 'sent' | 'busy' | 'blocked' | 'unconfirmed' | 'session_changed' | 'unavailable' | 'error';
+/** `sent` means ESC reached the agent, not that the turn stopped; the transcript says that. */
+export type ChatInterruptResult = 'sent' | 'not_running' | 'blocked' | 'session_changed' | 'unavailable' | 'error';
+/** A staged composer image, validated and thumbnailed by main. */
+export type ChatAttachmentPreview = { ok: true; path: string; name: string; bytes: number; thumbnail: string } | { ok: false; reason: 'type' | 'size' | 'missing' };
+
 export interface ChatBridgeApi {
+  settings?: (args: { ptyId: string; choice?: { model: string; effort: string; expectedRevision: string } }) => Promise<{ ok: boolean; settings?: { model: string; effort: string | null; busy: boolean; revision: string; models: { model: string; efforts: string[]; defaultEffort: string }[] }; error?: string }>;
+
+  skills?: (args: { ptyId: string; agent: string }) => Promise<import('./chatSkills').ChatSkillCatalog>;
+  launchTerminal?: (args: { ptyId: string; agent: 'claude' | 'codex'; prompt: string; mode?: import('./terminalChat').TerminalLaunchMode }) => Promise<{ ok: boolean; error?: string }>;
+  controls?: import('./chatSession').ChatControls;
+  /**
+   * Identity-bound, daemon-serialized input into the existing terminal agent process.
+   * `requestId` is `<13-digit ms>-<lowercase uuid>`. `effect`, when present, is
+   * what the send did to the pane and outranks `result` for the UI: `none`
+   * wrote nothing, `uncertain` may have written. An older daemon omits it.
+   * `queued` marks a `sent` the agent's composer queued behind a running turn.
+   */
+  send: (args: { ptyId: string; agentSessionId: string; text: string; requestId?: string; attachments?: string[] }) => Promise<{
+    result: ChatSendResult; replayed?: boolean; effect?: 'none' | 'uncertain' | 'submitted'; queued?: true;
+  }>;
+  /** ESC into the live terminal agent, only while its turn is running. */
+  interrupt?: (args: { ptyId: string; agentSessionId: string }) => Promise<{ result: ChatInterruptResult }>;
+  attachment?: (args: { path: string }) => Promise<ChatAttachmentPreview>;
   status: (ptyId: string) => Promise<TranscriptStatus>;
   /** `before` pages BACKWARD from a prior cursor.headOffset; omit for the tail. */
   snapshot: (ptyId: string, before?: number) => Promise<TranscriptPage | null>;
@@ -264,9 +317,8 @@ export interface ChatBridgeApi {
    * `onGate` is transition-only, so on mount and on every daemon reconnect the
    * gate has to be SEEDED from this before the composer may be enabled —
    * otherwise a reload during an open permission menu renders an unlocked
-   * composer over it. Returns an empty list in local mode (no registry, no
-   * approvals) — never throws, because the caller's fallback for a throw would
-   * be to guess.
+   * composer over it. Returns null when the daemon cannot be reached, so the composer stays
+   * disabled rather than treating unknown permission state as permission to send.
    */
-  openGates: () => Promise<string[]>;
+  openGates: () => Promise<string[] | null>;
 }

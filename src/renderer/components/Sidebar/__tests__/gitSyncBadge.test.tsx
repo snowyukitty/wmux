@@ -42,11 +42,18 @@ afterEach(() => {
 });
 
 describe('GitSyncBadge', () => {
-  it('renders the dirty count as muted text, not amber', () => {
+  it('renders the dirty count as readable secondary text, not amber', () => {
     const container = render(<GitSyncBadge sync={sync({ dirty: 41 })} />);
     const [dirty] = signals(container);
     expect(dirty.textContent).toBe('·41');
-    expect(dirty.style.color).toBe('var(--text-muted)');
+    expect(dirty.style.color).toBe('var(--text-subtle)');
+  });
+
+  it('shows the changed-file count when only untracked files changed (no line counts)', () => {
+    const [dirty] = signals(render(<GitSyncBadge sync={sync({ dirty: 2, added: 0, removed: 0 })} />));
+    expect(dirty.textContent).toBe('·2');
+    const lines = signals(render(<GitSyncBadge sync={sync({ dirty: 2, added: 5, removed: 0 })} />));
+    expect(lines.map((el) => el.textContent)).toEqual(['+5']);
   });
 
   it('keeps ahead on the steel accent', () => {
@@ -58,7 +65,9 @@ describe('GitSyncBadge', () => {
 
   it('keeps clean green and behind red', () => {
     const clean = signals(render(<GitSyncBadge sync={sync({})} />));
-    expect(clean[0].textContent).toBe('●');
+    // A drawn dot, not a text glyph that can render as an emoji disc.
+    expect(clean[0].hasAttribute('data-git-clean')).toBe(true);
+    expect(clean[0].querySelector('svg circle')).not.toBeNull();
     expect(clean[0].style.color).toBe('var(--accent-green)');
 
     const behind = signals(render(<GitSyncBadge sync={sync({ behind: 3 })} />));

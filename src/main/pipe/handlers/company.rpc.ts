@@ -1,6 +1,18 @@
 import type { BrowserWindow } from 'electron';
+import { refuseHandoffMarker } from '../handoffMarkerTripwire';
 import type { RpcRouter } from '../RpcRouter';
 import { sendToRenderer } from './_bridge';
+import type { RpcContext } from '../../../shared/rpc';
+
+/**
+ * `operatorOrigin` for the renderer, from the router context only. Company
+ * messages are pasted and submitted with Enter; the renderer sends a
+ * non-operator one through main's approval gate, and only a call from the
+ * operator's own surface skips it. Never copied from caller params.
+ */
+function operatorStamp(ctx: RpcContext | undefined): { operatorOrigin?: true } {
+  return ctx?.operator ? { operatorOrigin: true } : {};
+}
 
 type GetWindow = () => BrowserWindow | null;
 
@@ -120,11 +132,16 @@ export function registerCompanyRpc(router: RpcRouter, getWindow: GetWindow): voi
    * Sends a message to all members (via their PTY).
    * params: { message: string }
    */
-  router.register('company.broadcast', (params) => {
+  router.register('company.broadcast', (params, ctx) => {
+    const marked = refuseHandoffMarker('company.broadcast', params['message'], ctx);
+    if (marked) return Promise.resolve(marked);
     if (typeof params['message'] !== 'string' || params['message'].length === 0) {
       throw new Error('company.broadcast: missing required param "message"');
     }
-    return sendToRenderer(getWindow, 'company.broadcast', { message: params['message'] });
+    return sendToRenderer(getWindow, 'company.broadcast', {
+      ...operatorStamp(ctx),
+      message: params['message'],
+    });
   });
 
   /**
@@ -132,7 +149,9 @@ export function registerCompanyRpc(router: RpcRouter, getWindow: GetWindow): voi
    * Sends a message to all members in a department (via their PTYs).
    * params: { deptId: string; message: string }
    */
-  router.register('company.sendDept', (params) => {
+  router.register('company.sendDept', (params, ctx) => {
+    const marked = refuseHandoffMarker('company.sendDept', params['message'], ctx);
+    if (marked) return Promise.resolve(marked);
     if (typeof params['deptId'] !== 'string' || params['deptId'].trim().length === 0) {
       throw new Error('company.sendDept: missing required param "deptId"');
     }
@@ -140,6 +159,7 @@ export function registerCompanyRpc(router: RpcRouter, getWindow: GetWindow): voi
       throw new Error('company.sendDept: missing required param "message"');
     }
     return sendToRenderer(getWindow, 'company.sendDept', {
+      ...operatorStamp(ctx),
       deptId: params['deptId'],
       message: params['message'],
     });
@@ -150,7 +170,9 @@ export function registerCompanyRpc(router: RpcRouter, getWindow: GetWindow): voi
    * Sends a message to a specific member (via their PTY).
    * params: { deptId: string; memberId: string; message: string }
    */
-  router.register('company.sendMember', (params) => {
+  router.register('company.sendMember', (params, ctx) => {
+    const marked = refuseHandoffMarker('company.sendMember', params['message'], ctx);
+    if (marked) return Promise.resolve(marked);
     if (typeof params['deptId'] !== 'string' || params['deptId'].trim().length === 0) {
       throw new Error('company.sendMember: missing required param "deptId"');
     }
@@ -161,6 +183,7 @@ export function registerCompanyRpc(router: RpcRouter, getWindow: GetWindow): voi
       throw new Error('company.sendMember: missing required param "message"');
     }
     return sendToRenderer(getWindow, 'company.sendMember', {
+      ...operatorStamp(ctx),
       deptId: params['deptId'],
       memberId: params['memberId'],
       message: params['message'],
@@ -233,7 +256,9 @@ export function registerCompanyRpc(router: RpcRouter, getWindow: GetWindow): voi
     return sendToRenderer(getWindow, 'company.a2a.whoami', { workspaceId });
   });
 
-  router.register('company.a2a.send', (params) => {
+  router.register('company.a2a.send', (params, ctx) => {
+    const marked = refuseHandoffMarker('company.a2a.send', params['message'], ctx);
+    if (marked) return Promise.resolve(marked);
     if (typeof params['from'] !== 'string' || params['from'].trim().length === 0) {
       throw new Error('company.a2a.send: missing required param "from"');
     }
@@ -244,6 +269,7 @@ export function registerCompanyRpc(router: RpcRouter, getWindow: GetWindow): voi
       throw new Error('company.a2a.send: missing required param "message"');
     }
     return sendToRenderer(getWindow, 'company.a2a.send', {
+      ...operatorStamp(ctx),
       from: params['from'],
       to: params['to'],
       message: params['message'],
@@ -252,7 +278,9 @@ export function registerCompanyRpc(router: RpcRouter, getWindow: GetWindow): voi
     });
   });
 
-  router.register('company.a2a.broadcast', (params) => {
+  router.register('company.a2a.broadcast', (params, ctx) => {
+    const marked = refuseHandoffMarker('company.a2a.broadcast', params['message'], ctx);
+    if (marked) return Promise.resolve(marked);
     if (typeof params['from'] !== 'string' || params['from'].trim().length === 0) {
       throw new Error('company.a2a.broadcast: missing required param "from"');
     }
@@ -260,6 +288,7 @@ export function registerCompanyRpc(router: RpcRouter, getWindow: GetWindow): voi
       throw new Error('company.a2a.broadcast: missing required param "message"');
     }
     return sendToRenderer(getWindow, 'company.a2a.broadcast', {
+      ...operatorStamp(ctx),
       from: params['from'],
       message: params['message'],
       priority: params['priority'] ?? 'normal',
@@ -283,7 +312,7 @@ export function registerCompanyRpc(router: RpcRouter, getWindow: GetWindow): voi
     sendToRenderer(getWindow, 'company.a2a.status', {}),
   );
 
-  router.register('company.message', (params) => {
+  router.register('company.message', (params, ctx) => {
     if (typeof params['from'] !== 'string' || params['from'].trim().length === 0) {
       throw new Error('company.message: missing required param "from"');
     }
@@ -295,6 +324,7 @@ export function registerCompanyRpc(router: RpcRouter, getWindow: GetWindow): voi
       throw new Error('company.message: missing required param "to" (or set broadcast=true)');
     }
     return sendToRenderer(getWindow, 'company.message', {
+      ...operatorStamp(ctx),
       from: params['from'],
       to: params['to'] ?? '',
       message: params['message'],

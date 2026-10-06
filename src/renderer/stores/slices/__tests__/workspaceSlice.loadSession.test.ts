@@ -25,11 +25,13 @@ type TestState = WorkspaceSlice & {
   a2aAutoApproveExecute: boolean;
   sidebarPosition: 'left' | 'right';
   sidebarAttentionFirst: boolean;
+  sidebarSortMode?: string;
   multiviewArrangement: 'auto' | 'columns' | 'rows';
   notificationSoundEnabled: boolean;
   toastEnabled: boolean;
   notificationRingEnabled: boolean;
   anthropicUsageEnabled: boolean;
+  usageLimitAutoResume: boolean;
   customKeybindings: unknown[];
   autoUpdateEnabled: boolean;
   sidebarMode: 'workspaces' | 'company';
@@ -88,6 +90,7 @@ function createTestStore() {
       toastEnabled: true,
       notificationRingEnabled: true,
       anthropicUsageEnabled: false,
+      usageLimitAutoResume: false,
       customKeybindings: [],
       autoUpdateEnabled: true,
       sidebarMode: 'workspaces',
@@ -624,12 +627,64 @@ describe('loadSession — sidebar attention-first ordering', () => {
     expect(store.getState().sidebarAttentionFirst).toBe(true);
   });
 
-  it('ignores a non-boolean instead of parking it in the store', () => {
-    // A corrupted session file holding the string "false" must not read as
-    // truthy and start reordering the list the user never asked to reorder.
+  // Owner decision 2026-09-25: Attention is the default order. Only a mode the
+  // user explicitly chose survives the flip.
+  it('defaults a session with no explicit choice to Attention', () => {
     const store = createTestStore();
     store.getState().loadSession(sessionWith('false'));
+    expect(store.getState().sidebarSortMode).toBe('attention');
+    expect(store.getState().sidebarAttentionFirst).toBe(true);
+  });
+
+  it('keeps an explicitly chosen Manual order', () => {
+    const store = createTestStore();
+    store.getState().loadSession({ ...sessionWith(false), sidebarSortMode: 'manual', sidebarSortModeChosen: true } as SessionData);
+    expect(store.getState().sidebarSortMode).toBe('manual');
     expect(store.getState().sidebarAttentionFirst).toBe(false);
+  });
+});
+
+// Pinned to top (2026-09-26): a session saved when a pin meant "hold my manual
+// slot in Attention" loads with every live pin kept, as the pinned group.
+describe('loadSession — pinned to top migration', () => {
+  function sessionWithPins(order: string[], pinned: unknown): SessionData {
+    const workspaces = order.map((id) => ({
+      id,
+      name: id,
+      rootPane: makeBrowserSurfaceTree('https://example.com'),
+      activePaneId: 'pane-root',
+    })) as Workspace[];
+    return {
+      workspaces,
+      activeWorkspaceId: order[0],
+      sidebarVisible: true,
+      sidebarPinnedIds: pinned,
+    } as unknown as SessionData;
+  }
+  const order = (store: ReturnType<typeof createTestStore>) => store.getState().workspaces.map((w) => w.id);
+  const pins = (store: ReturnType<typeof createTestStore>) => (store.getState() as unknown as { sidebarPinnedIds: string[] }).sidebarPinnedIds;
+
+  it('keeps every live pin and moves the pinned rows up, in the order they had', () => {
+    const store = createTestStore();
+    store.getState().loadSession(sessionWithPins(['a', 'p1', 'b', 'p2', 'c'], ['p2', 'p1']));
+    expect(order(store)).toEqual(['p1', 'p2', 'a', 'b', 'c']);
+    expect(new Set(pins(store))).toEqual(new Set(['p1', 'p2']));
+  });
+
+  it('drops pins of workspaces that no longer exist and tolerates a torn value', () => {
+    const store = createTestStore();
+    store.getState().loadSession(sessionWithPins(['a', 'b'], ['gone', 'b', 7, 'b']));
+    expect(order(store)).toEqual(['b', 'a']);
+    expect(pins(store)).toEqual(['b']);
+    store.getState().loadSession(sessionWithPins(['a', 'b'], 'not-an-array'));
+    expect(order(store)).toEqual(['a', 'b']);
+    expect(pins(store)).toEqual([]);
+  });
+
+  it('leaves the stored order alone when nothing is pinned', () => {
+    const store = createTestStore();
+    store.getState().loadSession(sessionWithPins(['c', 'a', 'b'], []));
+    expect(order(store)).toEqual(['c', 'a', 'b']);
   });
 });
 
@@ -687,6 +742,35 @@ describe('loadSession — Anthropic usage meter (#896)', () => {
 
     expect(store.getState().anthropicUsageEnabled).toBe(false);
     expect(setUsageEnabled).not.toHaveBeenCalled();
+  });
+});
+
+describe('loadSession — usage-limit auto-resume setting', () => {
+  function sessionWith(value: unknown): SessionData {
+    const ws: Workspace = {
+      id: 'ws-limit',
+      name: 'Limit',
+      rootPane: makeBrowserSurfaceTree('https://example.com'),
+      activePaneId: 'pane-root',
+    };
+    return {
+      workspaces: [ws],
+      activeWorkspaceId: ws.id,
+      sidebarVisible: true,
+      ...(value !== undefined ? { usageLimitAutoResume: value } : {}),
+    } as unknown as SessionData;
+  }
+
+  it('restores a saved boolean and ignores a missing or malformed value', () => {
+    const store = createTestStore();
+    store.getState().loadSession(sessionWith(true));
+    expect(store.getState().usageLimitAutoResume).toBe(true);
+    store.getState().loadSession(sessionWith('true'));
+    expect(store.getState().usageLimitAutoResume).toBe(true);
+    store.getState().loadSession(sessionWith(false));
+    expect(store.getState().usageLimitAutoResume).toBe(false);
+    store.getState().loadSession(sessionWith(undefined));
+    expect(store.getState().usageLimitAutoResume).toBe(false);
   });
 });
 

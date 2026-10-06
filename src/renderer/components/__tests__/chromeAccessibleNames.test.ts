@@ -27,12 +27,15 @@ const COMPONENTS = join(__dirname, '..');
 /** The chrome this lane owns: titlebar, sidebar, pane tab strip, deck header. */
 const CHROME_FILES = [
   'Titlebar/Titlebar.tsx',
+  'Titlebar/SidebarToggle.tsx',
+  'Sidebar/RailMoreMenu.tsx',
   'StatusBar/StatusBar.tsx',
   'Sidebar/Sidebar.tsx',
   'Sidebar/WorkspaceItem.tsx',
   'Sidebar/WorkspaceAgentRoster.tsx',
   'Sidebar/MissionsSection.tsx',
   'Sidebar/MiniSidebar.tsx',
+  'Sidebar/SidebarNavigation.tsx',
   'Sidebar/CompanyPanel.tsx',
   'Sidebar/PresetPicker.tsx',
   'Sidebar/WorkspaceProfileModal.tsx',
@@ -42,7 +45,9 @@ const CHROME_FILES = [
   'Sidebar/AttachRemoteModal.tsx',
   'Pane/SurfaceTabs.tsx',
   'Deck/DeckTabs.tsx',
-  'Deck/DeckToggle.tsx',
+  'Moa/MoaTitlebarButton.tsx',
+  'Moa/MoaBubble.tsx',
+  'StatusBar/PhoneConnectWizard.tsx',
 ];
 
 /**
@@ -108,7 +113,7 @@ describe('chrome accessible names', () => {
 
   it('names the four controls the audit caught, from the existing table', () => {
     const expected: [string, RegExp][] = [
-      ['StatusBar/StatusBar.tsx', /aria-label=\{t\('statusBar\.settingsTooltip'\)\}/],
+      ['Sidebar/Sidebar.tsx', /aria-label=\{t\('settings\.title'\)\}/],
       ['Sidebar/Sidebar.tsx', /aria-label=\{t\('sidebar\.hideTooltip'\)\}/],
       ['Pane/SurfaceTabs.tsx', /aria-label=\{t\('surface\.closeTabNamed'/],
       ['Sidebar/CompanyPanel.tsx', /aria-label=\{t\('company\.destroyTitle'\)\}/],

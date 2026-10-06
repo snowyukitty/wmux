@@ -1,5 +1,31 @@
+import { CHAT_IPC } from '../shared/transcript/chatIpc';
+import type { ChatBridgeApi } from '../shared/transcript/turnEvents';
+import { CHATV2_IPC, type ChatV2BridgeApi, type ChatV2EventsPush, type ChatV2ResyncPush } from '../shared/chatv2/ipc';
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { IPC } from '../shared/constants';
+import type {
+  AgySensorInstallResult,
+  AgySensorStatus,
+  QuotaReadRequest,
+  QuotaReadResult,
+} from '../shared/tokenUsage/quotaTypes';
+import type {
+  ProviderInventory,
+  SurfaceApplyResult,
+  SurfaceChangeRequest,
+  SurfaceInventoryRequest,
+  SurfacePreview,
+  SurfaceProviderId,
+} from '../shared/tokenUsage/surfaceTypes';
+import type {
+  ApplyProfileOptions,
+  ProfileApplyAggregateResult,
+  ProfilePreviewResult,
+  SaveProfileRequest,
+  SaveProfileResult,
+  SurfaceProfile,
+} from '../shared/tokenUsage/profileTypes';
+import type { SurfaceReconcileResult } from '../main/surfaces/reconcile';
 import type {
   FirstRunCheckResult,
   RegisterMcpResult,
@@ -8,9 +34,19 @@ import type {
 import { isFileDrag } from '../shared/dragDrop';
 import { parseWindowsBuildNumber } from '../shared/platform';
 import type { NotificationCategory } from '../shared/types';
+import type { ComputerUseSettingsPayload } from '../shared/computer/config';
+import type { QuickLaunchSettingsPayload } from '../shared/quickLaunch';
 import type { ResumeBinding } from '../shared/agentResume';
+import type { PaneUsageLimit, PaneUsageLimitPatch } from '../shared/usageLimit';
+import type {
+  WorkspaceSettleChangedPayload,
+  WorkspaceSettleCommand,
+  WorkspaceSettleCommandResult,
+  WorkspaceSettleSnapshot,
+} from '../shared/workspaceSettle';
 import type { DeadPaneRecovery } from '../shared/ptyRecovery';
 import type { AgentSlug } from '../shared/events';
+import type { BrowserHelpOutcome, BrowserHelpRequestInfo } from '../shared/browserHelp';
 import type {
   RemoteInboxItem,
   LanLinkStatus,
@@ -23,14 +59,17 @@ import type {
   LanLinkPeersListResult,
 } from '../shared/lanlink';
 import type {
+  PairFlow,
   WebDeviceListError,
   WebDeviceRevokeResult,
   WebDeviceSetInputResult,
   WebDeviceSummary,
   WebStartArgs,
+  WebGrantArgs,
   WebTerminalInfo,
+  WebDiagnosis,
 } from '../shared/web';
-import type { PairFailureReason, RemoteAttachmentDescriptor, RemoteHostPublic, RemoteWorkspaceSummary } from '../shared/remoteHosts';
+import type { PairFailureReason, RemoteAttachmentDescriptor, RemoteErrorReason, RemoteHostPublic, RemoteHostStatus, RemoteWorkspaceSummary } from '../shared/remoteHosts';
 
 /** Mirrors {@link McpStatusPayload} in src/main/ipc/handlers/mcp.handler.ts. */
 export interface McpTargetStatusPayload {
@@ -43,11 +82,68 @@ export interface McpTargetStatusPayload {
   verified: boolean;
   wmux: { registered: boolean; path: string | null };
 }
-interface McpStatusPayload {
+export interface McpStatusPayload {
   targets: McpTargetStatusPayload[];
 }
+export interface McpRegisterTargetResult {
+  id: string;
+  success: boolean;
+  error?: string;
+  status: McpStatusPayload;
+}
+
+const chat: ChatBridgeApi = {
+  settings: (args) => ipcRenderer.invoke(CHAT_IPC.settings, args),
+  skills: (args) => ipcRenderer.invoke(CHAT_IPC.skills, args),
+  launchTerminal: (args) => ipcRenderer.invoke(CHAT_IPC.launchTerminal, args),
+  controls: {
+    close: (args) => ipcRenderer.invoke(CHAT_IPC.close, args),
+    providers: () => ipcRenderer.invoke(CHAT_IPC.providers),
+    start: (args) => ipcRenderer.invoke(CHAT_IPC.start, args),
+    reconnect: (args) => ipcRenderer.invoke(CHAT_IPC.reconnect, args),
+    cancel: (args) => ipcRenderer.invoke(CHAT_IPC.cancel, args),
+    respond: (args) => ipcRenderer.invoke(CHAT_IPC.respond, args),
+  },
+  status: (id) => ipcRenderer.invoke(CHAT_IPC.status, id),
+  snapshot: (id, before) => ipcRenderer.invoke(CHAT_IPC.snapshot, id, before),
+  subscribe: (id) => ipcRenderer.invoke(CHAT_IPC.subscribe, id),
+  unsubscribe: (id) => ipcRenderer.invoke(CHAT_IPC.unsubscribe, id),
+  codeBlock: (args) => ipcRenderer.invoke(CHAT_IPC.codeBlock, args),
+  send: (args) => ipcRenderer.invoke(CHAT_IPC.send, args),
+  interrupt: (args) => ipcRenderer.invoke(CHAT_IPC.interrupt, args),
+  attachment: (args) => ipcRenderer.invoke(CHAT_IPC.attachment, args),
+  openGates: () => ipcRenderer.invoke(CHAT_IPC.openGates),
+  onAppend: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, ...args: Parameters<typeof callback>) => callback(...args);
+    ipcRenderer.on(CHAT_IPC.append, listener);
+    return () => { ipcRenderer.removeListener(CHAT_IPC.append, listener); };
+  },
+  onGate: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, ...args: Parameters<typeof callback>) => callback(...args);
+    ipcRenderer.on(CHAT_IPC.gate, listener);
+    return () => { ipcRenderer.removeListener(CHAT_IPC.gate, listener); };
+  },
+};
+
+// Chat v2: one generic call per contract method (main validates and forwards).
+const chatv2: ChatV2BridgeApi = {
+  call: (method, params) => ipcRenderer.invoke(CHATV2_IPC[method], params),
+  stageAttachment: (path) => ipcRenderer.invoke(CHATV2_IPC.stageAttachment, path),
+  onEvents: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, push: ChatV2EventsPush) => listener(push);
+    ipcRenderer.on(CHATV2_IPC.events, handler);
+    return () => { ipcRenderer.removeListener(CHATV2_IPC.events, handler); };
+  },
+  onResync: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, push: ChatV2ResyncPush) => listener(push);
+    ipcRenderer.on(CHATV2_IPC.resync, handler);
+    return () => { ipcRenderer.removeListener(CHATV2_IPC.resync, handler); };
+  },
+};
 
 const electronAPI = {
+  chat,
+  chatv2,
   // OS-aware shortcut mapping support — renderer cannot read process.platform
   // directly under sandbox + contextIsolation, so expose it here.
   // 'win32' | 'darwin' | 'linux' | 'aix' | 'freebsd' | 'openbsd' | 'sunos' | 'cygwin' | 'netbsd'
@@ -81,7 +177,7 @@ const electronAPI = {
     // wmux.json leaf — `exec` runs the command as the pane's ROOT process and
     // `supervision` arms the daemon's PaneSupervisor (daemon mode only; the
     // local branch ignores them with a one-time warning toast).
-    create: (options?: { shell?: string; cwd?: string; recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd'>; cols?: number; rows?: number; workspaceId?: string; surfaceId?: string; env?: Record<string, string>; initialCommand?: string; exec?: string; supervision?: { restart: 'on-failure' | 'always'; limit?: { burst?: number; healthyUptimeSec?: number }; restorePermissionMode?: boolean } }) =>
+    create: (options?: { shell?: string; cwd?: string; recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd' | 'sourceSessionId'>; cols?: number; rows?: number; workspaceId?: string; surfaceId?: string; env?: Record<string, string>; initialCommand?: string; exec?: string; supervision?: { restart: 'on-failure' | 'always'; limit?: { burst?: number; healthyUptimeSec?: number }; restorePermissionMode?: boolean }; fanoutTaskOf?: string; fanoutOrigin?: { kind: 'pane' | 'orchestrator' | 'gui'; paneId?: string; surfaceId?: string; label?: string } }) =>
       ipcRenderer.invoke(IPC.PTY_CREATE, options),
     write: (id: string, data: string) => {
       ipcRenderer.send(IPC.PTY_WRITE, id, data);
@@ -129,6 +225,13 @@ const electronAPI = {
     },
     dispose: (id: string) =>
       ipcRenderer.invoke(IPC.PTY_DISPOSE, id),
+    // #1305 — cancel a create this surface still has in flight. The id is what
+    // a create has not returned yet, so `dispose` cannot reach one; the surface
+    // is the handle the caller already has. Resolves false when there is
+    // nothing pending (it already spawned — dispose that id instead — or the
+    // pane is a daemon one, where the daemon holds its own pending guard).
+    cancelCreate: (surfaceId: string): Promise<boolean> =>
+      ipcRenderer.invoke(IPC.PTY_CANCEL_CREATE, surfaceId),
     // `supervision` (X8) is additive and present only on supervised daemon-mode
     // sessions — the renderer uses it to hydrate its supervision slice on boot
     // and daemon-reconnect. Absent in local mode and for unsupervised panes.
@@ -139,7 +242,9 @@ const electronAPI = {
       // `surfaceId` (axis B, reboot-reattach): present only on sessions created
       // WITH a WMUX_SURFACE_ID (Terminal self-create path); reconcile uses it to
       // rebind a stale ptyId to the surviving session after a reboot.
-      ipcRenderer.invoke(IPC.PTY_LIST, opts) as Promise<{ id: string; shell: string; surfaceId?: string; createdAt?: string; state?: string; cwd?: string; spawnCwd?: string; supervision?: { status: 'armed' | 'stopped'; restartCount: number }; resumeAgent?: AgentSlug; resumeBinding?: ResumeBinding; commandRunning?: boolean; agentProcessAlive?: boolean }[]>,
+      // `workspaceId`/`agentName` (#1101): origin identity for the orphaned
+      // session list.
+      ipcRenderer.invoke(IPC.PTY_LIST, opts) as Promise<{ id: string; shell: string; surfaceId?: string; createdAt?: string; state?: string; cwd?: string; spawnCwd?: string; workspaceId?: string; agentName?: string; supervision?: { status: 'armed' | 'stopped'; restartCount: number }; resumeAgent?: AgentSlug; resumeBinding?: ResumeBinding; commandRunning?: boolean; agentProcessAlive?: boolean; liveAgent?: AgentSlug }[]>,
     // TASK-6 — per-pane agent RAM for the Fleet View cockpit. Given the ptyIds
     // currently shown as cards, returns { [ptyId]: { rss (bytes), image? } } by
     // walking each pane shell's descendant process tree from ONE CIM snapshot.
@@ -154,10 +259,15 @@ const electronAPI = {
       // writable yet, RPC threw during a handler-swap window) from a permanent
       // one (session genuinely dead). The renderer retries transient failures
       // instead of immediately clearing the ptyId and replacing the session.
-      ipcRenderer.invoke(IPC.PTY_RECONNECT, id) as Promise<{ success: boolean; id?: string; shell?: string; error?: string; code?: string; transient?: boolean; recovery?: DeadPaneRecovery }>,
+      // `cwdMissing` (#1305) rides the recoveryPending shape: the WSL directory
+      // itself is gone, so Retry cannot succeed until it is restored and the
+      // pane is offered a fresh start in the home directory instead.
+      ipcRenderer.invoke(IPC.PTY_RECONNECT, id) as Promise<{ success: boolean; id?: string; shell?: string; error?: string; code?: string; transient?: boolean; recoveryPending?: boolean; cwdMissing?: boolean; recovery?: DeadPaneRecovery }>,
     // Fix B — on-demand promote of a cap-skipped suspended session.
-    promote: (id: string) =>
-      ipcRenderer.invoke(IPC.PTY_PROMOTE, id) as Promise<{ success: boolean; error?: string }>,
+    // #1305 — `fresh` promotes it in the home directory WITHOUT resuming the
+    // recorded conversation: the way out when its own directory is gone.
+    promote: (id: string, opts?: { fresh?: boolean }) =>
+      ipcRenderer.invoke(IPC.PTY_PROMOTE, id, opts) as Promise<{ success: boolean; error?: string; cwdMissing?: boolean }>,
     // Phase 3 PR-B — live-pipe re-flush. Unlike `reconnect` (opens a fresh
     // socket), this re-runs the flush on the EXISTING session socket, so input
     // never pauses. Three success shapes: a live re-flush ('snapshot'|'raw'), a
@@ -175,7 +285,7 @@ const electronAPI = {
     // fallback for cold-parked panes that have no renderer xterm buffer.
     readText: (id: string, opts?: { scrollback?: number }) =>
       ipcRenderer.invoke(IPC.PTY_READ_TEXT, id, opts) as Promise<
-        | { success: true; rows: Array<{ text: string; wrapped: boolean }>; truncated?: boolean }
+        | { success: true; rows: Array<{ text: string; wrapped: boolean }>; bufferType?: 'normal' | 'alternate'; rowsBelowCursor?: number; truncated?: boolean }
         | { success: false; code: string; reason?: string }
       >,
     onData: (callback: (id: string, data: string, replay: boolean) => void) => {
@@ -235,6 +345,9 @@ const electronAPI = {
   },
   shell: {
     list: () => ipcRenderer.invoke(IPC.SHELL_LIST) as Promise<{ name: string; path: string; args?: string[] }[]>,
+    // #1103 — WSL distro names for the default-terminal picker ([] off
+    // Windows / on any enumeration failure).
+    wslDistros: () => ipcRenderer.invoke(IPC.SHELL_WSL_DISTROS) as Promise<string[]>,
     openExternal: (url: string) => ipcRenderer.invoke(IPC.SHELL_OPEN_EXTERNAL, url) as Promise<void>,
     // Open an absolute filesystem path in the OS default app / explorer.
     // Backed by Electron's shell.openPath; main validates the path is
@@ -290,6 +403,8 @@ const electronAPI = {
     setMutedNotificationCategories: (categories: NotificationCategory[]) =>
       ipcRenderer.send(IPC.MUTED_NOTIFICATION_CATEGORIES, categories),
     setAutoUpdateEnabled: (enabled: boolean) => ipcRenderer.send(IPC.AUTO_UPDATE_ENABLED, enabled),
+    // #1103 — null clears the choice (back to wsl.exe's system default).
+    setDefaultWslDistro: (distro: string | null) => ipcRenderer.send(IPC.SETTINGS_DEFAULT_WSL_DISTRO, distro),
   },
   // Windows "start on login" toggle (issue #460). Backed by the per-user Run
   // registry key. `get`/`set` resolve to the live state; off-Windows both
@@ -297,6 +412,18 @@ const electronAPI = {
   autostart: {
     get: () => ipcRenderer.invoke(IPC.AUTOSTART_GET) as Promise<{ enabled: boolean }>,
     set: (enabled: boolean) => ipcRenderer.invoke(IPC.AUTOSTART_SET, enabled) as Promise<{ enabled: boolean }>,
+  },
+  // Desktop computer use (Settings › Computer use). The switch lives in
+  // ~/.wmux/computer-use.json so the MCP server can read it too; `helper` says
+  // whether this build has the native helper for this OS.
+  computerUse: {
+    get: () => ipcRenderer.invoke(IPC.COMPUTER_USE_GET) as Promise<ComputerUseSettingsPayload>,
+    set: (enabled: boolean) => ipcRenderer.invoke(IPC.COMPUTER_USE_SET, enabled) as Promise<ComputerUseSettingsPayload>,
+  },
+  quickLaunch: {
+    settingsGet: () => ipcRenderer.invoke(IPC.QUICK_LAUNCH_SETTINGS_GET) as Promise<QuickLaunchSettingsPayload>,
+    settingsSet: (patch: { enabled?: boolean; accelerator?: string }) =>
+      ipcRenderer.invoke(IPC.QUICK_LAUNCH_SETTINGS_SET, patch) as Promise<QuickLaunchSettingsPayload>,
   },
   notification: {
     // ptyId may be null for app-level notifications (e.g. external MCP
@@ -364,8 +491,8 @@ const electronAPI = {
     // progress) flow through this one shape. Renderer routes by ptyId
     // (preferred) or workspaceId (for surface-less updates like
     // meta.setStatus on the active workspace).
-    onUpdate: (callback: (payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; pendingQuestion?: string; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean }) => void) => {
-      const listener = (_event: Electron.IpcRendererEvent, payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; pendingQuestion?: string; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean }) =>
+    onUpdate: (callback: (payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; pendingQuestion?: string; lastMessage?: string; lastActivity?: ''; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean }) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; pendingQuestion?: string; lastMessage?: string; lastActivity?: ''; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean }) =>
         callback(payload);
       ipcRenderer.on(IPC.METADATA_UPDATE, listener);
       return () => { ipcRenderer.removeListener(IPC.METADATA_UPDATE, listener); };
@@ -422,11 +549,64 @@ const electronAPI = {
     // channelLocal.handler.ts.
     mutateChannelLocal: (method: string, params: Record<string, unknown>) =>
       ipcRenderer.invoke(IPC.CHANNEL_MUTATE_LOCAL, method, params),
+    // Paste + submit a non-operator delivery through main's approval gate.
+    // Renderer-only; see IPC.GATED_SUBMIT.
+    // `opts.newTask`: an a2a new task, whose pane may get a fresh context (#1680).
+    gatedSubmit: (
+      ptyId: string,
+      text: string,
+      agent?: string | null,
+      opts?: import('../shared/ptyMessageDelivery').GatedSubmitOptions,
+    ) =>
+      ipcRenderer.invoke(IPC.GATED_SUBMIT, ptyId, text, agent ?? null, {
+        newTask: opts?.newTask === true,
+        ...(opts?.keepContext ? { keepContext: opts.keepContext } : {}),
+        ...(opts?.taskId ? { taskId: opts.taskId } : {}),
+        ...(opts?.pane ? { pane: opts.pane } : {}),
+        // The Git page's hand-off: the typing hold and its checks.
+        ...(opts?.waitQuiet ? { waitQuiet: true } : {}),
+        ...(opts?.waitQuiet && opts.expectAgent ? { expectAgent: opts.expectAgent } : {}),
+        ...(opts?.waitQuiet && opts.deadlineAt !== undefined ? { deadlineAt: opts.deadlineAt } : {}),
+        ...(opts?.waitQuiet && typeof opts.guardKey === 'string' ? { guardKey: opts.guardKey } : {}),
+      }) as Promise<
+        import('../shared/ptyMessageDelivery').GatedSubmitResult
+      >,
   },
   // J1 fan-out — 프롬프트 1개 → N 격리 태스크. 렌더러 다이얼로그가 요청을 조립해
   // main의 FanOutService로 보낸다(renderer-trusted 신원, 파이프 미노출).
   fanout: {
     start: (req: Record<string, unknown>) => ipcRenderer.invoke(IPC.FANOUT_START, req),
+    lineage: (workspaceIds: string[]) =>
+      ipcRenderer.invoke(IPC.FANOUT_LINEAGE, workspaceIds) as Promise<Record<string, { owner: string; at: number; origin?: import('../shared/fanoutOrigin').FanoutOrigin }>>,
+    recentAudit: (limit: number) =>
+      ipcRenderer.invoke(IPC.FANOUT_AUDIT_RECENT, limit) as Promise<
+        import('../main/worktask/fanoutGuards').FanOutAuditRecord[]
+      >,
+    getRequireApproval: () => ipcRenderer.invoke(IPC.FANOUT_REQUIRE_APPROVAL_GET) as Promise<boolean>,
+    setRequireApproval: (value: boolean) =>
+      ipcRenderer.invoke(IPC.FANOUT_REQUIRE_APPROVAL_SET, value) as Promise<boolean>,
+    getTrustAgyFolders: () => ipcRenderer.invoke(IPC.FANOUT_TRUST_AGY_FOLDERS_GET) as Promise<boolean>,
+    setTrustAgyFolders: (value: boolean) =>
+      ipcRenderer.invoke(IPC.FANOUT_TRUST_AGY_FOLDERS_SET, value) as Promise<boolean>,
+    getWorkerPermissionMode: () =>
+      ipcRenderer.invoke(IPC.FANOUT_WORKER_MODE_GET) as Promise<
+        import('../shared/workerLaunch').FanoutWorkerPermissionMode
+      >,
+    setWorkerPermissionMode: (mode: import('../shared/workerLaunch').FanoutWorkerPermissionMode) =>
+      ipcRenderer.invoke(IPC.FANOUT_WORKER_MODE_SET, mode) as Promise<
+        import('../shared/workerLaunch').FanoutWorkerPermissionMode
+      >,
+    getPresets: () =>
+      ipcRenderer.invoke(IPC.FANOUT_PRESETS_GET) as Promise<{
+        presets: import('../shared/fanoutPreset').FanoutPreset[];
+        dropped: import('../shared/fanoutPreset').FanoutPresetDropped[];
+        unreadable?: true;
+      }>,
+    setPresets: (presets: unknown[]) =>
+      ipcRenderer.invoke(IPC.FANOUT_PRESETS_SET, presets) as Promise<
+        | { ok: true; presets: import('../shared/fanoutPreset').FanoutPreset[] }
+        | ({ ok: false } & import('../shared/fanoutPreset').FanoutIssue)
+      >,
   },
   // Command Deck Phase 2 — the Commander brain. `send` runs one orchestrator
   // turn (resolves with the accept/reject verdict; the turn's content streams
@@ -437,6 +617,10 @@ const electronAPI = {
   // reads snapshots + requests mutations. Onboarding: onboardPrepare() creates
   // an isolated (hybrid-shared) config dir, the renderer spawns a login pane
   // pointed at it, polls credentialStatus() until login lands, then add()s.
+  quickCommands: {
+    list: () => ipcRenderer.invoke(IPC.QUICK_COMMAND_LIST) as Promise<import('../shared/quickCommands').QuickCommandSnapshot>,
+    replace: (snapshot: import('../shared/quickCommands').QuickCommandSnapshot) => ipcRenderer.invoke(IPC.QUICK_COMMAND_REPLACE, snapshot) as Promise<import('../shared/quickCommands').QuickCommandSnapshot>,
+  },
   accounts: {
     list: () =>
       ipcRenderer.invoke(IPC.ACCOUNT_LIST) as Promise<{
@@ -483,6 +667,88 @@ const electronAPI = {
       return () => { ipcRenderer.removeListener(IPC.ACCOUNT_USAGE_UPDATE, listener); };
     },
   },
+  // Quota-driven account choice for Claude/Codex launches: per-vendor switch
+  // and each registered account's last quota reading (no secrets).
+  accountRotation: {
+    get: () =>
+      ipcRenderer.invoke(IPC.ACCOUNT_ROTATION_GET) as Promise<{
+        settings: import('../main/account/AccountRotationService').RotationSettings;
+        rows: import('../main/account/AccountRotationService').RotationAccountRow[];
+      }>,
+    set: (vendor: 'claude' | 'codex', on: boolean) =>
+      ipcRenderer.invoke(IPC.ACCOUNT_ROTATION_SET, { vendor, on }) as Promise<{ ok: boolean }>,
+  },
+  // Scheduled runs. Invokes pass through to the daemon's automation.* RPCs and
+  // never reject for a missing daemon (empty lists / `{ ok:false }`). onPush
+  // carries daemon events + connect-time snapshots; onOpenRun is an OS toast
+  // click asking to open a run's terminal (or the schedule, for a draft).
+  automation: {
+    list: () =>
+      ipcRenderer.invoke(IPC.AUTOMATION_LIST) as Promise<{
+        automations: import('../shared/automation').Automation[];
+        available: boolean;
+        /** Set on a transient failure: keep what is shown. */
+        error?: string;
+      }>,
+    runs: (automationId?: string) =>
+      ipcRenderer.invoke(IPC.AUTOMATION_RUNS, automationId) as Promise<{
+        runs: import('../shared/automation').AutomationRun[];
+      }>,
+    snapshot: (runId: string) =>
+      ipcRenderer.invoke(IPC.AUTOMATION_SNAPSHOT, runId) as Promise<{ text: string | null }>,
+    create: (draft: import('../shared/automation').AutomationDraft, enabled?: boolean) =>
+      ipcRenderer.invoke(IPC.AUTOMATION_CREATE, draft, enabled) as Promise<
+        import('../shared/automation').AutomationMutationResult
+      >,
+    update: (id: string, draft: import('../shared/automation').AutomationDraft) =>
+      ipcRenderer.invoke(IPC.AUTOMATION_UPDATE, id, draft) as Promise<
+        import('../shared/automation').AutomationMutationResult
+      >,
+    remove: (id: string) =>
+      ipcRenderer.invoke(IPC.AUTOMATION_REMOVE, id) as Promise<import('../shared/automation').AutomationOkResult>,
+    setEnabled: (id: string, enabled: boolean) =>
+      ipcRenderer.invoke(IPC.AUTOMATION_SET_ENABLED, id, enabled) as Promise<
+        import('../shared/automation').AutomationMutationResult
+      >,
+    grant: (id: string, mode: import('../shared/automation').AutomationPermissionMode, allowedTools?: string[]) =>
+      ipcRenderer.invoke(IPC.AUTOMATION_GRANT, id, mode, allowedTools) as Promise<
+        import('../shared/automation').AutomationMutationResult
+      >,
+    runNow: (id: string, kind: 'manual' | 'test') =>
+      ipcRenderer.invoke(IPC.AUTOMATION_RUN_NOW, id, kind) as Promise<import('../shared/automation').AutomationRunNowResult>,
+    cancelRun: (runId: string) =>
+      ipcRenderer.invoke(IPC.AUTOMATION_CANCEL_RUN, runId) as Promise<import('../shared/automation').AutomationOkResult>,
+    // The UI locale id only; main owns the toast words.
+    setUiLocale: (locale: string) => ipcRenderer.send(IPC.AUTOMATION_TOAST_LABELS, locale),
+    onPush: (callback: (push: import('../main/automation/AutomationBridge').AutomationPush) => void) => {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        push: import('../main/automation/AutomationBridge').AutomationPush,
+      ) => callback(push);
+      ipcRenderer.on(IPC.AUTOMATION_PUSH, listener);
+      return () => { ipcRenderer.removeListener(IPC.AUTOMATION_PUSH, listener); };
+    },
+    onOpenRun: (callback: (request: import('../main/automation/AutomationBridge').AutomationOpenRequest) => void) => {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        request: import('../main/automation/AutomationBridge').AutomationOpenRequest,
+      ) => callback(request);
+      ipcRenderer.on(IPC.AUTOMATION_OPEN_RUN, listener);
+      return () => { ipcRenderer.removeListener(IPC.AUTOMATION_OPEN_RUN, listener); };
+    },
+  },
+  agentModels: {
+    /** Models an agent CLI reports; `refresh` bypasses main's cache. */
+    list: (agent: string, refresh = false) =>
+      ipcRenderer.invoke(IPC.AGENT_MODELS_LIST, { agent, refresh }) as Promise<
+        import('../shared/modelCatalog').ModelCatalogResult
+      >,
+    /** Fan-out only: trust the task folder agy is about to launch in. */
+    trustAgyFolder: (folder: string) =>
+      ipcRenderer.invoke(IPC.AGY_TRUST_FOLDER, folder) as Promise<
+        import('../main/agents/agyTrust').AgyTrustResult
+      >,
+  },
   deck: {
     // M1.5: one orchestrator per workspace — every call names the workspace
     // whose brain it addresses. `model` is the orchestrator model override
@@ -492,7 +758,7 @@ const electronAPI = {
     send: (args: { workspaceId: string; text: string; fleetContext?: string; model?: string }) =>
       ipcRenderer.invoke(IPC.DECK_SEND, args) as Promise<{
         ok: boolean;
-        code?: 'busy' | 'disposed' | 'empty' | 'invalid_workspace';
+        code?: 'busy' | 'disposed' | 'empty' | 'invalid_workspace' | 'mode_off' | 'task_workspace' | 'moa_off' | 'not_hq' | 'hq_missing' | 'hq_unknown';
       }>,
     interrupt: (workspaceId: string) =>
       ipcRenderer.invoke(IPC.DECK_INTERRUPT, { workspaceId }) as Promise<{ ok: true }>,
@@ -515,7 +781,90 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.DECK_STATUS, { workspaceId }) as Promise<{
         status: 'idle' | 'busy' | 'disposed';
         sessionId: string | null;
+        /** Present only while a designated HQ cannot run. */
+        hq?: 'hq-missing' | 'hq-unknown' | 'hq-store-corrupt';
       }>,
+    // The designated HQ workspace (main bot). Read-only from the renderer.
+    hq: {
+      get: () =>
+        ipcRenderer.invoke(IPC.DECK_HQ_GET) as Promise<{
+          workspaceId: string | null;
+          state: 'unset' | 'ok' | 'hq-missing' | 'hq-unknown' | 'hq-store-corrupt';
+        }>,
+    },
+    // The main bot's master switch (default on).
+    moa: {
+      get: () => ipcRenderer.invoke(IPC.DECK_MOA_GET) as Promise<{ enabled: boolean }>,
+      set: (enabled: boolean) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_SET, { enabled }) as Promise<{ ok: boolean; enabled?: boolean; code?: string }>,
+      // Settings → Moa: one read for the switch, its settings, the HQ and the
+      // archived-decision notice; onChanged says it moved.
+      state: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_STATE) as Promise<import('../shared/moa').MoaState>,
+      setConfig: (patch: import('../shared/moa').MoaConfigPatch) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_CONFIG_SET, patch) as Promise<{ ok: boolean; code?: string }>,
+      setup: (workspaceId: string, opts?: { rebind?: boolean }) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_SETUP, { workspaceId, ...(opts?.rebind ? { rebind: true } : {}) }) as Promise<import('../shared/moa').MoaSetupResult>,
+      archiveList: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_ARCHIVE_LIST) as Promise<{ decisions: import('../shared/moa').MoaArchivedDecision[] }>,
+      archiveAck: () => ipcRenderer.invoke(IPC.DECK_MOA_ARCHIVE_ACK) as Promise<{ ok: boolean }>,
+      resetStore: () => ipcRenderer.invoke(IPC.DECK_MOA_STORE_RESET) as Promise<{ ok: boolean }>,
+      memoryList: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_MEMORY_LIST) as Promise<{ items: import('../shared/moa').MoaMemoryItem[] }>,
+      memoryDelete: (kind: import('../shared/moa').MoaMemoryItem['kind'], name: string) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_MEMORY_DELETE, { kind, name }) as Promise<{ ok: boolean }>,
+      memoryCard: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_MEMORY_CARD) as Promise<{ card: import('../shared/moa').MoaMemoryCard | null }>,
+      memoryResolve: (args: { id: string; answer: 'save' | 'discard'; fullTextShown: boolean }) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_MEMORY_RESOLVE, args) as Promise<{ ok: boolean; code?: string }>,
+      // Moa's own permission prompt (the HQ brain's dialog as an approval
+      // record), and pressing one of its choices from the Moa chat.
+      approval: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_APPROVAL) as Promise<{ approval: import('../shared/moa').MoaApproval | null }>,
+      approvalAnswer: (args: { approvalId: string; choiceKey: string; promptFingerprint: string }) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_APPROVAL_ANSWER, args) as Promise<import('../shared/moa').MoaApprovalAnswerResult>,
+      // Every workspace's pending decision ("Waiting on you").
+      decisions: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DECISIONS) as Promise<{ decisions: import('../shared/moa').MoaPendingDecision[] }>,
+      taskResult: (args: { workspaceId: string; taskId: string }) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_TASK_RESULT, args) as Promise<{ result: import('../shared/moaResult').MoaTaskResult | null }>,
+      delegatedApprovals: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DELEGATED_APPROVALS) as Promise<{ approvals: import('../shared/moa').MoaDelegatedApproval[] }>,
+      delegatedAnswer: (args: { approvalId: string; choiceKey: string; promptFingerprint: string }) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DELEGATED_ANSWER, args) as Promise<import('../shared/moa').MoaApprovalAnswerResult>,
+      // Moa's hand-offs: answer a hand-off card (a body only when the operator
+      // edited it), the recent auto hand-offs, and stopping one of them.
+      handoffResolve: (args: import('../shared/moaHandoff').MoaHandoffResolveRequest) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_HANDOFF_RESOLVE, args) as Promise<import('../shared/moaHandoff').MoaHandoffResolveResult>,
+      handoffReceipts: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_HANDOFF_RECEIPTS) as Promise<{ receipts: import('../shared/moaHandoff').MoaAutoHandoffReceipt[] }>,
+      handoffStop: (args: { id: string }) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_HANDOFF_STOP, args) as Promise<{ ok: boolean }>,
+      // The HQ brain's transcript as turn events (chat look over the terminal brain).
+      transcript: {
+        status: () =>
+          ipcRenderer.invoke(IPC.DECK_MOA_TRANSCRIPT_STATUS) as Promise<import('../shared/transcript/turnEvents').TranscriptStatus>,
+        snapshot: (opts?: { before?: number }) =>
+          ipcRenderer.invoke(IPC.DECK_MOA_TRANSCRIPT_SNAPSHOT, opts ?? {}) as Promise<import('../shared/transcript/turnEvents').TranscriptPage | null>,
+        // `client` names who listens ('panel', 'notice'): appends flow while
+        // any client is subscribed, so one cannot unsubscribe the other.
+        subscribe: (client?: string) =>
+          ipcRenderer.invoke(IPC.DECK_MOA_TRANSCRIPT_SUBSCRIBE, client) as Promise<import('../shared/transcript/turnEvents').TranscriptStatus>,
+        unsubscribe: (client?: string) => ipcRenderer.invoke(IPC.DECK_MOA_TRANSCRIPT_UNSUBSCRIBE, client) as Promise<void>,
+        codeBlock: (args: { srcOffset: number; n: number; eventId?: string }) =>
+          ipcRenderer.invoke(IPC.DECK_MOA_TRANSCRIPT_CODEBLOCK, args) as Promise<{ body: string } | null>,
+        onAppend: (callback: (data: import('../shared/transcript/turnEvents').TranscriptAppendData) => void) => {
+          const listener = (_e: Electron.IpcRendererEvent, data: import('../shared/transcript/turnEvents').TranscriptAppendData): void => callback(data);
+          ipcRenderer.on(IPC.DECK_MOA_TRANSCRIPT_APPEND, listener);
+          return () => { ipcRenderer.removeListener(IPC.DECK_MOA_TRANSCRIPT_APPEND, listener); };
+        },
+      },
+      onChanged: (callback: () => void) => {
+        const listener = (): void => callback();
+        ipcRenderer.on(IPC.DECK_MOA_CHANGED, listener);
+        return () => { ipcRenderer.removeListener(IPC.DECK_MOA_CHANGED, listener); };
+      },
+    },
     // P3d — persisted orchestrator schedules (fire as ordinary brain turns on
     // their own workspace's orchestrator).
     schedules: {
@@ -634,10 +983,11 @@ const electronAPI = {
     },
     // Orchestrator model picker → main-side authority, so scheduled and
     // event-woken turns (and the composer-less terminal brain) all see it.
-    modelSet: (model: string) =>
-      ipcRenderer.invoke(IPC.DECK_MODEL_SET, { model }) as Promise<{
+    modelSet: (model: string, effort?: string) =>
+      ipcRenderer.invoke(IPC.DECK_MODEL_SET, { model, effort }) as Promise<{
         ok: true;
         model: string;
+        effort: string;
       }>,
     // The operator's `/clear` — resets one workspace orchestrator's brain
     // context (fresh SDK conversation on the next turn). Transcript stays.
@@ -659,6 +1009,10 @@ const electronAPI = {
       install: () =>
         ipcRenderer.invoke(IPC.HOOKS_BRIDGE_INSTALL) as Promise<
           import('../cli/commands/setupHooks').InstallOutcome
+        >,
+      allowWorkerTools: () =>
+        ipcRenderer.invoke(IPC.HOOKS_BRIDGE_ALLOW_WORKER_TOOLS) as Promise<
+          import('../cli/commands/setupHooks').AllowWorkerToolsOutcome
         >,
       // Durable "Don't ask again". GET is consulted before the prompt shows;
       // SET is written only by that explicit click and cleared from Settings.
@@ -693,7 +1047,7 @@ const electronAPI = {
         ipcRenderer.invoke(IPC.DECK_DECISION_GET, { workspaceId }) as Promise<{
           decision: import('../main/deck/deckDecisionStore').WorkspaceDecision | null;
         }>,
-      resolve: (args: { workspaceId: string; id: string; resolution: string }) =>
+      resolve: (args: { workspaceId: string; id: string; resolution: string; dismiss?: boolean }) =>
         ipcRenderer.invoke(IPC.DECK_DECISION_RESOLVE, args) as Promise<{
           ok: boolean;
           code?: string;
@@ -761,6 +1115,43 @@ const electronAPI = {
       ipcRenderer.on(IPC.DECK_BRAIN_PTY, listener);
       return () => { ipcRenderer.removeListener(IPC.DECK_BRAIN_PTY, listener); };
     },
+    // A fan-out worker of a brain-less owner ended its turn: a pointer for
+    // the requester pane's one-line nudge (renderer/hooks/fanoutCallerNudge).
+    onFanoutCaller: (
+      callback: (ev: import('../main/deck/fanoutCallerNotify').FanoutCallerEvent) => void,
+    ) => {
+      const listener = (
+        _e: Electron.IpcRendererEvent,
+        ev: import('../main/deck/fanoutCallerNotify').FanoutCallerEvent,
+      ) => callback(ev);
+      ipcRenderer.on(IPC.DECK_FANOUT_CALLER, listener);
+      return () => { ipcRenderer.removeListener(IPC.DECK_FANOUT_CALLER, listener); };
+    },
+    // A PR event for a brain-less workspace: a pointer for the PR owner
+    // pane's one-line nudge (same queue as the fan-out caller nudge).
+    onPrOwner: (
+      callback: (ev: import('../main/deck/prOwnerNotify').PrOwnerEvent) => void,
+    ) => {
+      const listener = (
+        _e: Electron.IpcRendererEvent,
+        ev: import('../main/deck/prOwnerNotify').PrOwnerEvent,
+      ) => callback(ev);
+      ipcRenderer.on(IPC.DECK_PR_OWNER, listener);
+      return () => { ipcRenderer.removeListener(IPC.DECK_PR_OWNER, listener); };
+    },
+    fanoutCallerSession: (ptyId: string) =>
+      ipcRenderer.invoke(IPC.DECK_FANOUT_CALLER_SESSION, ptyId) as Promise<{ incarnationId: string } | null>,
+    fanoutCallerSubmit: (payload: {
+      ptyId: string;
+      ownerWorkspaceId: string;
+      incarnationId: string;
+      text: string;
+      /** The PRs the line names, with the url the owner was resolved by. */
+      prs?: { number: number; url: string }[];
+    }) =>
+      ipcRenderer.invoke(IPC.DECK_FANOUT_CALLER_SUBMIT, payload) as Promise<
+        import('../main/deck/fanoutCallerSubmit').FanoutCallerSubmitReply
+      >,
   },
   // WorkspaceMirror push — fire-and-forget full snapshot of the workspace tree +
   // per-pane agent status. Keeps the main-process mirror warm so routing / hook
@@ -839,6 +1230,97 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.GITHUB_PR_DETAIL, repoPath, number, updatedAt) as Promise<
         import('../main/ipc/handlers/github.handler').GithubPrDetailResult
       >,
+    // host/owner/repo of origin (lowercased), or null — groups clones of one repo.
+    repoKey: (repoPath: string) =>
+      ipcRenderer.invoke(IPC.GITHUB_REPO_KEY, repoPath) as Promise<{ key: string | null }>,
+    // Open issues (filtered) and one issue's detail; force skips the 30s TTL.
+    issueList: (repoPath: string, filter: import('../shared/issueSurface').IssueFilter, force?: boolean) =>
+      ipcRenderer.invoke(IPC.GITHUB_ISSUE_LIST, repoPath, filter, force ?? false) as Promise<
+        import('../shared/issueSurface').IssueListResult
+      >,
+    issueDetail: (repoPath: string, number: number, updatedAt: string) =>
+      ipcRenderer.invoke(IPC.GITHUB_ISSUE_DETAIL, repoPath, number, updatedAt) as Promise<
+        import('../shared/issueSurface').IssueDetailResult
+      >,
+    // PR review and CI: reads, and writes tied to the head the person saw
+    // (main re-reads it right before writing and refuses if it moved).
+    prChecks: (repoPath: string, prUrl: string, force?: boolean) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_CHECKS, repoPath, prUrl, force === true) as Promise<
+        import('../shared/prReview').PrReviewRead<import('../shared/prReview').PrChecksState>
+      >,
+    prFiles: (repoPath: string, prUrl: string, headRefOid: string) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_FILES, repoPath, prUrl, headRefOid) as Promise<
+        import('../shared/prReview').PrReviewRead<import('../shared/prReview').PrFilesState>
+      >,
+    prThreads: (repoPath: string, prUrl: string, headRefOid: string, force?: boolean) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_THREADS, repoPath, prUrl, headRefOid, force === true) as Promise<
+        import('../shared/prReview').PrReviewRead<import('../shared/prReview').PrThreadsState>
+      >,
+    prComment: (repoPath: string, prUrl: string, req: import('../shared/prReview').PrCommentRequest) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_COMMENT, repoPath, prUrl, req) as Promise<import('../shared/prReview').PrWriteResult>,
+    prReply: (repoPath: string, prUrl: string, commentId: number, body: string) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_REPLY, repoPath, prUrl, commentId, body) as Promise<import('../shared/prReview').PrWriteResult>,
+    prSubmitReview: (repoPath: string, prUrl: string, req: import('../shared/prReview').PrSubmitReviewRequest) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_SUBMIT, repoPath, prUrl, req) as Promise<import('../shared/prReview').PrWriteResult>,
+    prMerge: (repoPath: string, prUrl: string, req: import('../shared/prReview').PrMergeRequest) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_MERGE, repoPath, prUrl, req) as Promise<import('../shared/prReview').PrWriteResult>,
+    prRunLog: (repoPath: string, prUrl: string, runId: string) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_RUN_LOG, repoPath, prUrl, runId) as Promise<
+        import('../shared/prReview').PrReviewRead<import('../shared/prReview').PrRunLog>
+      >,
+    prRerunFailed: (repoPath: string, prUrl: string, runId: string) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_RERUN, repoPath, prUrl, runId) as Promise<import('../shared/prReview').PrWriteResult>,
+    // Ship button: the current branch's status and its writes (each re-checked in main).
+    shipStatus: (repoPath: string) =>
+      ipcRenderer.invoke(IPC.GIT_SHIP_STATUS, repoPath) as Promise<import('../main/git/shipActions').ShipStatusResult>,
+    // Each write names the branch + HEAD it was asked for; main refuses if either moved.
+    shipCommit: (repoPath: string, message: string, expect: import('../main/git/shipActions').ShipExpect) =>
+      ipcRenderer.invoke(IPC.GIT_SHIP_COMMIT, repoPath, message, expect) as Promise<import('../main/git/shipActions').ShipActionResult>,
+    shipPush: (repoPath: string, expect: import('../main/git/shipActions').ShipExpect) =>
+      ipcRenderer.invoke(IPC.GIT_SHIP_PUSH, repoPath, expect) as Promise<import('../main/git/shipActions').ShipActionResult>,
+    shipCreatePr: (repoPath: string, title: string, expect: import('../main/git/shipActions').ShipExpect) =>
+      ipcRenderer.invoke(IPC.GIT_SHIP_CREATE_PR, repoPath, title, expect) as Promise<import('../main/git/shipActions').ShipActionResult>,
+    // Hand an issue / PR to an agent pane (gated, typing-held delivery) or to a new worktree.
+    handoffSend: (req: import('../shared/gitHandoff').HandoffSendRequest) =>
+      ipcRenderer.invoke(IPC.GIT_HANDOFF_SEND, req) as Promise<import('../shared/gitHandoff').HandoffSendResult>,
+    handoffStartWorktree: (req: import('../shared/gitHandoff').HandoffStartRequest) =>
+      ipcRenderer.invoke(IPC.GIT_HANDOFF_START_WORKTREE, req) as Promise<import('../shared/gitHandoff').HandoffStartResult>,
+    // One-step connect: main runs gh auth login --web; events carry the device code and the outcome.
+    loginStart: () => ipcRenderer.invoke(IPC.GH_LOGIN_START) as Promise<import('../shared/ghDeviceLogin').GhLoginStartResult>,
+    loginCancel: () => ipcRenderer.invoke(IPC.GH_LOGIN_CANCEL) as Promise<void>,
+    onLoginEvent: (callback: (event: import('../shared/ghDeviceLogin').GhLoginEvent) => void) => {
+      const listener = (_e: Electron.IpcRendererEvent, event: import('../shared/ghDeviceLogin').GhLoginEvent) => callback(event);
+      ipcRenderer.on(IPC.GH_LOGIN_EVENT, listener);
+      return () => { ipcRenderer.removeListener(IPC.GH_LOGIN_EVENT, listener); };
+    },
+  },
+  // Work links (docs/work-links.md): read-only here, main is the only writer.
+  // onChanged hands over the changed link ids; re-read what you show.
+  workLinks: {
+    list: (filter?: import('../shared/workLink').WorkLinkFilter) =>
+      ipcRenderer.invoke(IPC.WORK_LINK_LIST, filter ?? {}) as Promise<import('../shared/workLink').WorkLink[]>,
+    get: (id: string) =>
+      ipcRenderer.invoke(IPC.WORK_LINK_GET, id) as Promise<import('../shared/workLink').WorkLink | null>,
+    onChanged: (callback: (ids: string[]) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, ids: string[]) => callback(ids);
+      ipcRenderer.on(IPC.WORK_LINK_CHANGED, listener);
+      return () => { ipcRenderer.removeListener(IPC.WORK_LINK_CHANGED, listener); };
+    },
+  },
+  // Moa's track record: the weekly retro card and its settings.
+  trackRecord: {
+    getRetro: (workspaceId: string) =>
+      ipcRenderer.invoke(IPC.TRACK_RECORD_RETRO_GET, { workspaceId }) as Promise<{ card: import('../shared/trackRecord').RetroCard | null }>,
+    dismissRetro: () => ipcRenderer.invoke(IPC.TRACK_RECORD_RETRO_DISMISS) as Promise<{ ok: boolean }>,
+    getSchedule: () => ipcRenderer.invoke(IPC.TRACK_RECORD_SCHEDULE_GET) as Promise<import('../shared/trackRecord').RetroSchedule>,
+    setSchedule: (patch: Partial<import('../shared/trackRecord').RetroSchedule>) =>
+      ipcRenderer.invoke(IPC.TRACK_RECORD_SCHEDULE_SET, patch) as Promise<import('../shared/trackRecord').RetroSchedule>,
+    clear: () => ipcRenderer.invoke(IPC.TRACK_RECORD_CLEAR) as Promise<{ ok: boolean }>,
+    onChanged: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on(IPC.TRACK_RECORD_CHANGED, listener);
+      return () => { ipcRenderer.removeListener(IPC.TRACK_RECORD_CHANGED, listener); };
+    },
   },
   // Deck Git 탭 — worktree list/add/remove(렌더러 전용, 파이프 미노출).
   worktree: {
@@ -874,6 +1356,11 @@ const electronAPI = {
       >,
   },
   diff: {
+    // Fleet Ready to review — change counts only; `unchanged` when the state key matches.
+    summary: (worktreePath: string, knownStateKey?: string) =>
+      ipcRenderer.invoke(IPC.DIFF_SUMMARY, worktreePath, knownStateKey ?? '') as Promise<
+        import('../shared/diffParse').DiffSummaryResult | import('../shared/diffParse').DiffReadError
+      >,
     // 워크스페이스 diff — 임의 cwd를 자기 worktree toplevel로 정규화(비-git이면 ok:false).
     resolveRepo: (cwd: string) =>
       ipcRenderer.invoke(IPC.DIFF_RESOLVE_REPO, cwd) as Promise<
@@ -913,10 +1400,18 @@ const electronAPI = {
       >,
     // F2 — 재발사: prompt.md 실존 검사 후 원래 initialCommand를 정상 경로와 동일
     // sanitize로 재전송(맨 셸이 프롬프트를 실행하는 오배선 방지).
+    countPanes: (worktreePaths: string[]) =>
+      ipcRenderer.invoke(IPC.WORKTASK_COUNT_PANES, worktreePaths) as Promise<number>,
     refire: (params: { ptyId: string; worktreePath: string; initialCommand: string }) =>
       ipcRenderer.invoke(IPC.WORKTASK_REFIRE, params) as Promise<
         { ok: true } | { ok: false; error: string }
       >,
+    removePhone: (worktreePath: string, force: boolean) =>
+      ipcRenderer.invoke(IPC.WORKTASK_REMOVE_PHONE, { worktreePath, force }) as Promise<
+        import('../shared/workTask').RemovePhoneWorktreeResultWire
+      >,
+    deletePhoneBranch: (repo: string, branch: string) =>
+      ipcRenderer.invoke(IPC.WORKTASK_DELETE_PHONE_BRANCH, { repo, branch }) as Promise<{ ok: boolean; error?: string }>,
   },
   dialog: {
     pickFile: () => ipcRenderer.invoke(IPC.DIALOG_PICK_FILE) as Promise<string[]>,
@@ -1035,6 +1530,38 @@ const electronAPI = {
     check: () => ipcRenderer.invoke(IPC.MCP_CHECK) as Promise<McpStatusPayload>,
     reregister: () => ipcRenderer.invoke(IPC.MCP_REREGISTER) as Promise<McpStatusPayload>,
     unregister: () => ipcRenderer.invoke(IPC.MCP_UNREGISTER) as Promise<McpStatusPayload>,
+    registerTarget: (targetId: string) =>
+      ipcRenderer.invoke(IPC.MCP_REGISTER_TARGET, targetId) as Promise<McpRegisterTargetResult>,
+  },
+  tokenUsage: {
+    readQuota: (request?: QuotaReadRequest) =>
+      ipcRenderer.invoke(IPC.TOKEN_QUOTA_READ, request) as Promise<QuotaReadResult>,
+    agySensorStatus: () => ipcRenderer.invoke(IPC.TOKEN_QUOTA_SENSOR_STATUS) as Promise<AgySensorStatus>,
+    installAgySensor: () =>
+      ipcRenderer.invoke(IPC.TOKEN_QUOTA_SENSOR_INSTALL) as Promise<AgySensorInstallResult>,
+    readInventory: (request: SurfaceInventoryRequest) =>
+      ipcRenderer.invoke(IPC.TOKEN_SURFACE_INVENTORY, request) as Promise<ProviderInventory>,
+    previewChanges: (request: SurfaceChangeRequest) =>
+      ipcRenderer.invoke(IPC.TOKEN_SURFACE_PREVIEW, request) as Promise<SurfacePreview>,
+    applyChanges: (request: SurfaceChangeRequest) =>
+      ipcRenderer.invoke(IPC.TOKEN_SURFACE_APPLY, request) as Promise<SurfaceApplyResult>,
+    listProfiles: () =>
+      ipcRenderer.invoke(IPC.TOKEN_PROFILES_LIST) as Promise<SurfaceProfile[]>,
+    saveProfile: (nameOrRequest: string | SaveProfileRequest, maybeProviders?: SurfaceProviderId[]) => {
+      const payload: SaveProfileRequest =
+        typeof nameOrRequest === 'string'
+          ? { name: nameOrRequest, providers: maybeProviders }
+          : nameOrRequest;
+      return ipcRenderer.invoke(IPC.TOKEN_PROFILES_SAVE, payload) as Promise<SaveProfileResult>;
+    },
+    deleteProfile: (id: string) =>
+      ipcRenderer.invoke(IPC.TOKEN_PROFILES_DELETE, { id }) as Promise<boolean>,
+    previewProfile: (id: string) =>
+      ipcRenderer.invoke(IPC.TOKEN_PROFILES_PREVIEW, { id }) as Promise<ProfilePreviewResult>,
+    applyProfile: (id: string) =>
+      ipcRenderer.invoke(IPC.TOKEN_PROFILES_APPLY, { id }) as Promise<ProfileApplyAggregateResult>,
+    reconcileSurface: (provider: SurfaceProviderId) =>
+      ipcRenderer.invoke(IPC.TOKEN_SURFACE_RECONCILE, { provider }) as Promise<SurfaceReconcileResult>,
   },
   firstRun: {
     check: () => ipcRenderer.invoke(IPC.FIRST_RUN_CHECK) as Promise<FirstRunCheckResult>,
@@ -1110,6 +1637,13 @@ const electronAPI = {
           weeklyPct: number;
           weeklyResetEpochSec: number;
           fetchedAtMs: number;
+          scoped?: Array<{
+            kind: string;
+            group: string;
+            pct: number;
+            resetEpochSec: number | null;
+            scope: string | null;
+          }>;
         } | null;
         lastError: string | null;
         subscriptionType: string | null;
@@ -1127,6 +1661,33 @@ const electronAPI = {
     setEnabled: (enabled: boolean) => ipcRenderer.send(IPC.USAGE_TOGGLE, enabled),
     /** Manual refresh. UI is responsible for the 5-minute cooldown. */
     refresh: () => ipcRenderer.send(IPC.USAGE_REFRESH),
+  },
+  // Pane usage-limit pause (shared/usageLimit). The daemon owns the state;
+  // `list` hydrates on boot, `onChanged` streams per-pane changes (null =
+  // cleared), `update` edits one pane (auto-resume, dismiss, resume now).
+  usageLimit: {
+    list: () => ipcRenderer.invoke(IPC.USAGE_LIMIT_LIST) as Promise<PaneUsageLimit[]>,
+    onChanged: (callback: (payload: { ptyId: string; limit: PaneUsageLimit | null }) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: { ptyId: string; limit: PaneUsageLimit | null }) =>
+        callback(payload);
+      ipcRenderer.on(IPC.USAGE_LIMIT_CHANGED, listener);
+      return () => { ipcRenderer.removeListener(IPC.USAGE_LIMIT_CHANGED, listener); };
+    },
+    update: (ptyId: string, patch: PaneUsageLimitPatch) =>
+      ipcRenderer.invoke(IPC.USAGE_LIMIT_UPDATE, { ptyId, patch }) as Promise<{ ok: boolean }>,
+  },
+  // Workspace settle / snooze (shared/workspaceSettle). Main owns the state;
+  // `get` hydrates on boot, `onChanged` streams the snapshot and the changes
+  // behind it, `command` sends the user's verbs (settle, snooze, undo, ...).
+  workspaceSettle: {
+    get: () => ipcRenderer.invoke(IPC.WORKSPACE_SETTLE_GET) as Promise<WorkspaceSettleSnapshot>,
+    command: (command: WorkspaceSettleCommand) =>
+      ipcRenderer.invoke(IPC.WORKSPACE_SETTLE_COMMAND, command) as Promise<WorkspaceSettleCommandResult>,
+    onChanged: (callback: (payload: WorkspaceSettleChangedPayload) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: WorkspaceSettleChangedPayload) => callback(payload);
+      ipcRenderer.on(IPC.WORKSPACE_SETTLE_CHANGED, listener);
+      return () => { ipcRenderer.removeListener(IPC.WORKSPACE_SETTLE_CHANGED, listener); };
+    },
   },
   window: {
     hide: () => ipcRenderer.send(IPC.WINDOW_HIDE),
@@ -1196,8 +1757,10 @@ const electronAPI = {
   updater: {
     checkForUpdates: () =>
       ipcRenderer.invoke(IPC.UPDATE_CHECK) as Promise<{ status: string }>,
-    installUpdate: () =>
-      ipcRenderer.invoke(IPC.UPDATE_INSTALL),
+    // #1525 — `installAnyway` is the Smart App Control warning's "Install
+    // anyway" action: it skips that one pre-quit check for this call only.
+    installUpdate: (opts?: { installAnyway?: boolean }) =>
+      ipcRenderer.invoke(IPC.UPDATE_INSTALL, opts),
     // #866 — collect (and clear) the reason a previous install was refused.
     // Pulled by an always-mounted renderer surface, because the push-on-boot
     // version landed in a window whose only listener was the Settings panel.
@@ -1221,8 +1784,8 @@ const electronAPI = {
       ipcRenderer.on(IPC.UPDATE_NOT_AVAILABLE, listener);
       return () => { ipcRenderer.removeListener(IPC.UPDATE_NOT_AVAILABLE, listener); };
     },
-    onUpdateError: (callback: (data: { status: string; message: string; source?: 'install'; code?: 'in-progress' }) => void) => {
-      const listener = (_event: Electron.IpcRendererEvent, data: { status: string; message: string; source?: 'install'; code?: 'in-progress' }) =>
+    onUpdateError: (callback: (data: { status: string; message: string; source?: 'install'; code?: 'in-progress' | 'smart-app-control' }) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, data: { status: string; message: string; source?: 'install'; code?: 'in-progress' | 'smart-app-control' }) =>
         callback(data);
       ipcRenderer.on(IPC.UPDATE_ERROR, listener);
       return () => { ipcRenderer.removeListener(IPC.UPDATE_ERROR, listener); };
@@ -1325,6 +1888,35 @@ document.addEventListener('DOMContentLoaded', () => {
   },
 };
 
+// browser_request_help — main pushes an open help request over
+// BROWSER_HELP_OPEN, the renderer answers Done / Cancel over
+// BROWSER_HELP_RESOLVE, and BROWSER_HELP_CLOSED clears the row whatever settled
+// it (the human, the page condition, or main's deadline). Same three-channel
+// shape as permissionPrompt above, for the same reason: the payload is an
+// agent-authored string with a two-button answer, so it never touches the
+// RPC_COMMAND path.
+(electronAPI as Record<string, unknown>).browserHelp = {
+  onOpen: (callback: (info: BrowserHelpRequestInfo) => void) => {
+    const listener = (_event: unknown, info: BrowserHelpRequestInfo) => callback(info);
+    ipcRenderer.on(IPC.BROWSER_HELP_OPEN, listener);
+    return () => {
+      ipcRenderer.removeListener(IPC.BROWSER_HELP_OPEN, listener);
+    };
+  },
+  resolve: (requestId: string, outcome: BrowserHelpOutcome) =>
+    ipcRenderer.invoke(IPC.BROWSER_HELP_RESOLVE, { requestId, outcome }) as Promise<{
+      ok: boolean;
+      error?: string;
+    }>,
+  onClosed: (callback: (payload: { requestId: string }) => void) => {
+    const listener = (_event: unknown, payload: { requestId: string }) => callback(payload);
+    ipcRenderer.on(IPC.BROWSER_HELP_CLOSED, listener);
+    return () => {
+      ipcRenderer.removeListener(IPC.BROWSER_HELP_CLOSED, listener);
+    };
+  },
+};
+
 // LanLink PR-2 — dedicated channel for materialized read-only REMOTE inbox
 // items. Mirrors the permissionPrompt bridge: main pushes over IPC.LANLINK_REMOTE
 // and the renderer's useRemoteInboxBridge projects into the remoteInbox slice.
@@ -1374,11 +1966,15 @@ document.addEventListener('DOMContentLoaded', () => {
   status: (args?: { verifyFront?: boolean }) =>
     ipcRenderer.invoke(IPC.WEB_STATUS, args ?? {}) as Promise<WebTerminalInfo>,
   pairRefresh: () => ipcRenderer.invoke(IPC.WEB_PAIR_REFRESH) as Promise<WebTerminalInfo>,
-  pairStart: (name: string, allowInput = false) =>
-    ipcRenderer.invoke(IPC.WEB_PAIR_START, { name, allowInput }) as Promise<WebTerminalInfo>,
+  pairStart: (name: string, allowInput = false, flow?: PairFlow) =>
+    ipcRenderer.invoke(IPC.WEB_PAIR_START, { name, allowInput, ...(flow ? { flow } : {}) }) as Promise<WebTerminalInfo>,
+  pairCancel: () => ipcRenderer.invoke(IPC.WEB_PAIR_CANCEL) as Promise<WebTerminalInfo>,
   start: (args: WebStartArgs) =>
     ipcRenderer.invoke(IPC.WEB_START, args) as Promise<WebTerminalInfo>,
+  setGrants: (args: WebGrantArgs) =>
+    ipcRenderer.invoke(IPC.WEB_SET_GRANTS, args) as Promise<WebTerminalInfo>,
   stop: () => ipcRenderer.invoke(IPC.WEB_STOP) as Promise<WebTerminalInfo>,
+  diagnose: () => ipcRenderer.invoke(IPC.WEB_DIAGNOSE) as Promise<WebDiagnosis>,
   // Roster surface. Unlike the calls above these do NOT resolve a
   // WebTerminalInfo: the device roster is owned by the store, not by a running
   // server, so it answers even while the server is stopped.
@@ -1400,23 +1996,27 @@ document.addEventListener('DOMContentLoaded', () => {
     ipcRenderer.invoke(IPC.REMOTE_HOSTS_ADD, rawUrl, label) as Promise<
       { ok: true; host: RemoteHostPublic } | { ok: false; error: string }
     >,
-  hostsPair: (origin: string, code: string, label?: string) =>
-    ipcRenderer.invoke(IPC.REMOTE_HOSTS_PAIR, origin, code, label) as Promise<
+  hostsPair: (origin: string, code: string, label?: string, replaceHostId?: string) =>
+    ipcRenderer.invoke(
+      IPC.REMOTE_HOSTS_PAIR, origin, code, label, ...(replaceHostId ? [replaceHostId] : []),
+    ) as Promise<
       | { ok: true; host: RemoteHostPublic }
       | { ok: false; reason: PairFailureReason; attemptsLeft?: number }
     >,
   hostsRemove: (id: string) => ipcRenderer.invoke(IPC.REMOTE_HOSTS_REMOVE, id) as Promise<boolean>,
+  hostsStatus: (force?: boolean) =>
+    ipcRenderer.invoke(IPC.REMOTE_HOSTS_STATUS, force === true) as Promise<Record<string, RemoteHostStatus>>,
   workspacesList: (hostId: string) =>
     ipcRenderer.invoke(IPC.REMOTE_WORKSPACES_LIST, hostId) as Promise<
-      { ok: true; workspaces: RemoteWorkspaceSummary[] } | { ok: false; error: string }
+      { ok: true; workspaces: RemoteWorkspaceSummary[] } | { ok: false; error: string; reason?: RemoteErrorReason }
     >,
   workspaceCreate: (hostId: string, workspaceId: string, cwd?: string) =>
     ipcRenderer.invoke(IPC.REMOTE_WORKSPACE_CREATE, hostId, workspaceId, cwd) as Promise<
-      { ok: true; sessionId: string } | { ok: false; error: string }
+      { ok: true; sessionId: string } | { ok: false; error: string; reason?: RemoteErrorReason }
     >,
   sessionClose: (hostId: string, sessionId: string) =>
     ipcRenderer.invoke(IPC.REMOTE_SESSION_CLOSE, hostId, sessionId) as Promise<
-      { ok: true } | { ok: false; error: string }
+      { ok: true } | { ok: false; error: string; reason?: RemoteErrorReason }
     >,
   attachmentsList: () =>
     ipcRenderer.invoke(IPC.REMOTE_ATTACHMENTS_LIST) as Promise<RemoteAttachmentDescriptor[]>,
@@ -1432,6 +2032,10 @@ document.addEventListener('DOMContentLoaded', () => {
   paneWrite: (attachId: string, data: string) => {
     ipcRenderer.send(IPC.REMOTE_PANE_WRITE, attachId, data);
   },
+  paneResize: (attachId: string, cols: number, rows: number) =>
+    ipcRenderer.invoke(IPC.REMOTE_PANE_RESIZE_REQUEST, attachId, cols, rows) as Promise<
+      { ok: true; cols: number; rows: number } | { ok: false; reason: string }
+    >,
   onPaneMeta: (callback: (e: { attachId: string; cols: number; rows: number; snapshotB64: string; truncated?: boolean; omittedBytes?: number }) => void) => {
     const listener = (_event: unknown, payload: { attachId: string; cols: number; rows: number; snapshotB64: string; truncated?: boolean; omittedBytes?: number }) => callback(payload);
     ipcRenderer.on(IPC.REMOTE_PANE_META, listener);
@@ -1452,10 +2056,32 @@ document.addEventListener('DOMContentLoaded', () => {
     ipcRenderer.on(IPC.REMOTE_PANE_EXIT, listener);
     return () => { ipcRenderer.removeListener(IPC.REMOTE_PANE_EXIT, listener); };
   },
-  onPaneError: (callback: (e: { attachId: string; message: string }) => void) => {
-    const listener = (_event: unknown, payload: { attachId: string; message: string }) => callback(payload);
+  onPaneError: (callback: (e: { attachId: string; message: string; reason?: RemoteErrorReason }) => void) => {
+    const listener = (_event: unknown, payload: { attachId: string; message: string; reason?: RemoteErrorReason }) => callback(payload);
     ipcRenderer.on(IPC.REMOTE_PANE_ERROR, listener);
     return () => { ipcRenderer.removeListener(IPC.REMOTE_PANE_ERROR, listener); };
+  },
+  // #1391 — ask main for the liveness-poll cadence. Main's timers are not
+  // throttled when the window is backgrounded; a renderer `setInterval` is, and
+  // that is what made remote agent status go a minute stale.
+  //
+  // RESOLVES to the unsubscribe, and REJECTS if the subscribe did not land (no
+  // handler registered — main disposed, or a main bundle reloaded under a live
+  // window). Swallowing that would leave the caller believing it is subscribed
+  // and polling nothing at all, which is worse than the throttle this replaces;
+  // the caller arms its own interval instead. The tick carries no payload.
+  pollSubscribe: async () => {
+    await ipcRenderer.invoke(IPC.REMOTE_POLL_SUBSCRIBE);
+    return () => {
+      // A failed unsubscribe means main already forgot us (disposed, or the
+      // WebContents teardown path got there first) — the desired state either way.
+      void ipcRenderer.invoke(IPC.REMOTE_POLL_UNSUBSCRIBE).catch(() => undefined);
+    };
+  },
+  onPollTick: (callback: () => void) => {
+    const listener = () => callback();
+    ipcRenderer.on(IPC.REMOTE_POLL_TICK, listener);
+    return () => { ipcRenderer.removeListener(IPC.REMOTE_POLL_TICK, listener); };
   },
 };
 
@@ -1482,6 +2108,12 @@ contextBridge.exposeInMainWorld('clipboardAPI', {
    *  pane needs /mnt/...). Omit it and the host path is returned verbatim. */
   readImage: (ptyId?: string) => ipcRenderer.invoke(IPC.CLIPBOARD_READ_IMAGE, ptyId) as Promise<string | null>,
   hasImage: () => ipcRenderer.invoke(IPC.CLIPBOARD_HAS_IMAGE) as Promise<boolean>,
+  /** Write text main takes back off after `ttlMs` or on quit, if still there. */
+  writeEphemeral: (text: string, ttlMs: number) =>
+    ipcRenderer.invoke(IPC.CLIPBOARD_WRITE_EPHEMERAL, text, ttlMs) as Promise<void>,
+  /** Clear the ephemeral text now unless it is `stillValid` (`''` = nothing is). */
+  keepEphemeral: (stillValid: string) =>
+    ipcRenderer.invoke(IPC.CLIPBOARD_KEEP_EPHEMERAL, stillValid) as Promise<void>,
 });
 
 export type ElectronAPI = typeof electronAPI;

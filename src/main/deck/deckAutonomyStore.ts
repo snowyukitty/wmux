@@ -33,6 +33,7 @@
 import path from 'node:path';
 import { getWmuxDir } from '../../daemon/config';
 import { atomicReadJSONSync, atomicWriteJSON } from '../../daemon/util/atomicWrite';
+import { createSerialChain } from './serialChain';
 
 // ─── Agent mode (per-workspace, owner design 2026-07-13, revised 2026-08-01) ──
 //
@@ -206,6 +207,10 @@ function sanitizeEntry(raw: unknown): WorkspaceAutonomy {
 
 type AutonomyFile = Record<string, WorkspaceAutonomy>;
 
+/** Every read-modify-write of deck-autonomy.json (setters AND the teardown
+ *  delete) runs through this chain, so none can clobber another's change. */
+const serialize = createSerialChain();
+
 /** Load the whole map; a missing/corrupt file is an empty map (every workspace
  *  then resolves to DEFAULT). Bad keys are dropped. */
 function loadAll(dir?: string): AutonomyFile {
@@ -251,27 +256,50 @@ export async function setWorkspaceAutonomy(
   dir?: string,
 ): Promise<WorkspaceAutonomy> {
   if (!WORKSPACE_ID_RE.test(workspaceId)) return { ...DEFAULT_AUTONOMY };
-  const all = loadAll(dir);
-  const current = all[workspaceId] ?? { ...DEFAULT_AUTONOMY };
-  const next: WorkspaceAutonomy = {
-    // The mode is preserved unless explicitly patched — the loop cap-override
-    // path patches ONLY caps and must never silently change the stored mode.
-    mode: patch.mode ?? current.mode,
-    // Same for the wake policy: it is its own axis, so only an explicit patch
-    // moves it (a mode patch here does NOT re-derive it).
-    wakePolicy: patch.wakePolicy ?? current.wakePolicy,
-    summarize: typeof patch.summarize === 'boolean' ? patch.summarize : current.summarize,
-    continueInstruction:
-      typeof patch.continueInstruction === 'boolean'
-        ? patch.continueInstruction
-        : current.continueInstruction,
-    approvalPress:
-      typeof patch.approvalPress === 'boolean' ? patch.approvalPress : current.approvalPress,
-  };
-  all[workspaceId] = next;
-  await atomicWriteJSON(getDeckAutonomyPath(dir), all);
-  emitAutonomyWritten();
-  return next;
+  return serialize(async () => {
+    const all = loadAll(dir);
+    const current = all[workspaceId] ?? { ...DEFAULT_AUTONOMY };
+    const next: WorkspaceAutonomy = {
+      // The mode is preserved unless explicitly patched — the loop cap-override
+      // path patches ONLY caps and must never silently change the stored mode.
+      mode: patch.mode ?? current.mode,
+      // Same for the wake policy: it is its own axis, so only an explicit patch
+      // moves it (a mode patch here does NOT re-derive it).
+      wakePolicy: patch.wakePolicy ?? current.wakePolicy,
+      summarize: typeof patch.summarize === 'boolean' ? patch.summarize : current.summarize,
+      continueInstruction:
+        typeof patch.continueInstruction === 'boolean'
+          ? patch.continueInstruction
+          : current.continueInstruction,
+      approvalPress:
+        typeof patch.approvalPress === 'boolean' ? patch.approvalPress : current.approvalPress,
+    };
+    all[workspaceId] = next;
+    await atomicWriteJSON(getDeckAutonomyPath(dir), all);
+    emitAutonomyWritten();
+    return next;
+  });
+}
+
+/**
+ * Delete a workspace's stored autonomy entry (the workspace-removal teardown).
+ * Uses the same atomic write and listener notification as setWorkspaceAutonomy.
+ * Does NOT re-derive or re-create a default entry: if the workspace is absent
+ * or invalid, no write happens and returns false.
+ */
+export async function deleteWorkspaceAutonomy(
+  workspaceId: string,
+  dir?: string,
+): Promise<boolean> {
+  if (!WORKSPACE_ID_RE.test(workspaceId)) return false;
+  return serialize(async () => {
+    const all = loadAll(dir);
+    if (!(workspaceId in all)) return false;
+    delete all[workspaceId];
+    await atomicWriteJSON(getDeckAutonomyPath(dir), all);
+    emitAutonomyWritten();
+    return true;
+  });
 }
 
 /** Set a workspace's MODE and write the mode-derived caps together (the atomic
@@ -292,17 +320,19 @@ export async function setWorkspaceMode(
 ): Promise<WorkspaceAutonomy> {
   if (!WORKSPACE_ID_RE.test(workspaceId)) return { ...DEFAULT_AUTONOMY };
   if (!(ALL_MODES as readonly string[]).includes(mode)) return { ...DEFAULT_AUTONOMY };
-  const all = loadAll(dir);
-  const current = all[workspaceId];
-  const next: WorkspaceAutonomy = {
-    mode,
-    wakePolicy: current ? current.wakePolicy : modeToWakePolicy(mode),
-    ...modeToCaps(mode),
-  };
-  all[workspaceId] = next;
-  await atomicWriteJSON(getDeckAutonomyPath(dir), all);
-  emitAutonomyWritten();
-  return next;
+  return serialize(async () => {
+    const all = loadAll(dir);
+    const current = all[workspaceId];
+    const next: WorkspaceAutonomy = {
+      mode,
+      wakePolicy: current ? current.wakePolicy : modeToWakePolicy(mode),
+      ...modeToCaps(mode),
+    };
+    all[workspaceId] = next;
+    await atomicWriteJSON(getDeckAutonomyPath(dir), all);
+    emitAutonomyWritten();
+    return next;
+  });
 }
 
 /** Resolve just the mode (fail-closed to the product default). */

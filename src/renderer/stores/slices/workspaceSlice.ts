@@ -1,14 +1,17 @@
+import { isPhoneWorkspaceId, PHONE_WORKSPACE_REQUEST_LIMIT } from '../../../shared/phoneWorkspaceRequests';
 import type { StateCreator } from 'zustand';
+import { sanitizeClaudeEffort } from '../../../shared/claudeModels';
 import type { StoreState } from '../index';
-import { createWorkspace, clonePaneTreeFresh, assignPaneOrdinals, generateId, BUILTIN_TEMPLATES, DEFAULT_PREFIX_CONFIG, buildDefaultCustomKeybindings, upgradeDefaultKeybindingsForPlatform, TERMINAL_STATES, NOTIFICATION_CATEGORIES, type Pane, type PaneLeaf, type SessionData, type StashedPane, type Workspace, type WorkspaceMetadata, type WorkspaceProfile } from '../../../shared/types';
+import { isMoaHqWorkspace } from './moaSlice';
+import { createWorkspace, clonePaneTreeFresh, assignPaneOrdinals, generateId, BUILTIN_TEMPLATES, DEFAULT_PREFIX_CONFIG, buildDefaultCustomKeybindings, upgradeDefaultKeybindingsForPlatform, TERMINAL_STATES, NOTIFICATION_CATEGORIES, type ArchivedWorkspace, type Pane, type PaneLeaf, type SessionData, type StashedPane, type Workspace, type WorkspaceMetadata, type WorkspaceProfile } from '../../../shared/types';
 import { normalizeWorkspaceProfile } from '../../../shared/workspaceProfile';
-import { ADVERTISED_SHORTCUTS } from '../../../shared/keymap';
+import { overridesFromDisabledCombos, sanitizeShortcutOverrides } from '../../../shared/keymap';
 import { normalizeWorkspaceColor, type WorkspaceColorId } from '../../../shared/workspaceColors';
 import { normalizeRoleBindings } from '../../../shared/orchestratorRole';
 import { getPresetById } from '../../../shared/layoutPresets';
 import { setLocale as i18nSetLocale, t as i18nT, detectSupportedLocale, type Locale } from '../../i18n';
 import { applyCustomCssVars, migrateThemeId, migrateCustomThemeColors } from '../../themes';
-import { resetInspectState } from './uiSlice';
+import { resetInspectState, extractLayout, buildPaneFromLayout, siteGuidesAutoEnablePatch } from './uiSlice';
 import { sanitizeFontFamily } from '../../utils/terminalFont';
 import { sanitizeTerminalCursorStyle } from '../../../shared/terminalCursor';
 import { sanitizeImagePasteMode } from '../../../shared/imagePaste';
@@ -18,6 +21,7 @@ import { retentionMigrationDone, markRetentionMigrationDone } from '../retention
 import { decUnread } from './notificationSlice';
 import { mergeDeadPaneRecovery, type DeadPaneRecovery } from '../../../shared/ptyRecovery';
 import { stashedPaneLiveness } from '../../../shared/paneStash';
+import { clampSidebarWidth, dropOwnerFoldKeys, movePinned, pinnedFirst, pruneTaskGroupExpanded, resolveSidebarSortMode, sortModeMigratedToAttention, unpinNestedTasks } from '../../utils/sidebarLayout';
 import {
   collectLeafIds,
   getLeafPanes,
@@ -61,6 +65,38 @@ export function clearColdParkEntry(
  */
 export function clearRemoteSelection(state: { activeRemoteKey?: string | null }): void {
   if (state.activeRemoteKey !== undefined && state.activeRemoteKey !== null) state.activeRemoteKey = null;
+}
+
+/**
+ * #1086 — THE one place that makes a local workspace the visible surface.
+ *
+ * `activeWorkspaceId` and `activeRemoteKey` are independent fields and
+ * WorkspaceCenter checks the remote one FIRST, so an assignment that forgets
+ * `clearRemoteSelection` leaves the mirror on screen while the sidebar
+ * highlights the local row — the user's click looks swallowed and only a
+ * SECOND selection (which does run the clear) gets them back. The convention
+ * of "remember to call the two helpers at every assignment site" is what kept
+ * failing: it was documented but unenforceable, and new sites (orphan-session
+ * adopt) shipped without it.
+ *
+ * So: never write `state.activeWorkspaceId = …` directly — call this. Both
+ * companion clears are idempotent and guarded for stores/tests mounted
+ * without the cold-park maps or the remoteWorkspacesSlice, so this is safe
+ * everywhere. A guard test (activeWorkspaceIdAssignment.guard.test.ts) fails
+ * the build if a raw assignment reappears anywhere in src/renderer.
+ */
+export function activateLocalWorkspace(
+  state: {
+    activeWorkspaceId: string;
+    parkedWorkspaceIds?: Record<string, true>;
+    lastVisibleAt?: Record<string, number>;
+    activeRemoteKey?: string | null;
+  },
+  id: string,
+): void {
+  state.activeWorkspaceId = id; // guard-allow — the one legal assignment (see the guard test)
+  clearColdParkEntry(state, id);
+  clearRemoteSelection(state);
 }
 
 /**
@@ -189,7 +225,7 @@ export interface WorkspaceSlice {
   /** Create and activate a new workspace. An optional `profile` is normalized
    * (dropSecretKeys) and attached in the SAME immer set, so pane #1 spawns with
    * profile.startupCwd already present instead of a home fallback (#515). */
-  addWorkspace: (name?: string, profile?: WorkspaceProfile) => void;
+  addWorkspace: (name?: string, profile?: WorkspaceProfile, requestedId?: string) => void;
   addWorkspaceWithPreset: (presetId: string, name?: string) => void;
   /**
    * Duplicate an existing workspace's LAYOUT (pane tree, with fresh ids and
@@ -201,6 +237,17 @@ export interface WorkspaceSlice {
    */
   duplicateWorkspace: (id: string) => void;
   removeWorkspace: (id: string) => void;
+  // #1011 — Active → Archived → Permanently Deleted.
+  archivedWorkspaces: ArchivedWorkspace[];
+  phoneWorkspaceRequestIds: string[];
+  /** Snapshot the configuration, then tear the workspace down exactly like
+   *  Close (sessions die; the sidebar goes quiet; the config survives). */
+  archiveWorkspace: (id: string) => void;
+  /** Bring a snapshot back as a LIVE workspace: fresh ids, same name, color,
+   *  profile, pane arrangement and w<N> ordinal. */
+  restoreArchivedWorkspace: (archivedId: string) => void;
+  /** Destroy the snapshot forever. */
+  deleteArchivedWorkspace: (archivedId: string) => void;
   setActiveWorkspace: (id: string) => void;
   renameWorkspace: (id: string, name: string) => void;
   updateWorkspaceMetadata: (id: string, metadata: Partial<WorkspaceMetadata>) => void;
@@ -218,7 +265,8 @@ export interface WorkspaceSlice {
    * normalizeWorkspaceColor rather than stored.
    */
   setWorkspaceColor: (id: string, color: WorkspaceColorId | undefined) => void;
-  reorderWorkspace: (fromIndex: number, toIndex: number) => void;
+  /** `pin` is the drop target's pin state; omitted keeps the row's own. */
+  reorderWorkspace: (fromIndex: number, toIndex: number, pin?: boolean) => void;
   loadSession: (data: SessionData) => void;
   /**
    * Fix 0 fallback action. Clears every ptyId-keyed piece of renderer state
@@ -242,11 +290,29 @@ export interface WorkspaceSlice {
   clearSurfacePtyIdByPty: (ptyId: string, recovery?: DeadPaneRecovery) => void;
 }
 
+/**
+ * #1011 — recursive shape check for a persisted archive tree. Restore feeds it
+ * straight to buildPaneFromLayout, so a malformed nested child (hand-edited
+ * session.json) must be rejected at hydration, not throw on the restore click.
+ */
+function isArchivedLayoutNode(node: unknown, depth: number): boolean {
+  if (depth > 32 || typeof node !== 'object' || node === null) return false;
+  const n = node as { type?: unknown; direction?: unknown; sizes?: unknown; children?: unknown };
+  if (n.type === 'leaf') return true;
+  return n.type === 'branch'
+    && (n.direction === 'horizontal' || n.direction === 'vertical')
+    && Array.isArray(n.sizes) && n.sizes.every((s) => typeof s === 'number' && Number.isFinite(s))
+    && Array.isArray(n.children) && n.children.length > 0
+    && n.children.every((c) => isArchivedLayoutNode(c, depth + 1));
+}
+
 export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', never]], [], WorkspaceSlice> = (set, get) => {
   const initial = createWorkspace('Workspace 1', 1);
   return {
     workspaces: [initial],
     activeWorkspaceId: initial.id,
+    archivedWorkspaces: [],
+    phoneWorkspaceRequestIds: [],
     nextWorkspaceOrdinal: 2,
     lastVisibleAt: {},
     parkedWorkspaceIds: {},
@@ -292,7 +358,15 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       }
     }),
 
-    addWorkspace: (name, profile) => set((state: StoreState) => {
+    addWorkspace: (name, profile, requestedId) => set((state: StoreState) => {
+      if (requestedId) {
+        if (!isPhoneWorkspaceId(requestedId) || state.workspaces.some(w => w.id === requestedId) ||
+            state.phoneWorkspaceRequestIds.includes(requestedId) ||
+            state.phoneWorkspaceRequestIds.length >= PHONE_WORKSPACE_REQUEST_LIMIT) return;
+        // This ledger and the workspace are committed in the same state/session.
+        // Closing a workspace never makes its request eligible for creation again.
+        state.phoneWorkspaceRequestIds.push(requestedId);
+      }
       let wsName = name;
       if (!wsName) {
         const usedNumbers = new Set(
@@ -309,6 +383,7 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       }
       const wsOrdinal = state.nextWorkspaceOrdinal ?? 1;
       const ws = createWorkspace(wsName, wsOrdinal);
+      if (requestedId) ws.id = requestedId;
       // #515: attach the profile BEFORE activation (same set) so pane #1's PTY
       // create sees profile.startupCwd. Editor/save boundary → dropSecretKeys.
       if (profile) {
@@ -317,8 +392,9 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       }
       state.nextWorkspaceOrdinal = wsOrdinal + 1;
       state.workspaces.push(ws);
-      state.activeWorkspaceId = ws.id;
-      clearRemoteSelection(state);
+      // Glance board: a new workspace holds the top slot for a few minutes.
+      if (state.sidebarNewAt) state.sidebarNewAt[ws.id] = Date.now();
+      activateLocalWorkspace(state, ws.id);
     }),
 
     addWorkspaceWithPreset: (presetId, name) => set((state: StoreState) => {
@@ -354,8 +430,85 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       };
       state.nextWorkspaceOrdinal = wsOrdinal + 1;
       state.workspaces.push(ws);
-      state.activeWorkspaceId = ws.id;
-      clearRemoteSelection(state);
+      // Glance board: a new workspace holds the top slot for a few minutes.
+      if (state.sidebarNewAt) state.sidebarNewAt[ws.id] = Date.now();
+      activateLocalWorkspace(state, ws.id);
+    }),
+
+    // #1011 — Active → Archived → Deleted. Archiving snapshots the
+    // configuration, then delegates the teardown to removeWorkspace so every
+    // invariant of Close (a2a force-fail, ring/recovery cleanup, multiview
+    // pruning, promotion) stays in exactly one place. PTY disposal is the
+    // CALLER's job, same as Close — the sidebar path disposes everything the
+    // workspace owns (stashed panes included) before calling here.
+    archiveWorkspace: (id) => {
+      const ws = get().workspaces.find((w: Workspace) => w.id === id);
+      // Same protection as removeWorkspace: never archive the last workspace.
+      if (!ws || get().workspaces.length <= 1) return;
+      // Moa's HQ is app-owned: it is never archived (the UI disables it too).
+      if (isMoaHqWorkspace(get(), id)) return;
+      const color = normalizeWorkspaceColor(ws.color);
+      const snapshot: ArchivedWorkspace = {
+        id: generateId('arch'),
+        name: ws.name,
+        ...(color ? { color } : {}),
+        ...(ws.profile ? { profile: ws.profile } : {}),
+        tree: extractLayout(ws.rootPane),
+        archivedAt: Date.now(),
+      };
+      get().removeWorkspace(id);
+      // Push only when the removal actually happened. Today both guards read
+      // the same synchronous store, but a future refusal condition inside
+      // removeWorkspace must not produce a live+archived duplicate.
+      if (!get().workspaces.some((w: Workspace) => w.id === id)) {
+        set((state: StoreState) => {
+          state.archivedWorkspaces.push(snapshot);
+        });
+      }
+    },
+
+    // Fresh ids on the way back: the snapshot's LayoutNode carries no pane
+    // ids, and the workspace itself mints a new id + a FRESH ordinal, so a
+    // restored workspace can never collide with a live auto-name or A2A
+    // address. The NAME (what the user actually recognizes) is preserved.
+    restoreArchivedWorkspace: (archivedId) => {
+      const archived = get().archivedWorkspaces.find((a) => a.id === archivedId);
+      if (!archived) return;
+      set((state: StoreState) => {
+        // Fresh ordinal from the true FREE high-water: the counter, or one
+        // past the highest live ordinal when a fixture/backfilled session
+        // left the counter sitting at a live workspace's number. A restored
+        // w<N> must never collide with a live one.
+        const maxLive = state.workspaces.reduce((m, w) => Math.max(m, w.wsOrdinal ?? 0), 0);
+        const highWater = Math.max(state.nextWorkspaceOrdinal ?? 1, maxLive + 1);
+        const ws = createWorkspace(archived.name, highWater);
+        const rootPane = buildPaneFromLayout(archived.tree);
+        const leaves = collectLeafPanes(rootPane);
+        ws.nextPaneOrdinal = assignPaneOrdinals(rootPane, 1);
+        ws.rootPane = rootPane;
+        ws.activePaneId = leaves[0]?.id ?? rootPane.id;
+        const color = normalizeWorkspaceColor(archived.color);
+        if (color) ws.color = color;
+        // Same sanitize policy every other profile-entry path runs
+        // (loadSession normalizes live profiles; duplicateWorkspace
+        // dropSecretKeys) — the snapshot is session.json, i.e. hand-editable.
+        if (archived.profile) {
+          ws.profile = normalizeWorkspaceProfile(archived.profile) ?? undefined;
+        }
+        state.nextWorkspaceOrdinal = highWater + 1;
+        state.workspaces.push(ws);
+        // Glance board: a new workspace holds the top slot for a few minutes.
+        if (state.sidebarNewAt) state.sidebarNewAt[ws.id] = Date.now();
+        // A restore while a remote mirror is showing must actually land on the
+        // restored workspace — activateLocalWorkspace is the single site that
+        // guarantees it (see its doc comment).
+        activateLocalWorkspace(state, ws.id);
+        state.archivedWorkspaces = state.archivedWorkspaces.filter((a) => a.id !== archivedId);
+      });
+    },
+
+    deleteArchivedWorkspace: (archivedId) => set((state: StoreState) => {
+      state.archivedWorkspaces = state.archivedWorkspaces.filter((a) => a.id !== archivedId);
     }),
 
     duplicateWorkspace: (id) => set((state: StoreState) => {
@@ -401,9 +554,12 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       };
       state.nextWorkspaceOrdinal = wsOrdinal + 1;
       // Insert right after the source for intuitive placement, then activate.
-      state.workspaces.splice(idx + 1, 0, ws);
-      state.activeWorkspaceId = ws.id;
-      clearRemoteSelection(state);
+      // A copy is not pinned, so it goes no higher than the top of the rest.
+      const pinnedCount = state.workspaces.filter((w: Workspace) => state.sidebarPinnedIds?.includes(w.id)).length;
+      state.workspaces.splice(Math.max(idx + 1, pinnedCount), 0, ws);
+      // Glance board: a new workspace holds the top slot for a few minutes.
+      if (state.sidebarNewAt) state.sidebarNewAt[ws.id] = Date.now();
+      activateLocalWorkspace(state, ws.id);
     }),
 
     // NOTE: PTY cleanup is the caller's responsibility (see Sidebar.handleClose, useKeyboard Ctrl+Shift+W)
@@ -419,10 +575,16 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       // R2: decide whether the removal will actually happen ahead of the
       // transaction — the same condition as the in-set() guards (last-workspace
       // protection, nonexistent id).
+      // Moa's HQ is app-owned and never removed here (the UI disables Close
+      // for it; main refuses workspace.close for it). It also does not count
+      // toward the last-workspace guard: the operator must keep one of theirs.
+      if (isMoaHqWorkspace(get(), id)) return;
+      const visibleCount = (ws: readonly Workspace[]): number =>
+        ws.filter((w) => !isMoaHqWorkspace(get(), w.id)).length;
       const willRemove =
-        get().workspaces.length > 1 && get().workspaces.some((w: Workspace) => w.id === id);
+        visibleCount(get().workspaces) > 1 && get().workspaces.some((w: Workspace) => w.id === id);
       set((state: StoreState) => {
-        if (state.workspaces.length <= 1) return;
+        if (visibleCount(state.workspaces) <= 1) return;
         const idx = state.workspaces.findIndex((w: Workspace) => w.id === id);
         if (idx === -1) return;
         const closedAt = new Date().toISOString();
@@ -516,11 +678,13 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
           const neighbor = i >= 0 ? (mvBefore[i + 1] ?? mvBefore[i - 1]) : undefined;
           next = neighbor && mvNow.includes(neighbor) ? neighbor : mvNow[0];
         }
-        state.activeWorkspaceId =
-          next ?? state.workspaces[Math.min(idx, state.workspaces.length - 1)].id;
-        // Cold-park: the newly-promoted workspace must not stay parked.
-        clearColdParkEntry(state, state.activeWorkspaceId);
-        clearRemoteSelection(state);
+        // Promotion is an activation like any other: the helper un-parks the
+        // promoted workspace and drops any remote mirror selection, so the user
+        // actually lands on it instead of on a mirror that stayed on top.
+        activateLocalWorkspace(
+          state,
+          next ?? state.workspaces[Math.min(idx, state.workspaces.length - 1)].id,
+        );
       }
       // D-teardown: removing a workspace (sidebar X, Ctrl+Shift+W, kill-pane)
       // unmounts the marked-region DOM the inspect overlay queries. setActiveWorkspace
@@ -554,14 +718,28 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         // visibility rule reads workspace existence directly, so it is already
         // correct whether or not this RPC lands.
         void get().closeMissionForRemovedWorkspace?.(id);
+        // #1481 — sidebar display state keyed by this workspace goes with it.
+        get().pruneFanoutFor?.(id);
+        const foldKeys = Object.keys(get().sidebarTaskGroupExpanded ?? {});
+        if (foldKeys.some((k) => k === id || k.endsWith(`:${id}`) || k.includes(`:${id}:`))) {
+          set((s: StoreState) => { dropOwnerFoldKeys(s.sidebarTaskGroupExpanded, id); });
+        }
+        // Glance board: a removed workspace keeps no pin or new-workspace hold.
+        if (get().sidebarPinnedIds?.includes(id) || get().sidebarNewAt?.[id] !== undefined) {
+          set((s: StoreState) => {
+            s.sidebarPinnedIds = s.sidebarPinnedIds.filter((p) => p !== id);
+            delete s.sidebarNewAt[id];
+          });
+        }
         // NOTE: deliberately NOT `clearMissionsFor(id)`. That bucket is keyed by
         // the fan-out PARENT, and its tasks' child workspaces routinely outlive
         // the parent — wiping it would hide live missions from the sidebar AND
         // leave `closeMissionForRemovedWorkspace` unable to find those tasks when
         // the children are deleted later. The orphan bucket is harmless: it is
         // capped per workspace, `selectLiveMissions` filters rows by child
-        // workspace existence, and `refreshMissions` only ever visits workspaces
-        // that still exist, so it never grows again.
+        // workspace existence, and the poll only revisits a closed owner while the
+        // fan-out audit log still names it (#1481 — so its orphaned tasks can be
+        // told apart from detached ones and closed), so it stays bounded.
       }
     },
 
@@ -580,8 +758,7 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         if (state.parkedWorkspaceIds[id]) delete state.parkedWorkspaceIds[id];
         if (state.lastVisibleAt[id] !== undefined) delete state.lastVisibleAt[id];
       }
-      state.activeWorkspaceId = id;
-      clearRemoteSelection(state);
+      activateLocalWorkspace(state, id);
       // D-teardown: a workspace switch invalidates any marked-region queries
       // the inspect overlay is holding, so exit inspect explicitly rather than
       // letting it dangle against a now-unmounted DOM (inspect is preserved as
@@ -672,15 +849,40 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       }
     }),
 
-    reorderWorkspace: (fromIndex, toIndex) => set((state: StoreState) => {
-      if (fromIndex === toIndex) return;
-      if (fromIndex < 0 || fromIndex >= state.workspaces.length) return;
-      if (toIndex < 0 || toIndex >= state.workspaces.length) return;
-      const [removed] = state.workspaces.splice(fromIndex, 1);
-      state.workspaces.splice(toIndex, 0, removed);
+    reorderWorkspace: (fromIndex, toIndex, pin) => set((state: StoreState) => {
+      // The pinned group stays a prefix of the stored order; a drop beside a
+      // pinned row pins, beside an unpinned one unpins (sidebarLayout.movePinned).
+      const r = movePinned(state.workspaces, state.sidebarPinnedIds ?? [], fromIndex, toIndex, pin);
+      if (!r) return;
+      state.workspaces = r.items;
+      if (state.sidebarPinnedIds) state.sidebarPinnedIds = r.pinnedIds;
+      // The rail has no nesting, so a drop there can try to pin a task.
+      unpinNestedTasks(state);
     }),
 
     loadSession: (data: SessionData) => set((state: StoreState) => {
+      state.phoneWorkspaceRequestIds = [...new Set([
+        ...state.phoneWorkspaceRequestIds,
+        ...(Array.isArray(data.phoneWorkspaceRequestIds) ? data.phoneWorkspaceRequestIds.filter(isPhoneWorkspaceId) : []),
+        ...(Array.isArray(data.workspaces) ? data.workspaces.map(w => w.id).filter(isPhoneWorkspaceId) : []),
+      ])].slice(0, PHONE_WORKSPACE_REQUEST_LIMIT);
+      // Site guides are restored ahead of the empty-workspace return below:
+      // that return would otherwise skip the saved marker while the session
+      // still counts as loaded, and the Chrome auto-enable would override a
+      // user who turned guides off.
+      // Default OFF; only an explicit persisted true opts in.
+      if (typeof data.siteGuidesEnabled === 'boolean') {
+        state.siteGuidesEnabled = data.siteGuidesEnabled;
+      }
+      if (typeof data.siteGuidesAutoEnabled === 'boolean') {
+        state.siteGuidesAutoEnabled = data.siteGuidesAutoEnabled;
+      }
+      // The saved values just replaced the store's. If the backend boot read
+      // already landed, run the Chrome auto-enable now; otherwise
+      // hydrateBrowserBackend runs it when it arrives.
+      state.sessionSettingsLoaded = true;
+      if (state.browserBackendHydrated) Object.assign(state, siteGuidesAutoEnablePatch(state));
+
       if (!data.workspaces || data.workspaces.length === 0) return;
 
       // Cold-park is renderer-only and non-persisted. loadSession replaces the
@@ -878,13 +1080,29 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       // feeds the union starts empty anyway.
       for (const ws of data.workspaces) {
         if (ws.metadata?.listeningPorts !== undefined) delete ws.metadata.listeningPorts;
+        // The PR status and git sync are live readings too: restored as
+        // saved, an old PR's failing run would light the Git rail dot after a
+        // restart, and a pane that never reports again would keep it forever.
+        // main pushes fresh ones as the panes report.
+        if (ws.metadata?.pr !== undefined) delete ws.metadata.pr;
+        if (ws.metadata?.gitSync !== undefined) delete ws.metadata.gitSync;
       }
 
       state.workspaces = data.workspaces;
+      // #1011 — archived snapshots hydrate shape-guarded: a hand-edited or
+      // downgrade-round-tripped session file must not crash the load. Entries
+      // without a usable id/tree are dropped, not guessed at.
+      state.archivedWorkspaces = Array.isArray(data.archivedWorkspaces)
+        ? data.archivedWorkspaces.filter(
+            (a): a is ArchivedWorkspace =>
+              !!a && typeof a.id === 'string' && typeof a.name === 'string'
+              && typeof a.archivedAt === 'number'
+              && isArchivedLayoutNode(a.tree, 0),
+          )
+        : [];
       // The previous session's group cannot describe this one's workspaces.
       pruneMultiviewMembership(state);
-      state.activeWorkspaceId = data.activeWorkspaceId;
-      clearRemoteSelection(state);
+      activateLocalWorkspace(state, data.activeWorkspaceId);
       state.sidebarVisible = data.sidebarVisible;
 
       // ── P2 hydration backfill (checklist F) ──────────────────────────────
@@ -1006,7 +1224,19 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         state.imagePasteMode = sanitizeImagePasteMode(data.imagePasteMode);
       }
       if (data.defaultShell) state.defaultShell = data.defaultShell;
+      // #1103 — null-clears to undefined (wsl.exe's system default).
+      state.defaultWslDistro = typeof data.defaultWslDistro === 'string' && data.defaultWslDistro
+        ? data.defaultWslDistro
+        : undefined;
+      // Re-push the choice to main so pty.create injects `-d <distro>` from
+      // the very first pane (the mirror is main-side and does not survive a
+      // main restart on its own). Guarded: loadSession also runs in node-env
+      // tests where `window` does not exist.
+      if (typeof window !== 'undefined') {
+        window.electronAPI?.settings?.setDefaultWslDistro?.(state.defaultWslDistro ?? null);
+      }
       if (typeof data.deckBrainModel === 'string') state.deckBrainModel = data.deckBrainModel;
+      state.deckBrainEffort = sanitizeClaudeEffort(data.deckBrainEffort);
       // D2 — re-normalize on load (session.json is hand-editable / untrusted).
       state.orchestratorRoleBindings = normalizeRoleBindings(data.orchestratorRoleBindings);
       // Fail closed to raw mode: only an explicit true enables full power.
@@ -1053,6 +1283,10 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (typeof data.paneActionsVisible === 'boolean') {
         state.paneActionsVisible = data.paneActionsVisible;
       }
+      // Chat view — default OFF while experimental; only an explicit true enables it.
+      if (typeof data.chatViewEnabled === 'boolean') {
+        state.chatViewEnabled = data.chatViewEnabled;
+      }
       // Opt-in `+` — default OFF, so only an explicit true shows it. A session
       // written before this setting existed has no field, and must not be read
       // as consent to break one pane = one terminal.
@@ -1070,6 +1304,10 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       }
       if (typeof data.browserDiscardHidden === 'boolean') {
         state.browserDiscardHidden = data.browserDiscardHidden;
+      }
+      // Default ON; only an explicit persisted false opts out.
+      if (typeof data.siteMemoryEnabled === 'boolean') {
+        state.siteMemoryEnabled = data.siteMemoryEnabled;
       }
       let retentionMigrationApplied = false;
       if (typeof data.hiddenPaneRetentionEnabled === 'boolean') {
@@ -1120,6 +1358,8 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       }
       // Cold-park (TASK-9): default ON; only an explicit persisted false opts out.
       if (typeof data.coldParkEnabled === 'boolean') state.coldParkEnabled = data.coldParkEnabled;
+      // #1641: default ON; only an explicit persisted false opts out.
+      if (typeof data.inlineImagesEnabled === 'boolean') state.inlineImagesEnabled = data.inlineImagesEnabled;
       if (typeof data.startupDirectory === 'string') state.startupDirectory = data.startupDirectory.trim();
       if (data.scrollbackLines != null) state.scrollbackLines = data.scrollbackLines;
       if (data.scrollbackRestoreEnabled != null) state.scrollbackRestoreEnabled = data.scrollbackRestoreEnabled;
@@ -1133,6 +1373,40 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (typeof data.sidebarAttentionFirst === 'boolean') {
         state.sidebarAttentionFirst = data.sidebarAttentionFirst;
       }
+      if (typeof data.sidebarShowPaneCoordinates === 'boolean') {
+        state.sidebarShowPaneCoordinates = data.sidebarShowPaneCoordinates;
+      }
+      // #1481 — the sort mode supersedes the attention flag; a session that
+      // predates it carries only the flag, which maps onto 'attention'.
+      state.sidebarSortMode = resolveSidebarSortMode(data);
+      state.sidebarSortModeChosen = data.sidebarSortModeChosen === true;
+      state.sidebarSortMigrated = sortModeMigratedToAttention(data);
+      {
+        const liveIds = new Set((data.workspaces ?? []).map((w) => w.id));
+        state.sidebarPinnedIds = Array.isArray(data.sidebarPinnedIds)
+          ? [...new Set(data.sidebarPinnedIds.filter((id): id is string => typeof id === 'string' && liveIds.has(id)))]
+          : [];
+        // Pinned to top (2026-09-26): a pin used to hold a row's manual slot
+        // in the Attention order. Sessions saved then keep their pins, and the
+        // pinned rows move up into the group in the order they had.
+        if (state.sidebarPinnedIds.length > 0) {
+          state.workspaces = pinnedFirst(state.workspaces, new Set(state.sidebarPinnedIds));
+          // A pin on a nested task (set under the old slot rule, whose menu
+          // did not check task rows) is dropped: here if nesting is already
+          // known, else when missions or lineage land (workTaskSlice).
+          unpinNestedTasks(state);
+        }
+      }
+      state.sidebarAttentionFirst = state.sidebarSortMode === 'attention';
+      if (data.sidebarWidth !== undefined) state.sidebarWidth = clampSidebarWidth(data.sidebarWidth);
+      state.sidebarTaskGroupExpanded = pruneTaskGroupExpanded(
+        data.sidebarTaskGroupExpanded,
+        new Set((data.workspaces ?? []).map((w) => w.id)),
+        (ownerId) => {
+          const ws = (data.workspaces ?? []).find((w) => w.id === ownerId);
+          return ws ? getWorkspaceLeafPanes(ws).map((leaf) => leaf.id) : [];
+        },
+      );
       // Whitelisted, not a bare truthiness check: a forward-version session file
       // that names a fourth arrangement must not park an unknown string in the
       // store, where the settings control would render with nothing selected.
@@ -1164,6 +1438,9 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         state.anthropicUsageEnabled = data.anthropicUsageEnabled;
         window.electronAPI.usage.setEnabled(data.anthropicUsageEnabled);
       }
+      if (typeof data.usageLimitAutoResume === 'boolean') {
+        state.usageLimitAutoResume = data.usageLimitAutoResume;
+      }
       if (data.customKeybindings) {
         // Merge saved keybindings with current built-in defaults (mirrors the
         // layoutTemplates merge below). Built-in defaults (id 'kb-default-*')
@@ -1193,16 +1470,14 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         );
         state.customKeybindings = [...migrated, ...missingDefaults.map((k) => ({ ...k }))];
       }
-      if (Array.isArray(data.disabledShortcuts)) {
-        // #1152 — whitelist against the ADVERTISED rows only, not the whole
-        // keymap: only advertised rows render a re-enable toggle, so an
-        // unadvertised combo (Ctrl+B prefix, Ctrl+Tab, …) planted by a
-        // hand-edited or future-version session would be OFF with no way
-        // back short of editing session.json.
-        const known = new Set(ADVERTISED_SHORTCUTS.map((k) => k.combo));
-        state.disabledShortcuts = data.disabledShortcuts.filter(
-          (c): c is string => typeof c === 'string' && known.has(c),
-        );
+      // Whitelisted like everything else a hand-editable, cross-version
+      // session file carries: only configurable actions (they have a Settings
+      // row to undo the change from) and combos the matcher can press.
+      if (data.shortcutOverrides !== undefined) {
+        state.shortcutOverrides = sanitizeShortcutOverrides(data.shortcutOverrides);
+      } else if (Array.isArray(data.disabledShortcuts)) {
+        // #1152 sessions stored switched-off built-ins as a combo list.
+        state.shortcutOverrides = overridesFromDisabledCombos(data.disabledShortcuts);
       }
       if (data.autoUpdateEnabled != null) {
         state.autoUpdateEnabled = data.autoUpdateEnabled;

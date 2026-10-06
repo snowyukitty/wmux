@@ -7,15 +7,19 @@
 // ── What a hook-sourced awaiting_input ACTUALLY is (read this before editing
 //    the bytes below) ──────────────────────────────────────────────────────
 // The registry only ever acts on `source:'hook'` + `agent.awaiting_input`. For
-// Claude Code that signal has exactly ONE origin: the PreToolUse hook wired to
-// the `AskUserQuestion` matcher (integrations/claude/hooks/hooks.json), which
-// the bridge additionally re-checks by tool name before sending
-// (integrations/claude/bin/wmux-bridge.mjs — `tool_name === 'AskUserQuestion'`,
-// everything else is dropped). Claude's PERMISSION prompts ("Do you want to
-// proceed?", the tool-approval gate) have no hook at all — they are detector-
-// only, which is exactly why HookIngest.arbitrateDetector exempts
-// awaiting_input from the hook-authority veto, and why M2 refuses to act on
-// detector-sourced signals.
+// Claude Code that signal has two origins, and only ONE of them reaches here:
+//   - the PreToolUse hook wired to the `AskUserQuestion` matcher
+//     (integrations/claude/hooks/hooks.json), which the bridge re-checks by
+//     tool name before sending (integrations/claude/bin/wmux-bridge.mjs —
+//     `tool_name === 'AskUserQuestion'`, every other PreToolUse is dropped);
+//   - the PermissionRequest hook behind Claude's PERMISSION prompts ("Do you
+//     want to proceed?"). HookIngest.noteAwaitingInput refuses to create a
+//     record for it (`hook_event_name === 'PermissionRequest'`): it carries no
+//     question, and the mapping below is built for a select. It is pane status
+//     only. Without that hook installed the prompt is detector-only, which is
+//     why HookIngest.arbitrateDetector exempts awaiting_input from the
+//     hook-authority veto, and why M2 refuses to act on detector-sourced
+//     signals.
 //
 // So the prompt on screen when we press is an AskUserQuestion SELECT: a
 // question with the agent's own numbered options, rendered by Claude's TUI with
@@ -66,13 +70,18 @@ export interface ApprovalKeystrokes {
 }
 
 /**
- * Keystroke map v1 — Claude Code ONLY. Every other slug is `unsupported-agent`
- * rather than a guess: pressing the wrong byte into a TUI is not a recoverable
- * error, and a codex/gemini/opencode pane has neither the same prompt shape nor
- * the same hook wiring.
+ * Keystroke map v1 — the Claude Code family ONLY. openclaude is a fork of
+ * Claude Code that draws the same AskUserQuestion select, so it shares the map
+ * (the same set `isClaudeFamilyAgent` names). Every other slug is
+ * `unsupported-agent` rather than a guess: pressing the wrong byte into a TUI
+ * is not a recoverable error, and a codex/gemini/opencode pane has neither the
+ * same prompt shape nor the same hook wiring. Measured key semantics per TUI:
+ * `__tests__/fixtures/terminal-prompts/KEYS.md`.
  */
+const CLAUDE_KEYSTROKES: ApprovalKeystrokes = { approve: '1', deny: '\x1b' };
 const KEYSTROKES_BY_AGENT: Readonly<Record<string, ApprovalKeystrokes>> = {
-  claude: { approve: '1', deny: '\x1b' },
+  claude: CLAUDE_KEYSTROKES,
+  openclaude: CLAUDE_KEYSTROKES,
 };
 
 export function keystrokesForAgent(agentSlug: string): ApprovalKeystrokes | null {
@@ -154,6 +163,78 @@ export function looksLikeChoiceOnScreen(
   return rows.some((row) => pattern.test(row));
 }
 
+/**
+ * Is THIS AskUserQuestion — the record's own question and every one of its
+ * options — the dialog on screen right now?
+ *
+ *   unprovable  the record carries no question text or no choices, so there
+ *               is nothing to identify its dialog by. Never pressed into.
+ *   absent      no row shows the question: the dialog is gone (answered,
+ *               cancelled with Esc, replaced by another dialog).
+ *   changed     the question row is there but the option rows do not all
+ *               match (a re-render, a wrap the prefix rule cannot bridge).
+ *   match       the question row, then each option row in key order below it,
+ *               then Claude's own free-text row (`N. Type something.`).
+ *
+ * Identity is the whole dialog, not one label: a question whose option 1 is
+ * "Yes" must not match a permission prompt's `❯ 1. Yes`. Each option row is
+ * anchored (optional frame, optional cursor, the exact key, `.`) so `11. Yes`
+ * cannot stand in for key 1, and its text must EQUAL the label or be a prefix
+ * of it (a label cut at the pane's width) — never the other way round, which
+ * is how `Yes` would match `Yes, and always allow …`. A multi-select row's
+ * `[ ]` / `[✔]` checkbox is skipped. The question row matches the same way:
+ * equal to the question, or a prefix of it at least 8 characters long (or the
+ * whole question when shorter), so a prompt echo such as
+ * `❯ Call AskUserQuestion … "Pick a fruit?"` does not count.
+ *
+ * The trailing `Type something` row is what makes it an AskUserQuestion at
+ * all: Claude Code (2.1.283, measured) appends it to every question, single-
+ * and multi-select, and draws it on no permission dialog. Without it a
+ * question that happens to read "Do you want to proceed?" with options Yes/No
+ * would be indistinguishable from the permission prompt of the same words.
+ */
+export type QuestionScreenProof = 'unprovable' | 'absent' | 'changed' | 'match';
+
+const FRAME_EDGE = /^[\s│║┃]*|[\s│║┃]*$/g;
+const MIN_QUESTION_PREFIX = 8;
+const MIN_LABEL_PREFIX = 3;
+const FREE_TEXT_ROW = /^(?:❯\s*)?\d{1,2}\.\s+(?:\[[^\]]*\]\s*)?Type something\.?$/;
+
+const normalizeText = (text: string): string => text.replace(/\s+/g, ' ').trim();
+
+/** `text` equals `full`, or is a prefix of it at least `min` characters long (the whole of a shorter `full`). */
+function isCutOf(text: string, full: string, min: number): boolean {
+  const cut = text.replace(/…$/, '').trimEnd();
+  if (!cut) return false;
+  if (cut === full) return true;
+  return full.startsWith(cut) && cut.length >= Math.min(full.length, min);
+}
+
+export function questionOnScreen(
+  rows: readonly string[],
+  record: { question?: string; choices?: ReadonlyArray<{ key: string; label: string }> },
+): QuestionScreenProof {
+  const question = record.question ? normalizeText(record.question) : '';
+  const choices = record.choices ?? [];
+  if (!question || choices.length === 0) return 'unprovable';
+  const lines = rows.map((row) => normalizeText(row.replace(FRAME_EDGE, '')));
+  const questionAt = lines.findIndex((line) => isCutOf(line, question, MIN_QUESTION_PREFIX));
+  if (questionAt < 0) return 'absent';
+  let from = questionAt + 1;
+  for (const choice of choices) {
+    const label = normalizeText(choice.label);
+    const row = new RegExp(`^(?:❯\\s*)?${escapeDigit(choice.key)}\\.\\s+(?:\\[[^\\]]*\\]\\s*)?(.*)$`);
+    let found = -1;
+    for (let i = from; i < lines.length; i++) {
+      const m = row.exec(lines[i]);
+      if (m && isCutOf(m[1], label, MIN_LABEL_PREFIX)) { found = i; break; }
+    }
+    if (found < 0) return 'changed';
+    from = found + 1;
+  }
+  return lines.slice(from).some((line) => FREE_TEXT_ROW.test(line)) ? 'match' : 'changed';
+}
+
 function escapeDigit(d: string): string {
   // Digits are regex-safe, but be explicit for safety.
   return d.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -191,6 +272,20 @@ function escapeDigit(d: string): string {
 //   4. a re-read taken NOW still shows the prompt (looksLikeApprovalPrompt).
 //      Everything upstream is a fact about when the hook fired, which is not
 //      a fact about the screen a press is about to land on.
+//
+// Two more, added with the HQ approval lane (C2 v2, 2026-10-04), for every
+// automated approve whichever process relays it:
+//   5. the task's single open OWNER is in `danger` right now. The task
+//      workspace's own mode is a copy taken at fan-out; the owner's live mode
+//      is the operator's current word, so a downgrade after the fan-out stops
+//      presses at once instead of when the copy catches up;
+//   6. the record is not flagged `risk: 'critical'`. The flag is a regex hint
+//      (shared/criticalPatterns), so it misses and over-fires — but it only
+//      ever withholds an AUTOMATED approve. The human still answers it.
+//      Checked FIRST, before any workspace fact;
+//   7. the record's hook named this pane exactly (`attribution: 'exact'`);
+//   8. a caller that declared the HQ lane finds main's lane policy still open
+//      at the generation it checked.
 //
 // UNKNOWN IS A REFUSAL. Each fact is optional in the input because the daemon
 // cannot see all of them yet (task-workspace membership and autonomy mode live
@@ -236,6 +331,19 @@ export interface ApprovalPressFacts {
   origin?: ApprovalPromptOrigin;
   /** A re-read taken now still shows an answerable prompt. */
   stillOnScreen?: boolean;
+  /**
+   * The LIVE mode of the task's one open owner workspace. Undefined when the
+   * task has no single open owner (none, or several) — never "fine".
+   */
+  ownerMode?: string;
+  /** The record's own risk flag (see ApprovalRequest.risk). */
+  risk?: 'critical';
+  /** How the record was tied to its pane (see ApprovalRequest.attribution). */
+  attribution?: 'exact' | 'inexact';
+  /** The caller declared the HQ lane; `laneOpen` is main's published policy,
+   *  re-read at release and matched against the caller's generation. */
+  lane?: 'hq';
+  laneOpen?: boolean;
 }
 
 /** Who is answering the prompt. */
@@ -252,7 +360,13 @@ export type ApprovalPressRefusal =
   | 'press-capability-off'
   | 'origin-unknown'
   | 'detector-only'
-  | 'prompt-gone';
+  | 'prompt-gone'
+  | 'owner-mode-unknown'
+  | 'owner-autonomy-off'
+  | 'owner-not-danger'
+  | 'critical-risk'
+  | 'attribution-inexact'
+  | 'hq-lane-closed';
 
 export type ApprovalPressDecision =
   | { press: true }
@@ -282,6 +396,14 @@ export function decideApprovalPress(facts: ApprovalPressFacts): ApprovalPressDec
   // Denying is the safe direction — it cancels the tool call and gives the turn
   // back. A refused deny would keep a pane blocked in the name of safety.
   if (facts.decision === 'deny') return { press: true };
+  // Critical first: whatever else is true of this pane, a machine never says
+  // yes to it, and the refusal must say so rather than name a policy the
+  // caller would escalate as a decision (the approval is already the human's).
+  if (facts.risk === 'critical') return { press: false, reason: 'critical-risk' };
+  // A record tied to its pane by a guess (workspace or cwd) may belong to an
+  // agent wmux did not launch.
+  if (facts.attribution !== 'exact') return { press: false, reason: 'attribution-inexact' };
+  if (facts.lane === 'hq' && facts.laneOpen !== true) return { press: false, reason: 'hq-lane-closed' };
   if (facts.scopeAvailable === false) return { press: false, reason: 'scope-unavailable' };
   if (facts.isTaskWorkspace === undefined) return { press: false, reason: 'workspace-unknown' };
   if (!facts.isTaskWorkspace) return { press: false, reason: 'not-a-task-workspace' };
@@ -298,6 +420,11 @@ export function decideApprovalPress(facts: ApprovalPressFacts): ApprovalPressDec
   if (!facts.approvalPress) return { press: false, reason: 'press-capability-off' };
   if (facts.origin === undefined) return { press: false, reason: 'origin-unknown' };
   if (facts.origin !== 'hook') return { press: false, reason: 'detector-only' };
+  // The owner's live word beats the task workspace's copy of it. Only `danger`
+  // means "nothing prompts", so only `danger` lets an automated approve through.
+  if (facts.ownerMode === undefined) return { press: false, reason: 'owner-mode-unknown' };
+  if (facts.ownerMode === 'off') return { press: false, reason: 'owner-autonomy-off' };
+  if (facts.ownerMode !== 'danger') return { press: false, reason: 'owner-not-danger' };
   if (facts.stillOnScreen !== true) return { press: false, reason: 'prompt-gone' };
   return { press: true };
 }

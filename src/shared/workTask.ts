@@ -61,6 +61,12 @@ export interface WorkTask {
    * 무임승차). J0 additive-only 규약상 필드명은 불변, 의미만 확정한다.
    */
   paneGroupId?: string;
+  /**
+   * worktree:false fan-out (preset option): the task's own output folder under
+   * `<wmux data>/outputs/`. Such a task has no branch and no worktreePath.
+   * close/cleanup/scan never delete it. Write-once like the J1 fields.
+   */
+  outputDir?: string;
   // ── J2 ──
   prUrl?: string;
   /**
@@ -131,6 +137,8 @@ export interface WorkTaskUpdatePayload {
   worktreePath?: string;
   paneGroupId?: string;
   prUrl?: string;
+  /** Additive — see WorkTask.outputDir. */
+  outputDir?: string;
 }
 
 // ── 상수 캡 (§2 DoS 캡 — 채널 상수 재사용 관례) ─────────────────────────
@@ -225,6 +233,10 @@ export interface WorkTaskMetaStamp {
   title: string;
   createdAt: number;
   closedAt?: number;
+  /** T3 — the commit the task branch started from (origin's default branch at
+   *  fan-out time). Task-mode diffs compare against it; absent when the task
+   *  fell back to the owner's HEAD. */
+  baseOid?: string;
 }
 
 /** meta dir에 스탬프를 쓰는 파일명(J3 §1 — 정리 스캔 역추적 정본). */
@@ -262,7 +274,8 @@ export type WorktaskScanCategoryWire =
   | 'unmaterialized-open'
   | 'disk-missing'
   | 'preserved'
-  | 'orphan-dir';
+  | 'orphan-dir'
+  | 'phone-worktree';
 
 export interface WorktaskScanEntryWire {
   category: WorktaskScanCategoryWire;
@@ -279,3 +292,8 @@ export interface WorktaskScanEntryWire {
 export type WorktaskScanResultWire =
   | { ok: true; scannedRoot: string; entries: WorktaskScanEntryWire[] }
   | { ok: false; error: string; scannedRoot: string; entries: WorktaskScanEntryWire[] };
+
+/** worktask:remove-phone result (PhoneWorktreeRemoval mirror). */
+export type RemovePhoneWorktreeResultWire =
+  | { ok: true; branch?: string; repo?: string }
+  | { ok: false; reason: 'invalid' | 'in-use' | 'held' | 'dirty' | 'locked' | 'unregistered' | 'error'; error?: string };

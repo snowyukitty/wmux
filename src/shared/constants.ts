@@ -1,4 +1,5 @@
 // IPC Channel names
+import { QUICK_LAUNCH_IPC } from './quickLaunchIpc';
 export const IPC = {
   PTY_CREATE: 'pty:create',
   PTY_WRITE: 'pty:write',
@@ -9,6 +10,7 @@ export const IPC = {
   // route can tell "attached and watched" from "attached but nobody looking".
   PTY_SET_VIEWER_VISIBILITY: 'pty:setViewerVisibility',
   PTY_DISPOSE: 'pty:dispose',
+  PTY_CANCEL_CREATE: 'pty:cancel-create',
   PTY_DATA: 'pty:data',
   PTY_EXIT: 'pty:exit',
   PTY_LIST: 'pty:list',
@@ -61,6 +63,9 @@ export const IPC = {
   // before letting the live PTY output compose on a clean buffer.
   PTY_FLUSH_COMPLETE: 'pty:flush-complete',
   SHELL_LIST: 'shell:list',
+  // #1103 — WSL distro names (`wsl --list --quiet`), for the default-terminal
+  // distro picker. [] off Windows / on any enumeration failure.
+  SHELL_WSL_DISTROS: 'shell:wsl-distros',
   FONTS_LIST: 'fonts:list',
   SESSION_SAVE: 'session:save',
   // A4 — non-blocking periodic autosave. Same payload/atomicity as SESSION_SAVE
@@ -129,11 +134,26 @@ export const IPC = {
   // workspace, sound by the Electron process boundary) and forwards to the
   // daemon, whose authz gates run against it. See channelLocal.handler.ts.
   CHANNEL_MUTATE_LOCAL: 'channels:mutate-local',
+  // Renderer → main: paste a message into a pty and submit it, gated by the
+  // raw-input approval guard `input.send` applies, re-checked before the Enter
+  // (input.rpc.ts `gatedPasteSubmit`). Used for every non-operator delivery
+  // (A2A, company, channel mention nudges). Renderer-only, not on the pipe.
+  GATED_SUBMIT: 'pty:gated-submit',
   // J1 fan-out — renderer(다이얼로그) → main: 프롬프트 1개 → N 격리 태스크 스폰.
   // main의 FanOutService가 데몬 RPC(mission.start/update/invite)와 렌더러 spawn을
   // 조립한다. 렌더러 신뢰 신원(verifiedWorkspaceId)은 channelLocal과 동일 trust
   // basis(Electron 프로세스 경계). 파이프 미노출 — 같은 사용자 MCP 클라가 못 닿는다.
   FANOUT_START: 'fanout:start',
+  FANOUT_WORKER_MODE_GET: 'fanout:workerMode:get',
+  FANOUT_WORKER_MODE_SET: 'fanout:workerMode:set',
+  FANOUT_REQUIRE_APPROVAL_GET: 'fanout:requireApproval:get',
+  FANOUT_REQUIRE_APPROVAL_SET: 'fanout:requireApproval:set',
+  FANOUT_TRUST_AGY_FOLDERS_GET: 'fanout:trustAgyFolders:get',
+  FANOUT_TRUST_AGY_FOLDERS_SET: 'fanout:trustAgyFolders:set',
+  FANOUT_AUDIT_RECENT: 'fanout:audit:recent',
+  FANOUT_LINEAGE: 'fanout:lineage',
+  FANOUT_PRESETS_GET: 'fanout:presets:get',
+  FANOUT_PRESETS_SET: 'fanout:presets:set',
   // J3 태스크 수명주기 — renderer → main(파이프 미노출, channelLocal과 동일 trust).
   //  TASK_CLOSE: remove 성공→close 커밋 순서 오케스트레이션(TaskCloseService).
   //  TASK_CREATE_PR: gh 4중 게이트 1클릭 PR(TaskPrService).
@@ -144,6 +164,12 @@ export const IPC = {
   TASK_CREATE_PR: 'task:create-pr',
   WORKTASK_SCAN: 'worktask:scan',
   WORKTASK_REFIRE: 'worktask:refire',
+  // Read-only: how many panes were started inside the given task worktrees (close confirm).
+  WORKTASK_COUNT_PANES: 'worktask:count-panes',
+  // Phone worktrees (no task) in the cleanup list: remove by path, then
+  // optionally delete their phone/<slug> branch.
+  WORKTASK_REMOVE_PHONE: 'worktask:remove-phone',
+  WORKTASK_DELETE_PHONE_BRANCH: 'worktask:delete-phone-branch',
   // Command Deck Phase 2 — the Commander brain (an Agent-SDK orchestrator that
   // runs in MAIN and drives the fleet via wmux MCP). Renderer-only surface, same
   // trust basis as channelLocal/fanout (Electron process boundary, pipe-
@@ -194,6 +220,14 @@ export const IPC = {
   //                   automation-driven turns spawned brains on whatever model
   //                   the last typed turn happened to leave behind.
   DECK_MODEL_SET: 'deck:model:set',
+  //   AGENT_MODELS_LIST (invoke) renderer → main: the models an agent CLI
+  //                   reports (`agy models`, `codex debug models`, claude's
+  //                   static list), cached in main. `{ agent, refresh? }` →
+  //                   ModelCatalogResult. Never rejects for a missing CLI.
+  AGENT_MODELS_LIST: 'agents:models:list',
+  //   AGY_TRUST_FOLDER (invoke) renderer → main: list a fan-out task folder in
+  //   agy's trustedWorkspaces before agy launches there (main/agents/agyTrust).
+  AGY_TRUST_FOLDER: 'agents:agy:trust-folder',
   //   DECK_BRAIN_PTY  (send) main → renderer: the `claude-pty` brain just
   //                   spawned its interactive TUI in daemon session <ptyId>.
   //                   One-way and additive to DECK_STREAM (which carries only
@@ -208,6 +242,25 @@ export const IPC = {
   //                   mounts — the same hydrate-then-subscribe shape the other
   //                   main-authoritative deck state uses.
   DECK_BRAIN_PTY_LIST: 'deck:brainpty:list',
+  //   DECK_FANOUT_CALLER (send) main → renderer: a fan-out worker's turn
+  //                   ended while its owner workspace has no brain. Carries
+  //                   the task pointer and the requester's pane/surface ids
+  //                   only (no PTY id, no worker text); the renderer types one
+  //                   fixed line into that pane if it is still there and idle.
+  DECK_FANOUT_CALLER: 'deck:fanout-caller',
+  //   DECK_FANOUT_CALLER_SESSION (invoke) renderer → main: the verified agent
+  //                   incarnation in a PTY, so a pointer is bound to the
+  //                   caller's session. Null when unverified or not daemon-backed.
+  DECK_FANOUT_CALLER_SESSION: 'deck:fanout-caller:session',
+  //   DECK_FANOUT_CALLER_SUBMIT (invoke) renderer → main: write the fixed
+  //                   nudge line through the delivery gate and the daemon.
+  DECK_FANOUT_CALLER_SUBMIT: 'deck:fanout-caller:submit',
+  //   DECK_PR_OWNER (send) main → renderer: a PR event (CI failed, checks
+  //                   passed, review comment, merge conflict) for a workspace
+  //                   with no brain. The renderer finds the one agent pane whose
+  //                   checkout is that PR and writes through
+  //                   DECK_FANOUT_CALLER_SUBMIT (main/deck/prOwnerNotify.ts).
+  DECK_PR_OWNER: 'deck:pr-owner',
   //   DECK_SCHEDULES_* (invoke) renderer → main: CRUD over the persisted
   //                    orchestrator schedules (P3d). Same renderer-only trust
   //                    boundary as DECK_SEND.
@@ -261,6 +314,90 @@ export const IPC = {
   //   + schedules. Same renderer-only trust boundary.
   DECK_MODE_GET: 'deck:mode:get',
   DECK_MODE_SET: 'deck:mode:set',
+  //   DECK_HQ_GET — the designated HQ workspace (deckHqStore.ts, main is the
+  //   source of truth): { workspaceId, state: 'unset' | 'ok' | 'hq-missing' |
+  //   'hq-unknown' | 'hq-store-corrupt' }. Read-only; no renderer setter yet.
+  DECK_HQ_GET: 'deck:hq:get',
+  //   DECK_MOA_* — the main bot's master switch (deckHqStore.ts `moaEnabled`,
+  //   default on). Off stops the whole deck runtime (brains, timers, bus and
+  //   mirror subscriptions); nothing is deleted. { enabled: boolean } both
+  //   ways; SET answers { ok: false, code: 'store_corrupt' } while the store
+  //   is unreadable.
+  DECK_MOA_GET: 'deck:moa:get',
+  DECK_MOA_SET: 'deck:moa:set',
+  //   DECK_MOA_STATE — Settings → Moa's one read: { config, hq: { workspaceId,
+  //   state }, archive: { unacked, total } }. DECK_MOA_CHANGED (send, main →
+  //   renderer, no payload) says it moved. DECK_MOA_CONFIG_SET takes a partial
+  //   { onboarded, level, maxTurnsPerHour, bubbles, reduceMotion }.
+  //   DECK_MOA_SETUP { workspaceId } makes a just-created workspace the HQ at
+  //   level 1 and turns Moa on (first run, and "Recreate Moa workspace").
+  //   With `rebind: true` and the current HQ's own id it only turns Moa on:
+  //   the lost HQ came back under its id, so its settings are kept.
+  //   DECK_MOA_ARCHIVE_LIST / _ACK: the decisions the HQ migration archived and
+  //   their one-time notice. DECK_MOA_STORE_RESET moves an unreadable
+  //   deck-hq.json aside and starts over (Moa off, no HQ).
+  DECK_MOA_STATE: 'deck:moa:state',
+  DECK_MOA_CHANGED: 'deck:moa:changed',
+  DECK_MOA_CONFIG_SET: 'deck:moa:config:set',
+  DECK_MOA_SETUP: 'deck:moa:setup',
+  DECK_MOA_ARCHIVE_LIST: 'deck:moa:archive:list',
+  DECK_MOA_ARCHIVE_ACK: 'deck:moa:archive:ack',
+  DECK_MOA_STORE_RESET: 'deck:moa:store:reset',
+  //   DECK_MOA_MEMORY_LIST / _DELETE: what Moa remembers (saved precedents,
+  //   notes and skills, all approved by the operator) and deleting one by
+  //   { kind, name }. DECK_MOA_CHANGED also says this list moved.
+  DECK_MOA_MEMORY_LIST: 'deck:moa:memory:list',
+  DECK_MOA_MEMORY_DELETE: 'deck:moa:memory:delete',
+  //   DECK_MOA_MEMORY_CARD: the pending "Remember this?" card with the full
+  //   text Save would write, or null. DECK_MOA_MEMORY_RESOLVE { id, answer:
+  //   'save' | 'discard', fullTextShown } answers it. DECK_MOA_CHANGED says the
+  //   card moved (raised, answered, next).
+  DECK_MOA_MEMORY_CARD: 'deck:moa:memory:card',
+  DECK_MOA_MEMORY_RESOLVE: 'deck:moa:memory:resolve',
+  //   DECK_MOA_DECISIONS — every workspace's pending decision, for the right
+  //   panel's "Waiting on you" ({ decisions: MoaPendingDecision[] }); a change
+  //   rides DECK_MOA_CHANGED.
+  //   DECK_MOA_TRANSCRIPT_* — the HQ brain's Claude transcript, projected in
+  //   main by the same TranscriptProjector the phone turn view uses (the brain
+  //   pane is never a daemon transcript session). STATUS / SNAPSHOT
+  //   ({ before? }) / SUBSCRIBE / UNSUBSCRIBE (invoke); APPEND (send, main →
+  //   renderer, TranscriptAppendData).
+  DECK_MOA_DECISIONS: 'deck:moa:decisions',
+  // Permission prompts of agents Moa delegated work to ({ approvals:
+  // MoaDelegatedApproval[] }), for the panel's "Waiting on you".
+  DECK_MOA_DELEGATED_APPROVALS: 'deck:moa:delegated-approvals',
+  // Answer one of those prompts in place ({ approvalId, choiceKey,
+  // promptFingerprint } → MoaApprovalAnswerResult). Main presses only a prompt
+  // it lists above, through the daemon's first-party desktop answer.
+  DECK_MOA_DELEGATED_ANSWER: 'deck:moa:delegated-answer',
+  // A delegated task's result from its A2A completion evidence ({ workspaceId,
+  // taskId } → { result: MoaTaskResult | null }), for Moa's result card.
+  DECK_MOA_TASK_RESULT: 'deck:moa:task-result',
+  //   DECK_MOA_HANDOFF_RESOLVE (invoke MoaHandoffResolveRequest): answer a
+  //   hand-off card by id (main reads the body from its own store; an edited
+  //   body is the operator's own input). DECK_MOA_HANDOFF_RECEIPTS (invoke):
+  //   recent auto hand-offs. DECK_MOA_HANDOFF_STOP (invoke { id }): interrupt
+  //   the worker and cancel an auto hand-off's task.
+  DECK_MOA_HANDOFF_RESOLVE: 'deck:moa:handoff:resolve',
+  DECK_MOA_HANDOFF_RECEIPTS: 'deck:moa:handoff:receipts',
+  DECK_MOA_HANDOFF_STOP: 'deck:moa:handoff:stop',
+  DECK_MOA_TRANSCRIPT_STATUS: 'deck:moa:transcript:status',
+  DECK_MOA_TRANSCRIPT_SNAPSHOT: 'deck:moa:transcript:snapshot',
+  DECK_MOA_TRANSCRIPT_SUBSCRIBE: 'deck:moa:transcript:subscribe',
+  DECK_MOA_TRANSCRIPT_UNSUBSCRIBE: 'deck:moa:transcript:unsubscribe',
+  DECK_MOA_TRANSCRIPT_APPEND: 'deck:moa:transcript:append',
+  //   CODEBLOCK (invoke { srcOffset, n, eventId? }): one code-block body from
+  //   the HQ brain's transcript (the daemon cannot resolve the brain pty).
+  DECK_MOA_TRANSCRIPT_CODEBLOCK: 'deck:moa:transcript:codeblock',
+  //   DECK_MOA_APPROVAL — Moa's own permission prompt (#1772): the daemon's
+  //   pending `terminal_prompt` record for the HQ brain pane, or null
+  //   ({ approval: MoaApproval | null }). DECK_MOA_APPROVAL_ANSWER
+  //   { approvalId, choiceKey, promptFingerprint } presses one of its choices
+  //   (MoaApprovalAnswerResult). Renderer-only: the daemon RPCs behind them
+  //   (daemon.moa.prompt / daemon.moa.answerPrompt) have no pipe route, MCP
+  //   tool or CLI verb.
+  DECK_MOA_APPROVAL: 'deck:moa:approval',
+  DECK_MOA_APPROVAL_ANSWER: 'deck:moa:approval:answer',
   //   HOOKS_BRIDGE_* — the Claude Code hook bridge (wmux setup-hooks, in-app).
   //   STATUS reports whether the wmux hook entries are installed in
   //   ~/.claude/settings.json; INSTALL performs the same idempotent install as
@@ -269,6 +406,9 @@ export const IPC = {
   //   2026-07-17). Renderer-only trust boundary.
   HOOKS_BRIDGE_STATUS: 'hooks:bridge:status',
   HOOKS_BRIDGE_INSTALL: 'hooks:bridge:install',
+  //   ALLOW_WORKER_TOOLS — the Settings button that adds the minimal fan-out
+  //   worker tool list to permissions.allow. User-clicked, like INSTALL.
+  HOOKS_BRIDGE_ALLOW_WORKER_TOOLS: 'hooks:bridge:allow-worker-tools',
   //   PROMPT_PREF_* — the durable "Don't ask again" for the install prompt.
   //   GET is read by the prompt before it decides to show; SET is written only
   //   by that explicit click, and cleared again from Settings. Refusing the
@@ -320,6 +460,8 @@ export const IPC = {
   //   accounts.json; the renderer never resolves spawn env). Onboarding
   //   provisions an isolated config dir (hybrid share) and reports credential
   //   status by polling; the renderer commits ACCOUNT_ADD once login lands.
+  QUICK_COMMAND_LIST: 'quick-command:list',
+  QUICK_COMMAND_REPLACE: 'quick-command:replace',
   ACCOUNT_LIST: 'account:list',
   ACCOUNT_ONBOARD_PREPARE: 'account:onboard:prepare',
   ACCOUNT_ADD: 'account:add',
@@ -334,11 +476,19 @@ export const IPC = {
   ACCOUNT_USAGE_LIST: 'account:usage:list',
   ACCOUNT_USAGE_REFRESH: 'account:usage:refresh',
   ACCOUNT_USAGE_UPDATE: 'account:usage:update',
+  // Quota-driven account choice for Claude and Codex launches (per vendor
+  // switch + quota rows).
+  ACCOUNT_ROTATION_GET: 'account:rotation:get',
+  ACCOUNT_ROTATION_SET: 'account:rotation:set',
   // Clipboard (main process bridge)
   CLIPBOARD_WRITE: 'clipboard:write',
   CLIPBOARD_READ: 'clipboard:read',
   CLIPBOARD_READ_IMAGE: 'clipboard:read-image',
   CLIPBOARD_HAS_IMAGE: 'clipboard:has-image',
+  /** Write text that main takes back off the clipboard at its expiry or on quit. */
+  CLIPBOARD_WRITE_EPHEMERAL: 'clipboard:write-ephemeral',
+  /** Clear the ephemeral text unless it equals the still-valid value passed. */
+  CLIPBOARD_KEEP_EPHEMERAL: 'clipboard:keep-ephemeral',
   SYSTEM_BUILTIN_DISPLAY: 'system:builtin-display',
   // Fired by main's powerMonitor 'resume' so the renderer can rebuild GPU
   // state that sleep may have invalidated (shared glyph atlas — see
@@ -367,6 +517,10 @@ export const IPC = {
   // no-renderer toast fallback in dispatchNotification can honor them.
   MUTED_NOTIFICATION_CATEGORIES: 'settings:muted-notification-categories',
   AUTO_UPDATE_ENABLED: 'settings:auto-update-enabled',
+  // #1103 — the renderer's default-WSL-distro choice, pushed to main so
+  // pty.create can inject `wsl.exe -d <distro>` at the shell-resolution
+  // choke point without threading it through every create call.
+  SETTINGS_DEFAULT_WSL_DISTRO: 'settings:default-wsl-distro',
   // Phase 2.2 — MCP plugin permission approval (main → renderer subscribe,
   // renderer → main response). Emitted when the enforcer rejects an
   // unconfirmed plugin in enforce mode and the ApprovalQueue mints a
@@ -379,6 +533,16 @@ export const IPC = {
   // the pluginHost deadlock-break, or a coalesced sibling). Lets the renderer
   // approval-inbox remove the row. Payload: { promptId }.
   PERMISSION_PROMPT_CLOSED: 'permission:prompt-closed',
+  // browser_request_help — the agent hands one browser step to the human.
+  // Deliberately modelled on the permission-prompt trio above rather than the
+  // RPC_COMMAND path: an agent-authored prompt string is untrusted text with a
+  // Done/Cancel answer, so the channel that carries it stays structurally
+  // incapable of reaching anything else. Payloads: BrowserHelpRequestInfo on
+  // OPEN, `{ requestId, outcome }` on RESOLVE, `{ requestId }` on CLOSED.
+  // Timeouts are main's (HelpRequests holds the deadline), never the renderer's.
+  BROWSER_HELP_OPEN: 'browser:help-open',
+  BROWSER_HELP_RESOLVE: 'browser:help-resolve',
+  BROWSER_HELP_CLOSED: 'browser:help-closed',
   // #898 — main → renderer push, once at startup, when a Claude Code plugin
   // install is found whose bridge still forces a permission prompt. wmux
   // refreshes its OWN copy of the bridge but never the plugin's, so this tells
@@ -420,6 +584,9 @@ export const IPC = {
   // (서브디렉토리 cwd를 그대로 diff:read에 넘기면 untracked 합성의
   //  join(worktreePath, rel)이 repo-root 상대경로와 어긋난다.)
   DIFF_RESOLVE_REPO: 'diff:resolveRepo',
+  // Fleet Ready to review — a task's change counts only (numstat + untracked),
+  // no patch text; answers `unchanged` when the worktree state key matches.
+  DIFF_SUMMARY: 'diff:summary',
   // Deck Git 탭 — 워크트리 GUI (list/add/remove; remove는 --force 미제공)
   WORKTREE_LIST: 'worktree:list',
   WORKTREE_ADD: 'worktree:add',
@@ -432,6 +599,44 @@ export const IPC = {
   // Git 탭 PR 섹션 — gh CLI 기반 PR 목록·코멘트(성긴 pull, 30s TTL)
   GITHUB_PR_LIST: 'github:prList',
   GITHUB_PR_DETAIL: 'github:prDetail',
+  GITHUB_REPO_KEY: 'github:repoKey',
+  // Git page Issues view (gh CLI, 30s TTL, rate-limit breaker)
+  GITHUB_ISSUE_LIST: 'github:issueList',
+  GITHUB_ISSUE_DETAIL: 'github:issueDetail',
+  // PR review and CI on the Git page's detail pane (src/main/github/GhPrReviewService.ts).
+  PR_REVIEW_CHECKS: 'prReview:checks',
+  PR_REVIEW_FILES: 'prReview:files',
+  PR_REVIEW_THREADS: 'prReview:threads',
+  PR_REVIEW_COMMENT: 'prReview:comment',
+  PR_REVIEW_REPLY: 'prReview:reply',
+  PR_REVIEW_SUBMIT: 'prReview:submit',
+  PR_REVIEW_MERGE: 'prReview:merge',
+  PR_REVIEW_RUN_LOG: 'prReview:runLog',
+  PR_REVIEW_RERUN: 'prReview:rerun',
+  // Work links (src/shared/workLink.ts): renderer reads only; main is the sole writer.
+  WORK_LINK_LIST: 'workLink:list',
+  WORK_LINK_GET: 'workLink:get',
+  WORK_LINK_CHANGED: 'workLink:changed',
+  // Moa's track record (src/shared/trackRecord.ts): the weekly retro card and
+  // its schedule. The counts themselves are main's and Moa's, not the renderer's.
+  TRACK_RECORD_RETRO_GET: 'trackRecord:retro:get',
+  TRACK_RECORD_RETRO_DISMISS: 'trackRecord:retro:dismiss',
+  TRACK_RECORD_SCHEDULE_GET: 'trackRecord:schedule:get',
+  TRACK_RECORD_SCHEDULE_SET: 'trackRecord:schedule:set',
+  TRACK_RECORD_CLEAR: 'trackRecord:clear',
+  TRACK_RECORD_CHANGED: 'trackRecord:changed',
+  // Git page ship button: the branch's status, commit / push / create PR
+  GIT_SHIP_STATUS: 'gitShip:status',
+  GIT_SHIP_COMMIT: 'gitShip:commit',
+  GIT_SHIP_PUSH: 'gitShip:push',
+  GIT_SHIP_CREATE_PR: 'gitShip:createPr',
+  // Git page hand-off: an issue / PR to an agent pane, or to a new worktree
+  GIT_HANDOFF_SEND: 'gitHandoff:send',
+  GIT_HANDOFF_START_WORKTREE: 'gitHandoff:startWorktree',
+  // One-step GitHub connect: gh auth login --web run by main, its device code shown in the page
+  GH_LOGIN_START: 'ghLogin:start',
+  GH_LOGIN_CANCEL: 'ghLogin:cancel',
+  GH_LOGIN_EVENT: 'ghLogin:event',
   DIALOG_PICK_FILE: 'dialog:pick-file',
   DIALOG_PICK_FOLDER: 'dialog:pick-folder',
   // File system
@@ -463,6 +668,19 @@ export const IPC = {
   // "지금 새로고침" button). Triggers an immediate poll regardless of
   // interval timing. Caller enforces a UI-side cooldown (5 min).
   USAGE_REFRESH: 'usage:refresh',
+  // Pane usage-limit pause (shared/usageLimit). Main → renderer push of one
+  // pane's limit (`{ ptyId, limit: PaneUsageLimit | null }`, null = cleared),
+  // renderer → main list on boot, and renderer → main edits (auto-resume,
+  // dismiss, resume now) relayed to the daemon, which owns the state.
+  USAGE_LIMIT_CHANGED: 'usageLimit:changed',
+  USAGE_LIMIT_LIST: 'usageLimit:list',
+  USAGE_LIMIT_UPDATE: 'usageLimit:update',
+  // Workspace settle / snooze (shared/workspaceSettle). Main owns and decides
+  // the state; renderer → main snapshot read on boot and the user's verbs,
+  // main → renderer push of the snapshot plus the changes behind it (toasts).
+  WORKSPACE_SETTLE_GET: 'workspaceSettle:get',
+  WORKSPACE_SETTLE_COMMAND: 'workspaceSettle:command',
+  WORKSPACE_SETTLE_CHANGED: 'workspaceSettle:changed',
   // EventBus publish — renderer→main one-way for pane lifecycle events
   EVENTS_PUBLISH: 'events:publish',
   // Total app memory (renderer → main, invoke). Returns the summed
@@ -475,6 +693,23 @@ export const IPC = {
   // the post-op state. No-op returning { enabled: false } off-Windows.
   AUTOSTART_GET: 'autostart:get',
   AUTOSTART_SET: 'autostart:set',
+  // Desktop computer use (Settings › Computer use). GET returns
+  // { enabled, helper, stopKey }; SET writes the switch to
+  // ~/.wmux/computer-use.json and returns the same shape. Turning it off also stops
+  // anything in flight.
+  COMPUTER_USE_GET: 'computer-use:get',
+  COMPUTER_USE_SET: 'computer-use:set',
+  // Global quick launch (Settings › Shortcuts, and the floating composer).
+  // SETTINGS_GET/SET return QuickLaunchSettingsPayload; the rest are the
+  // composer window's own calls, refused from any other sender. The strings
+  // live in quickLaunchIpc.ts for the composer's sandboxed preload.
+  QUICK_LAUNCH_SETTINGS_GET: QUICK_LAUNCH_IPC.SETTINGS_GET,
+  QUICK_LAUNCH_SETTINGS_SET: QUICK_LAUNCH_IPC.SETTINGS_SET,
+  QUICK_LAUNCH_CONTEXT: QUICK_LAUNCH_IPC.CONTEXT,
+  QUICK_LAUNCH_SUBMIT: QUICK_LAUNCH_IPC.SUBMIT,
+  QUICK_LAUNCH_DISMISS: QUICK_LAUNCH_IPC.DISMISS,
+  QUICK_LAUNCH_FIT: QUICK_LAUNCH_IPC.FIT,
+  QUICK_LAUNCH_SHOWN: QUICK_LAUNCH_IPC.SHOWN,
   // Window control
   WINDOW_HIDE: 'window:hide',
   // Windows taskbar attention recall. Renderer asks main to flash the
@@ -511,6 +746,20 @@ export const IPC = {
   MCP_CHECK: 'mcp:check',
   MCP_REREGISTER: 'mcp:reregister',
   MCP_UNREGISTER: 'mcp:unregister',
+  MCP_REGISTER_TARGET: 'mcp:register-target',
+  // Settings -> Token usage: quota (manual refresh only) and the CLI "surface" inventory / toggles.
+  TOKEN_QUOTA_READ: 'tokenUsage:quota:read',
+  TOKEN_QUOTA_SENSOR_STATUS: 'tokenUsage:quota:sensor-status',
+  TOKEN_QUOTA_SENSOR_INSTALL: 'tokenUsage:quota:sensor-install',
+  TOKEN_SURFACE_INVENTORY: 'tokenUsage:surface:inventory',
+  TOKEN_SURFACE_PREVIEW: 'tokenUsage:surface:preview',
+  TOKEN_SURFACE_APPLY: 'tokenUsage:surface:apply',
+  TOKEN_SURFACE_RECONCILE: 'tokenUsage:surface:reconcile',
+  TOKEN_PROFILES_LIST: 'tokenUsage:profiles:list',
+  TOKEN_PROFILES_SAVE: 'tokenUsage:profiles:save',
+  TOKEN_PROFILES_DELETE: 'tokenUsage:profiles:delete',
+  TOKEN_PROFILES_PREVIEW: 'tokenUsage:profiles:preview',
+  TOKEN_PROFILES_APPLY: 'tokenUsage:profiles:apply',
   // LanLink PR-3 control plane (renderer → main → daemon control pipe).
   LANLINK_STATUS: 'lanlink:status',
   LANLINK_CONFIGURE: 'lanlink:configure',
@@ -524,6 +773,25 @@ export const IPC = {
   LANLINK_SEND: 'lanlink:send',
   LANLINK_PEERS_LIST: 'lanlink:peers:list',
   LANLINK_PEERS_REMOVE: 'lanlink:peers:remove',
+  // Scheduled runs (renderer → main → daemon `automation.*`). Invoke channels
+  // resolve even with no daemon (empty lists / `{ ok:false }`). AUTOMATION_PUSH
+  // carries daemon events and connect-time snapshots main → renderer;
+  // AUTOMATION_OPEN_RUN is an OS toast click asking the renderer to open a
+  // run's terminal; AUTOMATION_TOAST_LABELS hands main the localized status
+  // words for those toasts (main has no locale of its own).
+  AUTOMATION_LIST: 'automation:list',
+  AUTOMATION_RUNS: 'automation:runs',
+  AUTOMATION_SNAPSHOT: 'automation:snapshot',
+  AUTOMATION_CREATE: 'automation:create',
+  AUTOMATION_UPDATE: 'automation:update',
+  AUTOMATION_REMOVE: 'automation:remove',
+  AUTOMATION_SET_ENABLED: 'automation:setEnabled',
+  AUTOMATION_GRANT: 'automation:grant',
+  AUTOMATION_RUN_NOW: 'automation:runNow',
+  AUTOMATION_CANCEL_RUN: 'automation:cancelRun',
+  AUTOMATION_PUSH: 'automation:push',
+  AUTOMATION_OPEN_RUN: 'automation:openRun',
+  AUTOMATION_TOAST_LABELS: 'automation:toastLabels',
   // wmux web — browser/PWA terminal server control (renderer → main → daemon
   // control pipe). The server lives inside the daemon; these forward the
   // daemon.web.{status,start,stop} string RPCs and degrade gracefully when the
@@ -534,12 +802,18 @@ export const IPC = {
   WEB_PAIR_REFRESH: 'web:pairRefresh',
   /** Name a device, THEN mint its code. The daemon refuses a blank name. */
   WEB_PAIR_START: 'web:pairStart',
+  /** End the pairing in progress (either card), burning its code and name. */
+  WEB_PAIR_CANCEL: 'web:pairCancel',
   /** The operator's paired-device roster. Carries no secret material. */
   WEB_DEVICE_LIST: 'web:deviceList',
   /** Revoke one device permanently and cut its live streams. */
   WEB_DEVICE_REVOKE: 'web:deviceRevoke',
   /** Grant or withdraw one device's permission to type. */
   WEB_DEVICE_SET_INPUT: 'web:deviceSetInput',
+  /** Change the phone grants (transcript / upload) of the running server in place. */
+  WEB_SET_GRANTS: 'web:setGrants',
+  /** Read-only readiness check for the phone wizard: tailscale + server status, changes nothing. */
+  WEB_DIAGNOSE: 'web:diagnose',
   // First-run wizard (Plan 1.15) — magical-moment onboarding flow
   FIRST_RUN_CHECK: 'first-run:check',
   FIRST_RUN_COMPLETE: 'first-run:complete',
@@ -577,6 +851,9 @@ export const IPC = {
   // pasting the full wmux-web URL with the token embedded.
   REMOTE_HOSTS_PAIR: 'remote:hosts:pair',
   REMOTE_HOSTS_REMOVE: 'remote:hosts:remove',
+  // Per-host status for the Remote hub: `/api/config` probed with a short
+  // timeout, cached 60 s, combined with this app's live streams.
+  REMOTE_HOSTS_STATUS: 'remote:hosts:status',
   REMOTE_WORKSPACES_LIST: 'remote:workspaces:list',
   // Bootstrap the FIRST pane of a NEW workspace on a remote host (#1001):
   // the desktop mints the workspace id and hands it to `POST /api/sessions`
@@ -598,6 +875,13 @@ export const IPC = {
   REMOTE_PANE_ATTACH: 'remote:pane:attach',
   REMOTE_PANE_DETACH: 'remote:pane:detach',
   REMOTE_PANE_WRITE: 'remote:pane:write',
+  // renderer → main invoke (#1322): ask the remote daemon to resize the PTY
+  // behind `attachId` via `RemoteHostClient.resizeSession` — the same
+  // `POST /api/sessions/:id/resize` route the phone uses (#766). A GRANT
+  // arrives back through REMOTE_PANE_RESIZE below (the daemon's own SSE
+  // broadcast of the applied geometry), not as this invoke's return value;
+  // the return value only says whether the ROUTE accepted the request.
+  REMOTE_PANE_RESIZE_REQUEST: 'remote:pane:resize-request',
   REMOTE_PANE_DATA: 'remote:pane:data',      // main → renderer push
   REMOTE_PANE_META: 'remote:pane:meta',      // main → renderer push (cols/rows/snapshot)
   // main → renderer push (cols/rows only). A resize on the machine that owns
@@ -606,6 +890,17 @@ export const IPC = {
   REMOTE_PANE_RESIZE: 'remote:pane:resize',
   REMOTE_PANE_EXIT: 'remote:pane:exit',      // main → renderer push
   REMOTE_PANE_ERROR: 'remote:pane:error',    // main → renderer push (reconnect gave up)
+  // #1391 — the CADENCE of the per-host `/api/workspaces` liveness poll, moved
+  // out of the renderer. A renderer `setInterval` is throttled by Chromium once
+  // the window is hidden or occluded (measured: 10s → 17s → 60s), so a user
+  // watching a remote agent from a background window saw minute-old status.
+  // Main's timers are never throttled. Subscribe/unsubscribe are refcounted per
+  // WebContents so a window with nothing attached costs no periodic anything,
+  // and TICK carries no payload: it means only "poll now", leaving every bit of
+  // polling policy (host set, backoff, dedup) in the renderer where #1385 put it.
+  REMOTE_POLL_SUBSCRIBE: 'remote:poll:subscribe',
+  REMOTE_POLL_UNSUBSCRIBE: 'remote:poll:unsubscribe',
+  REMOTE_POLL_TICK: 'remote:poll:tick',      // main → renderer push
 } as const;
 
 // Daemon process exit codes. A spawned daemon that finds the canonical control
@@ -752,11 +1047,35 @@ export function getTcpPortPath(): string {
   return `${home}/.wmux${dataSuffix()}-tcp-port`;
 }
 
+/**
+ * Fail-closed safety guard: refuses to touch the live wmux data directory from a test.
+ * Active under vitest when dataSuffix() is empty and either
+ *   - the isolate setup (src/test-utils/isolateDataDir.ts) did not run, i.e. a runner
+ *     bypassed vitest.config.ts (a config in a parent folder, `--config` elsewhere), or
+ *   - the given home matches the real user home (case-insensitive, \// normalized).
+ */
+export function assertNotLiveWmuxDataDir(home: string): void {
+  if (process.env.VITEST && dataSuffix() === '' && process.env.WMUX_TEST_ISOLATED !== '1') {
+    throw new Error('Refusing to touch the live wmux data dir from a test (isolate setup did not run)');
+  }
+  if (
+    process.env.VITEST &&
+    process.env.WMUX_TEST_REAL_HOME &&
+    dataSuffix() === ''
+  ) {
+    const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    if (home && norm(home) === norm(process.env.WMUX_TEST_REAL_HOME)) {
+      throw new Error('Refusing to touch the live wmux data dir from a test');
+    }
+  }
+}
+
 // wmux user home directory — root for plugin-trust.json, pid-map/, and other
 // substrate state that needs to survive across wmux restarts. Single source
 // of truth so callers don't reimplement the USERPROFILE/HOME dance.
 export function getWmuxHomeDir(): string {
   const home = process.env.USERPROFILE || process.env.HOME || '';
+  assertNotLiveWmuxDataDir(home);
   return `${home}/.wmux${dataSuffix()}`;
 }
 

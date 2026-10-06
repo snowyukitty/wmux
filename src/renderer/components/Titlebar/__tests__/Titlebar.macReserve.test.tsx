@@ -9,7 +9,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createRoot } from 'react-dom/client';
 import { act } from 'react';
-import Titlebar, { MAC_TRAFFIC_LIGHT_RESERVE } from '../Titlebar';
+import Titlebar, { MAC_TRAFFIC_LIGHT_RESERVE, BRAND_INSET } from '../Titlebar';
 import { useStore } from '../../../stores';
 
 vi.mock('../../StatusBar/StatusBar', () => ({ default: () => null }));
@@ -47,18 +47,28 @@ function render(): { header: HTMLElement; segment: HTMLElement; cleanup: () => v
 }
 
 describe('Titlebar macOS traffic-light reserve', () => {
-  it('확장 사이드바(240px): 예약이 세그먼트 안쪽 패딩으로 들어가고 헤더는 0', () => {
-    act(() => useStore.setState({ sidebarPosition: 'left', sidebarVisible: true }));
+  it('확장 사이드바(264px default): 예약이 세그먼트 안쪽 패딩으로 들어가고 헤더는 0', () => {
+    act(() => useStore.setState({ sidebarPosition: 'left', sidebarVisible: true, sidebarWidth: 264 }));
     const { header, segment } = render();
     expect(header.style.paddingLeft).toBe('0px');
-    expect(segment.style.paddingLeft).toBe(`${MAC_TRAFFIC_LIGHT_RESERVE}px`);
-    expect(segment.style.width).toBe('240px');
+    // …plus the wordmark's inset past the lights.
+    expect(segment.style.paddingLeft).toBe(`${MAC_TRAFFIC_LIGHT_RESERVE + BRAND_INSET}px`);
+    // The segment spans the 48px icon rail plus the sheet sidebar (+1px edge).
+    expect(segment.style.width).toBe('313px');
+  });
+
+  // #1481 — the segment follows the user's dragged width (DESIGN.md: the
+  // titlebar's left segment is width-matched to the sidebar).
+  it('tracks a resized sidebar width', () => {
+    act(() => useStore.setState({ sidebarPosition: 'left', sidebarVisible: true, sidebarWidth: 332 }));
+    const { segment } = render();
+    expect(segment.style.width).toBe('381px');
   });
 
   it('미니 사이드바(48px): 세그먼트가 예약보다 좁으니 헤더가 예약을 진다', () => {
     act(() => useStore.setState({ sidebarPosition: 'left', sidebarVisible: false }));
     const { header, segment } = render();
     expect(header.style.paddingLeft).toBe(`${MAC_TRAFFIC_LIGHT_RESERVE}px`);
-    expect(segment.style.paddingLeft).toBe('');
+    expect(segment.style.paddingLeft).toBe(`${BRAND_INSET}px`);
   });
 });

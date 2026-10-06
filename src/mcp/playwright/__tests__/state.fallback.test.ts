@@ -8,25 +8,37 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 // Mock the RPC transport. __tests__/ -> playwright/ -> mcp/, so ../../wmux-client
 // resolves to src/mcp/wmux-client.
 // #517: tool handlers are wrapped in withAutomationLease, which issues
-// browser.lease.* RPCs around the real operation. Keep those transparent to
-// this suite's call-sequence assertions: lease traffic is answered inline
-// ({ token: null } → the helper proceeds unleased, no renew/release) and only
-// non-lease methods reach the recorded mock.
+// browser.lease.* RPCs around the real operation — and browser tools resolve
+// the surface a call that names none belongs to, one browser.cdp.info ahead of
+// that. Keep both transparent to this suite's call-sequence assertions:
+// infrastructure traffic is answered inline ({ token: null } → the helper
+// proceeds unleased, no renew/release; no targets → no surface to pin) and only
+// the operation's own methods reach the recorded mock.
 const { mockSendRpc } = vi.hoisted(() => ({ mockSendRpc: vi.fn() }));
 vi.mock('../../wmux-client', () => ({
   sendRpc: (method: string, ...args: unknown[]) =>
-    typeof method === 'string' && (method.startsWith('browser.lease.') || method === 'browser.lifecycle.get')
-      ? Promise.resolve({ token: null })
+    typeof method === 'string'
+    && (method.startsWith('browser.lease.')
+      || method === 'browser.lifecycle.get'
+      || method === 'browser.cdp.info'
+      || method === 'browser.tabs'
+      || method === 'browser.surface.adopt'
+      || method === 'browser.open')
+      ? Promise.resolve({ token: null, targets: [], ok: false })
       : mockSendRpc(method, ...args),
 }));
 
-// Mock PlaywrightEngine so getPage() is controllable per test.
+// Mock PlaywrightEngine so getPage() is controllable per test. The live
+// agent-window answer defaults to "not confined" so the packaged/builtin cases
+// below are untouched by the profile-wide cookie refusal.
 const getPage = vi.fn();
+const isLiveWriteConfined = vi.fn(async () => false);
 vi.mock('../PlaywrightEngine', () => ({
-  PlaywrightEngine: { getInstance: () => ({ getPageForScope: getPage }) },
+  PlaywrightEngine: { getInstance: () => ({ getPageForScope: getPage, isLiveWriteConfined }) },
 }));
 
 import { registerStateTools } from '../tools/state';
+import { __resetSurfaceRoutingForTesting } from '../surfaceRouting';
 
 const browserToolDeps = { resolveWorkspaceId: vi.fn(async () => 'ws-test') };
 
@@ -54,6 +66,9 @@ const emulate = tools.get('browser_emulate')!;
 const resize = tools.get('browser_resize')!;
 
 beforeEach(() => {
+  // Per-connection pin: no broker scope here, so it lives in the module
+  // fallback and would leak between cases.
+  __resetSurfaceRoutingForTesting();
   browserToolDeps.resolveWorkspaceId.mockClear();
   browserToolDeps.resolveWorkspaceId.mockResolvedValue('ws-test');
   mockSendRpc.mockReset();
@@ -73,7 +88,11 @@ describe('browser_cookies RPC fallback', () => {
       workspaceId: 'ws-test',
       surfaceId: 's1',
     });
-    expect(getPage).toHaveBeenCalledWith({ workspaceId: 'ws-test', surfaceId: 's1' });
+    // A cookie read stays a read — the live write gate does not touch it.
+    expect(getPage).toHaveBeenCalledWith(
+      { workspaceId: 'ws-test', surfaceId: 's1' },
+      { intent: 'read' },
+    );
     expect(browserToolDeps.resolveWorkspaceId).toHaveBeenCalledTimes(1);
     expect(res.isError).toBeUndefined();
     expect(res.content[0].text).toContain('"value": "abc"');
@@ -128,6 +147,30 @@ describe('browser_cookies RPC fallback', () => {
     await cookies({ action: 'clear' });
     expect(clearCookies).toHaveBeenCalledTimes(1);
     expect(mockSendRpc).not.toHaveBeenCalled();
+  });
+
+  it('refuses set/clear on Live Chrome under the agent-window policy — the mutation is profile-wide', async () => {
+    // page.context() on Live Chrome is the user's whole profile: clearCookies
+    // logs them out of every site, addCookies plants cookies every tab sends.
+    // Owning THIS tab proves nothing about that, so the write is refused.
+    const clearCookies = vi.fn().mockResolvedValue(undefined);
+    const addCookies = vi.fn().mockResolvedValue(undefined);
+    getPage.mockResolvedValue({ url: () => 'https://agent.test/', context: () => ({ clearCookies, addCookies }) });
+    isLiveWriteConfined.mockResolvedValueOnce(true).mockResolvedValueOnce(true);
+
+    const cleared = await cookies({ action: 'clear' });
+    expect(cleared.isError).toBe(true);
+    expect(cleared.content[0].text).toMatch(/^agent_window_scope: browser_cookies clear on Live Chrome/);
+    expect(clearCookies).not.toHaveBeenCalled();
+
+    const set = await cookies({ action: 'set', cookies: [{ name: 'sid', value: '1' }] });
+    expect(set.isError).toBe(true);
+    expect(set.content[0].text).toMatch(/^agent_window_scope: browser_cookies set on Live Chrome/);
+    expect(addCookies).not.toHaveBeenCalled();
+    // A read is untouched: the live binding is that consent.
+    getPage.mockResolvedValue({ context: () => ({ cookies: vi.fn().mockResolvedValue([]) }) });
+    const got = await cookies({ action: 'get' });
+    expect(got.isError).toBeUndefined();
   });
 });
 
@@ -230,10 +273,21 @@ describe('browser_emulate RPC fallback', () => {
   });
 
   it('signals device reset when device is null', async () => {
-    mockSendRpc.mockResolvedValue({ applied: ['device=reset (use browser_resize to set viewport)'] });
-    await emulate({ device: null });
+    // #1357: the packaged handler restores the viewport, disables touch and
+    // reloads, then reports what the page actually says. The tool renders that
+    // summary verbatim, so the caller sees the real state on this lane too.
+    mockSendRpc.mockResolvedValue({
+      applied: [
+        'device=reset (viewport 1280x720 restored, reloaded)',
+        'probe=1280x720 dpr=1 maxTouchPoints=0',
+      ],
+    });
+    const res = await emulate({ device: null });
     const params = mockSendRpc.mock.calls[0][1] as Record<string, unknown>;
     expect(params.deviceReset).toBe(true);
     expect(params.deviceMetrics).toBeUndefined();
+    expect(res.content[0].text).toContain('device=reset (viewport 1280x720 restored, reloaded)');
+    expect(res.content[0].text).toContain('probe=1280x720 dpr=1 maxTouchPoints=0');
+    expect(res.content[0].text).not.toContain('use browser_resize to set viewport');
   });
 });

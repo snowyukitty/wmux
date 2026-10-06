@@ -31,6 +31,7 @@ import { getWmuxHomeDir } from '../../shared/constants';
 import { getExecEnv } from '../../shared/execEnv';
 import { normalizeWorktreePath, WORKTASK_META_FILENAME, type WorkTaskMetaStamp } from '../../shared/workTask';
 import { metaDirForWorktree } from './TaskWorktreeManager';
+import { PHONE_WORKTREE_DIR_PREFIX } from '../../shared/phoneGitV1';
 
 const execFileAsync = promisify(execFile);
 
@@ -38,7 +39,8 @@ export type WorktaskScanCategory =
   | 'unmaterialized-open'
   | 'disk-missing'
   | 'preserved'
-  | 'orphan-dir';
+  | 'orphan-dir'
+  | 'phone-worktree';
 
 export interface WorktaskScanEntry {
   category: WorktaskScanCategory;
@@ -68,6 +70,13 @@ export interface ScanOpenTask {
   /** F1 — owner(부모) ws id. 이상 엔트리 close를 owner 스코프로 부르는 재료. */
   ownerWorkspaceId?: string;
   worktreePath?: string;
+  /**
+   * worktree:false fan-out task: its output folder. Such a task never has a
+   * worktree, so it is fully materialized without one — not
+   * 'unmaterialized-open'. Its folder lives under outputs/, outside the scan
+   * root, so nothing here can ever list it for deletion.
+   */
+  outputDir?: string;
   /**
    * A detached task (closed but its worktree/branch/PTY are still alive). When true,
    * that worktree is a "normally working, independent workspace" and is excluded
@@ -127,6 +136,7 @@ export class WorktaskScanService {
         // to protect and nothing to reconcile (the independent workspace was
         // already deleted) — skip it silently.
         if (t.detached) continue;
+        if (t.outputDir) continue;
         entries.push({
           category: 'unmaterialized-open',
           taskId: t.taskId,
@@ -173,6 +183,17 @@ export class WorktaskScanService {
       }
       // 무연결 디렉토리 — task.json으로 역추적(GC된 closed·크래시 잔여).
       const stamp = this.readStamp(dir);
+      // A phone-created worktree (contract item 5) has no task and no stamp.
+      // It is listed in its own category, never hidden, so the operator can
+      // see and reclaim it here like any other unlinked directory.
+      if (!stamp && path.basename(dir).startsWith(PHONE_WORKTREE_DIR_PREFIX)) {
+        entries.push({
+          category: 'phone-worktree',
+          worktreePath: dir,
+          detail: 'Created from the phone (branch phone/…) — check it, then remove it once no longer needed',
+        });
+        continue;
+      }
       entries.push({
         category: 'orphan-dir',
         ...(stamp?.taskId ? { taskId: stamp.taskId } : {}),

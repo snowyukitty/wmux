@@ -84,6 +84,46 @@ describe('PairedDevicesModal', () => {
     unmount();
   });
 
+  it("shows each device's kind and who is here now, and counts active devices in the footer", async () => {
+    deviceList.mockResolvedValue({
+      devices: [
+        { ...PHONE, kind: 'phone', activeNow: true },
+        { ...OLD, deviceId: 'dev-laptop', name: 'Laptop', kind: 'computer', activeNow: false },
+        { ...OLD, kind: 'unknown' },
+      ],
+    });
+    const { container, unmount } = render(<PairedDevicesModal onClose={() => { /* noop */ }} />);
+    await flush();
+
+    const kinds = Array.from(container.querySelectorAll('[role="img"]')).map((el) => el.getAttribute('aria-label'));
+    expect(kinds).toEqual(['Phone', 'Computer', 'Device']);
+    expect(container.textContent).toContain('Active now');
+    // Exactly the one active device reads "Active now"; the others keep a timestamp.
+    expect((container.textContent ?? '').match(/Active now/g)).toHaveLength(1);
+    expect(container.textContent).toContain('3 paired · 1 active now');
+
+    unmount();
+  });
+
+  it('counts nothing as active right after a revoke', async () => {
+    deviceList
+      .mockResolvedValueOnce({ devices: [{ ...PHONE, kind: 'phone', activeNow: true }] })
+      .mockResolvedValueOnce({ devices: [{ ...PHONE, kind: 'phone', activeNow: false, revokedAt: NOW }] });
+    const { container, unmount } = render(<PairedDevicesModal onClose={() => { /* noop */ }} />);
+    await flush();
+    expect(container.textContent).toContain('1 paired · 1 active now');
+
+    const btn = revokeButtons(container)[0]!;
+    act(() => { btn.click(); });
+    await flush();
+    act(() => { btn.click(); });
+    await flush();
+
+    expect(container.textContent).toContain('0 paired · 0 active now');
+    expect(container.textContent).not.toContain('Active now');
+    unmount();
+  });
+
   // Revocation is permanent and the rows look alike. One stray click next to
   // the wrong name must not be able to cut a device off.
   it('does not revoke on the first click — it asks first', async () => {
@@ -267,16 +307,9 @@ describe('PairedDevicesModal', () => {
     const { container, unmount } = render(<PairedDevicesModal onClose={() => { /* noop */ }} />);
     await flush();
 
-    const box = container.querySelector('input[type="checkbox"]') as HTMLInputElement;
-    // React tracks `checked` behind a value setter, so assigning the property
-    // directly is invisible to onChange — same trick the sibling suites use.
-    const setChecked = Object.getOwnPropertyDescriptor(
-      window.HTMLInputElement.prototype, 'checked',
-    )!.set!;
-    act(() => {
-      setChecked.call(box, !box.checked);
-      box.dispatchEvent(new Event('click', { bubbles: true }));
-    });
+    // The grant is the shared Checkbox primitive (role="checkbox").
+    const box = container.querySelector('[role="checkbox"]') as HTMLButtonElement;
+    act(() => { box.click(); });
     await flush();
 
     expect(container.textContent).toContain('daemon is not running');

@@ -19,6 +19,8 @@ import {
   loadDeckAutonomy,
   setWorkspaceAutonomy,
   setWorkspaceMode,
+  deleteWorkspaceAutonomy,
+  onAutonomyWritten,
   getDeckAutonomyPath,
   type AgentMode,
 } from '../deckAutonomyStore';
@@ -228,5 +230,70 @@ describe('deckAutonomyStore', () => {
     const r = await setWorkspaceMode('bad key!', 'danger', dir);
     expect(r).toEqual({ ...DEFAULT_AUTONOMY });
     expect(loadDeckAutonomy(dir)).toEqual({});
+  });
+
+  describe('deleteWorkspaceAutonomy', () => {
+    it('deletes an existing workspace, notifies write listeners, and leaves other workspaces intact', async () => {
+      await setWorkspaceMode('ws-1', 'danger', dir);
+      await setWorkspaceMode('ws-2', 'assist', dir);
+
+      let listenerFired = 0;
+      const unsub = onAutonomyWritten(() => {
+        listenerFired++;
+      });
+
+      const deleted = await deleteWorkspaceAutonomy('ws-1', dir);
+      expect(deleted).toBe(true);
+      expect(listenerFired).toBe(1);
+
+      const all = loadDeckAutonomy(dir);
+      expect(all['ws-1']).toBeUndefined();
+      expect(all['ws-2']).toBeDefined();
+      expect(all['ws-2'].mode).toBe('assist');
+
+      // Direct file check
+      const raw = JSON.parse(fs.readFileSync(getDeckAutonomyPath(dir), 'utf8'));
+      expect(raw['ws-1']).toBeUndefined();
+      expect(raw['ws-2']).toBeDefined();
+
+      unsub();
+    });
+
+    it('returns false for absent workspace without calling listeners or re-creating default', async () => {
+      await setWorkspaceMode('ws-2', 'assist', dir);
+
+      let listenerFired = 0;
+      const unsub = onAutonomyWritten(() => {
+        listenerFired++;
+      });
+
+      const deleted = await deleteWorkspaceAutonomy('ws-absent', dir);
+      expect(deleted).toBe(false);
+      expect(listenerFired).toBe(0);
+
+      const all = loadDeckAutonomy(dir);
+      expect(all['ws-absent']).toBeUndefined();
+      expect(all['ws-2']).toBeDefined();
+
+      unsub();
+    });
+
+    it('returns false for invalid workspace ID without error', async () => {
+      expect(await deleteWorkspaceAutonomy('', dir)).toBe(false);
+      expect(await deleteWorkspaceAutonomy('bad workspace ID!', dir)).toBe(false);
+    });
+  });
+});
+
+describe('concurrent writers', () => {
+  it('a set and a delete for different workspaces both survive', async () => {
+    await setWorkspaceMode('ws-a', 'danger', dir);
+    await setWorkspaceMode('ws-b', 'assist', dir);
+    // Unserialized, both read the same snapshot and the later write won: the
+    // delete would resurrect ws-a's danger mode, or the set would revive ws-b.
+    await Promise.all([setWorkspaceMode('ws-a', 'off', dir), deleteWorkspaceAutonomy('ws-b', dir)]);
+    const all = loadDeckAutonomy(dir);
+    expect(all['ws-a']?.mode).toBe('off');
+    expect(all['ws-b']).toBeUndefined();
   });
 });

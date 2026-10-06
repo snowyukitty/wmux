@@ -10,10 +10,11 @@ different routes, and you want **one** of them, not both.
 | Codex floor | any | **0.141.0** |
 | Reports | turn complete | turn complete, turn start, session start, approval pause |
 | Needs operator approval | no | **yes** (trust gate) |
-| Installed by wmux | yes (`lifecycleIntegrations`) | no — see *Installation* |
+| Installed by wmux | yes (`lifecycleIntegrations`) | yes — approve-then-verify, see *Installation* |
 
-The notify program is what ships today. The hooks bridge is the replacement,
-and it is not wired into the installer yet for the reason in *Installation*.
+The notify program is what shipped first. The hooks bridge is the
+replacement: it reports everything the notify program does plus turn start,
+session start, and approval pauses.
 
 ## Why the hooks bridge exists
 
@@ -69,7 +70,9 @@ vocabulary — a shell call arrives as `tool_name: "Bash"`. A captured `Stop`:
 
 **Pane environment is inherited.** `WMUX_PTY_ID` set on the Codex process
 reaches the hook unchanged, so pane attribution works exactly as it does for
-Kiro and Claude.
+Kiro and Claude — as long as that Codex process runs the turn itself. Under
+Codex 0.157+'s shared server it does not; see
+[Shared Codex server](#shared-codex-server-1523).
 
 **Resume binding is possible**, unlike Kiro. `SessionStart.source` is
 `"startup"` on a fresh session and `"resume"` on `codex … resume`, with the
@@ -180,41 +183,60 @@ Deliberately unmapped, each for its own reason — the full argument is in the
 
 ## Installation
 
-**Not wired up.** `installLifecycleIntegrations` writes the notify program and
-stops there.
+**Wired up — approve-then-verify.** `wmux setup-hooks` now installs both
+Codex bridges. Writing the block is deliberately **not** the end of the
+install, because Codex requires an operator to trust a hook before it runs,
+gives no warning when it has not been trusted, and a programmatic installer
+almost certainly should not be able to pre-trust its own hook. An installer
+that wrote the block and reported success would be reporting a lie — the pane
+would go on being screen-scraped and nothing would say so.
 
-This is not an oversight, and it is a different shape of problem from Kiro's.
-For Kiro, writing the file *was* the whole job and only an account was missing.
-Here, writing the file is explicitly **not** the job: Codex requires an operator
-to trust the hook before it runs, it gives no warning when it has not been
-trusted, and a programmatic installer almost certainly should not be able to
-pre-trust its own hook. So an installer that wrote this block and reported
-success would be reporting a lie — the pane would go on being screen-scraped
-and nothing would say so.
+So the flow is:
 
-What an installer will have to do instead is write the block, then tell the
-operator to approve it in Codex, then verify it actually fires. The third step
-is the one that needs designing, and it needs a machine with a working Codex
-login to design against.
+1. `wmux setup-hooks` — writes the bridge to the stable managed location
+   (`~/.wmux/hooks/wmux-codex-hooks-bridge.mjs`, refreshed on every run) and
+   appends the marker-bracketed `[[hooks.*]]` block to `$CODEX_HOME/config.toml`
+   (default `~/.codex/config.toml`). It refuses to write when:
+   - `codex --version` cannot be probed or is below **0.141.0** (fail closed —
+     0.140.0 parses the block, advertises the feature, and fires nothing);
+   - config.toml already has ANY `[[hooks.*]]` the wmux markers cannot claim
+     (skip-if-foreign, the notify lane's rule applied one level wider);
+   - the config is unparseable, or a hand-pasted wmux block is missing its
+     end marker (the installer never guesses a region boundary).
+2. **Approve** — start Codex interactively and approve the wmux hooks when it
+   asks. Until then Codex silently runs nothing; wmux's status says so.
+3. **Verify** — `wmux setup-hooks --status` reports the honest verdict:
+   `WRITTEN but NOT trusted` until the bridge has actually fired after the
+   block was written, `ACTIVE` once it has.
 
-Until then, manual setup:
+The verdict is evidence-based, not file-based: the installer stamps when it
+wrote the block (`~/.wmux/codex-hooks-install.json`), and the bridge appends
+one JSON line per firing to `~/.wmux/codex-hooks.log`. A log entry newer than
+the stamp is the only thing that reads as installed — it proves the operator
+approved AND Codex actually spawned the hook. Idempotent re-runs never move
+the stamp, and a refresh that changes the bridge path resets it (re-approval
+genuinely required, and the status says so).
+
+Manual setup (no `wmux setup-hooks`) still works:
 
 1. Check your version: `codex --version` must be **0.141.0 or newer**.
 2. Copy the bridge somewhere **stable** — not the repo checkout:
    ```sh
-   mkdir -p ~/.wmux/bridges
-   cp integrations/codex/bin/wmux-codex-hooks-bridge.mjs ~/.wmux/bridges/
+   mkdir -p ~/.wmux/hooks
+   cp integrations/codex/bin/wmux-codex-hooks-bridge.mjs ~/.wmux/hooks/
    ```
    The path goes into `config.toml` and into the trust hash Codex records
    against it. Pointing it at a working tree means moving, renaming, or
-   re-cloning the checkout silently un-trusts the hook — and an un-trusted hook
-   does not run and does not say so, which is the exact failure mode above.
-   Re-copy after a `git pull` that touches the bridge, then re-approve.
+   re-cloning the checkout silently un-trusts the hook — and an un-trusted
+   hook does not run and does not say so, which is the exact failure mode
+   above. Re-copy after a `git pull` that touches the bridge, then re-approve.
 3. Get the block (substitute the path you copied to):
    ```sh
-   node -e "import('./integrations/codex/hooks/wmuxHooks.mjs').then(m=>console.log(m.renderCodexHooksToml(process.env.HOME + '/.wmux/bridges/wmux-codex-hooks-bridge.mjs')))"
+   node -e "import('./integrations/codex/hooks/wmuxHooks.mjs').then(m=>console.log(m.renderCodexHooksToml(process.env.HOME + '/.wmux/hooks/wmux-codex-hooks-bridge.mjs')))"
    ```
 4. Append it to `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`).
+   A manually-installed block has no install stamp, so `--status` counts ANY
+   firing as active — the honest floor for a block wmux did not write.
 5. Start Codex interactively and **approve the hooks when it asks**. If it never
    asks, the hooks are not registered — re-check step 4.
 6. Confirm: run a turn, then look for `"outcome":"ok"` lines in
@@ -223,6 +245,121 @@ Until then, manual setup:
 If you use this bridge, remove the `notify = [...]` line — otherwise every turn
 reports `agent.stop` twice. The `HookSignalRouter` dedup window swallows the
 duplicate, so nothing breaks, but the second spawn is pure waste.
+
+## Shared Codex server (#1523)
+
+Codex 0.157+ runs turns in one shared background server per account
+(`codex app-server --listen unix:// --managed-daemon`), started by whichever
+Codex needed it first and keeping that process's environment. A program Codex
+spawns from that server — `notify` included — inherits the `WMUX_*` variables
+of the pane that started the server, possibly a closed pane or a pane of
+another wmux instance, not the pane whose turn finished. The payload names no
+pane either.
+
+Both bridges inspect their spawning process, skipping wrappers that re-run
+an entry point, including sh, cmd and PowerShell command wrappers. A
+pane-side `SessionStart` with confirmed top-level rollout metadata records the thread's pane,
+workspace, surface, instance suffix and endpoint overrides under
+`$CODEX_HOME/wmux-thread-owners` (default `~/.codex/wmux-thread-owners`). The
+index is account-scoped because one app-server can serve several wmux
+instances. It contains routing metadata only, never tokens or conversation
+content. Writes are atomic. Starting or resuming another thread in the same
+pane invalidates its previous ownership record; attaching a thread in another
+pane transfers ownership there. Closing the pane removes its owner pointer.
+Relay records use the account the relay actually attached, even if pane
+environment variables name a different account.
+
+For wmux-managed shared-server launches, the daemon also writes this index
+from the TUI relay's confirmed foreground selection, before forwarding the
+start/resume reply to the TUI. A live empty selection invalidates the old
+record even after a restart; a transport interruption retains it. Invalidation
+and publication failures abort selection forwarding. Old pointers are removed
+before publication, so a full disk cannot leave a stale pair valid. This covers builds whose hooks
+all run inside the shared server, without trusting those hooks' environment.
+
+Shared-server notifications resolve the thread through that index and replace
+all inherited routing fields with the recorded owner's fields. A missing owner
+gets one 75 ms re-lookup before the signal is dropped. An unknown,
+unreadable or invalidated owner is dropped without sending, logging under the
+inherited instance, or writing a resume spool. There is no cwd fallback. A
+shared-server hook cannot establish or overwrite ownership. A TUI launched outside the managed relay that only fires server-side hooks
+has no proven owner, so its signals remain dropped.
+
+A confirmed per-pane process (including a stdio app-server) always uses its own
+pane environment, ignoring older registry records. Without a pane id it is
+dropped, including a direct launch outside wmux. An uninspectable parent with
+a pane id retains the legacy environment fallback, including permission hooks.
+Hooks skip ancestor lookup when no identity is inherited; using an existing
+owner in that case requires confirming a clean shared-server parent first. On WSL the launcher supplies the Linux parent's argv through
+`WMUX_CODEX_NOTIFIER_ARGV`, and the same rules apply. This routing does not
+require the user to pass `--no-daemon`.
+
+Both entry points use `wmux-codex-thread.mjs` for rollout classification.
+Sub-agent Stop and SessionStart hooks emit `agent.subagent_stop` without an
+`agentSessionId` or transcript path; nested prompt and approval hooks are
+ignored. An unconfirmed SessionStart cannot record ownership, and only a Stop
+with confirmed top-level rollout metadata carries a resume-binding id. Each
+hook classifies its rollout once and reuses that result. Shared sub-agent
+notifications resolve the pane through the root
+thread's ownership. They never replace the pane's resume binding or spool.
+The shared module is shipped and installed beside both entry points.
+
+### MCP and A2A identity under the shared server (#1778)
+
+The wmux MCP server Codex spawns is the shared server's child too, so the
+PID-map walk climbs through the server instead of reaching a pane, and its
+inherited `WMUX_*` env names the pane that started the server. Codex names the
+conversation on every `tools/call` in `_meta.threadId`. When a call carries a
+thread id **and** the MCP server's parent is positively a shared app-server
+(`app-server --managed-daemon`, or a non-stdio `--listen`; wrappers that
+re-run the MCP entry itself are skipped), the server resolves that call's pane
+from the ownership index above and requires it to be a live pid-map anchor of
+this wmux instance. The parent must be the Codex executable itself (a node
+shim or another program carrying the same arguments does not count). The
+workspace is the one main resolves now. Nothing about it is cached, so a
+resumed thread, a closed pane or a restarted server is seen on the next call.
+The owner index is read from `CODEX_HOME`, which Codex does not pass to MCP
+servers, so the server also derives it from the shared server's executable
+path (`<CODEX_HOME>/packages/app-server-daemon/releases/<version>/bin/codex`).
+The parent's argv comes from `/proc` on Linux and from `ps` `comm` plus
+`args` elsewhere, so an executable path with spaces stays one token; an argv
+line that cannot be aligned counts as uninspectable, not as another parent.
+
+Where an owner can be recorded (the pane relay, off Windows), a call from a
+shared server is identified by its thread only. The PID walks, the cached
+identity, the commander token, the `WMUX_WORKSPACE_ID` / `WMUX_PTY_ID` env
+hints, the external-client terminal claim and the process-wide computer-use
+instance id are not used, and tools that would otherwise fall back to the
+focused workspace (`pane_list`, `surface_list`, `pane_split`, `surface_new`)
+fail instead. A call fails with a `Workspace identity unknown`
+error that names the reason instead of acting as another pane when:
+
+- its thread has no live owner (no owning pane, owning pane closed, another
+  wmux instance);
+- it carries no valid `_meta.threadId`;
+- the parent process could not be inspected (a timeout or `ps` failure), or
+  wmux is not reachable. Both are retryable, and an uninspectable parent is
+  never remembered.
+
+Any other parent — Claude Code, `codex --no-daemon`, a stdio app-server, a
+script run by Codex's shell tool, an external MCP client — cannot claim a
+thread id and keeps the existing resolution. A call without a thread id whose
+parent could not be inspected also keeps it.
+
+On Windows the pane relay is not used, so no owner is recorded for a session
+behind the shared server. There a call whose thread has no owner record keeps
+the existing resolution: the walk to the pane that started the server, which is
+right for a single Codex pane. A thread that does have a live owner still
+resolves to it. A Windows owner writer is a separate follow-up.
+
+Diagnostics go to the MCP server's stderr: `identity: parent shared-server`,
+`identity: codex-thread HIT ws=… pty=…` or `identity: codex-thread MISS <reason>`.
+
+A thread has an owner only when a pane recorded one: wmux's own Codex launches
+(through the pane relay, off Windows) and a pane-side `SessionStart` do. A
+`codex` typed in a shell that starts or joins the shared server records none
+(the shell guard from #1584 covers bash and zsh only), so off Windows its A2A
+calls fail closed until it is started through wmux or with `--no-daemon`.
 
 ## Identity on the main pipe (#1111)
 

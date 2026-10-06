@@ -1,0 +1,84 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
+import { githubRepository, sessionPullRequests } from '../sessionPullRequests';
+import type { GitRunner } from '../sessionDiff';
+const git: GitRunner = async args => ({ok:true,stdout:args.includes('remote') ? 'git@github.com:team/project.git\n' : 'feature/test\n',stderr:''});
+describe('phone PR status', () => {
+  it('only accepts credential-free GitHub remotes', () => {
+    expect(githubRepository('https://github.com/team/project.git')).toBe('team/project');
+    expect(githubRepository('git@github.com:team/project.git')).toBe('team/project');
+    for (const url of ['https://github.com.evil.invalid/team/repo', 'https://secret@github.com/team/repo', 'https://evil.invalid/repo', 'file:///tmp/repo']) {
+      expect(githubRepository(url)).toBeNull();
+    }
+  });
+  it('passes a fixed repo and branch and validates response links', async () => {
+    expect(await sessionPullRequests('/repo', git, async (repo, branch) => {
+      expect(repo).toBe('team/project'); expect(branch).toBe('feature/test');
+      return [{number:7,title:'Review',state:'OPEN',url:'https://github.com/team/project/pull/7',isDraft:true,headRefName:'feature/test',headRepository:{nameWithOwner:'team/project'}}];
+    })).toMatchObject({state:'available',items:[{number:7,isDraft:true}]});
+    expect(await sessionPullRequests('/repo', git, async () => [{number:7,title:'Review',state:'OPEN',url:'https://evil.invalid',isDraft:false}]))
+      .toEqual({state:'unavailable',items:[]});
+  });
+  it('excludes same-name branches in another fork and deleted head repositories', async () => {
+    const row = {number:7,title:'Review',state:'OPEN',url:'https://github.com/team/project/pull/7',isDraft:false,headRefName:'feature/test'};
+    expect(await sessionPullRequests('/repo', git, async () => [
+      {...row,headRepository:{nameWithOwner:'someone/project'}},
+      {...row,headRepository:null},
+      {...row,headRefName:'other',headRepository:{nameWithOwner:'team/project'}},
+      {...row,headRepository:{nameWithOwner:'TEAM/Project'}},
+    ])).toEqual({state:'available',items:[{number:7,title:'Review',state:'OPEN',url:row.url,isDraft:false}]});
+  });
+  it('refuses missing head identity instead of trusting the branch filter', async () => {
+    expect(await sessionPullRequests('/repo', git, async () => [
+      {number:7,title:'Review',state:'OPEN',url:'https://github.com/team/project/pull/7',isDraft:false},
+    ])).toEqual({state:'unavailable',items:[]});
+  });
+  it('does not claim no PR after a full page of unrelated forks', async () => {
+    expect(await sessionPullRequests('/repo', git, async () => Array.from({length:100}, (_, i) => ({
+      number:i+1,title:'Review',state:'OPEN',url:`https://github.com/team/project/pull/${i+1}`,isDraft:false,
+      headRefName:'feature/test',headRepository:{nameWithOwner:'someone/project'},
+    })))).toEqual({state:'unavailable',items:[]});
+  });
+  it('distinguishes no PR from missing CLI or authentication', async () => {
+    expect(await sessionPullRequests('/repo', git, async () => [])).toEqual({state:'available',items:[]});
+    expect(await sessionPullRequests('/repo', git, async () => { throw new Error('not signed in'); })).toEqual({state:'unavailable',items:[]});
+  });
+});
+
+// A Finder-launched daemon has launchd's PATH; gh is typically a Homebrew or
+// per-user install, so the real runner must search the exec fallbacks too.
+// The spawn is observed rather than run: a real gh elsewhere on the fallback
+// PATH (e.g. Homebrew's) would otherwise answer instead of the fixture.
+describe.skipIf(process.platform === 'win32')('phone PR status under a Finder-launched PATH', () => {
+  it('spawns gh with the per-user fallback dir on PATH and the sanitized env kept', async () => {
+    const saved = { PATH: process.env.PATH, HOME: process.env.HOME, GIT_DIR: process.env.GIT_DIR };
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-gh-path-'));
+    try {
+      vi.resetModules(); // getExecEnv caches per module instance
+      process.env.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+      process.env.HOME = home;
+      process.env.GIT_DIR = '/elsewhere';
+      let seen: NodeJS.ProcessEnv | undefined;
+      vi.doMock('node:child_process', () => ({
+        execFile: (_file: string, _args: string[], options: { env: NodeJS.ProcessEnv }, callback: (error: Error | null, stdout: string) => void) => {
+          seen = options.env;
+          callback(null, '[]');
+        },
+      }));
+      const fresh = await import('../sessionPullRequests');
+      expect(await fresh.sessionPullRequests('/repo', git)).toEqual({ state: 'available', items: [] });
+      expect((seen?.PATH ?? '').split(':')).toContain(path.join(home, '.local', 'bin'));
+      expect(seen?.PATH?.startsWith('/usr/bin:/bin:/usr/sbin:/sbin')).toBe(true);
+      expect(seen?.GIT_DIR).toBeUndefined(); // still the buildGitEnv allowlist
+    } finally {
+      vi.doUnmock('node:child_process');
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});

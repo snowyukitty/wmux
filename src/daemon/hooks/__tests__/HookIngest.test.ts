@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   HookIngest,
+  gateInputIsCritical,
   resolveSessionIdForSignal,
   type DetectorHeldEventData,
   type HookAgentEventData,
@@ -103,6 +104,16 @@ describe('HookIngest', () => {
     vi.useRealTimers();
   });
 
+  it('hands every resolved signal, payload intact, to onResolvedSignal', () => {
+    const seen: Array<[string, AgentSignal]> = [];
+    const withHook = new HookIngest({ ...fixture.deps, onResolvedSignal: (id: string, signal: AgentSignal) => { seen.push([id, signal]); } });
+    const failure = makeSignal({ ptyId: 'pty-a', kind: 'agent.stop_failure', payload: { error: 'rate_limit', last_assistant_message: "You've hit your limit" } });
+    withHook.handle(failure);
+    expect(seen).toEqual([['pty-a', failure]]);
+    withHook.handle(makeSignal({ ptyId: 'nobody' , cwd: '/elsewhere' }));
+    expect(seen).toHaveLength(1);
+  });
+
   describe('envelope validation', () => {
     it('rejects anything that is not a canonical AgentSignal', () => {
       expect(ingest.handle(null).reason).toBe('invalid-envelope');
@@ -146,6 +157,27 @@ describe('HookIngest', () => {
       expect(data.hookKind).toBe('agent.stop');
       expect(data.decision).toBe('emit');
       expect(data.signal.kind).toBe('agent.stop');
+    });
+
+    it('#1463 — a SubagentStop after the turn ended does not reopen it', () => {
+      // Live dogfood (Claude Code 2.1.281): every Stop was followed ~6 s later
+      // by a background SubagentStop, whose `running` repainted the finished
+      // pane Running for two minutes.
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.user_prompt_submit' }));
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.subagent_stop' }));
+      // Inside the turn it is still the turn's work.
+      expect(fixture.emitted.at(-1)?.data).toMatchObject({ status: 'running', hookKind: 'agent.subagent_stop' });
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.stop' }));
+      vi.advanceTimersByTime(DEFAULT_ALARM_WINDOW_MS);
+      expect(fixture.emitted.at(-1)?.data).toMatchObject({ status: 'complete', hookKind: 'agent.stop' });
+      const count = fixture.emitted.length;
+      vi.advanceTimersByTime(6_000);
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.subagent_stop' }));
+      expect(fixture.emitted).toHaveLength(count);
+      // The next turn start reopens it, and its subagents count again.
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.user_prompt_submit' }));
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.subagent_stop' }));
+      expect(fixture.emitted.at(-1)?.data).toMatchObject({ status: 'running', hookKind: 'agent.subagent_stop' });
     });
 
     it('maps subagent_stop and awaiting_input to their own shapes', () => {
@@ -342,6 +374,29 @@ describe('HookIngest', () => {
       expect(fixture.emitted).toHaveLength(0);
     });
 
+    it('#1463 — hands the answer to the daemon so the pane leaves Needs you now', () => {
+      // The key check cannot see every answer (a mouse click on an option), so
+      // the agent's own "answered" signal is the release path of last resort.
+      // A permission gate answer is not a question answer and stays out.
+      const answered: Array<[string, number]> = [];
+      const withHook = new HookIngest({
+        ...fixture.deps,
+        onInputAnswered: (id: string, at: number) => { answered.push([id, at]); },
+      });
+      withHook.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.permission_answered' }));
+      expect(answered).toEqual([]);
+      // Routed only by cwd/workspace: a guess, which could be a sibling pane's
+      // agent answering its own question — never released on that.
+      withHook.handle(makeSignal({ kind: 'agent.input_answered', workspaceId: 'ws-1' }));
+      // It DID resolve to pty-a (the card sweep ran) — only the release is withheld.
+      expect(fixture.approvalsCalls.at(-1)).toEqual({ sessionId: 'pty-a', reason: 'answered-locally', kind: 'awaiting_input' });
+      expect(answered).toEqual([]);
+      withHook.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.input_answered', ts: 2_000 }));
+      expect(answered).toEqual([['pty-a', 2_000]]);
+      // The status still travels on the daemon's `answered` broadcast, never here.
+      expect(fixture.emitted).toHaveLength(0);
+    });
+
     it('scopes the sweep to awaiting_input so a parallel permission gate survives', () => {
       // A turn can open a gate and an AskUserQuestion at once. Answering the
       // question locally says nothing about the gate, and expiring the gate
@@ -457,6 +512,7 @@ describe('HookIngest', () => {
       const health = ingest.health();
       expect(health.latency.total).toBe(0);
       expect(health.latency.workspaceMatchRate).toEqual({ matched: 0, missed: 0 });
+      expect(health.refused).toEqual({ claimedPaneNotLive: 0, gateBypassedOnRefusedClaim: 0 });
       // Nothing recorded yet → no partial window to report.
       expect(health.flood).toBeNull();
     });
@@ -898,6 +954,61 @@ describe('HookIngest', () => {
       });
     }
 
+    // The summary stops at 200 characters; the danger verdict must not.
+    it('flags a gate critical from the FULL command, past the summary cut', () => {
+      const base = makeDeps();
+      const seen: Array<{ toolInputSummary?: string; risk?: 'critical' }> = [];
+      const ingestWithGate = new HookIngest({
+        ...base.deps,
+        gateConfig: () => ({ gatedTools: ['Bash'] }),
+        approvals: {
+          ...base.deps.approvals,
+          noteGateAwaiting: (input) => {
+            seen.push(input);
+            return 'gate-id';
+          },
+        },
+      });
+      const command = `echo ${'a'.repeat(250)} && rm -rf ./build`;
+      ingestWithGate.handlePermissionGate(makeSignal({
+        kind: 'agent.awaiting_permission',
+        ptyId: 'pty-a',
+        payload: { tool_name: 'Bash', tool_input: { command } },
+      }));
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.toolInputSummary).not.toContain('rm -rf');
+      expect(seen[0]!.risk).toBe('critical');
+
+      seen.length = 0;
+      ingestWithGate.handlePermissionGate(makeSignal({
+        kind: 'agent.awaiting_permission',
+        ptyId: 'pty-a',
+        payload: { tool_name: 'Bash', tool_input: { command: 'ls -la' } },
+      }));
+      expect(seen[0]!.risk).toBeUndefined();
+    });
+
+    it('finds a critical command in nested input: MultiEdit edits[] and an MCP argument tree', () => {
+      expect(gateInputIsCritical({ tool_input: { file_path: 'a.sh', edits: [{ old_string: 'x', new_string: 'rm -rf /tmp/y ' }] } })).toBe(true);
+      expect(gateInputIsCritical({ tool_input: { args: { steps: [{ run: { sh: 'git push --force origin main' } }] } } })).toBe(true);
+      expect(gateInputIsCritical({ tool_input: { edits: [{ old_string: 'a', new_string: 'b' }] } })).toBe(false);
+      // Past the walk's bounds the unread rest is not evidence of safety.
+      expect(gateInputIsCritical({ tool_input: { content: 'a'.repeat(1_000_001) } })).toBe(true);
+    });
+
+    it('marks a gate exact only when the hook named the pane, inexact when routed by cwd', () => {
+      const base = makeDeps();
+      const seen: Array<{ attribution?: string }> = [];
+      const ingestWithGate = new HookIngest({
+        ...base.deps,
+        gateConfig: () => ({ gatedTools: ['Bash'] }),
+        approvals: { ...base.deps.approvals, noteGateAwaiting: (input) => { seen.push(input); return 'gate-id'; } },
+      });
+      ingestWithGate.handlePermissionGate(makeSignal({ kind: 'agent.awaiting_permission', ptyId: 'pty-a', payload: { tool_name: 'Bash' } }));
+      ingestWithGate.handlePermissionGate(makeSignal({ kind: 'agent.awaiting_permission', ptyId: undefined, payload: { tool_name: 'Bash' } }));
+      expect(seen.map((g) => g.attribution)).toEqual(['exact', 'inexact']);
+    });
+
     it('passes a bypassPermissions session straight through without opening a gate', () => {
       // The user launched with --dangerously-skip-permissions: re-asking is the
       // exact thing they opted out of, and with no phone attached every gated
@@ -912,6 +1023,28 @@ describe('HookIngest', () => {
       expect(emitted.at(-1)?.data.hookKind).toBe('agent.tool_started');
     });
 
+    it('opens no gate for a pane in the scheduled-run registry (and still gates others)', () => {
+      const base = makeDeps();
+      let gatesOpened = 0;
+      const ingestWithGate = new HookIngest({
+        ...base.deps,
+        gateConfig: () => ({ gatedTools: ['Bash'] }),
+        isAutomationPane: (id) => id === 'pty-a',
+        approvals: {
+          ...base.deps.approvals,
+          noteGateAwaiting: () => {
+            gatesOpened += 1;
+            return 'gate-id';
+          },
+        },
+      });
+      const result = ingestWithGate.handlePermissionGate(gateSignal());
+      expect(result.ok).toBe(true);
+      expect(result.gateId).toBeUndefined();
+      expect(gatesOpened).toBe(0);
+      expect(base.emitted.at(-1)?.data.hookKind).toBe('agent.tool_started');
+    });
+
     it('still gates the same tool when the session prompts (acceptEdits / default / absent)', () => {
       // acceptEdits auto-approves edits but still prompts for Bash, so its gate
       // stays meaningful — only bypassPermissions is a declared opt-out.
@@ -922,6 +1055,175 @@ describe('HookIngest', () => {
         expect(result.gateId, `mode=${String(mode)}`).toBe('gate-id');
         expect(gates(), `mode=${String(mode)}`).toBe(1);
       }
+    });
+  });
+
+  describe('#1397 — the orchestrator brain pane produces no approval record', () => {
+    // The brain's TUI is a live daemon session like any other, and every
+    // device-facing surface already refuses it. The approvals pipeline did not:
+    // a brain record was merely unlikely, because `ClaudePtyBrainAdapter` spawns
+    // the brain with `WMUX_HOOKS_TO_MAIN=1` and these hooks are therefore not
+    // armed for it. That is a property of one adapter's spawn profile, not a
+    // gate — so these drive the hooks AS IF they were armed, which is the case
+    // that has to hold.
+    function ingestFor(sessions: HookIngestSession[]) {
+      const base = makeDeps(sessions);
+      const awaitingInput: string[] = [];
+      const gates: string[] = [];
+      const ingestWithGate = new HookIngest({
+        ...base.deps,
+        gateConfig: () => ({ gatedTools: ['Bash'] }),
+        approvals: {
+          ...base.deps.approvals,
+          noteHookAwaitingInput: (input) => { awaitingInput.push(input.sessionId); },
+          noteGateAwaiting: (input) => { gates.push(input.sessionId); return 'gate-id'; },
+        },
+      });
+      return { ingestWithGate, awaitingInput, gates, emitted: base.emitted };
+    }
+
+    // Both marks, because either one alone can be the only one present: the env
+    // marker travels with the session record, the id prefix is what a listing
+    // without env still carries.
+    const brains: Array<[string, HookIngestSession]> = [
+      ['env marker', session({ id: 'pty-brain', env: { WMUX_WORKSPACE_ID: 'ws-1', WMUX_BRAIN_PTY: '1' } })],
+      ['id prefix', session({ id: 'brain-abc' })],
+    ];
+
+    it.each(brains)('opens no permission gate for a brain pane (%s)', (_label, brain) => {
+      const { ingestWithGate, gates, emitted } = ingestFor([brain]);
+
+      const result = ingestWithGate.handlePermissionGate(makeSignal({
+        kind: 'agent.awaiting_permission',
+        ptyId: brain.id,
+        payload: { tool_name: 'Bash' },
+      }));
+
+      // Refused as NOT GATED, exactly like a bypassPermissions session: the
+      // tool is allowed and the agent keeps its own local prompt, which is what
+      // happens today. A refusal that returned a gateId would block the brain
+      // on a card nobody can answer.
+      expect(result.ok).toBe(true);
+      expect(result.gateId).toBeUndefined();
+      expect(gates).toEqual([]);
+      expect(emitted.at(-1)?.data.hookKind).toBe('agent.tool_started');
+    });
+
+    it.each(brains)('raises no awaiting_input card for a brain pane (%s)', (_label, brain) => {
+      const { ingestWithGate, awaitingInput } = ingestFor([brain]);
+
+      ingestWithGate.handle(makeSignal({ kind: 'agent.awaiting_input', ptyId: brain.id }));
+
+      expect(awaitingInput).toEqual([]);
+    });
+
+    it('still records both for a worker pane', () => {
+      const worker = session({ id: 'pty-a' });
+      const { ingestWithGate, gates, awaitingInput } = ingestFor([worker]);
+
+      const gated = ingestWithGate.handlePermissionGate(makeSignal({
+        kind: 'agent.awaiting_permission',
+        ptyId: 'pty-a',
+        payload: { tool_name: 'Bash' },
+      }));
+      ingestWithGate.handle(makeSignal({ kind: 'agent.awaiting_input', ptyId: 'pty-a' }));
+
+      expect(gated.gateId).toBe('gate-id');
+      expect(gates).toEqual(['pty-a']);
+      expect(awaitingInput).toEqual(['pty-a']);
+    });
+  });
+
+  describe('Claude PermissionRequest is pane status only', () => {
+    // The approval card's keystroke map and screen check are built for an
+    // AskUserQuestion select. A permission dialog carries no question to show,
+    // so a card would let a phone press `1` on a Bash command nobody read.
+    function ingestTracking() {
+      const base = makeDeps([session({ id: 'pty-a' })]);
+      const awaitingInput: string[] = [];
+      const ingestWithCards = new HookIngest({
+        ...base.deps,
+        approvals: {
+          ...base.deps.approvals,
+          noteHookAwaitingInput: (input) => { awaitingInput.push(input.sessionId); },
+        },
+      });
+      return { ingestWithCards, awaitingInput, emitted: base.emitted };
+    }
+
+    it('broadcasts awaiting_input but raises no approval card', () => {
+      const { ingestWithCards, awaitingInput, emitted } = ingestTracking();
+
+      ingestWithCards.handle(makeSignal({
+        kind: 'agent.awaiting_input',
+        ptyId: 'pty-a',
+        payload: { hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'rm -rf build' } },
+      }));
+      vi.advanceTimersByTime(DEFAULT_ALARM_WINDOW_MS);
+
+      expect(awaitingInput).toEqual([]);
+      expect(emitted.at(-1)?.data).toMatchObject({ status: 'awaiting_input', source: 'hook' });
+    });
+
+    it('an AskUserQuestion awaiting_input still raises its card', () => {
+      const { ingestWithCards, awaitingInput } = ingestTracking();
+
+      ingestWithCards.handle(makeSignal({
+        kind: 'agent.awaiting_input',
+        ptyId: 'pty-a',
+        payload: { hook_event_name: 'PreToolUse', tool_name: 'AskUserQuestion' },
+      }));
+
+      expect(awaitingInput).toEqual(['pty-a']);
+    });
+
+    const PERMISSION_REQUEST = { hook_event_name: 'PermissionRequest', tool_name: 'Bash' };
+    const awaitingEmits = (base: { emitted: Array<{ data: HookAgentEventData }> }) =>
+      base.emitted.filter((e) => e.data.status === 'awaiting_input');
+
+    it('an answer inside the window cancels the held awaiting (no late re-lock)', () => {
+      const base = makeDeps([session({ id: 'pty-a' })]);
+      const ing = new HookIngest(base.deps);
+      ing.handle(makeSignal({ kind: 'agent.awaiting_input', ptyId: 'pty-a', payload: PERMISSION_REQUEST }));
+      vi.advanceTimersByTime(300);
+      ing.noteAnswered('pty-a', 'claude');
+      vi.advanceTimersByTime(DEFAULT_ALARM_WINDOW_MS * 2);
+      expect(awaitingEmits(base)).toEqual([]);
+    });
+
+    it('subagent tool activity during the window does not cancel it', () => {
+      const base = makeDeps([session({ id: 'pty-a' })]);
+      const ing = new HookIngest(base.deps);
+      ing.handle(makeSignal({ kind: 'agent.awaiting_input', ptyId: 'pty-a', payload: PERMISSION_REQUEST }));
+      ing.handle(makeSignal({ kind: 'agent.activity', ptyId: 'pty-a', payload: { tool_name: 'Grep' } }));
+      ing.notePaneWorking('pty-a', 'claude');
+      vi.advanceTimersByTime(DEFAULT_ALARM_WINDOW_MS);
+      expect(awaitingEmits(base)).toHaveLength(1);
+    });
+
+    it('the hook and the detector reporting one dialog produce one awaiting broadcast', () => {
+      const base = makeDeps([session({ id: 'pty-a' })]);
+      const ing = new HookIngest(base.deps);
+      ing.handle(makeSignal({ kind: 'agent.awaiting_input', ptyId: 'pty-a', payload: PERMISSION_REQUEST }));
+      vi.advanceTimersByTime(100);
+      const arb = ing.arbitrateDetector('pty-a', { agent: 'Claude Code', status: 'awaiting_input', message: 'Approval requested' });
+      expect(arb.decision).toBe('pending');
+      vi.advanceTimersByTime(DEFAULT_ALARM_WINDOW_MS * 2);
+      const detectorAwaiting = base.detectorEmitted.filter((e) => e.data.status === 'awaiting_input');
+      expect(awaitingEmits(base).length + detectorAwaiting.length).toBe(1);
+    });
+
+    it('leaves the Codex PermissionRequest card path as it was', () => {
+      const { ingestWithCards, awaitingInput } = ingestTracking();
+
+      ingestWithCards.handle(makeSignal({
+        kind: 'agent.awaiting_input',
+        agent: 'codex',
+        ptyId: 'pty-a',
+        payload: { hook_event_name: 'PermissionRequest', tool_name: 'Bash' },
+      }));
+
+      expect(awaitingInput).toEqual(['pty-a']);
     });
   });
 });
@@ -942,18 +1244,23 @@ describe('resolveSessionIdForSignal', () => {
 
   it('refuses a ptyId that claims the wrong workspace', () => {
     // Pane env is writable from inside the pane, so an authenticated hook must
-    // not be able to target a sibling pane by id. Falls back to cwd routing.
+    // not be able to target a sibling pane by id. Refused outright: guessing a
+    // pane by cwd/workspace for a signal that named another one misroutes it.
     expect(resolveSessionIdForSignal(
       makeSignal({ ptyId: 'pty-c', cwd: '/repo', workspaceId: 'ws-1' }),
       sessions,
-    )).toBe('pty-a');
+    )).toBeNull();
   });
 
-  it('ignores a ptyId that names no live session', () => {
+  it('refuses a ptyId that names no live session — no cwd/workspace fallback', () => {
     expect(resolveSessionIdForSignal(
       makeSignal({ ptyId: 'pty-gone', cwd: '/other' }),
       sessions,
-    )).toBe('pty-c');
+    )).toBeNull();
+    expect(resolveSessionIdForSignal(
+      makeSignal({ ptyId: 'pty-gone', cwd: '/other', workspaceId: 'ws-2' }),
+      sessions,
+    )).toBeNull();
   });
 
   it('resolves a lone pane in the claimed workspace when cwd cannot place it', () => {
@@ -996,5 +1303,176 @@ describe('resolveSessionIdForSignal', () => {
       session({ id: 'pty-new', cwd: '/repo', env: {}, lastActivity: '2026-02-01T00:00:00.000Z' }),
     ];
     expect(resolveSessionIdForSignal(makeSignal({ cwd: '/repo' }), tied)).toBe('pty-new');
+  });
+});
+
+describe('HookIngest — a signal whose claimed pane is gone is refused (#1523)', () => {
+  // The live bug: a Codex notify carrying the identity of a pane that has since
+  // closed. The dead ptyId used to be dropped and routing fell back to the
+  // workspace tier, where the ONE live pane left (a Claude pane) took the
+  // conversation — overwriting its resume binding.
+  const claudePane = session({
+    id: 'pty-claude',
+    cwd: '/repo',
+    env: { WMUX_WORKSPACE_ID: 'ws-1' },
+    resumeBinding: { agent: 'claude' },
+  });
+  const otherWorkspacePane = session({ id: 'pty-other', cwd: '/other', env: { WMUX_WORKSPACE_ID: 'ws-2' } });
+  const codexStop = (overrides: Partial<AgentSignal> = {}) => makeSignal({
+    kind: 'agent.stop',
+    agent: 'codex',
+    cwd: '/repo',
+    agentSessionId: 'codex-conv',
+    ...overrides,
+  });
+
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('dead ptyId + one live Claude pane in the same workspace → refused, nothing lands on the Claude pane', () => {
+    const fixture = makeDeps([claudePane, otherWorkspacePane]);
+    const ingest = new HookIngest(fixture.deps);
+    const res = ingest.handle(codexStop({ ptyId: 'pty-closed', workspaceId: 'ws-1' }));
+    vi.advanceTimersByTime(DEFAULT_ALARM_WINDOW_MS + 1);
+    expect(res).toEqual({ ok: false, reason: 'no-workspace-match' });
+    expect(fixture.bindings).toHaveLength(0);
+    expect(fixture.emitted).toHaveLength(0);
+    expect(fixture.nudges).toHaveLength(0);
+  });
+
+  it('Codex hooks-bridge Stop shape with a dead ptyId → refused, counted, logged once', () => {
+    // Exactly what buildCodexHookEnvelope emits for a Stop from an inherited
+    // pane env: ptyId + workspaceId + surfaceId, metadata-only payload.
+    const fixture = makeDeps([claudePane]);
+    const logs: Array<{ level: string; message: string }> = [];
+    const ingest = new HookIngest({ ...fixture.deps, log: (level, message) => { logs.push({ level, message }); } });
+    const bridgeStop = (ts: number) => codexStop({
+      ts,
+      ptyId: 'pty-closed',
+      workspaceId: 'ws-1',
+      surfaceId: 'surface-closed',
+      payload: { turn_id: 'turn-1', transcript_path: '/home/u/.codex/sessions/rollout.jsonl' },
+    });
+    expect(ingest.handle(bridgeStop(1_000))).toEqual({ ok: false, reason: 'no-workspace-match' });
+    expect(ingest.handle(bridgeStop(2_000))).toEqual({ ok: false, reason: 'no-workspace-match' });
+    vi.advanceTimersByTime(DEFAULT_ALARM_WINDOW_MS + 1);
+    expect(fixture.bindings).toHaveLength(0);
+    expect(fixture.emitted).toHaveLength(0);
+    expect(fixture.nudges).toHaveLength(0);
+    expect(ingest.health().refused).toEqual({ claimedPaneNotLive: 2, gateBypassedOnRefusedClaim: 0 });
+    const refusals = logs.filter((l) => l.message.includes('claimed-pane-not-live'));
+    expect(refusals).toEqual([{ level: 'info', message: expect.stringContaining('pty-closed') }]);
+  });
+
+  it('an ordinary no-ptyId miss is not counted as a refused claim', () => {
+    const fixture = makeDeps([claudePane]);
+    const ingest = new HookIngest(fixture.deps);
+    expect(ingest.handle(codexStop({ cwd: '/elsewhere' })).ok).toBe(false);
+    expect(ingest.handlePermissionGate(codexStop({ kind: 'agent.awaiting_permission', cwd: '/elsewhere' })).ok)
+      .toBe(false);
+    expect(ingest.health().refused).toEqual({ claimedPaneNotLive: 0, gateBypassedOnRefusedClaim: 0 });
+  });
+
+  it('ptyId of a live pane in ANOTHER workspace → refused', () => {
+    const fixture = makeDeps([claudePane, otherWorkspacePane]);
+    const ingest = new HookIngest(fixture.deps);
+    const res = ingest.handle(codexStop({ ptyId: 'pty-other', workspaceId: 'ws-1' }));
+    vi.advanceTimersByTime(DEFAULT_ALARM_WINDOW_MS + 1);
+    expect(res).toEqual({ ok: false, reason: 'no-workspace-match' });
+    expect(fixture.bindings).toHaveLength(0);
+    expect(fixture.emitted).toHaveLength(0);
+  });
+
+  it('a refused permission gate fails open without touching the Claude pane, and leaves a trace', () => {
+    const fixture = makeDeps([claudePane]);
+    const logs: string[] = [];
+    const ingest = new HookIngest({ ...fixture.deps, log: (_level, message) => { logs.push(message); } });
+    const gate = () => ingest.handlePermissionGate(codexStop({
+      kind: 'agent.awaiting_permission',
+      ptyId: 'pty-closed',
+      workspaceId: 'ws-1',
+      payload: { tool_name: 'Bash' },
+    }));
+    expect(gate()).toEqual({ ok: false, reason: 'no-workspace-match' });
+    expect(gate()).toEqual({ ok: false, reason: 'no-workspace-match' });
+    expect(fixture.emitted).toHaveLength(0);
+    expect(ingest.health().refused).toEqual({ claimedPaneNotLive: 0, gateBypassedOnRefusedClaim: 2 });
+    const traces = logs.filter((m) => m.includes('ungated'));
+    expect(traces).toHaveLength(1);
+    expect(traces[0]).toContain('Bash');
+    expect(traces[0]).toContain('pty-closed');
+  });
+
+  it('exact live ptyId → routed as before', () => {
+    const fixture = makeDeps([claudePane, otherWorkspacePane]);
+    const ingest = new HookIngest(fixture.deps);
+    const res = ingest.handle(codexStop({ ptyId: 'pty-other', workspaceId: 'ws-2', cwd: '/other' }));
+    expect(res.ok).toBe(true);
+    expect(fixture.bindings).toEqual([
+      expect.objectContaining({ ptyId: 'pty-other', binding: expect.objectContaining({ agent: 'codex', sessionId: 'codex-conv' }) }),
+    ]);
+  });
+
+  it('no ptyId → workspace/cwd routing unchanged', () => {
+    const fixture = makeDeps([session({ id: 'pty-a', cwd: '/repo' }), otherWorkspacePane]);
+    const ingest = new HookIngest(fixture.deps);
+    expect(ingest.handle(codexStop({ workspaceId: 'ws-1', cwd: '/elsewhere' })).ok).toBe(true);
+    expect(ingest.handle(codexStop({ cwd: '/other/sub' })).ok).toBe(true);
+    expect(fixture.bindings.map((b) => b.ptyId)).toEqual(['pty-a', 'pty-other']);
+  });
+
+  it('a guessed route never overwrites another agent’s resume binding', () => {
+    const fixture = makeDeps([claudePane]);
+    const ingest = new HookIngest(fixture.deps);
+    // No ptyId: routed by workspace to the lone pane, but that pane is bound to
+    // claude — a codex binding from a guess must not replace it.
+    expect(ingest.handle(codexStop({ workspaceId: 'ws-1' })).ok).toBe(true);
+    expect(fixture.bindings).toHaveLength(0);
+  });
+
+  it('a guessed route may rebind when the detector already sees the new agent in the pane', () => {
+    // The pane went claude → codex and the sender carries no ptyId: the old
+    // binding is the stale one, so the new session must be captured.
+    const switched = { ...claudePane, lastDetectedAgent: 'codex' };
+    const fixture = makeDeps([switched]);
+    const ingest = new HookIngest(fixture.deps);
+    expect(ingest.handle(codexStop({ workspaceId: 'ws-1' })).ok).toBe(true);
+    expect(fixture.bindings).toEqual([
+      expect.objectContaining({ ptyId: 'pty-claude', binding: expect.objectContaining({ agent: 'codex' }) }),
+    ]);
+  });
+
+  it('a guessed route still cannot clobber when the pane is still running the bound agent', () => {
+    const stillClaude = { ...claudePane, lastDetectedAgent: 'claude' };
+    const fixture = makeDeps([stillClaude]);
+    const ingest = new HookIngest(fixture.deps);
+    expect(ingest.handle(codexStop({ workspaceId: 'ws-1' })).ok).toBe(true);
+    expect(fixture.bindings).toHaveLength(0);
+  });
+
+  it('an exact-ptyId signal may rebind the pane to a different agent', () => {
+    const fixture = makeDeps([claudePane]);
+    const ingest = new HookIngest(fixture.deps);
+    expect(ingest.handle(codexStop({ ptyId: 'pty-claude', workspaceId: 'ws-1' })).ok).toBe(true);
+    expect(fixture.bindings).toEqual([
+      expect.objectContaining({ ptyId: 'pty-claude', binding: expect.objectContaining({ agent: 'codex' }) }),
+    ]);
+  });
+});
+
+describe('HookIngest — #1463 /clear queued behind a turn', () => {
+  it('a SessionStart inside the verdict window swallows the held Stop (why main must close the turn)', () => {
+    vi.useFakeTimers();
+    const f = makeDeps();
+    const i = new HookIngest(f.deps);
+    i.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.user_prompt_submit' }));
+    i.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.activity', payload: { tool_name: 'Bash' } }));
+    i.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.stop' }));
+    f.advance(60);
+    i.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.session_start', payload: { source: 'clear' } }));
+    vi.advanceTimersByTime(DEFAULT_ALARM_WINDOW_MS * 2);
+    expect(f.emitted.map((e) => e.data.hookKind)).not.toContain('agent.stop');
+    expect(f.emitted.at(-1)?.data).toMatchObject({ hookKind: 'agent.session_start' });
+    vi.useRealTimers();
   });
 });

@@ -193,6 +193,35 @@ try {
     $version = 'main'
 }
 
+# Setup.exe deletes the existing install folder before anything else and does
+# not stop a running wmux first. A running copy keeps its files locked, the
+# delete fails halfway, and the install is left broken (#502). Check first and
+# let the user shut wmux down themselves: killing it here would end their
+# sessions without asking. The session daemon also runs as wmux.exe from the
+# install folder, so it counts as running.
+function Test-WmuxRunning {
+    $root = Join-Path $env:LOCALAPPDATA 'wmux'
+    # The script runs with $ErrorActionPreference = 'Stop', so a broken WMI is
+    # caught here rather than aborting the script. An unknown state is treated
+    # as running: launching Setup.exe against a running wmux breaks the install.
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name='wmux.exe'" -ErrorAction Stop |
+            Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith("$root\", [System.StringComparison]::OrdinalIgnoreCase) }
+    } catch {
+        Write-Host "  [!] Could not check whether wmux is running ($($_.Exception.Message))." -ForegroundColor Yellow
+        return $true
+    }
+    return [bool]$procs
+}
+
+function Write-QuitWmuxFirst([string]$setupPath) {
+    Write-Host "  [!] wmux may be running. The installer cannot replace it while it is open." -ForegroundColor Yellow
+    Write-Host "      Right-click the wmux tray icon -> 'Shut down wmux (close all sessions)'." -ForegroundColor Yellow
+    Write-Host "      Plain 'Quit' keeps the session daemon running, which still blocks Setup." -ForegroundColor Yellow
+    Write-Host "      Then run:" -ForegroundColor Yellow
+    Write-Host "      $setupPath" -ForegroundColor White
+}
+
 # ===========================================================================
 # DEFAULT PATH — download the prebuilt Setup.exe and verify its SHA-256
 # ===========================================================================
@@ -256,6 +285,10 @@ if (-not $FromSource) {
     }
     Write-Host "  [2/3] Verified SHA-256" -ForegroundColor Green
 
+    if (Test-WmuxRunning) {
+        Write-QuitWmuxFirst $tempExe
+        return
+    }
     Write-Host "  [3/3] Launching installer..." -ForegroundColor Green
     Start-Process -FilePath $tempExe
     Write-Host ""
@@ -431,6 +464,12 @@ if (-not $hasVCTools) {
 # Clone + build
 # ---------------------------------------------------------------------------
 
+if (Test-WmuxRunning) {
+    # The clone below deletes $installDir, which is also the install root.
+    Write-QuitWmuxFirst "pwsh -File install.ps1 -FromSource"
+    return
+}
+
 Write-Host "  [1/5] Cloning repository..." -ForegroundColor DarkGray
 
 if (Test-Path $installDir) {
@@ -533,7 +572,9 @@ $builtSetupExe = Get-ChildItem "$installDir\out\make\squirrel.windows\x64" -Filt
     Where-Object { $_.Name -match 'Setup' } |
     Select-Object -First 1
 
-if ($builtSetupExe) {
+if ($builtSetupExe -and (Test-WmuxRunning)) {
+    Write-QuitWmuxFirst $builtSetupExe.FullName
+} elseif ($builtSetupExe) {
     Write-Host "  [5/5] Launching installer: $($builtSetupExe.Name)..." -ForegroundColor Green
     Start-Process -FilePath $builtSetupExe.FullName
 } else {

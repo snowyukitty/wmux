@@ -78,7 +78,7 @@ Validation limits live in `src/shared/types.ts` (PANE_METADATA_MAX_BYTES, PANE_M
 
 | Method | Params | Tier | Notes |
 |---|---|---|---|
-| `input.send` | `{ text, paneId?, workspaceId? }` | stable | Send literal text to a pane's PTY. |
+| `input.send` | `{ text, ptyId?, workspaceId?, submit?, raw?, newTask? }` | stable | Send literal text to a pane's PTY. The role-enforcement reply fields `enforcedModel`, `enforcedOptions` and `note` are **experimental** (#1681), and so are the `newTask` param and the `freshContext`, `freshContextCommand`, `freshContextSignal` and `freshContextReason` reply fields (#1680); see [`stability.md`](./stability.md#inputsend). |
 | `input.sendKey` | `{ key, paneId?, workspaceId? }` | stable | Send a control key sequence. |
 | `input.readScreen` | `{ paneId?, workspaceId? }` | stable | Read the current visible terminal buffer. |
 | `terminal.readEvents` | `{ paneId?, workspaceId?, sinceSeq? }` | stable | Read structured terminal output events (prompt detection, etc.). |
@@ -127,13 +127,23 @@ Validation limits live in `src/shared/types.ts` (PANE_METADATA_MAX_BYTES, PANE_M
 
 | Method | Params | Tier | Notes |
 |---|---|---|---|
-| `browser.tabs` | `{ action, workspaceId, surfaceId?, url? }` | internal | Workspace-exact lifecycle backing for the bundled MCP `browser_tabs` tool. `workspaceId` is supplied by its strict caller-identity resolver and is not exposed as public tool input; the renderer re-checks surface ownership before select/close. The handler trusts the supplied `workspaceId` rather than binding it to the caller, which is exactly why the method stays reserved — see the note in `methodCapabilityMap.ts`. |
+| `browser.tabs` | `{ action, workspaceId, surfaceId?, url?, scope? }` | internal | Workspace-exact lifecycle backing for the bundled MCP `browser_tabs` tool. `workspaceId` is supplied by its strict caller-identity resolver and is not exposed as public tool input; the renderer re-checks surface ownership before select/close. The handler trusts the supplied `workspaceId` rather than binding it to the caller, which is exactly why the method stays reserved — see the note in `methodCapabilityMap.ts`. |
 | `browser.open` | `{ url? }` | experimental | The browser/CDP surface backs the MCP `browser_*` tools. Wire shapes may evolve before v3.0. Currently the primary AI-agent capability driver, but not part of the substrate identity. |
 | `browser.navigate`, `browser.goBack`, `browser.close` | various | experimental | |
 | `browser.session.{start,stop,status,list}` | various | experimental | |
 | `browser.type.humanlike`, `browser.type.cdp`, `browser.click.cdp`, `browser.hover.cdp`, `browser.drag.cdp`, `browser.press.cdp` | various | experimental | |
 | `browser.cdp.target`, `browser.cdp.info` | various | experimental | |
 | `browser.screenshot`, `browser.evaluate` | various | experimental | |
+
+### Computer use surface
+
+Desktop computer use ([design](../computer-use-design.md)). Off unless the user turns it on in Settings › Computer use (stored in `~/.wmux/computer-use.json`). Every app an agent observes or drives also needs the person's per-app consent, and password managers, terminals and agent apps, wmux itself and OS credential prompts are always refused. Errors cross the wire as `[code] message` with a code from `src/shared/computer/errors.ts`.
+
+| Method | Params | Tier | Notes |
+|---|---|---|---|
+| `computer.capabilities`, `computer.listApps`, `computer.listWindows` | `{}` / `{ app? }` | experimental | Capability `computer.observe`. Blocked apps are listed with a `blocked` reason and their window titles blanked. |
+| `computer.getAppState` | `{ app, window?, mode? }` | experimental | Capability `computer.observe`. Returns a `snapshotId`, the accessibility tree text and/or a scaled window screenshot. |
+| `computer.act` | `{ action, snapshotId, index? \| x?, y?, ... }` | experimental | Capability `computer.control`, the only input-injecting method. Targets only a snapshot the same agent took; x/y are screenshot pixels. One agent drives at a time; 120 actions per minute. |
 
 The full list lives in `src/shared/rpc.ts` (`ALL_RPC_METHODS`). For the MCP-facing tool names (which are the actual external API for most consumers), see [MCP tools](#mcp-tools).
 
@@ -173,8 +183,9 @@ The surface a server registers is chosen once, by a launch argument in the host 
 | MCP tool | Backs RPC method | Notes |
 |---|---|---|
 | `pane_list` | `pane.list` | Returns the snapshot envelope `{ asOfSeq, bootId, panes }`. |
-| `pane_get_metadata` | `pane.getMetadata` | |
-| `pane_set_metadata` | `pane.setMetadata` | The substrate write entrypoint. |
+| `pane_metadata` | `pane.getMetadata` / `pane.setMetadata` | Merged `{action: get\|set}` form of the pane metadata read/write. `get` accepts the cross-workspace `workspaceId` override; `set` is the substrate write entrypoint. |
+| `pane_get_metadata` | `pane.getMetadata` | Unlisted pre-merge alias of `pane_metadata {action:'get'}` — still callable via `tools/call` for one release. |
+| `pane_set_metadata` | `pane.setMetadata` | Unlisted pre-merge alias of `pane_metadata {action:'set'}` — still callable via `tools/call` for one release. |
 | `workspace_list` | `workspace.list` | |
 | `surface_list` | `surface.list` | |
 | `pane_split` | `pane.split` | Split a leaf pane (CREATE family — optional `workspaceId`, defaults to the caller's own; `direction` defaults to `horizontal`). Issue #285. |
@@ -182,15 +193,15 @@ The surface a server registers is chosen once, by a launch argument in the host 
 | `pane_focus` | `pane.focus` | Focus a leaf pane by `paneId` — **non-yank** (does not switch the on-screen workspace; use `workspace.focus` for that). Issue #285. |
 | `surface_new` | `surface.new` | Open a new surface (CREATE family — optional `workspaceId`/`shell`/`cwd`, defaults to the caller's own workspace). Issue #285. |
 | `surface_close` | `surface.close` | Close a surface by globally-unique `surfaceId` (resolved across all workspaces). Issue #285. |
-| `pane_stash` | `pane.stash` | Take a leaf pane out of the layout, keeping its session running. Issue #977. |
-| `pane_unstash` | `pane.unstash` | Put a stashed pane back. Idempotent — the remedy named by every `PANE_STASHED` error. Issue #977. |
+| `pane_stash` | `pane.stash` / `pane.unstash` | Take a leaf pane out of the layout, keeping its session running; `restore: true` puts a stashed pane back (idempotent — the remedy named by every `PANE_STASHED` error). Issue #977. |
+| `pane_unstash` | `pane.unstash` | Unlisted pre-merge alias of `pane_stash {restore:true}` — still callable via `tools/call` for one release. |
 | `terminal_read` | `input.readScreen` | |
 | `terminal_read_events` | `terminal.readEvents` | Structured prompt-detected events. |
-| `terminal_send` | `input.send` | |
+| `terminal_send` | `input.send` | `new_task` (experimental, #1680) maps to `input.send` `newTask`. |
 | `terminal_send_key` | `input.sendKey` | |
 | `wmux_events_poll` | `events.poll` | Pull-based event stream. |
 | `wmux_search_panes` | `pane.search` | |
-| `send_message` | inter-workspace messaging — send a message to another workspace. Backed by the same handler as `a2a_task_send` (which is registered as a literal alias). NOT `input.send` semantics. | |
+| `send_message` | inter-workspace messaging — send a message to another workspace. Backed by the same handler as `a2a_task_send` (an unlisted-but-callable literal alias). NOT `input.send` semantics. | |
 
 ### REPL surface (experimental)
 
@@ -209,9 +220,9 @@ Backed by **no RPC method**: the sessions are child processes of the MCP server 
 | `a2a_whoami` | `a2a.whoami` | Reports the calling workspace's identity (envelope-pinned). |
 | `a2a_discover` | `a2a.discover` | Lists known workspaces and their advertised skills. |
 | `a2a_set_skills` | `meta.setSkills` | Registers the calling agent's skill tags. |
-| `a2a_task_send` | `a2a.task.send` | Sends a structured task to another workspace. |
-| `a2a_task_query` | `a2a.task.query` | Pulls tasks by id / status / role (sender or receiver). |
-| `a2a_task_update` | `a2a.task.update` | Transitions a task to working / completed / failed / input-required. |
+| `a2a_task_send` | `a2a.task.send` | Sends a structured task to another workspace. Unlisted literal alias of `send_message` — same handler and shape, still callable via `tools/call`; use `send_message` in new prompts. |
+| `a2a_task_query` | `a2a.task.query` | Pulls tasks by id / status / role (sender or receiver); flags `orphaned: true` when the addressed receiver pane is gone. |
+| `a2a_task_update` | `a2a.task.update` | Transitions a task to working / completed / failed / input-required, or canceled by the receiver (with a reason). |
 | `a2a_task_cancel` | `a2a.task.cancel` | Cancels a task you sent (sender-only). |
 | `a2a_broadcast` | `a2a.broadcast` | Broadcasts an announcement to every workspace. |
 | `channel_list` | `a2a.channel.list` | Lists channels in the caller's company. |
@@ -244,7 +255,14 @@ Two of the six have a direct workspace-level equivalent. The other four do not �
 | MCP tool family | Count | Notes |
 |---|---|---|
 | `browser_tabs` | 1 | Manages logical browser surfaces only in the calling session's workspace. `list`/`new` return stable opaque `surfaceId` values used by `select`/`close`; the former experimental numeric `tabId` index is no longer accepted. |
-| Other `browser_*` tools (open, close, navigate, navigate_back, screenshot, fill, type, click, hover, drag, press_key, scroll, scroll_into_view, snapshot, smart_snapshot, console, cookies, dialog, download, evaluate, extract_data, extract_text, file_upload, highlight, network, pdf, resize, response_body, select, session_list, session_start, session_status, session_stop, storage, trace, wait, wait_for_download, emulate) | ~39 | Wire shapes may evolve before v3.0. Backs Claude Code / Codex / Gemini CLI browser-control use cases. |
+| `browser_request_help` | 1 | Hands ONE step to the human and blocks until they answer: a Done / Cancel bar on the browser pane plus a row in the Fleet inbox, for the login walls, CAPTCHAs, OTP fields, payment confirmations and consent screens an agent cannot get past. The result's last two lines are machine-readable (`help_state: completed | continued | cancelled | timed_out` and `url: <page url>`). One open request per surface; a second call is refused with `help_already_pending:`. The optional `completion` condition (`urlIncludes` / `selector`, polled every 500ms and honoured once it holds for 1s) is evaluated in the TOP frame of an in-window webview, so it is builtin-backend only and a selector inside a cross-origin iframe (a CAPTCHA widget, a 3-D Secure step) will never match — use `urlIncludes` for those. The whole tool returns `not_supported` on `external`. The deadline is enforced in the wmux main process, not by the caller. |
+| Other `browser_*` tools (open, close, navigate, navigate_back, screenshot, fill, type, click, hover, drag, press_key, scroll, scroll_into_view, snapshot, smart_snapshot, console, cookies, dialog, download, evaluate, extract_data, extract_text, file_upload, highlight, network, pdf, resize, response_body, select, session, storage, trace, wait, wait_for_download, emulate) | ~31 listed | Wire shapes may evolve before v3.0. Backs Claude Code / Codex / Gemini CLI browser-control use cases. `browser_session {action}` merges the four `browser_session_*` tools (unlisted but callable for one release), and the seven `browser_repl` sub-steps (`navigate_back`, `hover`, `drag`, `select`, `scroll_into_view`, `highlight`, `dialog`) are likewise unlisted but callable — inside a `browser_repl` snippet they remain `await browser.X(args)` with the argument cheat sheet in that tool's description. |
+
+### Computer use (experimental, opt-in)
+
+| MCP tool | Count | Notes |
+|---|---|---|
+| `computer` | 1 | One tool with an `action` enum (`capabilities`, `listApps`, `listWindows`, `getAppState`, `click`, `setValue`, `type`, `pressKey`, `hotkey`, `scroll`) over the `computer.*` RPCs. Registered only in the `full` profile and only when computer use is turned on, so the default tool surface is unchanged. Strict input: unknown options are rejected. |
 
 ---
 
@@ -312,6 +330,7 @@ The EventBus (`src/main/events/EventBus.ts`) is an in-memory ring buffer of `RIN
 
 | Date | Change |
 |---|---|
+| 2026-10-01 | Desktop computer use — added five `computer.*` RPC methods (**experimental**), the opt-in `computer` MCP tool, and the `computer.observe` / `computer.control` capabilities (risk class `computer`, critical). Per-app consent rides the approval queue as a new `computer-app` prompt kind. No new event type. |
 | 2026-07-24 | Workspace-scoped browser tabs (issue #565) — defined a browser tab as a logical wmux browser surface and replaced the global Playwright-page inventory plus mutable numeric `tabId` with stable `surfaceId` addressing. The public experimental `browser_tabs` tool now resolves the caller workspace strictly; its reserved `browser.tabs` backing RPC re-checks ownership at the renderer effect boundary and is denied to commander-role callers because it multiplexes close. |
 | 2026-07-05 | Channel delivery reliability (v3.15.0) — added the `a2a.channel.nudgeRecorded` daemon RPC (**internal** tier) to the A2A table: the renderer reports a just-delivered mention paste into the wake worker's shared nudge ledger, so an attached agent is not pasted AND re-nudged for the same mention. Renderer-only mutate path (`channels:mutate-local`), absent from the main pipe router by design. No new MCP tool, event type, or capability. |
 | 2026-06-23 | Pane + surface lifecycle MCP tools (issue #285) — exposed five tools (`pane_split`, `pane_close`, `pane_focus`, `surface_new`, `surface_close`) mirroring the workspace-scoped pane/surface RPCs (#236/#238/#256/#257). CREATE family (split/new) takes an optional `workspaceId` (defaults to the caller's own workspace); ADDRESS family (close/focus) takes a globally-unique id resolved across all workspaces. Added the five to `FIRST_PARTY_METHODS`; the reserved `wmux.internal` `surface.new`/`surface.close` also widen `ALLOWED_RESERVED_FIRST_PARTY` per the §2.4 first-party security review. No new RPC method or capability. |
@@ -328,7 +347,7 @@ Every RPC method maps to a single declarative entry in `src/main/mcp/methodCapab
 The capability column below summarises the table. Three sentinels:
 
 - `null` — identity-bootstrap / system-introspection method; no capability required. Any caller can invoke regardless of trust state.
-- `wmux.internal` — reserved-prefix capability that NO plugin can ever declare (`permissionGrammar.ts` rejects `wmux.*` at declaration time). Internal-only surfaces. Legacy callers (no `clientName` envelope) still grandfather through.
+- `wmux.internal` — reserved-prefix capability that NO plugin can ever declare (`permissionGrammar.ts` rejects `wmux.*` at declaration time). Internal-only surfaces, reached only through wmux's own curated lanes. Legacy callers (no `clientName` envelope) used to grandfather through; they are refused since #1111 closed that lane.
 - `<capability>` — must match one of `KNOWN_CAPABILITIES` (spec §3.2).
 
 ### Capability map (subset — full table in code)
@@ -366,7 +385,37 @@ The capability column below summarises the table. Three sentinels:
 | `company.*` | `wmux.internal` | — | — |
 | `notify` | `wmux.internal` | — | — |
 | `hooks.signal` | `wmux.internal` | — | — |
+| `usage.rateLimits` | `wmux.internal` | — | — |
 
 Methods marked **bold** are surfaced in the approval dialog with stronger user-facing language (spec §3.6 — terminal-content / terminal-input risk classes).
 
 The full machine-readable map (with path extractors and `multiPathMode` flags) lives at `src/main/mcp/methodCapabilityMap.ts`. `tsc --noEmit` enforces totality via `Record<RpcMethod, ...>` so a new RPC method without a map entry fails the build.
+
+### Terminal launch and managed chat (internal, first-party desktop only)
+
+`daemon.chat.launchTerminal` starts a fixed installed Claude/Codex CLI with an initial message and an optional agent-specific mode (`default`, Claude `bypass`, or Codex `yolo`) in the same pane. It requires an unchanged, positively empty POSIX shell prompt, fresh shell process attribution without children, and no pending approval. It never creates a managed session.
+
+`daemon.chat.providers`, `daemon.chat.start`, `daemon.chat.reconnect`,
+`daemon.chat.cancel`, `daemon.chat.respond`, and `daemon.chat.close` are private
+main-process RPCs, guarded by the existing first-party client identity. They are
+not exposed as public MCP tools or HTTP routes. Managed chat reuses the private
+`daemon.transcript.*` read/send subscription surface; optional managed status,
+request IDs, file previews, and history generations are defined in
+`src/shared/transcript/`. See [managed chat](../managed-chat.md) for delivery,
+retention, and capability semantics. A future mobile bridge needs its own
+explicit authenticated contract; these methods grant no remote access.
+
+
+`daemon.chat.skills` is first-party-only read-only discovery for an existing pane:
+`{ id, agent: "claude" | "codex" }` → `{ state: "ready" | "partial" | "unavailable",
+skills: [{ name, description, invocation, source }] }`. Cwd/account are resolved by
+the daemon; arbitrary paths and provider RPC methods are not accepted. No public
+MCP or phone HTTP route is added by this internal method.
+
+
+Private desktop `chat:settings` accepts `{ptyId, choice?: {model, effort,
+expectedRevision}}` and returns `{ok, settings?, error?}` for the existing native
+Codex session. Read returns only model/effort/catalogue, busy state and a scoped
+opaque revision. Write rechecks pane identity and runtime revision, rejects busy
+or unsupported choices, and confirms the result by rereading the runtime.
+It is not registered in the public RPC/MCP or phone HTTP routers.

@@ -23,6 +23,8 @@
 // so a multi-MB field cannot make the control-char scan do O(n) work, then
 // strip, collapse, trim, and truncate to the display cap.
 
+import type { DecisionForm } from './types';
+
 /** Cap applied BEFORE any regex work on an untrusted string (activitySummary's MAX_RAW_LEN). */
 const MAX_RAW_LEN = 1024;
 
@@ -49,11 +51,24 @@ export const MAX_INSPECTED_OPTIONS = 64;
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS_RE = /[\x00-\x1f\x7f-\x9f]/g;
 
+/**
+ * Why one keystroke cannot answer this AskUserQuestion. Absent for the only
+ * shape a single press answers whole: ONE single-select question.
+ *
+ * Measured on Claude Code 2.1.283 (fixtures/terminal-prompts/KEYS.md): on a
+ * multi-select question a digit only TOGGLES that row's checkbox, and on the
+ * first of several questions a digit selects and moves to the next tab. Either
+ * way the tool is still waiting after the press, so reporting it answered
+ * would be wrong.
+ */
+export type QuestionShape = 'multi-select' | 'multi-question';
+
 export interface ExtractedQuestion {
   question?: string;
   options?: string[];
   /** Structured choices preserving the original 1-based index as key. */
   choices?: Array<{ key: string; label: string }>;
+  questionShape?: QuestionShape;
 }
 
 /**
@@ -68,8 +83,8 @@ export interface ExtractedQuestion {
  * ONLY THE FIRST QUESTION is extracted. AskUserQuestion may carry several, but
  * the keystroke map presses one option on whatever the TUI is showing, which is
  * the first question — surfacing options from a later one would describe a
- * choice the press cannot make. Multi-question prompts remain a real gap: the
- * daemon has no way to advance to a later question and answer it separately.
+ * choice the press cannot make. A multi-question prompt is answered whole only
+ * through its `decision-v2` form (claudeQuestionsForm, below).
  *
  * `choices` preserves the ORIGINAL 1-based index of each option in the payload
  * array as the `key`. When a label is blank/unusable the entry is dropped from
@@ -93,6 +108,15 @@ export function extractAskUserQuestion(payload: unknown): ExtractedQuestion {
   >;
 
   const out: ExtractedQuestion = {};
+  // Judged on the WHOLE payload, not only the question surfaced below: a
+  // second question is exactly what the single press cannot reach.
+  if (questions && questions.length > 1) out.questionShape = 'multi-question';
+  // Fail closed: anything but an absent or literal-false multiSelect (a string
+  // "true", a 1, a future object) is treated as multi-select, which refuses a
+  // one-key approve rather than pressing a digit that might only toggle.
+  else if (source['multiSelect'] !== undefined && source['multiSelect'] !== null && source['multiSelect'] !== false) {
+    out.questionShape = 'multi-select';
+  }
   const question = clean(readString(source, 'question'), MAX_QUESTION_CHARS);
   if (question) out.question = question;
 
@@ -101,6 +125,72 @@ export function extractAskUserQuestion(payload: unknown): ExtractedQuestion {
   if (choices.length > 0) out.choices = choices;
 
   return out;
+}
+
+/** Claude Code's AskUserQuestion asks at most this many questions at once. */
+export const CLAUDE_FORM_MAX_QUESTIONS = 4;
+/**
+ * Most options a question may have for a form: with the free-text row after
+ * them, every row the driver presses keeps a one-digit number.
+ */
+export const CLAUDE_FORM_MAX_OPTIONS = 8;
+/** The limits `boundDecisionForm` puts on question text and labels. */
+const FORM_TEXT_MAX = 500;
+const FORM_LABEL_MAX = 200;
+// Text that would not reach the screen as it is: C0/C1 controls, DEL, the
+// Unicode line and paragraph separators, or a run of whitespace the TUI
+// could collapse.
+// eslint-disable-next-line no-control-regex -- refusing them is the point
+const FORM_UNSHOWABLE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]|\s{2,}|^\s|\s$/;
+
+/**
+ * The `decision-v2` `questions` form for a Claude Code AskUserQuestion
+ * PreToolUse payload (#1649), or null when the payload is not one the
+ * stepwise driver can answer whole. Strict where `extractAskUserQuestion` is
+ * lenient: only the canonical `{questions: [{question, header, multiSelect,
+ * options: [{label}]}]}` shape, 1–4 questions whose texts differ even with
+ * every space removed, each with a header (its tab), a literal boolean
+ * `multiSelect` and 1–8 options, every string short enough and clean enough
+ * to be shown and read back exactly as it is. A string that would be cut or
+ * cleaned gets no form: the screen could not be matched against it.
+ *
+ * Option keys are their 1-based positions, the digit Claude draws. Every
+ * question allows free text: Claude appends its "Type something" row to each.
+ */
+export function claudeQuestionsForm(payload: unknown): DecisionForm | null {
+  const raw = readArray(readObject(payload, 'tool_input'), 'questions');
+  if (!raw || raw.length === 0 || raw.length > CLAUDE_FORM_MAX_QUESTIONS) return null;
+  const showable = (value: unknown, max: number): value is string =>
+    typeof value === 'string' && value.length > 0 && value.length <= max && !FORM_UNSHOWABLE.test(value);
+  const questions: NonNullable<DecisionForm['questions']> = [];
+  for (const [i, entry] of raw.entries()) {
+    if (!isObject(entry)) return null;
+    const { question, header, multiSelect, options } = entry;
+    if (!showable(question, FORM_TEXT_MAX) || !showable(header, FORM_LABEL_MAX) || typeof multiSelect !== 'boolean') return null;
+    if (!Array.isArray(options) || options.length === 0 || options.length > CLAUDE_FORM_MAX_OPTIONS) return null;
+    const labels = options.map((o) => (isObject(o) ? o['label'] : undefined));
+    if (!labels.every((label) => showable(label, FORM_LABEL_MAX))) return null;
+    // The description is drawn under the label, and the screen check reads
+    // both (an option is matched by its whole label and description).
+    const descriptions = options.map((o) => (isObject(o) ? o['description'] : undefined));
+    if (!descriptions.every((d) => d === undefined || d === '' || showable(d, FORM_TEXT_MAX))) return null;
+    // The screen tells questions apart by their text with every space removed
+    // (sameQuestionText): two that read the same that way cannot be.
+    const compactText = (text: string): string => text.replace(/\s+/g, '');
+    if (questions.some((q) => compactText(q.text) === compactText(question))) return null;
+    questions.push({
+      id: `q${i}`,
+      header,
+      text: question,
+      multiSelect,
+      allowOther: true,
+      options: (labels as string[]).map((label, j) => {
+        const description = descriptions[j];
+        return { key: String(j + 1), label, ...(typeof description === 'string' && description ? { description } : {}) };
+      }),
+    });
+  }
+  return { v: 1, kind: 'questions', questions, actions: [{ id: 'submit', label: 'Submit' }, { id: 'deny', label: 'Cancel' }] };
 }
 
 /**
@@ -230,4 +320,9 @@ export function sanitizeChoices(
     }
   }
   return out.length > 0 ? out : undefined;
+}
+
+/** Re-apply the closed set to a `questionShape` read back from disk. */
+export function sanitizeQuestionShape(value: unknown): QuestionShape | undefined {
+  return value === 'multi-select' || value === 'multi-question' ? value : undefined;
 }

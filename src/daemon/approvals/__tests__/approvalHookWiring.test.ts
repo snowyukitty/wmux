@@ -7,7 +7,7 @@
 // has to be enforced structurally rather than described in a prompt.
 
 import { describe, it, expect, vi } from 'vitest';
-import { HookIngest, type HookIngestSession } from '../../hooks/HookIngest';
+import { HookIngest, reportedAnswers, type HookIngestSession } from '../../hooks/HookIngest';
 import type { AgentSignal } from '../../../shared/hooks/signal-types';
 import { DEFAULT_ALARM_WINDOW_MS } from '../../../shared/hooks/CompletionAlarm';
 import type { ApprovalExpiryReason, ApprovalHookSink } from '../types';
@@ -19,19 +19,27 @@ type Created = {
   question?: string;
   options?: string[];
 };
-type Expired = { sessionId: string; reason: ApprovalExpiryReason };
+type Expired = { sessionId: string; reason: ApprovalExpiryReason; kind?: string; answered?: Readonly<Record<string, string>> };
 
-function makeSink(): ApprovalHookSink & { created: Created[]; expired: Expired[]; gateCreated: Array<{ sessionId: string; toolName: string }> } {
+function makeSink(): ApprovalHookSink & {
+  created: Created[];
+  expired: Expired[];
+  gateCreated: Array<{ sessionId: string; toolName: string }>;
+  retired: string[];
+} {
   const created: Created[] = [];
   const expired: Expired[] = [];
   const gateCreated: Array<{ sessionId: string; toolName: string }> = [];
+  const retired: string[] = [];
   return {
     created,
     expired,
     gateCreated,
+    retired,
+    retireStaleQuestion: (sessionId) => { retired.push(sessionId); },
     noteHookAwaitingInput: (input) => { created.push(input); },
     noteGateAwaiting: (input) => { gateCreated.push({ sessionId: input.sessionId, toolName: input.toolName }); return `gate-${gateCreated.length}`; },
-    expireForSession: (sessionId, reason) => { expired.push({ sessionId, reason }); },
+    expireForSession: (sessionId, reason, kind, answered) => { expired.push({ sessionId, reason, ...(kind ? { kind } : {}), ...(answered ? { answered } : {}) }); },
   };
 }
 
@@ -61,13 +69,58 @@ function makeIngest(sessions: HookIngestSession[] = [
 }
 
 describe('hook → approval registry wiring', () => {
+  it('Claude\'s answered AskUserQuestion passes on the answers it reports', () => {
+    const { ingest, approvals } = makeIngest();
+    ingest.handle(makeSignal({
+      kind: 'agent.input_answered',
+      payload: {
+        hook_event_name: 'PostToolUse',
+        tool_name: 'AskUserQuestion',
+        tool_response: { questions: [], answers: { 'Which size?': 'Medium', 'Which toppings?': 'Cheese, Basil' } },
+      },
+    }));
+    expect(approvals.expired).toEqual([{
+      sessionId: 'pty-a',
+      reason: 'answered-locally',
+      kind: 'awaiting_input',
+      answered: { 'Which size?': 'Medium', 'Which toppings?': 'Cheese, Basil' },
+    }]);
+  });
+
+  it('reads reported answers only in their own shape', () => {
+    expect(reportedAnswers({ tool_response: { answers: { 'Q?': 'A' } } })).toEqual({ 'Q?': 'A' });
+    expect(reportedAnswers({ tool_response: { answers: { 'Q?': 1 } } })).toBeUndefined();
+    expect(reportedAnswers({ tool_response: { answers: [] } })).toBeUndefined();
+    expect(reportedAnswers({ tool_response: { answers: {} } })).toBeUndefined();
+    expect(reportedAnswers({ tool_response: 'done' })).toBeUndefined();
+    expect(reportedAnswers(null)).toBeUndefined();
+  });
+
+  it('a submitted prompt expires the pane\'s pending question, and only questions', () => {
+    const { ingest, approvals } = makeIngest();
+
+    ingest.handle(makeSignal({ kind: 'agent.user_prompt_submit' }));
+
+    expect(approvals.expired).toEqual([{ sessionId: 'pty-a', reason: 'prompt-submitted', kind: 'awaiting_input' }]);
+  });
+
+  it('another tool starting asks the registry to retire a question that is gone; the question itself does not', () => {
+    const { ingest, approvals } = makeIngest();
+
+    ingest.handlePermissionGate(makeSignal({ kind: 'agent.awaiting_permission', payload: { tool_name: 'Bash' } }));
+    ingest.handlePermissionGate(makeSignal({ kind: 'agent.awaiting_permission', payload: { tool_name: 'AskUserQuestion' } }));
+
+    expect(approvals.retired).toEqual(['pty-a']);
+  });
+
   it('a hook awaiting_input that EMITS creates a request', () => {
     const { ingest, approvals } = makeIngest();
 
     expect(ingest.handle(makeSignal())).toEqual({ ok: true });
 
     expect(approvals.created).toEqual([
-      { sessionId: 'pty-a', agent: 'claude', workspaceId: 'ws-real' },
+      // Routed by cwd (the signal names no pane), so not exact.
+      { sessionId: 'pty-a', agent: 'claude', workspaceId: 'ws-real', attribution: 'inexact' },
     ]);
   });
 
@@ -90,6 +143,52 @@ describe('hook → approval registry wiring', () => {
       question: 'Which file should I delete?',
       options: ['src/old.ts', 'src/older.ts'],
     });
+  });
+
+  it('carries the question shape when one key cannot answer it', () => {
+    const { ingest, approvals } = makeIngest();
+
+    ingest.handle(makeSignal({
+      payload: {
+        tool_name: 'AskUserQuestion',
+        tool_input: {
+          questions: [
+            { question: 'Which size?', multiSelect: false, options: [{ label: 'Small' }, { label: 'Large' }] },
+            { question: 'Which toppings?', multiSelect: true, options: [{ label: 'Cheese' }] },
+          ],
+        },
+      },
+    }));
+
+    expect(approvals.created[0]).toMatchObject({ question: 'Which size?', questionShape: 'multi-question' });
+  });
+
+  it('carries a Claude AskUserQuestion whole as a questions form (#1649), never another agent\'s', () => {
+    const payload = {
+      tool_name: 'AskUserQuestion',
+      tool_input: {
+        questions: [
+          { question: 'Which size?', header: 'Size', multiSelect: false, options: [{ label: 'Small' }, { label: 'Large' }] },
+          { question: 'Which toppings?', header: 'Toppings', multiSelect: true, options: [{ label: 'Cheese' }] },
+        ],
+      },
+    };
+    const claude = makeIngest();
+    claude.ingest.handle(makeSignal({ payload }));
+    expect(claude.approvals.created[0]).toMatchObject({
+      questionShape: 'multi-question',
+      form: {
+        kind: 'questions',
+        questions: [
+          { id: 'q0', header: 'Size', text: 'Which size?', multiSelect: false, allowOther: true },
+          { id: 'q1', header: 'Toppings', text: 'Which toppings?', multiSelect: true, allowOther: true },
+        ],
+      },
+    });
+    const other = makeIngest();
+    other.ingest.handle(makeSignal({ agent: 'gemini', payload }));
+    expect(other.approvals.created).toHaveLength(1);
+    expect(other.approvals.created[0]).not.toHaveProperty('form');
   });
 
   it('A4: a payload with no usable tool_input still creates the request', () => {
@@ -212,7 +311,7 @@ describe('hook → approval registry wiring', () => {
 
     ingest.handle(makeSignal({ kind: 'agent.input_answered' }));
 
-    expect(approvals.expired).toEqual([{ sessionId: 'pty-a', reason: 'answered-locally' }]);
+    expect(approvals.expired).toEqual([{ sessionId: 'pty-a', reason: 'answered-locally', kind: 'awaiting_input' }]);
   });
 
   it('agent.session_start expires it — a new session never asked the old question', () => {

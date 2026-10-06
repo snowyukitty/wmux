@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import RemoteMirrorTerminal from './RemoteMirrorTerminal';
+import RemoteResumeChip from './RemoteResumeChip';
+import { useStore } from '../../stores';
 
 export interface RemotePaneSurfaceProps {
   hostId: string;
@@ -30,7 +32,10 @@ export interface RemotePaneSurfaceProps {
 export default function RemotePaneSurface({ hostId, sessionId, surfaceId, shell, cwd, isActive = true, onTitleChange }: RemotePaneSurfaceProps) {
   const [attachId, setAttachId] = useState<string | null>(null);
   const [error, setError] = useState<string | undefined>(undefined);
+  /** The attach was refused: this host needs HTTPS (its token is withheld). */
+  const [insecure, setInsecure] = useState(false);
   const [allowInput, setAllowInput] = useState<boolean | undefined>(undefined);
+  const [hostLabel, setHostLabel] = useState<string | undefined>(undefined);
   const teardown = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
@@ -41,6 +46,7 @@ export default function RemotePaneSurface({ hostId, sessionId, surfaceId, shell,
       if (cancelled) return;
       const host = hosts.find((h) => h.id === hostId);
       setAllowInput(host?.allowInput);
+      setHostLabel(host?.label);
     });
     return () => { cancelled = true; };
   }, [hostId]);
@@ -51,6 +57,7 @@ export default function RemotePaneSurface({ hostId, sessionId, surfaceId, shell,
     if (!remote) return;
     setAttachId(null);
     setError(undefined);
+    setInsecure(false);
     let openedId: string | null = null;
 
     const attaching = teardown.current
@@ -61,6 +68,12 @@ export default function RemotePaneSurface({ hostId, sessionId, surfaceId, shell,
           if (!cancelled) setAttachId(res.attachId);
         } else if (!cancelled) {
           setError(res.error);
+          // Needs HTTPS is a standing state, not a transient failure: say so
+          // on this pane and on the host's rows, and keep input shut.
+          if (res.reason === 'insecure-transport') {
+            setInsecure(true);
+            useStore.getState().setRemoteHostInsecure(hostId, true);
+          }
         }
       })
       .catch((err: unknown) => {
@@ -86,11 +99,27 @@ export default function RemotePaneSurface({ hostId, sessionId, surfaceId, shell,
           {cwd ? ` — ${cwd}` : ''}
         </div>
       )}
-      <div className="flex-1 min-h-0">
+      {/* #1342 — `position: relative` so the absolutely-positioned resume chip
+          anchors to the mirror, not over the shell/cwd header above it. */}
+      <div className="flex-1 min-h-0" style={{ position: 'relative' }}>
+        <RemoteResumeChip
+          hostId={hostId}
+          sessionId={sessionId}
+          attachId={attachId}
+          // Stricter than the mirror's own read-only rule below, deliberately:
+          // the mirror renders either way and a refused keystroke is visible,
+          // but a chip is an OFFER. Until the probe has answered `true`, this
+          // desktop does not know the host takes input, and an offer whose
+          // click is silently dropped is worse than no offer.
+          readOnly={allowInput !== true || insecure}
+        />
         <RemoteMirrorTerminal
           attachId={attachId}
           error={error}
+          insecureTransport={insecure}
           readOnly={allowInput === false}
+          hostLabel={hostLabel}
+          hostId={hostId}
           onTitleChange={(title) => onTitleChange(surfaceId, title)}
         />
       </div>

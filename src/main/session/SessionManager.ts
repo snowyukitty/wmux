@@ -265,6 +265,62 @@ export class SessionManager {
     }
   }
 
+  /**
+   * #1250: the persisted auto-update toggle, as a targeted read.
+   *
+   * The updater needs the value before the renderer's session load runs, and
+   * load() is the wrong tool: it pulls the whole workspace payload through
+   * the migration machinery and logs a second load line, all for one boolean.
+   * Returns null when nothing is persisted (first launch, or a locked/corrupt
+   * file — the caller keeps its default rather than failing the boot).
+   */
+  readAutoUpdateEnabled(): boolean | null {
+    try {
+      const loaded = atomicReadJSONSync<SessionData>(this.filePath, {
+        validate: SessionManager.isSessionData,
+      });
+      return loaded?.autoUpdateEnabled ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The persisted per-site memory toggle, as a targeted read.
+   *
+   * Same shape and same reasoning as readAutoUpdateEnabled: the browser RPC
+   * handlers need one boolean per call and must not pull the whole workspace
+   * payload through the migration machinery to get it. Returns null when
+   * nothing is persisted (first launch, or a locked/corrupt file), which the
+   * caller reads as the default — ON.
+   */
+  readSiteMemoryEnabled(): boolean | null {
+    try {
+      const loaded = atomicReadJSONSync<SessionData>(this.filePath, {
+        validate: SessionManager.isSessionData,
+      });
+      return loaded?.siteMemoryEnabled ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The persisted site guide pointer toggle, as a targeted read. Same shape as
+   * readSiteMemoryEnabled, but null is read by the caller as OFF: this feature
+   * reads files from disk on every landing and is opt-in.
+   */
+  readSiteGuidesEnabled(): boolean | null {
+    try {
+      const loaded = atomicReadJSONSync<SessionData>(this.filePath, {
+        validate: SessionManager.isSessionData,
+      });
+      return loaded?.siteGuidesEnabled ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   load(): SessionData | null {
     // v2 RCA fix (adversarial review): distinguish "no session file" (true
     // first launch → null) from "file exists but unreadable" (transient AV/

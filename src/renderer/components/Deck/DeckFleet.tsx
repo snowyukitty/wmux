@@ -14,7 +14,8 @@ import {
 } from '../../stores/selectors/fleet';
 import type { AgentStatus } from '../../../shared/types';
 import { shellDisplayName } from '../../utils/ptyCreateOptions';
-import { ORCH_ROLES, bindingEnforcesModel } from '../../../shared/orchestratorRole';
+import { bindingEnforcesModel, bindingSkipPermissionsFlag } from '../../../shared/orchestratorRole';
+import { paneRoleOptions } from '../FleetView/paneRoleOptions';
 
 /**
  * Bridge P2① — the Fleet roster inside the deck's Orchestrator tab.
@@ -34,12 +35,14 @@ import { ORCH_ROLES, bindingEnforcesModel } from '../../../shared/orchestratorRo
 /** DESIGN.md status-dot vocabulary: amber=running, green=ok, gray=idle, red=needs input. */
 function dotColor(status: AgentStatus): string {
   switch (status) {
+    // Waiting on the user is --accent-yellow (as in the sidebar and on the
+    // Fleet board); running and complete are muted; red is kept for errors.
     case 'running':
-      return 'var(--accent-cursor)';
     case 'complete':
-      return 'var(--accent-green)';
+      return 'var(--text-sub)';
     case 'awaiting_input':
     case 'waiting':
+      return 'var(--accent-yellow)';
     case 'error':
       return 'var(--accent-red)';
     default:
@@ -90,6 +93,7 @@ export default function DeckFleet({
   const surfaceTurnOpenAt = useStore((s) => s.surfaceTurnOpenAt);
   const commandRunningByPtyId = useStore((s) => s.commandRunningByPtyId);
   const agentAliveByPtyId = useStore((s) => s.agentAliveByPtyId);
+  const usageLimitWaiting = useStore((s) => s.usageLimitWaiting);
   // ...and the decay clock's VERDICT rather than the clock itself. Subscribing
   // to `agentClockMs` here would re-run the fleet selector and re-render every
   // roster row every 2 s while any agent is fresh, for a tick that usually
@@ -115,11 +119,18 @@ export default function DeckFleet({
       surfaceTurnOpenAt,
       commandRunningByPtyId,
       agentAliveByPtyId,
+      usageLimitWaiting,
     });
     // Roster = live terminal panes of the ACTIVE workspace only (M1.5: the
     // deck is this workspace's orchestrator, so its roster is this
     // workspace's agents — the fleet-wide view lives in the titlebar vitals).
     // Browser/editor/diff surfaces and not-yet-spawned panes are not agents.
+    // #1343 — remote agents are deliberately NOT here, though Fleet View and
+    // the titlebar vitals chip show them. This roster is COMMANDABLE: every row
+    // drives the local input path, and a remote pane can only be driven through
+    // its own host's input API. Excluded twice over — `remoteWorkspaces` is
+    // never passed to the selector above, and a remote row keeps
+    // `surfaceType: 'remote-terminal'`, which this filter rejects.
     return sortFleetPanes(
       all.filter(
         (p) =>
@@ -130,7 +141,7 @@ export default function DeckFleet({
   }, [
     workspaces, activeWorkspaceId, surfaceAgentStatus, surfaceActivity, paneLabel,
     surfaceAgent, surfacePendingQuestion, surfaceActivityAt, hookRunningByPtyId,
-    surfaceTurnOpenAt, commandRunningByPtyId, agentAliveByPtyId,
+    surfaceTurnOpenAt, commandRunningByPtyId, agentAliveByPtyId, usageLimitWaiting,
   ]);
 
   if (panes.length === 0) return null;
@@ -138,7 +149,7 @@ export default function DeckFleet({
   return (
     <div
       data-deck-fleet
-      className="shrink-0 px-3 pt-2.5 pb-1.5 border-b border-[var(--bg-surface)]"
+      className="shrink-0 px-3 pt-2.5 pb-1.5"
       style={{ borderColor: 'var(--border-soft)' }}
       {...tokenAttrs('bgSurface', 'border')}
     >
@@ -160,9 +171,7 @@ export default function DeckFleet({
           // built-in vocabulary; surface it as an extra option so the <select>
           // never renders blank for a known-but-custom role.
           const role = paneRole[p.paneId] ?? '';
-          const roleOptions = role && !(ORCH_ROLES as readonly string[]).includes(role)
-            ? [role, ...ORCH_ROLES]
-            : [...ORCH_ROLES];
+          const roleOptions = paneRoleOptions(role);
           // D2 — the enforced agent/model for this role, shown as a muted
           // sub-label so the operator sees what a worker will actually launch as.
           // Gated on the binding REALLY injecting the model (bindingEnforcesModel),
@@ -170,10 +179,21 @@ export default function DeckFleet({
           // chip here, because a chip reading "gemini · flash" is indistinguishable
           // from an enforced one while the launch is untouched. Settings is where
           // an inert row explains itself; this roster only states facts about the
-          // launch. Consequence: an args-only binding shows no chip either.
+          // launch. Consequence: an args-only binding shows no chip either —
+          // unless its args skip permission prompts, which, like the role's
+          // skipPermissions, is shown when the role names its agent (#1681;
+          // without one wmux cannot tell which spelling is the skip flag).
           const binding = role ? roleBindings[role] : undefined;
-          const bindingLabel = bindingEnforcesModel(binding)
-            ? [binding?.agent, binding?.model].filter(Boolean).join(' · ')
+          const enforcesModel = bindingEnforcesModel(binding);
+          const skipFlag = bindingSkipPermissionsFlag(binding);
+          const bindingLabel = enforcesModel || skipFlag
+            ? [binding?.agent, enforcesModel ? binding?.model : undefined].filter(Boolean).join(' · ')
+            : '';
+          const bindingTitle = bindingLabel
+            ? t('deck.fleet.enforcedLaunch', {
+                binding: [bindingLabel, skipFlag ? t('pane.enforcedSkipPermissions', { flag: skipFlag }) : '']
+                  .filter(Boolean).join(' · '),
+              })
             : '';
           return (
             // Row = flex container so the jump button and the role <select> are
@@ -235,10 +255,19 @@ export default function DeckFleet({
                   stays reserved for alive+focus per DESIGN.md. */}
               {bindingLabel && (
                 <span
+                  data-deck-fleet-binding
                   className="shrink-0 font-mono text-[10px] leading-none text-[var(--text-muted)] max-w-[92px] truncate"
                   {...tokenAttrs('textMuted', 'text')}
-                  title={t('deck.fleet.enforcedLaunch', { binding: bindingLabel })}
+                  title={bindingTitle}
                 >
+                  {/* Skip leads, in red text (the pane badge's convention), so
+                      the 92px truncation eats the model id before it. */}
+                  {skipFlag && (
+                    <span data-deck-fleet-skip className="text-[var(--accent-red)]" {...tokenAttrs('danger', 'text')}>
+                      {t('pane.enforcedSkipBadge')}
+                    </span>
+                  )}
+                  {skipFlag ? ' · ' : ''}
                   {bindingLabel}
                 </span>
               )}

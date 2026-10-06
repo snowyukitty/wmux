@@ -22,11 +22,51 @@ export interface AttachedRemoteWorkspace {
   workspaceId: string;
   name: string;                   // remote name snapshot ('' → UI falls back to workspaceId prefix)
   panes: RemotePaneSummary[];     // refreshed on re-attach / exit event / poll
+  /**
+   * #1086 — local-side aliases. `label` renames the SIDEBAR ROW without
+   * touching the remote host (which owns the real name); `color` is a
+   * WorkspaceColorId in the same grammar as local workspaces. Both persist
+   * with the descriptor.
+   */
+  label?: string;
+  color?: string;
   /** The host could not be reached, or the workspace is gone from it. The
    *  entry deliberately STAYS in the sidebar — dropping a user's attachment
    *  because a laptop slept would be silent data loss — it just renders
    *  disconnected until a refresh succeeds or the user detaches. */
   stale?: boolean;
+  /** The host answered 401: it no longer accepts this computer's credential.
+   *  Implies `stale`, but unlike a sleeping laptop it will not heal on its
+   *  own — the row says so and offers to pair again. Cleared by the next
+   *  successful fetch. */
+  authRejected?: boolean;
+  /** The host is on plain http to another machine, so its token is never
+   *  sent: nothing on this row can load until it is paired again over HTTPS.
+   *  Shown like `authRejected` (it will not heal on its own). */
+  insecureTransport?: boolean;
+  /**
+   * #1329 — this row exists ONLY to drive the per-host poll for a
+   * remote-terminal SURFACE (the "New remote pane" / "Split right|down —
+   * remote" flows), not because the user attached a mirror.
+   *
+   * `attachRemoteWorkspace` fuses three things into one row: the poll input,
+   * a permanent sidebar mirror, and an on-disk descriptor replayed on every
+   * boot. A surface wants the FIRST only — it is a "tab = mine to operate"
+   * leaf in a local pane tree, not a "mirror = watching" attachment
+   * (remoteSessionTeardown.ts states that split). So an ephemeral row is:
+   *
+   *   - invisible: filtered out by `selectAttachedRemoteWorkspaces`, which
+   *     both the sidebar and WorkspaceCenter read (an unfiltered row would
+   *     also mount a SECOND RemoteWorkspaceView and double-attach the same
+   *     SSE stream);
+   *   - unpersisted: no `attachmentsAdd`, so it can never resurrect on a
+   *     later boot as an unreapable `stale: true` ghost;
+   *   - never selected: `activeRemoteKey` is not touched when one lands.
+   *
+   * Reaped by reconciliation, not by teardown call sites — see
+   * `pruneRemoteSurfaceWorkspaces`.
+   */
+  ephemeral?: boolean;
   /** Bumped every time this entry recovers from `stale`. A host that slept
    *  long enough for RemoteHostClient to give up reconnecting comes back with
    *  the SAME remote sessionIds, so the pane list is byte-identical and
@@ -50,6 +90,8 @@ function toDescriptor(w: AttachedRemoteWorkspace): RemoteAttachmentDescriptor {
     hostLabel: w.hostLabel,
     workspaceId: w.workspaceId,
     name: w.name,
+    ...(w.label ? { label: w.label } : {}),
+    ...(w.color ? { color: w.color } : {}),
   };
 }
 
@@ -85,11 +127,27 @@ export function mergePaneSets(
 
 /** Whether a merge result is indistinguishable from what is already in the
  *  store — the 10s poll runs forever, so an unchanged fetch must not push a
- *  new array identity and re-render every mirror. */
+ *  new array identity and re-render every mirror. Agent fields participate
+ *  (#1163): a remote agent's status flip must re-render its roster row. */
 function samePanes(a: RemotePaneSummary[], b: RemotePaneSummary[]): boolean {
   if (a.length !== b.length) return false;
   return a.every((pane, i) =>
-    pane.sessionId === b[i].sessionId && pane.shell === b[i].shell && pane.cwd === b[i].cwd);
+    pane.sessionId === b[i].sessionId
+    && pane.shell === b[i].shell
+    && pane.cwd === b[i].cwd
+    && pane.agentName === b[i].agentName
+    && pane.agentStatus === b[i].agentStatus
+    // #1342 — the resume offer and BOTH of its liveness signals. This function
+    // decides whether a poll result is worth storing, so a field missing from
+    // it is a field that never updates after the first snapshot: the chip's
+    // "never type into a live agent" gate would answer from whatever the host
+    // happened to say the first time and never hear that the agent came back.
+    && pane.commandRunning === b[i].commandRunning
+    && pane.agentProcessAlive === b[i].agentProcessAlive
+    && pane.resume?.agent === b[i].resume?.agent
+    && pane.resume?.sessionId === b[i].resume?.sessionId
+    && pane.resume?.cwdMatches === b[i].resume?.cwdMatches
+    && pane.resume?.permissionMode === b[i].resume?.permissionMode);
 }
 
 export interface RemoteWorkspacesSlice {
@@ -106,6 +164,15 @@ export interface RemoteWorkspacesSlice {
    * selecting it (a restore must not steal the user's view) and without
    * re-persisting what it just read. ADDITIVE ONLY — see the implementation. */
   restoreRemoteWorkspace: (w: AttachedRemoteWorkspace) => void;
+  /** #1329 — register the invisible, unpersisted poll input a remote-terminal
+   * SURFACE needs (see `AttachedRemoteWorkspace.ephemeral`). ADDITIVE ONLY:
+   * a key that is already present wins, so a real sidebar attachment on the
+   * same `hostId:workspaceId` is never demoted to an invisible row. */
+  trackRemoteSurfaceWorkspace: (w: AttachedRemoteWorkspace) => void;
+  /** #1329 — drop every EPHEMERAL row whose key is not in `keepKeys`. Rows the
+   * user attached are never touched, so pane teardown can never reap an
+   * attachment. Nothing is unpersisted because nothing was persisted. */
+  pruneRemoteSurfaceWorkspaces: (keepKeys: ReadonlySet<string>) => void;
   /** Remove the entry AND its persisted descriptor; clears activeRemoteKey
    * only if it was the active one. */
   detachRemoteWorkspace: (key: string) => void;
@@ -116,15 +183,113 @@ export interface RemoteWorkspacesSlice {
   setRemoteWorkspacePanes: (key: string, panes: RemotePaneSummary[], name?: string) => void;
   /** Marks the entry unreachable (or reachable again) without dropping it. */
   setRemoteWorkspaceStale: (key: string, stale: boolean) => void;
+  /** Flags (or clears) every row on `hostId` as refused by the host — see
+   *  `AttachedRemoteWorkspace.authRejected`. */
+  setRemoteHostAuthRejected: (hostId: string, rejected: boolean) => void;
+  /** Flags (or clears) every row on `hostId` as needing HTTPS — see
+   *  `AttachedRemoteWorkspace.insecureTransport`. */
+  setRemoteHostInsecure: (hostId: string, insecure: boolean) => void;
+  /** The host whose stale credential the user asked to replace from outside
+   *  the attach modal (a remote workspace's "Pair again"). AppLayout mounts
+   *  the modal for it: re-pairing removes the host, which unmounts every view
+   *  of that host — including the one the request came from. */
+  remoteRepairHostId: string | null;
+  requestRemoteRepair: (hostId: string | null) => void;
+  /** Bumped to ask the Remote hub (the sidebar's Remote popover) to open on
+   *  its "Other computers" section — the + menu's "Attach remote workspace". */
+  remoteHubRequestSeq: number;
+  openRemoteHub: () => void;
+  /** How many Remote hubs are mounted. Zero (the sidebar is not rendering
+   *  its nav) means a request has nowhere to land, and callers fall back to
+   *  the attach dialog. */
+  remoteHubMounted: number;
+  setRemoteHubMounted: (mounted: boolean) => void;
+  /** #1086 — rename the row LOCALLY (the remote host owns the real name).
+   *  Empty clears the alias; the remote snapshot name shows again. */
+  renameRemoteWorkspace: (key: string, label: string | null) => void;
+  /** #1086 — color-tag the row in the same grammar as local workspaces.
+   *  undefined clears the tag. */
+  setRemoteWorkspaceColor: (key: string, color: string | undefined) => void;
   /** Selecting a LOCAL workspace calls this with null. */
   setActiveRemoteKey: (key: string | null) => void;
+}
+
+/**
+ * #1086 — the ONE definition of "a remote mirror is what's on screen".
+ *
+ * WorkspaceCenter renders the local pane tree and every attached mirror at
+ * once and picks with display:none, so this predicate decides which surface
+ * the user is looking at. Keeping it here (rather than re-deriving
+ * `activeRemoteKey ? …` at each call site) means the local-vs-remote gate has
+ * a single reading, and it adds the check the raw flag cannot make on its
+ * own: a key with no live entry behind it selects nothing, so it must fall
+ * back to the local tree instead of hiding everything.
+ */
+export function isRemoteMirrorVisible(state: {
+  remoteWorkspaces: AttachedRemoteWorkspace[];
+  activeRemoteKey: string | null;
+}): boolean {
+  if (!state.activeRemoteKey) return false;
+  // #1329 — an EPHEMERAL row is a poll input, not a mirror: nothing renders it,
+  // so treating one as visible would hide the local tree behind a blank centre.
+  // Nothing sets activeRemoteKey to an ephemeral key today; this keeps the two
+  // halves of the gate reading the same list rather than relying on that.
+  return state.remoteWorkspaces.some((r) => r.key === state.activeRemoteKey && !r.ephemeral);
+}
+
+/**
+ * #1329 — the ONE definition of "a remote mirror the user attached", i.e. every
+ * row that renders: a sidebar entry and a mounted RemoteWorkspaceView.
+ *
+ * Kept here, next to `isRemoteMirrorVisible`, for the same reason that
+ * predicate lives here: the sidebar and WorkspaceCenter must never disagree
+ * about which rows exist. A row they disagreed on would either be clickable
+ * with nothing behind it, or would silently double-attach an SSE stream the
+ * user cannot see.
+ *
+ * Subscribe through `useShallow`, never bare. `remoteWorkspaces` gets a new
+ * array identity on every 10s poll round that changes ANY row — including the
+ * invisible ones behind remote-terminal panes, whose agent status flips are
+ * deliberately part of `samePanes` — so a bare subscription would re-render
+ * the whole sidebar and every mounted mirror on a tick that changed nothing
+ * they display. Shallow-comparing the filtered result is what keeps an
+ * ephemeral row's churn off the visible components entirely.
+ */
+export function selectAttachedRemoteWorkspaces(state: {
+  remoteWorkspaces: AttachedRemoteWorkspace[];
+}): AttachedRemoteWorkspace[] {
+  return state.remoteWorkspaces.some((r) => r.ephemeral)
+    ? state.remoteWorkspaces.filter((r) => !r.ephemeral)
+    : state.remoteWorkspaces;
+}
+
+/** The name a remote workspace's sidebar row shows: the local alias, else the
+ *  host's name, else a workspace id prefix. Shared by the row and the search. */
+export function remoteWorkspaceDisplayName(rw: Pick<AttachedRemoteWorkspace, 'label' | 'name' | 'workspaceId'>): string {
+  return rw.label || rw.name || rw.workspaceId.slice(0, 8);
 }
 
 export const createRemoteWorkspacesSlice: StateCreator<StoreState, [['zustand/immer', never]], [], RemoteWorkspacesSlice> = (set) => ({
   remoteWorkspaces: [],
   activeRemoteKey: null,
+  remoteRepairHostId: null,
+  remoteHubRequestSeq: 0,
+  remoteHubMounted: 0,
+
+  openRemoteHub: () => set((state: StoreState) => {
+    state.remoteHubRequestSeq += 1;
+  }),
+
+  setRemoteHubMounted: (mounted) => set((state: StoreState) => {
+    state.remoteHubMounted = Math.max(0, state.remoteHubMounted + (mounted ? 1 : -1));
+  }),
 
   attachRemoteWorkspace: (w) => {
+    // Persist the MERGED entry, not `w`: a re-attach hands us a fresh snapshot
+    // without the #1086 aliases, so writing `w` would wipe the carried-over
+    // label/color from disk and lose them on the next reload. Built inside
+    // the producer (a draft must not escape set()).
+    let descriptor: RemoteAttachmentDescriptor | undefined;
     set((state: StoreState) => {
       const idx = state.remoteWorkspaces.findIndex((r: AttachedRemoteWorkspace) => r.key === w.key);
       if (idx === -1) {
@@ -132,16 +297,27 @@ export const createRemoteWorkspacesSlice: StateCreator<StoreState, [['zustand/im
       } else {
         // Carry the epoch across a re-attach: its only job is to be different
         // from the value the mounted PaneCells last saw, and resetting it
-        // would tear down streams that are perfectly healthy.
-        state.remoteWorkspaces[idx] = { ...w, attachEpoch: state.remoteWorkspaces[idx].attachEpoch };
+        // would tear down streams that are perfectly healthy. The #1086
+        // aliases survive too — a re-attach (re-attach flow, bootstrap) hands
+        // us a fresh snapshot with no label/color, and letting it overwrite
+        // would silently wipe the user's rename/tag.
+        const prev = state.remoteWorkspaces[idx];
+        state.remoteWorkspaces[idx] = {
+          ...w,
+          attachEpoch: prev.attachEpoch,
+          ...(prev.label && !w.label ? { label: prev.label } : {}),
+          ...(prev.color && !w.color ? { color: prev.color } : {}),
+        };
       }
       state.activeRemoteKey = w.key;
+      const entry = state.remoteWorkspaces.find((r: AttachedRemoteWorkspace) => r.key === w.key);
+      if (entry) descriptor = toDescriptor(entry);
     });
     // Fire-and-forget: a failed write only costs this attachment its
     // restore-after-reload, and the attach itself has already happened. The
     // method check covers an older preload bundle without these routes.
     const api = persistApi();
-    if (api?.attachmentsAdd) void api.attachmentsAdd(toDescriptor(w)).catch(() => { /* see above */ });
+    if (descriptor && api?.attachmentsAdd) void api.attachmentsAdd(descriptor).catch(() => { /* see above */ });
   },
 
   // ADDITIVE ONLY. A boot restore fetches each host's panes before it lands,
@@ -153,6 +329,44 @@ export const createRemoteWorkspacesSlice: StateCreator<StoreState, [['zustand/im
   restoreRemoteWorkspace: (w) => set((state: StoreState) => {
     if (state.remoteWorkspaces.some((r: AttachedRemoteWorkspace) => r.key === w.key)) return;
     state.remoteWorkspaces.push(w);
+  }),
+
+  // ADDITIVE ONLY, for the same class of reason restoreRemoteWorkspace is.
+  // The mint flows behind a remote-terminal surface create a REAL workspace on
+  // the host (`remote-pane-*`), which AttachRemoteModal lists like any other —
+  // so the user can legitimately attach the very same `hostId:workspaceId` as
+  // a visible mirror. Present key wins, always: overwriting would hide a row
+  // the user is looking at, wipe its #1086 label/color, and orphan its
+  // persisted descriptor. The reverse order is safe without extra code —
+  // attachRemoteWorkspace replaces the entry with a snapshot that carries no
+  // `ephemeral`, promoting the row to a real attachment.
+  trackRemoteSurfaceWorkspace: (w) => set((state: StoreState) => {
+    if (state.remoteWorkspaces.some((r: AttachedRemoteWorkspace) => r.key === w.key)) return;
+    state.remoteWorkspaces.push({ ...w, ephemeral: true });
+  }),
+
+  pruneRemoteSurfaceWorkspaces: (keepKeys) => set((state: StoreState) => {
+    // Plain strings, captured BEFORE the array is rebuilt: a draft that has
+    // been detached from the tree is not something to keep reading fields off.
+    const doomed = new Set<string>(
+      state.remoteWorkspaces
+        .filter((r: AttachedRemoteWorkspace) => r.ephemeral === true && !keepKeys.has(r.key))
+        .map((r: AttachedRemoteWorkspace) => r.key),
+    );
+    if (doomed.size === 0) return; // no new array identity on a no-op round
+    // The `ephemeral` re-check is belt and braces: keys are unique across both
+    // kinds of row, so `doomed` alone would do. "Prune never reaps an
+    // attachment" is the invariant this whole design rests on, and it should
+    // not depend on a uniqueness argument made somewhere else.
+    state.remoteWorkspaces = state.remoteWorkspaces.filter(
+      (r: AttachedRemoteWorkspace) => !(r.ephemeral === true && doomed.has(r.key)),
+    );
+    // Defensive: nothing selects an ephemeral row, but a dangling
+    // activeRemoteKey would make isRemoteMirrorVisible disagree with what is
+    // mounted. Cheap to keep the two in step here rather than reason about it.
+    if (state.activeRemoteKey && doomed.has(state.activeRemoteKey)) {
+      state.activeRemoteKey = null;
+    }
   }),
 
   detachRemoteWorkspace: (key) => {
@@ -179,6 +393,7 @@ export const createRemoteWorkspacesSlice: StateCreator<StoreState, [['zustand/im
       entry.stale = false;
       entry.attachEpoch = (entry.attachEpoch ?? 0) + 1;
     }
+    if (entry.authRejected) entry.authRejected = false;
   }),
 
   setRemoteWorkspaceStale: (key, stale) => set((state: StoreState) => {
@@ -192,6 +407,60 @@ export const createRemoteWorkspacesSlice: StateCreator<StoreState, [['zustand/im
     entry.stale = stale;
     if (!stale) entry.attachEpoch = (entry.attachEpoch ?? 0) + 1;
   }),
+
+  setRemoteHostAuthRejected: (hostId, rejected) => set((state: StoreState) => {
+    for (const entry of state.remoteWorkspaces) {
+      if (entry.hostId !== hostId || (entry.authRejected === true) === rejected) continue;
+      entry.authRejected = rejected;
+    }
+  }),
+
+  setRemoteHostInsecure: (hostId, insecure) => set((state: StoreState) => {
+    for (const entry of state.remoteWorkspaces) {
+      if (entry.hostId !== hostId || (entry.insecureTransport === true) === insecure) continue;
+      entry.insecureTransport = insecure;
+    }
+  }),
+
+  requestRemoteRepair: (hostId) => set((state: StoreState) => {
+    state.remoteRepairHostId = hostId;
+  }),
+
+  renameRemoteWorkspace: (key, label) => {
+    // The descriptor is built INSIDE the producer (a draft that escapes set()
+    // is a revoked proxy — the same trap stashPane's comments warn about) and
+    // persisted as a plain object.
+    let descriptor: RemoteAttachmentDescriptor | undefined;
+    set((state: StoreState) => {
+      const entry = state.remoteWorkspaces.find((r: AttachedRemoteWorkspace) => r.key === key);
+      if (!entry) return;
+      const trimmed = label?.trim();
+      if (trimmed) entry.label = trimmed;
+      else delete entry.label;
+      descriptor = toDescriptor(entry);
+    });
+    // Re-adding the same key overwrites its descriptor in place (the store's
+    // own upsert rule), which is how the alias survives a reload.
+    const api = persistApi();
+    if (descriptor && api?.attachmentsAdd) {
+      void api.attachmentsAdd(descriptor).catch(() => { /* best-effort, same as attach */ });
+    }
+  },
+
+  setRemoteWorkspaceColor: (key, color) => {
+    let descriptor: RemoteAttachmentDescriptor | undefined;
+    set((state: StoreState) => {
+      const entry = state.remoteWorkspaces.find((r: AttachedRemoteWorkspace) => r.key === key);
+      if (!entry) return;
+      if (color) entry.color = color;
+      else delete entry.color;
+      descriptor = toDescriptor(entry);
+    });
+    const api = persistApi();
+    if (descriptor && api?.attachmentsAdd) {
+      void api.attachmentsAdd(descriptor).catch(() => { /* best-effort */ });
+    }
+  },
 
   setActiveRemoteKey: (key) => set((state: StoreState) => {
     state.activeRemoteKey = key;

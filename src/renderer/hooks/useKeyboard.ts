@@ -5,7 +5,8 @@ import { collectPaneTreePtyIds, findLeaf, getLeafPanes, getWorkspacePtyIds } fro
 import { terminalRegistry } from './useTerminal';
 import { t } from '../i18n';
 import { pastePtyChunked } from '../utils/clipboardChunk';
-import { matchesDisabledShortcut } from '../../shared/keymap';
+import { isPrefixTrigger, resolveShortcut, type ShortcutActionId } from '../../shared/keymap';
+import { currentShortcutBindings, shortcutPressGuard } from '../utils/shortcutBindings';
 import { createTerminalSurface } from '../utils/createTerminalSurface';
 import { openUrlInBrowserPane } from '../utils/browserPaneActions';
 import {
@@ -13,6 +14,12 @@ import {
   destroySurfaceRemoteSession,
   destroyWorkspaceRemoteSessions,
 } from '../utils/remoteSessionTeardown';
+import { disposePanePtys } from '../utils/paneTeardown';
+import { mentionKeyClaim } from '../utils/agentMention';
+import { OPEN_MENTION_PICKER_EVENT } from '../utils/agentMentionInsert';
+import { isChatV2Covering } from '../components/ChatV2/coverage';
+import { showWorkspaces } from '../utils/showWorkspaces';
+import { listedWorkspaces, moaHqId, refuseWorkspaceClose } from '../components/Moa/moaHqGuard';
 
 // Lightweight bookmark toast — reuses the same DOM element pattern as showCopyToast
 let bookmarkToastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -51,6 +58,35 @@ const PREFIX_TIMEOUT_MS = 2000;
 /** How long to show "Unknown: [key]" error */
 const PREFIX_ERROR_DISPLAY_MS = 500;
 
+/**
+ * Built-in actions whose keydown must not reach any later listener — xterm
+ * above all. Tab would emit a literal `\t` into the newly focused pane, and
+ * Arrow chords would arrive as escape sequences.
+ */
+/**
+ * Built-ins that act on the active pane, its PTY or the pane layout. Another
+ * rail page covers the panes (inert, still mounted), so these run only on the
+ * Workspaces page: a split, a close or a pane-focus move behind Fleet or
+ * Settings would change a terminal the user cannot see. Workspace switches are
+ * not here — they bring the Workspaces page forward instead. One exception:
+ * the floating pane floats over every page, so while it is shown its toggle
+ * still runs (to hide it); opening it stays a Workspaces-page action.
+ */
+export const WORKSPACES_ONLY_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<ShortcutActionId>([
+  'splitHorizontal', 'splitVertical', 'newSurface', 'closeSurface', 'closePane', 'closeWorkspace',
+  'searchTerminal', 'viCopyMode', 'renameWorkspace', 'highlightPane', 'floatingPane',
+  'nextSurface', 'prevSurface', 'nextPane', 'prevPane',
+  'focusUp', 'focusDown', 'focusLeft', 'focusRight',
+  'focusUpAlt', 'focusDownAlt', 'focusLeftAlt', 'focusRightAlt',
+  'clearMultiview', 'openBrowser', 'addBookmark', 'zoomIn', 'zoomOut', 'zoomReset',
+]);
+
+const STOP_PROPAGATION_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<ShortcutActionId>([
+  'nextPane', 'prevPane',
+  'focusUp', 'focusDown', 'focusLeft', 'focusRight',
+  'prevWorkspace', 'nextWorkspace',
+]);
+
 // Terminal font-size zoom bounds. Kept in lockstep with the Appearance tab's
 // font-size slider (SettingsPanel TabAppearance: min 12 / max 24) and the
 // store default (uiSlice terminalFontSize: 14) so keyboard zoom and the slider
@@ -61,6 +97,17 @@ const FONT_SIZE_DEFAULT = 14;
 const FONT_SIZE_STEP = 1;
 
 /** Clamp a candidate terminal font size into the [MIN, MAX] zoom range. */
+
+/** The key came from the chat-v2 view, or the active pane is covered by it. */
+function chatV2OwnsKey(target: EventTarget | null): boolean {
+  if (target instanceof Element && target.closest('[data-chatv2-surface]')) return true;
+  const state = useStore.getState();
+  const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
+  const leaf = ws ? findLeaf(ws.rootPane, ws.activePaneId) : null;
+  const surface = leaf?.surfaces.find((s) => s.id === leaf.activeSurfaceId);
+  return isChatV2Covering(surface?.ptyId);
+}
+
 export function clampFontSize(n: number): number {
   return Math.max(FONT_SIZE_MIN, Math.min(FONT_SIZE_MAX, n));
 }
@@ -78,14 +125,6 @@ export function ctrlByteForKeyCode(code: string): string | null {
   const m = /^Key([A-Z])$/.exec(code);
   if (!m) return null;
   return String.fromCharCode(m[1].charCodeAt(0) - 64);
-}
-
-/** Dispose all PTYs inside a pane tree — plus every remote session the tree
- *  owns (#1129), which carries no ptyId and would otherwise survive the pane
- *  that was running it. */
-function disposePanePtys(pane: import('../../shared/types').Pane): void {
-  for (const ptyId of collectPaneTreePtyIds(pane)) window.electronAPI.pty.dispose(ptyId);
-  destroyPaneTreeRemoteSessions(pane);
 }
 
 /**
@@ -199,19 +238,27 @@ export function createPrefixActions(deps: PrefixActionDeps): Record<string, () =
       state.closePane(ws.activePaneId);
     },
     newWorkspace: () => { store.getState().addWorkspace(); },
+    // Cycles the operator's workspaces only: Moa's HQ is not in the list.
     nextWorkspace: () => {
-      const { workspaces, activeWorkspaceId } = store.getState();
-      if (workspaces.length <= 1) return;
+      const state = store.getState();
+      const { activeWorkspaceId } = state;
+      const workspaces = listedWorkspaces(state.workspaces, moaHqId(state));
       const currentIdx = workspaces.findIndex((w) => w.id === activeWorkspaceId);
-      const nextIdx = (currentIdx + 1) % workspaces.length;
-      store.getState().setActiveWorkspace(workspaces[nextIdx].id);
+      const next = workspaces[(currentIdx + 1) % workspaces.length];
+      if (!next || next.id === activeWorkspaceId) return;
+      store.getState().setActiveWorkspace(next.id);
+      store.getState().setAppRoute('workspaces');
     },
     prevWorkspace: () => {
-      const { workspaces, activeWorkspaceId } = store.getState();
-      if (workspaces.length <= 1) return;
+      const state = store.getState();
+      const { activeWorkspaceId } = state;
+      const workspaces = listedWorkspaces(state.workspaces, moaHqId(state));
       const currentIdx = workspaces.findIndex((w) => w.id === activeWorkspaceId);
-      const prevIdx = (currentIdx - 1 + workspaces.length) % workspaces.length;
-      store.getState().setActiveWorkspace(workspaces[prevIdx].id);
+      // From the HQ (not in the list), back to the last one.
+      const prev = workspaces[currentIdx === -1 ? workspaces.length - 1 : (currentIdx - 1 + workspaces.length) % workspaces.length];
+      if (!prev || prev.id === activeWorkspaceId) return;
+      store.getState().setActiveWorkspace(prev.id);
+      store.getState().setAppRoute('workspaces');
     },
     hideWindow: () => { electronAPI.window.hide(); },
     toggleZoom: () => {
@@ -250,6 +297,8 @@ export function createPrefixActions(deps: PrefixActionDeps): Record<string, () =
       const state = store.getState();
       const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
       if (!ws) return;
+      // Moa's HQ and the last workspace: refused before any session is touched.
+      if (refuseWorkspaceClose(ws.id, state)) return;
       // Workspace-wide (#977) — see Sidebar.disposeAllPtys: a stashed pane's
       // session dies with its workspace or it becomes an orphan.
       for (const ptyId of getWorkspacePtyIds(ws)) electronAPI.pty.dispose(ptyId);
@@ -284,6 +333,235 @@ export function useKeyboard() {
       electronAPI: window.electronAPI,
       doc: document,
     });
+    // ─── Built-in shortcut actions ─────────────────────────────────────
+    // What each ShortcutActionId (shared/keymap.ts) does. WHICH key runs it
+    // is not decided here: the handler resolves the keydown against the
+    // effective bindings — the one table, with the user's overrides applied —
+    // so moving or switching off a shortcut in Settings changes this hook,
+    // useTerminal and useComposeShortcut together (#1455).
+    //
+    // Actions with no entry (richInput, owned by useComposeShortcut) leave
+    // the event alone.
+    const activeWorkspace = () => {
+      const state = store.getState();
+      return state.workspaces.find((w) => w.id === state.activeWorkspaceId);
+    };
+    // Ctrl+N counts the list the operator sees, which leaves out Moa's HQ.
+    const jumpToWorkspace = (idx: number) => {
+      const state = store.getState();
+      const workspaces = listedWorkspaces(state.workspaces, moaHqId(state));
+      if (idx >= 0 && idx < workspaces.length) {
+        store.getState().setActiveWorkspace(workspaces[idx].id);
+        // Switching workspace means "show me that workspace", from any page.
+        store.getState().setAppRoute('workspaces');
+      }
+    };
+    // Terminal font zoom writes through setTerminalFontSize, so xterm picks
+    // it up via the runtime font effect in useTerminal (no terminal
+    // re-creation, scrollback preserved).
+    const zoomFont = (delta: number) => {
+      const cur = store.getState().terminalFontSize;
+      const next = clampFontSize(cur + delta);
+      if (next !== cur) store.getState().setTerminalFontSize(next);
+    };
+    // Ctrl+Shift+Arrow MOVES focus — pane focus within the active workspace,
+    // or (in multiview) focus between grid tiles.
+    const moveFocus = (dir: 'up' | 'down' | 'left' | 'right') => {
+      const { multiviewIds, activeWorkspaceId } = store.getState();
+      if (multiviewIds.length >= 2 && multiviewIds.includes(activeWorkspaceId)) {
+        store.getState().focusMultiviewDirection(dir);
+      } else {
+        store.getState().focusPaneDirection(dir);
+      }
+    };
+
+    const builtinActions: Partial<Record<ShortcutActionId, () => void>> = {
+      splitHorizontal: () => {
+        const ws = activeWorkspace();
+        if (ws) store.getState().splitPane(ws.activePaneId, 'horizontal');
+      },
+      splitVertical: () => {
+        const ws = activeWorkspace();
+        if (ws) store.getState().splitPane(ws.activePaneId, 'vertical');
+      },
+      newSurface: () => {
+        const state = store.getState();
+        // S-A Step 1 — the renderer now mounts in parallel with the daemon
+        // bootstrap, so this handler is live while the LOCAL→DAEMON handler
+        // swap may still be in flight. A pty.create fired in that window
+        // mints a local-mode id whose writes the daemon handler silently
+        // drops (the dda4c0c first-keystroke bug). paneGate flips to
+        // 'ready' only after the startup reconcile, which is serialized
+        // behind the daemon-vs-local decision — gate on it like every
+        // other create path.
+        if (state.paneGate !== 'ready') return;
+        const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
+        if (ws) {
+          void createTerminalSurface({
+            workspaceId: ws.id,
+            paneId: ws.activePaneId,
+            paneGate: state.paneGate,
+            workspaces: state.workspaces,
+            startupDirectory: state.startupDirectory,
+            defaultShell: state.defaultShell,
+            ipcInvoke: ipcInvokeRef.current,
+            ptyCreate: window.electronAPI.pty.create,
+            addSurface: state.addSurface,
+          });
+        }
+      },
+      newWorkspace: () => {
+        store.getState().addWorkspace();
+        showWorkspaces(store.getState());
+      },
+      // Close active surface. If it was the last surface in the pane, also
+      // collapse the pane so split layouts can actually be torn down via the
+      // keyboard. Mirrors the X-button cascade in Pane.tsx — the tab strip
+      // path was the only way to reach closePane before, and single-tab panes
+      // don't render a tab strip at all.
+      closeSurface: () => {
+        const state = store.getState();
+        const ws = activeWorkspace();
+        if (!ws) return;
+        const activePane = findLeaf(ws.rootPane, ws.activePaneId);
+        if (activePane && activePane.activeSurfaceId) {
+          const surface = activePane.surfaces.find((s) => s.id === activePane.activeSurfaceId);
+          if (surface?.ptyId) {
+            window.electronAPI.pty.dispose(surface.ptyId);
+          }
+          // #1129 — the tab-strip X does the same (Pane.handleCloseSurface);
+          // the two close paths must not diverge on what closing a remote tab
+          // means.
+          destroySurfaceRemoteSession(surface);
+          const wasLastSurface = activePane.surfaces.length <= 1;
+          state.closeSurface(activePane.id, activePane.activeSurfaceId);
+          if (wasLastSurface) {
+            // Non-root panes collapse here; root pane is a no-op (paneSlice
+            // refuses to drop it) so AppLayout's empty-leaf effect refills it
+            // with a fresh PTY — same behaviour as before for the lone pane.
+            state.closePane(activePane.id);
+          }
+        }
+      },
+      // Close active pane outright (tmux 'kill-pane' direct key). Disposes
+      // every PTY in the subtree first so background terminals don't leak
+      // when the pane disappears.
+      closePane: () => {
+        const ws = activeWorkspace();
+        if (!ws) return;
+        const activeLeaf = findLeaf(ws.rootPane, ws.activePaneId);
+        if (activeLeaf) disposePanePtys(activeLeaf);
+        store.getState().closePane(ws.activePaneId);
+      },
+      searchTerminal: () => { store.getState().toggleSearchBar(); },
+      commandPalette: () => { store.getState().toggleCommandPalette(); },
+      toggleNotifications: () => { store.getState().toggleNotificationPanel(); },
+      // (Ctrl+Shift+C is reserved for clipboard copy, hence X.)
+      viCopyMode: () => { store.getState().setViCopyModeActive(true); },
+      // Handled by the Sidebar component via a custom event.
+      renameWorkspace: () => { document.dispatchEvent(new CustomEvent('wmux:rename-workspace')); },
+      highlightPane: () => { document.dispatchEvent(new CustomEvent('wmux:flash-pane')); },
+      floatingPane: () => { store.getState().toggleFloatingPane(); },
+      prevWorkspace: () => { prefixActions.prevWorkspace(); },
+      nextWorkspace: () => { prefixActions.nextWorkspace(); },
+      workspace1: () => jumpToWorkspace(0),
+      workspace2: () => jumpToWorkspace(1),
+      workspace3: () => jumpToWorkspace(2),
+      workspace4: () => jumpToWorkspace(3),
+      workspace5: () => jumpToWorkspace(4),
+      workspace6: () => jumpToWorkspace(5),
+      workspace7: () => jumpToWorkspace(6),
+      workspace8: () => jumpToWorkspace(7),
+      workspace9: () => {
+        const state = store.getState();
+        jumpToWorkspace(listedWorkspaces(state.workspaces, moaHqId(state)).length - 1);
+      },
+      closeWorkspace: () => {
+        const state = store.getState();
+        const ws = activeWorkspace();
+        // Moa's HQ and the last workspace: refused before any session is touched.
+        if (ws && refuseWorkspaceClose(ws.id, state)) return;
+        if (ws) {
+          // 워크스페이스가 소유한 모든 PTY 정리 — 보관된 페인 포함(#977).
+          // Same reasoning as Sidebar's close button and the prefix
+          // killWorkspace action: a stashed session outliving its workspace is
+          // an orphan nothing can reach.
+          for (const ptyId of getWorkspacePtyIds(ws)) window.electronAPI.pty.dispose(ptyId);
+          destroyWorkspaceRemoteSessions(ws); // #1129 — same reasoning, no ptyId
+        }
+        state.removeWorkspace(state.activeWorkspaceId);
+      },
+      // Jump to the latest unread notification's workspace.
+      jumpToUnread: () => {
+        const state = store.getState();
+        const unread = state.notifications
+          .filter((n) => !n.read)
+          .sort((a, b) => b.timestamp - a.timestamp);
+        if (unread.length > 0) {
+          const latest = unread[0];
+          state.setActiveWorkspace(latest.workspaceId);
+          state.setAppRoute('workspaces');
+          state.markRead(latest.id);
+        }
+      },
+      nextSurface: () => {
+        const ws = activeWorkspace();
+        if (ws) store.getState().nextSurface(ws.activePaneId);
+      },
+      prevSurface: () => {
+        const ws = activeWorkspace();
+        if (ws) store.getState().prevSurface(ws.activePaneId);
+      },
+      // Cycle through every leaf pane in the active workspace (wraps around).
+      nextPane: () => { store.getState().cyclePane('next'); },
+      prevPane: () => { store.getState().cyclePane('prev'); },
+      focusUp: () => moveFocus('up'),
+      focusDown: () => moveFocus('down'),
+      focusLeft: () => moveFocus('left'),
+      focusRight: () => moveFocus('right'),
+      // The alternate combo; kept so the macOS ⌘+Alt+Arrow path and existing
+      // muscle memory still work.
+      focusUpAlt: () => { store.getState().focusPaneDirection('up'); },
+      focusDownAlt: () => { store.getState().focusPaneDirection('down'); },
+      focusLeftAlt: () => { store.getState().focusPaneDirection('left'); },
+      focusRightAlt: () => { store.getState().focusPaneDirection('right'); },
+      toggleSidebar: () => { store.getState().toggleSidebar(); },
+      openSettings: () => { store.getState().toggleSettingsPanel(); },
+      // S-C1 cockpit — every agent, one screen.
+      toggleFleetView: () => { store.getState().toggleFleetView(); },
+      toggleCompanyView: () => { store.getState().toggleCompanyView(); },
+      // Back to single view.
+      clearMultiview: () => { store.getState().clearMultiview(); },
+      // Browser panel in a new horizontal split. forceNew keeps the
+      // explicit-creation semantics — link/port clicks reuse an existing
+      // browser pane, but this shortcut always makes another one.
+      openBrowser: () => { openUrlInBrowserPane(undefined, { forceNew: true }); },
+      // Scrollback bookmark at the current scroll position.
+      addBookmark: () => {
+        const state = store.getState();
+        const ws = activeWorkspace();
+        if (!ws) return;
+        const pane = findLeaf(ws.rootPane, ws.activePaneId);
+        if (!pane) return;
+        const surface = pane.surfaces.find((s) => s.id === pane.activeSurfaceId);
+        if (!surface?.ptyId) return;
+        const term = terminalRegistry.get(surface.ptyId);
+        if (!term) return;
+        const line = term.buffer.active.baseY + term.buffer.active.viewportY;
+        state.addBookmark(surface.ptyId, line);
+        showBookmarkToast();
+      },
+      toggleMessageFeed: () => { store.getState().toggleMessageFeed(); },
+      zoomIn: () => zoomFont(FONT_SIZE_STEP),
+      zoomOut: () => zoomFont(-FONT_SIZE_STEP),
+      zoomReset: () => {
+        if (store.getState().terminalFontSize !== FONT_SIZE_DEFAULT) {
+          store.getState().setTerminalFontSize(FONT_SIZE_DEFAULT);
+        }
+      },
+      mentionAgent: () => { document.dispatchEvent(new CustomEvent(OPEN_MENTION_PICKER_EVENT)); },
+    };
+
     /** Clear the prefix timeout if running */
     const clearPrefixTimeout = () => {
       if (prefixTimeoutRef.current !== null) {
@@ -298,15 +576,21 @@ export function useKeyboard() {
       store.getState().setPrefixMode(false);
     };
 
-    // OS-aware shortcut mapping (DX D1 decision):
-    //   • Most shortcuts (split, palette, settings, …) use ⌘ on macOS, Ctrl elsewhere.
-    //   • tmux prefix (Ctrl+B), sidebar toggle (Ctrl+Shift+B) and bookmark (Ctrl+Shift+M)
-    //     keep literal Ctrl on every OS to honor tmux convention.
-    // On non-macOS systems cmdOrCtrl === literalCtrl, so Windows/Linux behaviour is
-    // byte-identical to the previous implementation.
+    // OS-aware modifiers (DX D1 decision): most built-ins use ⌘ on macOS and
+    // Ctrl elsewhere; the tmux prefix and the sidebar / bookmark family keep
+    // literal Ctrl on every OS. That split lives in the keymap table
+    // (`literalCtrl`); here it only matters for the editable-field guard.
     const isMac = window.electronAPI.platform === 'darwin';
 
     const handler = (e: KeyboardEvent) => {
+      // The IME's plain-key follow-up of a press something already acted on
+      // (Hangul composition: `Process` then `t` for one Ctrl+T). Swallowed
+      // whole, before any mode below can read it as a second press.
+      if (shortcutPressGuard.isDuplicate(e)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        return;
+      }
       // D-exclusive: inspect (point-and-style) is the top-level exclusive mode.
       // While it's active, suppress EVERY global shortcut — the prefix trigger,
       // split/close/zoom/focus, palette/settings toggles, custom keybindings —
@@ -315,6 +599,10 @@ export function useKeyboard() {
       // handled here: it stays unconsumed and bubbles to InspectOverlay's own
       // React onKeyDown (which calls exitInspect), so exiting still works.
       if (store.getState().inspectModeActive) return;
+      // Settings is recording a combo (Settings → Shortcuts, custom
+      // keybindings, prefix key): the chord belongs to the recorder, which
+      // listens on the same capture phase but registered after this hook.
+      if (store.getState().keyCaptureActive) return;
 
       const cmdOrCtrl = isMac ? e.metaKey : e.ctrlKey;
       const literalCtrl = e.ctrlKey;
@@ -325,20 +613,25 @@ export function useKeyboard() {
 
       // Read prefix mode from store (fresh, no stale closure)
       const prefixMode = store.getState().prefixMode;
+      // Another rail page covers the panes: nothing below may reach a PTY or
+      // change the layout (see WORKSPACES_ONLY_ACTIONS).
+      const onWorkspaces = store.getState().appRoute === 'workspaces';
 
-      // Custom-keybinding dispatch, extracted so BOTH exits can reach it: the
-      // normal tail (after every built-in declined) and the #1152 disabled
-      // gate below — disabling a built-in must still let a custom macro the
-      // user rebound onto that combo fire, not silently die with it.
+      // Custom-keybinding dispatch: runs when no built-in owns the combo —
+      // including one the user switched off or moved away, so a custom macro
+      // on that combo fires instead of dying with it (#1152).
       const dispatchCustomKeybinding = (): boolean => {
         // Custom keybindings are stored in literal "Ctrl+…" form for cross-OS
         // consistency; match against literalCtrl so user-defined combos behave
         // identically on Windows / Linux / macOS.
         const { customKeybindings } = store.getState();
-        if (customKeybindings.length === 0) return false;
+        if (customKeybindings.length === 0 || !onWorkspaces) return false;
         const pressed = formatKeyCombo(literalCtrl, shift, alt, key);
         const match = customKeybindings.find((kb) => kb.key === pressed);
         if (!match) return false;
+        // A chat-v2 pane hides its shell: a macro typed there would be input
+        // the user cannot see, so the key is left to the chat.
+        if (chatV2OwnsKey(e.target)) return false;
         e.preventDefault();
         e.stopImmediatePropagation();
         const state = store.getState();
@@ -367,28 +660,11 @@ export function useKeyboard() {
         return true;
       };
 
-      // #1152 — a built-in the user disabled (Settings → Shortcuts) skips
-      // every built-in handler below. A custom macro rebound onto the combo
-      // still fires; otherwise the event leaves with no preventDefault, so
-      // the key falls through to whatever has focus — useTerminal's twin
-      // gate (matchesDisabledShortcut, the SAME function) then lets xterm
-      // encode it for the PTY, and Ctrl+T opens Codex's own transcript
-      // instead of a new surface. Prefix-mode SUB-commands stay unaffected.
-      // The CURRENT prefix trigger is exempt: a user who moved the prefix
-      // onto an advertised combo (prefixConfig.key is free-form) and then
-      // disabled that combo's built-in must still be able to enter prefix
-      // mode — losing the trigger would strand every prefix binding at once.
-      const isPrefixTrigger =
-        literalCtrl && !shift && !alt && code === store.getState().prefixConfig.key;
-      if (!prefixMode && !isPrefixTrigger && matchesDisabledShortcut(
-        store.getState().disabledShortcuts, e, isMac ? 'darwin' : 'win32',
-      )) {
-        dispatchCustomKeybinding();
-        return;
-      }
-
       // ─── Prefix mode: intercept the next key ───────────────────────
-      if (prefixMode) {
+      // Every prefix action works on panes; a page switch already ends the
+      // mode (applyAppRoute), this covers a mode armed some other way.
+      if (prefixMode && !onWorkspaces) exitPrefixMode();
+      else if (prefixMode) {
         e.preventDefault();
         e.stopImmediatePropagation();
         clearPrefixTimeout();
@@ -406,12 +682,13 @@ export function useKeyboard() {
               const leaf = findLeaf(ws.rootPane, ws.activePaneId);
               if (leaf) {
                 const surface = leaf.surfaces.find((s) => s.id === leaf.activeSurfaceId);
-                if (surface?.ptyId) {
+                if (surface?.ptyId && !isChatV2Covering(surface.ptyId) && !chatV2OwnsKey(e.target)) {
                   window.electronAPI.pty.write(surface.ptyId, byte);
                 }
               }
             }
           }
+          shortcutPressGuard.noteActed(e);
           exitPrefixMode();
           return;
         }
@@ -477,9 +754,9 @@ export function useKeyboard() {
       // Ctrl+<prefixKey>: Enter prefix mode (configurable, default Ctrl+B)
       // Use e.code for Korean IME compatibility (see commit 60e39b0)
       // tmux convention → literal Ctrl on every OS (do NOT remap to ⌘ on macOS).
-      const prefixKeyCode = store.getState().prefixConfig.key;
-      if (literalCtrl && !shift && !alt && code === prefixKeyCode) {
+      if (onWorkspaces && isPrefixTrigger(e, store.getState().prefixConfig.key)) {
         e.preventDefault();
+        shortcutPressGuard.noteActed(e);
         store.getState().setPrefixMode(true);
         // Start timeout — auto-exit prefix mode after 2s
         clearPrefixTimeout();
@@ -490,421 +767,51 @@ export function useKeyboard() {
         return;
       }
 
-      // Ctrl+Shift+B: Toggle sidebar (moved from Ctrl+B)
-      // Pairs with the tmux prefix above → literal Ctrl on every OS.
-      if (literalCtrl && shift && !alt && code === 'KeyB') {
+      // ─── Built-in shortcuts ─────────────────────────────────────────
+      // One lookup in the effective bindings decides. A shortcut the user
+      // switched off is simply not there, so the key goes on to whatever has
+      // focus — useTerminal asks the same resolver and lets xterm encode it
+      // for the PTY (Ctrl+T reaches Codex, Alt+Up reaches a TUI). A custom
+      // macro on the combo still fires. (#1152, #1455)
+      const resolved = resolveShortcut(e, currentShortcutBindings());
+      const action = resolved && (onWorkspaces || !WORKSPACES_ONLY_ACTIONS.has(resolved)
+        || (resolved === 'floatingPane' && store.getState().floatingPaneVisible)) ? resolved : undefined;
+      const run = action ? builtinActions[action] : undefined;
+      // The mention picker claims its key only while an agent pane (or Chat
+      // view) has focus — whatever key it is bound to — and only when the key
+      // came from that pane. In a plain shell, a floating pane or a brain
+      // embed, F2 belongs to mc / htop / vim, so it goes on to the terminal.
+      // A ⌘ chord on macOS is no terminal's: it is consumed with a toast
+      // instead of dying silently (see mentionKeyClaim).
+      const mentionClaim = action === 'mentionAgent'
+        ? mentionKeyClaim(store.getState(), e, window.electronAPI?.platform)
+        : undefined;
+      if (action && run && mentionClaim !== null) {
         e.preventDefault();
-        store.getState().toggleSidebar();
-        return;
-      }
-
-      // Ctrl+N: New workspace
-      if (cmdOrCtrl && !shift && !alt && key === 'n') {
-        e.preventDefault();
-        store.getState().addWorkspace();
-        return;
-      }
-
-      // Ctrl+Shift+W: Close workspace
-      if (cmdOrCtrl && shift && !alt && key === 'W') {
-        e.preventDefault();
-        const state = store.getState();
-        const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-        if (ws) {
-          // 워크스페이스가 소유한 모든 PTY 정리 — 보관된 페인 포함(#977).
-          // Same reasoning as Sidebar's close button and the prefix
-          // killWorkspace action: a stashed session outliving its workspace is
-          // an orphan nothing can reach.
-          for (const ptyId of getWorkspacePtyIds(ws)) window.electronAPI.pty.dispose(ptyId);
-          destroyWorkspaceRemoteSessions(ws); // #1129 — same reasoning, no ptyId
-        }
-        state.removeWorkspace(state.activeWorkspaceId);
-        return;
-      }
-
-      // Ctrl+1~9: Switch workspace
-      if (cmdOrCtrl && !shift && !alt && key >= '1' && key <= '9') {
-        e.preventDefault();
-        const { workspaces } = store.getState();
-        const idx = key === '9' ? workspaces.length - 1 : parseInt(key) - 1;
-        if (idx >= 0 && idx < workspaces.length) {
-          store.getState().setActiveWorkspace(workspaces[idx].id);
-        }
-        return;
-      }
-
-      // ─── Terminal font zoom (Ctrl+= / Ctrl+- / Ctrl+0) ─────────────────
-      // Matches the Windows Terminal / VS Code / browser convention. We match
-      // both e.key and the physical e.code: '=' and '-' sit on the same keys
-      // across Latin layouts, but resolving by code as well keeps zoom working
-      // under a Hangul / non-Latin IME (where e.key can be a composed glyph or
-      // 'Process'), mirroring the IME-safe split/prefix handling elsewhere in
-      // this file. Numpad +/-/0 are accepted too. Ctrl+1~9 above already
-      // returned, so '0' here is unambiguous (digit 0 is not a workspace key).
-      //
-      // The zoom step writes through setTerminalFontSize, so xterm picks it up
-      // via the runtime font effect in useTerminal (no terminal re-creation,
-      // scrollback preserved). For these to reach this handler while a terminal
-      // is focused, useTerminal's attachCustomKeyEventHandler must let the combo
-      // bubble (it does — see the zoom pass-through there).
-      const zoomFont = (delta: number) => {
-        const cur = store.getState().terminalFontSize;
-        const next = clampFontSize(cur + delta);
-        if (next !== cur) store.getState().setTerminalFontSize(next);
-      };
-      // Zoom in: Ctrl+= or Ctrl++ (Shift+=) — accept either so users needn't
-      // reach for Shift. NumpadAdd covers the numeric keypad.
-      if (cmdOrCtrl && !alt && (key === '=' || key === '+' || code === 'Equal' || code === 'NumpadAdd')) {
-        e.preventDefault();
-        zoomFont(FONT_SIZE_STEP);
-        return;
-      }
-      // Zoom out: Ctrl+- (Shift produces '_', accepted for symmetry).
-      if (cmdOrCtrl && !alt && (key === '-' || key === '_' || code === 'Minus' || code === 'NumpadSubtract')) {
-        e.preventDefault();
-        zoomFont(-FONT_SIZE_STEP);
-        return;
-      }
-      // Reset zoom: Ctrl+0 → back to the default font size.
-      if (cmdOrCtrl && !shift && !alt && (key === '0' || code === 'Digit0' || code === 'Numpad0')) {
-        e.preventDefault();
-        if (store.getState().terminalFontSize !== FONT_SIZE_DEFAULT) {
-          store.getState().setTerminalFontSize(FONT_SIZE_DEFAULT);
-        }
-        return;
-      }
-
-      // Ctrl+D: Split right (horizontal)
-      // Match by physical key code as well so Hangul / non-Latin IME state
-      // (where e.key may be 'ㅇ' or 'Process') still triggers the split.
-      if (cmdOrCtrl && !shift && !alt && (key === 'd' || code === 'KeyD')) {
-        e.preventDefault();
-        const state = store.getState();
-        const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-        if (ws) {
-          state.splitPane(ws.activePaneId, 'horizontal');
-        }
-        return;
-      }
-
-      // Ctrl+Shift+D: Split down (vertical)
-      if (cmdOrCtrl && shift && !alt && (key === 'D' || code === 'KeyD')) {
-        e.preventDefault();
-        const state = store.getState();
-        const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-        if (ws) {
-          state.splitPane(ws.activePaneId, 'vertical');
-        }
-        return;
-      }
-
-      // Ctrl+T: New surface
-      if (cmdOrCtrl && !shift && !alt && key === 't') {
-        e.preventDefault();
-        const state = store.getState();
-        // S-A Step 1 — the renderer now mounts in parallel with the daemon
-        // bootstrap, so this handler is live while the LOCAL→DAEMON handler
-        // swap may still be in flight. A pty.create fired in that window
-        // mints a local-mode id whose writes the daemon handler silently
-        // drops (the dda4c0c first-keystroke bug). paneGate flips to
-        // 'ready' only after the startup reconcile, which is serialized
-        // behind the daemon-vs-local decision — gate on it like every
-        // other create path.
-        if (state.paneGate !== 'ready') return;
-        const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-        if (ws) {
-          void createTerminalSurface({
-            workspaceId: ws.id,
-            paneId: ws.activePaneId,
-            paneGate: state.paneGate,
-            workspaces: state.workspaces,
-            startupDirectory: state.startupDirectory,
-            defaultShell: state.defaultShell,
-            ipcInvoke: ipcInvokeRef.current,
-            ptyCreate: window.electronAPI.pty.create,
-            addSurface: state.addSurface,
-          });
-        }
-        return;
-      }
-
-      // Ctrl+W: Close active surface. If it was the last surface in the pane,
-      // also collapse the pane so split layouts can actually be torn down via
-      // the keyboard. Mirrors the X-button cascade in Pane.tsx (line 85) — the
-      // tab strip path was the only way to reach closePane before, and single-
-      // tab panes don't render a tab strip at all.
-      if (cmdOrCtrl && !shift && !alt && key === 'w') {
-        e.preventDefault();
-        const state = store.getState();
-        const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-        if (!ws) return;
-        const activePane = findLeaf(ws.rootPane, ws.activePaneId);
-        if (activePane && activePane.activeSurfaceId) {
-          const surface = activePane.surfaces.find((s) => s.id === activePane.activeSurfaceId);
-          if (surface?.ptyId) {
-            window.electronAPI.pty.dispose(surface.ptyId);
-          }
-          // #1129 — the tab-strip X does the same (Pane.handleCloseSurface);
-          // the two close paths must not diverge on what closing a remote tab
-          // means.
-          destroySurfaceRemoteSession(surface);
-          const wasLastSurface = activePane.surfaces.length <= 1;
-          state.closeSurface(activePane.id, activePane.activeSurfaceId);
-          if (wasLastSurface) {
-            // Non-root panes collapse here; root pane is a no-op (paneSlice
-            // refuses to drop it) so AppLayout's empty-leaf effect refills it
-            // with a fresh PTY — same behaviour as before for the lone pane.
-            state.closePane(activePane.id);
-          }
-        }
-        return;
-      }
-
-      // Ctrl+Shift+Q: Close active pane outright (tmux 'kill-pane' direct key).
-      // Disposes every PTY in the subtree first so background terminals don't
-      // leak when the pane disappears. Matches the prefix-mode 'closePane'
-      // action so users have both a discoverable shortcut and the tmux flow.
-      if (cmdOrCtrl && shift && !alt && key === 'Q') {
-        e.preventDefault();
-        const state = store.getState();
-        const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-        if (!ws) return;
-        const activeLeaf = findLeaf(ws.rootPane, ws.activePaneId);
-        if (activeLeaf) disposePanePtys(activeLeaf);
-        state.closePane(ws.activePaneId);
-        return;
-      }
-
-      // Ctrl+Shift+]: Next surface
-      if (cmdOrCtrl && shift && !alt && key === ']') {
-        e.preventDefault();
-        const state = store.getState();
-        const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-        if (ws) state.nextSurface(ws.activePaneId);
-        return;
-      }
-
-      // Ctrl+Shift+[: Previous surface
-      if (cmdOrCtrl && shift && !alt && key === '[') {
-        e.preventDefault();
-        const state = store.getState();
-        const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-        if (ws) state.prevSurface(ws.activePaneId);
-        return;
-      }
-
-      // Alt+Ctrl+Arrow: Focus pane directionally (alternate combo; kept so the
-      // macOS ⌘+Alt+Arrow path and existing muscle memory still work).
-      if (cmdOrCtrl && alt && !shift && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(key)) {
-        e.preventDefault();
-        const dirMap: Record<string, 'up' | 'down' | 'left' | 'right'> = {
-          ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
-        };
-        store.getState().focusPaneDirection(dirMap[key]);
-        return;
-      }
-
-      // Ctrl+Tab / Ctrl+Shift+Tab: Cycle through every leaf pane in the active
-      // workspace (wraps around). Browser-style tab switching — bare Tab would
-      // break shell completion inside the terminal so we require literal Ctrl
-      // on every OS (matches Chrome / VS Code convention, including macOS).
-      // stopImmediatePropagation prevents xterm from also seeing the Tab and
-      // emitting a literal `\t` into the now-focused pane.
-      if (literalCtrl && !alt && key === 'Tab') {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        store.getState().cyclePane(shift ? 'prev' : 'next');
-        return;
-      }
-
-      // Ctrl+I: Toggle notification panel
-      if (cmdOrCtrl && !shift && !alt && key === 'i') {
-        e.preventDefault();
-        store.getState().toggleNotificationPanel();
-        return;
-      }
-
-      // Ctrl+Shift+M: Toggle message feed panel
-      // Bookmark/message-feed convention → literal Ctrl on every OS.
-      if (literalCtrl && shift && !alt && key === 'm') {
-        e.preventDefault();
-        store.getState().toggleMessageFeed();
-        return;
-      }
-
-      // Ctrl+K: Toggle command palette
-      if (cmdOrCtrl && !shift && !alt && key === 'k') {
-        e.preventDefault();
-        store.getState().toggleCommandPalette();
-        return;
-      }
-
-      // Ctrl+Shift+A: Toggle Fleet View (S-C1 cockpit — every agent, one
-      // screen). `code` fallback keeps it firing under IME composition where
-      // e.key can arrive as the 229 dead-key (the #189/#153 lesson).
-      if (cmdOrCtrl && shift && !alt && (key === 'A' || code === 'KeyA')) {
-        e.preventDefault();
-        store.getState().toggleFleetView();
-        return;
-      }
-
-      // Ctrl+,: Toggle settings panel
-      if (cmdOrCtrl && !shift && !alt && key === ',') {
-        e.preventDefault();
-        store.getState().toggleSettingsPanel();
-        return;
-      }
-
-      // Ctrl+Shift+U: Jump to latest unread notification's workspace
-      if (cmdOrCtrl && shift && !alt && key === 'U') {
-        e.preventDefault();
-        const state = store.getState();
-        const unread = state.notifications
-          .filter((n) => !n.read)
-          .sort((a, b) => b.timestamp - a.timestamp);
-        if (unread.length > 0) {
-          const latest = unread[0];
-          state.setActiveWorkspace(latest.workspaceId);
-          state.markRead(latest.id);
-        }
-        return;
-      }
-
-      // Ctrl+Shift+R: Rename workspace (triggers inline rename in sidebar)
-      // This is handled by the Sidebar component via a custom event
-      if (cmdOrCtrl && shift && !alt && key === 'R') {
-        e.preventDefault();
-        document.dispatchEvent(new CustomEvent('wmux:rename-workspace'));
-        return;
-      }
-
-      // Ctrl+Shift+L: Open browser panel in a new horizontal split. forceNew
-      // keeps the explicit-creation semantics — link/port clicks reuse an
-      // existing browser pane, but this shortcut always makes another one.
-      if (cmdOrCtrl && shift && !alt && key === 'L') {
-        e.preventDefault();
-        openUrlInBrowserPane(undefined, { forceNew: true });
-        return;
-      }
-
-      // Ctrl+Shift+X: Enter Vi Copy Mode for terminal scrollback
-      // (Ctrl+Shift+C is reserved for clipboard copy)
-      if (cmdOrCtrl && shift && !alt && key === 'X') {
-        e.preventDefault();
-        store.getState().setViCopyModeActive(true);
-        return;
-      }
-
-      // Ctrl+F: Toggle terminal search bar
-      if (cmdOrCtrl && !shift && !alt && key === 'f') {
-        e.preventDefault();
-        store.getState().toggleSearchBar();
-        return;
-      }
-
-      // Ctrl+`: Toggle floating terminal pane
-      if (cmdOrCtrl && !shift && !alt && e.code === 'Backquote') {
-        e.preventDefault();
-        store.getState().toggleFloatingPane();
-        return;
-      }
-
-      // Ctrl+Shift+H: Flash active pane to highlight its position
-      if (cmdOrCtrl && shift && !alt && key === 'H') {
-        e.preventDefault();
-        document.dispatchEvent(new CustomEvent('wmux:flash-pane'));
-        return;
-      }
-
-      // Ctrl+Shift+O: Toggle Company View overlay
-      if (cmdOrCtrl && shift && !alt && key === 'O') {
-        e.preventDefault();
-        store.getState().toggleCompanyView();
-        return;
-      }
-
-      // Ctrl+Shift+G: Clear multiview (back to single view)
-      if (cmdOrCtrl && shift && !alt && key === 'G') {
-        e.preventDefault();
-        store.getState().clearMultiview();
-        return;
-      }
-
-      // Ctrl+M: Add scrollback bookmark at current scroll position
-      // Bookmark convention → literal Ctrl on every OS.
-      if (literalCtrl && !shift && !alt && key === 'm') {
-        e.preventDefault();
-        const state = store.getState();
-        const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-        if (ws) {
-          const pane = findLeaf(ws.rootPane, ws.activePaneId);
-          if (pane) {
-            const surface = pane.surfaces.find((s) => s.id === pane.activeSurfaceId);
-            if (surface?.ptyId) {
-              const term = terminalRegistry.get(surface.ptyId);
-              if (term) {
-                const line = term.buffer.active.baseY + term.buffer.active.viewportY;
-                state.addBookmark(surface.ptyId, line);
-                showBookmarkToast();
-              }
-            }
-          }
-        }
-        return;
-      }
-
-      // Ctrl+Shift+Arrow: MOVE focus — pane focus within the active workspace,
-      // or (in multiview) focus between grid tiles. focusPaneDirection walks one
-      // workspace's pane tree (bails at leaves<=1); focusMultiviewDirection
-      // navigates the multiview grid. This is the primary directional-move
-      // gesture (bare Ctrl+Arrow is intentionally unbound). split stays on
-      // Ctrl+D / Ctrl+Shift+D. stopImmediatePropagation so xterm never sees it.
-      if (literalCtrl && shift && !alt && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(key)) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        const dirMap: Record<string, 'up' | 'down' | 'left' | 'right'> = {
-          ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
-        };
-        // Multiview grid → move between tiles (workspaces); else pane focus.
-        const { multiviewIds, activeWorkspaceId } = store.getState();
-        if (multiviewIds.length >= 2 && multiviewIds.includes(activeWorkspaceId)) {
-          store.getState().focusMultiviewDirection(dirMap[key]);
+        if (STOP_PROPAGATION_ACTIONS.has(action)) e.stopImmediatePropagation();
+        shortcutPressGuard.noteActed(e);
+        if (mentionClaim === 'noSource') {
+          // Once per press: a held chord auto-repeats, and one toast is enough.
+          if (!e.repeat) store.getState().pushToast({ message: t('mention.noSource'), level: 'info' });
         } else {
-          store.getState().focusPaneDirection(dirMap[key]);
+          run();
         }
-        return;
-      }
-
-      // Alt+ArrowUp: previous workspace. wmux only had Ctrl+1-9 (jump to N) and
-      // the prefix path before — this adds direct prev/next cycling on the
-      // sidebar order (↑ = previous, ↓ = next). Reuses the prefix
-      // prevWorkspace/nextWorkspace logic. stopImmediatePropagation so xterm
-      // never sees Alt+Arrow as an escape sequence.
-      if (alt && !literalCtrl && !shift && key === 'ArrowUp') {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        prefixActions.prevWorkspace();
-        return;
-      }
-
-      // Alt+ArrowDown: next workspace (pairs with Alt+ArrowUp = previous).
-      // stopImmediatePropagation so xterm never sees Alt+Arrow as an escape seq.
-      if (alt && !literalCtrl && !shift && key === 'ArrowDown') {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        prefixActions.nextWorkspace();
         return;
       }
 
       // ─── Custom keybindings → terminal input ─────────────────────────
-      // Custom keybindings (extracted above so the #1152 gate can share it).
       dispatchCustomKeybinding();
     };
 
+    // The guard's view of when a press ends (see ShortcutPressGuard).
+    const onKeyUp = (e: KeyboardEvent) => shortcutPressGuard.onKeyUp(e);
+
     // Use capture phase so we run BEFORE xterm's stopPropagation
     window.addEventListener('keydown', handler, true);
+    window.addEventListener('keyup', onKeyUp, true);
     return () => {
       window.removeEventListener('keydown', handler, true);
+      window.removeEventListener('keyup', onKeyUp, true);
       // Clean up prefix timeout on unmount
       if (prefixTimeoutRef.current !== null) {
         clearTimeout(prefixTimeoutRef.current);

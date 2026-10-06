@@ -48,8 +48,11 @@
  */
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { AGENT_SLUG_SET, type AgentSlug } from '../shared/agentIdentity';
+import type { WslAgentLocation, WslReportedAgent, WslWatchedAgent } from './wslAgentProcess';
 
 const execFileAsync = promisify(execFile);
 
@@ -112,6 +115,14 @@ const ARM_BACKOFF_MS = 30_000;
  *  rate-limited: repeated conflicting banners against an OLD pick that keeps
  *  winning add no new information. */
 const REARM_COOLDOWN_MS = 10_000;
+
+/** How long an armIfAgent probe that found no named agent keeps the next one
+ *  away. A guess-driven probe fires on every foreground command that outlives
+ *  its settle window, so without this a run of long commands (or pwsh on
+ *  Windows, where each listing spawns PowerShell) would enumerate per Enter.
+ *  Shorter than the retry gap in commandStartAgentProbe.ts, so a command's
+ *  own retry still runs. */
+export const AGENT_MISS_BACKOFF_MS = 4_000;
 
 /** `claude.exe` → `claude`; `C:\...\node.EXE` → `node`; `pwsh` → `pwsh`. */
 function imageStem(name: string): string {
@@ -294,6 +305,12 @@ export interface AgentProcessPick {
  *      the foreground command, so its death is the same edge,
  *   4. undefined — nothing attributable (the caller stays undecided).
  *
+ * Depth 0 comes first: when the ROOT itself resolves to an agent it is the
+ * pick. Exec-rooted panes (`bash -lc <agent>`) have the shell exec-replace
+ * itself, so the PTY root IS the agent and its children are MCP servers and
+ * tools; searching descendants only would name one of those instead. A plain
+ * shell root (zsh/bash) never resolves, so interactive panes are unaffected.
+ *
  * An exact-depth tie between two DIFFERENT slugs is ambiguous (two agents at
  * equal depth) → the pick keeps the pid for the death edge but drops the slug
  * rather than guessing. BFS with a visited set: Windows PPIDs can be
@@ -309,6 +326,16 @@ export function selectAgentProcess(
     if (list) list.push(e);
     else byParent.set(e.ppid, [e]);
   }
+  const slugOf = (entry: ProcessTreeEntry): AgentSlug | undefined => {
+    const stem = imageStem(entry.name);
+    return AGENT_SLUG_SET.has(stem)
+      ? (stem as AgentSlug)
+      : NATIVE_STEM_TO_SLUG.get(stem) ??
+        (RUNTIME_STEMS.has(stem) ? resolveAgentSlug(entry.cmdline) : undefined);
+  };
+  const root = entries.find((e) => e.pid === shellPid);
+  const rootSlug = root ? slugOf(root) : undefined;
+  if (rootSlug) return { pid: shellPid, slug: rootSlug };
   let attributed: { pid: number; depth: number; slug: AgentSlug } | undefined;
   let ambiguous = false;
   let sluglessRuntime: { pid: number; depth: number } | undefined;
@@ -323,10 +350,7 @@ export function selectAgentProcess(
       const childDepth = depth + 1;
       if (childDepth === 1 && directChild === undefined) directChild = child.pid;
       const stem = imageStem(child.name);
-      const slug = AGENT_SLUG_SET.has(stem)
-        ? (stem as AgentSlug)
-        : NATIVE_STEM_TO_SLUG.get(stem) ??
-          (RUNTIME_STEMS.has(stem) ? resolveAgentSlug(child.cmdline) : undefined);
+      const slug = slugOf(child);
       if (slug) {
         if (!attributed || childDepth < attributed.depth) {
           attributed = { pid: child.pid, depth: childDepth, slug };
@@ -343,6 +367,114 @@ export function selectAgentProcess(
   if (attributed) return ambiguous ? { pid: attributed.pid } : { pid: attributed.pid, slug: attributed.slug };
   if (sluglessRuntime) return { pid: sluglessRuntime.pid };
   return directChild !== undefined ? { pid: directChild } : undefined;
+}
+
+const GITSTATUS_VALUE_FLAGS = new Map<string, RegExp>([
+  ['-s', /^-?\d{1,9}$/], ['-u', /^-?\d{1,9}$/], ['-c', /^-?\d{1,9}$/], ['-d', /^-?\d{1,9}$/],
+  ['-m', /^-?\d{1,12}$/], ['-t', /^\d{1,4}$/], ['-v', /^[A-Z]{1,8}$/],
+]);
+const GITSTATUS_SWITCHES = new Set(['-e', '-U', '-W', '-D']);
+
+/** Homebrew's powerlevel10k package (Apple silicon, Intel): the only roots outside home. */
+const GITSTATUS_PACKAGE_DIRS = [
+  '/opt/homebrew/share/powerlevel10k/gitstatus/usrbin',
+  '/usr/local/share/powerlevel10k/gitstatus/usrbin',
+] as const;
+
+/**
+ * The fixed package dirs, plus each one's resolved form when it exists:
+ * Homebrew links `share/powerlevel10k` into its Cellar, so the real image
+ * (lsof / `/proc/<pid>/exe`) names the versioned Cellar directory. Still an
+ * exact-directory list; nothing here comes from the pane.
+ */
+export function gitstatusPackageDirs(realpath: (dir: string) => string = fs.realpathSync): ReadonlySet<string> {
+  const dirs = new Set<string>(GITSTATUS_PACKAGE_DIRS);
+  for (const dir of GITSTATUS_PACKAGE_DIRS) {
+    try { dirs.add(realpath(dir)); } catch { /* not installed */ }
+  }
+  return dirs;
+}
+
+/**
+ * Whether `image` is a gitstatusd install: under the daemon user's home,
+ * `gitstatusd-<os>-<arch>` in the gitstatus download cache
+ * (`$GITSTATUS_CACHE_DIR`, `${XDG_CACHE_HOME:-~/.cache}/gitstatus`,
+ * `~/.cache/gitstatus`) or `gitstatusd` in a plugin checkout's
+ * `gitstatus/usrbin`; outside home, only `gitstatusd` whose directory is
+ * exactly one of `packageDirs` (the Homebrew powerlevel10k package), never a
+ * suffix match. Absolute, normalized path; a pane env or a checkout in /tmp
+ * cannot widen it, and the `$GITSTATUS_DAEMON` override is not trusted.
+ */
+export function isHelperImage(
+  image: string | undefined,
+  env: NodeJS.ProcessEnv = {},
+  userHome = os.homedir(),
+  packageDirs: ReadonlySet<string> = gitstatusPackageDirs(),
+): boolean {
+  if (!image || !path.posix.isAbsolute(image) || path.posix.normalize(image) !== image) return false;
+  const home = path.posix.normalize(userHome).replace(/\/+$/, '');
+  const underHome = (value: string) => home.length > 1 && value.startsWith(home + '/');
+  const base = path.posix.basename(image);
+  const dir = path.posix.dirname(image);
+  const cacheDirs = [env.GITSTATUS_CACHE_DIR, path.posix.join(env.XDG_CACHE_HOME || path.posix.join(home, '.cache'), 'gitstatus'),
+    path.posix.join(home, '.cache', 'gitstatus')].filter((value): value is string => !!value && path.posix.isAbsolute(value))
+    .map(value => path.posix.normalize(value).replace(/\/+$/, '')).filter(underHome);
+  return /^gitstatusd-[a-z0-9_]+-[a-z0-9_]+$/.test(base) && cacheDirs.includes(dir) ||
+    base === 'gitstatusd' && (packageDirs.has(dir) || dir.endsWith('/gitstatus/usrbin') && underHome(dir));
+}
+
+/**
+ * A resident shell child that cannot be reading the terminal, so typing a
+ * launcher at the prompt still reaches the shell (N19). Only gitstatusd
+ * (gitstatus / powerlevel10k), and only when every property matches the way
+ * gitstatus.plugin.zsh starts it — a process NAME alone never qualifies:
+ *   - argv[0] passes `isHelperImage`;
+ *   - argv exactly `<image> -G v<x.y.z>` followed only by the plugin's flags;
+ *   - a direct child of this shell with no children of its own.
+ * argv is self-reported (`exec -a`), so `idleShellState` also checks the real
+ * executable image. Note the current plugin starts the daemon from a
+ * backgrounded process substitution, which usually reparents it away from the
+ * shell; this covers installs where it does stay the shell's child. Pure
+ * apart from resolving the fixed package roots — exported for tests.
+ */
+export function isVerifiedPassiveHelper(
+  entry: ProcessTreeEntry,
+  shellPid: number,
+  entries: ReadonlyArray<ProcessTreeEntry>,
+  env: NodeJS.ProcessEnv = {},
+  userHome = os.homedir(),
+): boolean {
+  if (entry.ppid !== shellPid || entries.some(other => other.ppid === entry.pid)) return false;
+  const image = entry.name;
+  if (!isHelperImage(image, env, userHome)) return false;
+  const argv = (entry.cmdline ?? '').trim().split(/\s+/);
+  if (argv[0] !== image || argv[1] !== '-G' || !/^v\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(argv[2] ?? '')) return false;
+  for (let i = 3; i < argv.length; i++) {
+    const value = GITSTATUS_VALUE_FLAGS.get(argv[i]);
+    if (value) { if (!value.test(argv[++i] ?? '')) return false; continue; }
+    if (!GITSTATUS_SWITCHES.has(argv[i])) return false;
+  }
+  return true;
+}
+
+/**
+ * The executable image a process really runs, or undefined when it cannot be
+ * read — never argv[0], which the process sets itself. darwin: the first `txt`
+ * name lsof reports; linux: `/proc/<pid>/exe`. Absolute lsof path, no PATH trust.
+ */
+export async function readExecutableImage(pid: number): Promise<string | undefined> {
+  try {
+    if (process.platform === 'linux') return fs.realpathSync(`/proc/${pid}/exe`);
+    if (process.platform !== 'darwin') return undefined;
+    const { stdout } = await execFileAsync('/usr/sbin/lsof', ['-a', '-p', String(pid), '-d', 'txt', '-Fn'],
+      { encoding: 'utf-8', timeout: 5_000 });
+    const lines = (stdout as string).split('\n');
+    const txt = lines.indexOf('ftxt');
+    const name = txt === -1 ? undefined : lines[txt + 1];
+    return name?.startsWith('n') && name.length > 1 ? name.slice(1) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** One full process-table snapshot (pid/ppid/name[/cmdline]). Windows has no
@@ -381,6 +513,24 @@ interface TrackedAgent {
   pid: number;
   alive: boolean;
   slug?: AgentSlug;
+  /** #1727 — set for an agent inside a WSL pane: `pid` is a LINUX pid, and
+   *  this says where it lives and how to tell it from a reused one. */
+  wsl?: WslWatchedAgent;
+}
+
+/** #1727 — what the tracker needs to follow agents inside WSL panes. All
+ *  optional: without them WSL panes simply stay unattributed. */
+export interface WslTrackingOptions {
+  /** True for a session whose shell is `wsl.exe`. Such a session never takes
+   *  the Windows tree walk: the agent is not in that table, and the walk's
+   *  slugless fallback would pick a Windows interop child instead. */
+  isWslSession?: (sessionId: string) => boolean;
+  watcher?: {
+    watch(key: string, agent: WslWatchedAgent, onDead: () => void): void;
+    unwatch(key: string): void;
+  };
+  /** Fresh delivery-time check (checkWslAgentRunning). */
+  isRunning?: (agent: WslWatchedAgent) => Promise<boolean>;
 }
 
 /** Identity/liveness snapshot handed to the state-change listener. */
@@ -394,6 +544,8 @@ export class AgentProcessTracker {
   /** In-flight probe per session — coalesces the hook-storm case (a claude
    *  turn can fire several hooks back-to-back) into one enumeration. */
   private readonly inFlight = new Set<string>();
+  /** The in-flight probe came from armIfAgent (commits named agents only). */
+  private readonly slugOnlyInFlight = new Set<string>();
   /** Bumped by disarm(); a probe that resolves after its session was
    *  disarmed must not resurrect state for a destroyed pane. */
   private readonly generation = new Map<string, number>();
@@ -406,6 +558,10 @@ export class AgentProcessTracker {
   private readonly lastRearmAt = new Map<string, number>();
   /** rearm() called while a probe was in flight → replay once it lands. */
   private readonly forceQueued = new Set<string>();
+  /** armIfAgent() called while a probe was in flight → replay once it lands. */
+  private readonly slugQueued = new Set<string>();
+  /** armIfAgent's own backoff: until when the next agent-only probe waits. */
+  private readonly slugProbeBlockedUntil = new Map<string, number>();
   /** Shared snapshot promise — concurrent probes across sessions ride one
    *  enumeration instead of spawning one each. */
   private snapshotInFlight: Promise<ProcessTreeEntry[]> | null = null;
@@ -414,7 +570,44 @@ export class AgentProcessTracker {
   constructor(
     private readonly watcher: PidWatcher,
     private readonly enumerate: () => Promise<ProcessTreeEntry[]> = enumerateProcesses,
+    private readonly readImage: (pid: number) => Promise<string | undefined> = readExecutableImage,
+    private readonly userHome: string = os.homedir(),
+    private readonly wsl: WslTrackingOptions = {},
   ) {}
+
+  private isWsl(sessionId: string): boolean {
+    return this.wsl.isWslSession?.(sessionId) === true;
+  }
+
+  async verifyIdleShell(pid: number): Promise<boolean> {
+    return (await this.idleShellState(pid)).ok;
+  }
+
+  /** A live pid's full command line from the process table, or undefined when it is gone. */
+  async commandLineOf(pid: number): Promise<string | undefined> {
+    const entry = (await this.snapshot()).find((e) => e.pid === pid);
+    return entry ? entry.cmdline ?? entry.name : undefined;
+  }
+
+  /** Which launch precondition failed, so a phone can be told what to do.
+   *  `env` is the pane's spawn env, used only to locate a helper's install.
+   *  `anyShell` also accepts PowerShell, pwsh and cmd: for a caller that only
+   *  needs the shell idle and never types a command into it. */
+  async idleShellState(pid: number, env: NodeJS.ProcessEnv = {}, anyShell = false): Promise<{ ok: true } | { ok: false; reason: 'missing' | 'unsupported-shell' | 'shell-has-children' }> {
+    const entries = await this.snapshot();
+    const root = entries.find(entry => entry.pid === pid);
+    if (!root) return { ok: false, reason: 'missing' };
+    const shell = anyShell ? /^(?:-?)(?:zsh|bash|sh|powershell|pwsh|cmd)(?:\.exe)?$/i : /^(?:-?)(?:zsh|bash|sh)$/i;
+    if (!shell.test(path.basename(root.name))) return { ok: false, reason: 'unsupported-shell' };
+    for (const child of entries.filter(entry => entry.ppid === pid)) {
+      // The real image is read only for a child whose self-reported argv already qualifies.
+      if (!isVerifiedPassiveHelper(child, pid, entries, env, this.userHome) ||
+          !isHelperImage(await this.readImage(child.pid).catch(() => undefined), env, this.userHome)) {
+        return { ok: false, reason: 'shell-has-children' };
+      }
+    }
+    return { ok: true };
+  }
 
   private static watchKey(sessionId: string): string {
     // Namespaced so it can never collide with the daemon's shell-PID watches,
@@ -444,6 +637,7 @@ export class AgentProcessTracker {
    * backoff — the probe runs once per agent LAUNCH, not per hook.
    */
   arm(sessionId: string, shellPid: number): void {
+    if (this.isWsl(sessionId)) return; // attributed by armWsl() instead
     this.shellPids.set(sessionId, shellPid);
     if (this.states.get(sessionId)?.alive) return;
     const failedAt = this.lastFailedAt.get(sessionId);
@@ -462,6 +656,7 @@ export class AgentProcessTracker {
    * nothing new.
    */
   rearm(sessionId: string, shellPid: number): void {
+    if (this.isWsl(sessionId)) return;
     this.shellPids.set(sessionId, shellPid);
     const last = this.lastRearmAt.get(sessionId);
     if (last !== undefined && Date.now() - last < REARM_COOLDOWN_MS) return;
@@ -474,15 +669,76 @@ export class AgentProcessTracker {
     this.probe(sessionId, shellPid);
   }
 
-  private probe(sessionId: string, shellPid: number): void {
-    if (this.inFlight.has(sessionId)) return;
+  /**
+   * Probe for a NAMED agent with no evidence that one is running — the
+   * banner- and hook-independent trigger (a foreground command outlived its
+   * settle window — see commandStartAgentProbe.ts). An agent with no session-start
+   * hook (Codex) is otherwise named only by its banner, and a missed banner
+   * left the pane anonymous until its first turn ended.
+   *
+   * Commits ONLY a pick that resolves to an agent slug. A plain long-running
+   * command (`npm run dev`, `vim`) leaves no state behind, so it can mint
+   * neither an alive flag nor a later `agent.processExit` edge. A miss backs
+   * off only this trigger (AGENT_MISS_BACKOFF_MS; an enumeration failure,
+   * ARM_BACKOFF_MS): a guess that found no agent must not delay the arm() of
+   * an agent launched seconds later.
+   *
+   * It probes even while the tracked agent reads alive. A new command-start
+   * means the shell got the terminal back, so the tracked agent has usually
+   * exited and the ProcessMonitor has not polled it yet (up to one cadence).
+   * If the tracked pid is gone from the table, its death edge is recorded
+   * then and there, and the new agent is named instead of the dead one.
+   */
+  armIfAgent(sessionId: string, shellPid: number): void {
+    if (this.isWsl(sessionId)) return;
+    this.shellPids.set(sessionId, shellPid);
+    const blockedUntil = this.slugProbeBlockedUntil.get(sessionId);
+    if (blockedUntil !== undefined && Date.now() < blockedUntil) return;
+    if (this.inFlight.has(sessionId)) {
+      this.slugQueued.add(sessionId);
+      return;
+    }
+    this.probe(sessionId, shellPid, true);
+  }
+
+  private probe(sessionId: string, shellPid: number, requireSlug = false): void {
+    if (this.inFlight.has(sessionId)) {
+      // A hook or banner arm arriving while an armIfAgent probe runs must not
+      // be swallowed: that probe discards a slugless pick, which this arm
+      // would have kept for liveness. Replay it once the probe lands.
+      if (!requireSlug && this.slugOnlyInFlight.has(sessionId)) this.forceQueued.add(sessionId);
+      return;
+    }
     this.inFlight.add(sessionId);
+    if (requireSlug) this.slugOnlyInFlight.add(sessionId);
     const gen = this.generation.get(sessionId) ?? 0;
     void (async () => {
       try {
         const entries = await this.snapshot();
         if ((this.generation.get(sessionId) ?? 0) !== gen) return; // disarmed meanwhile
         const pick = selectAgentProcess(entries, shellPid);
+        if (requireSlug) {
+          const cur = this.states.get(sessionId);
+          if (cur?.alive) {
+            // Still running: the same agent, or one left in the background.
+            // Nothing new to name. (The walk covers every descendant of the
+            // shell, not only the foreground job, so `codex &` followed by a
+            // long command can name the pane after the background agent.
+            // Narrowing to the terminal's foreground process group needs a
+            // pgid column no Windows listing has.)
+            if (entries.some((e) => e.pid === cur.pid)) return;
+            // Gone before the monitor noticed: record its death edge now, and
+            // drop its watch so the monitor cannot report the same death again.
+            this.watcher.unwatch(AgentProcessTracker.watchKey(sessionId));
+            cur.alive = false;
+            this.emitState(sessionId, { ...(cur.slug ? { slug: cur.slug } : {}), alive: false });
+          }
+          // No named agent → leave the session as it is.
+          if (!pick?.slug) {
+            this.slugProbeBlockedUntil.set(sessionId, Date.now() + AGENT_MISS_BACKOFF_MS);
+            return;
+          }
+        }
         // No attributable descendant (agent already gone, or an exotic launch
         // we can't see) → stay undecided so the renderer keeps its heuristic.
         if (!pick) {
@@ -509,19 +765,57 @@ export class AgentProcessTracker {
         this.emitState(sessionId, { ...(pick.slug ? { slug: pick.slug } : {}), alive: true });
       } catch {
         // Enumeration failed (timeout, spawn error) — undecided, never a lie.
-        this.lastFailedAt.set(sessionId, Date.now());
+        if (requireSlug) this.slugProbeBlockedUntil.set(sessionId, Date.now() + ARM_BACKOFF_MS);
+        else this.lastFailedAt.set(sessionId, Date.now());
       } finally {
         this.inFlight.delete(sessionId);
+        this.slugOnlyInFlight.delete(sessionId);
         // Replay a queued forced rearm DIRECTLY — routing it through rearm()
         // again would hit the cooldown already paid when the rearm queued it
         // (lastRearmAt was set seconds ago, so rearm() no-opped and the forced
         // probe was lost). forceQueued is a single bit: no self-retrigger.
+        const pid = this.shellPids.get(sessionId);
         if (this.forceQueued.delete(sessionId)) {
-          const pid = this.shellPids.get(sessionId);
+          this.slugQueued.delete(sessionId); // the plain probe covers it
           if (pid !== undefined) this.probe(sessionId, pid);
+        } else if (this.slugQueued.delete(sessionId) && pid !== undefined) {
+          // Through armIfAgent, so its backoff still applies.
+          this.armIfAgent(sessionId, pid);
         }
       }
     })();
+  }
+
+  /**
+   * #1727 — attach to the agent a WSL pane's own hook reported (see
+   * wslAgentProcess.ts). The caller has already checked the report came from
+   * this exact pane and names the hook's own agent. A no-op while that same
+   * process is tracked alive, so a hook storm costs nothing; a different
+   * process (a relaunch) replaces it.
+   */
+  armWsl(sessionId: string, location: WslAgentLocation, agent: WslReportedAgent): void {
+    if (!this.wsl.watcher) return;
+    const cur = this.states.get(sessionId);
+    if (cur?.alive && cur.wsl && cur.wsl.bootId === agent.bootId) {
+      if (cur.pid === agent.pid && cur.wsl.start === agent.start) return;
+      // Keep the tracked agent when the report comes from a process nested
+      // inside it (the pane's claude ran `claude -p`, whose hooks also name
+      // this pane), or from an older process (a late hook of the previous run).
+      // Either would read the pane dead when that other process exits.
+      if (agent.ancestors.includes(cur.pid)) return;
+      if (BigInt(agent.start) < BigInt(cur.wsl.start)) return;
+    }
+    const key = AgentProcessTracker.watchKey(sessionId);
+    const watched: WslWatchedAgent = { ...location, pid: agent.pid, start: agent.start, bootId: agent.bootId };
+    const state: TrackedAgent = { pid: agent.pid, alive: true, slug: agent.slug, wsl: watched };
+    this.states.set(sessionId, state);
+    this.wsl.watcher.watch(key, watched, () => {
+      // Only the same tracked process may flip the flag.
+      if (this.states.get(sessionId) !== state) return;
+      state.alive = false;
+      this.emitState(sessionId, { slug: agent.slug, alive: false });
+    });
+    this.emitState(sessionId, { slug: agent.slug, alive: true });
   }
 
   /** true = agent process observed alive; false = it was observed and DIED
@@ -539,15 +833,81 @@ export class AgentProcessTracker {
     return { ...(s.slug ? { slug: s.slug } : {}), alive: s.alive };
   }
 
+  /** #1307 — the attributed process's pid, for a delivery-time liveness
+   *  probe fresher than the cached `alive` flag (a death between
+   *  ProcessMonitor polls). undefined = never attributed. */
+  pidFor(sessionId: string): number | undefined {
+    // Windows pids only: a WSL agent's pid is a Linux pid, and every caller
+    // hands this to a Windows process check (#1727).
+    const s = this.states.get(sessionId);
+    return s?.wsl ? undefined : s?.pid;
+  }
+
+  /** #1307 — re-picks from a fresh process table: true only while the
+   *  tracked pid is still the pane shell's agent descendant with the
+   *  expected slug, so a reused pid fails. Enumerates, unlike identityFor. */
+  async verifyLive(sessionId: string, expectedSlug: AgentSlug): Promise<boolean> {
+    const s = this.states.get(sessionId);
+    if (s?.wsl) {
+      if (!s.alive || s.slug !== expectedSlug || !this.wsl.isRunning) return false;
+      const running = await this.wsl.isRunning(s.wsl);
+      return running && this.states.get(sessionId) === s && s.alive;
+    }
+    const shellPid = this.shellPids.get(sessionId);
+    if (!s?.alive || shellPid === undefined) return false;
+    try {
+      const pick = selectAgentProcess(await this.snapshot(), shellPid);
+      // The death edge, disarm or a re-arm can land while the table is read.
+      return this.states.get(sessionId) === s && s.alive &&
+        this.shellPids.get(sessionId) === shellPid &&
+        pick?.pid === s.pid && pick.slug === expectedSlug;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * #1727 — the delivery-time liveness check for session prompt scheduling:
+   * the tracked agent is still this pane's `expectedSlug` agent AND running
+   * (a stopped or zombie agent is not). Windows: verifyLive plus a fresh
+   * process check of the pid. WSL: verifyLive already stats the Linux
+   * process, state included.
+   */
+  async isAgentRunning(
+    sessionId: string,
+    expectedSlug: AgentSlug,
+    isRunning: (pid: number) => Promise<boolean>,
+  ): Promise<boolean> {
+    const s = this.states.get(sessionId);
+    if (!s) return false;
+    if (s.wsl) return this.verifyLive(sessionId, expectedSlug);
+    return await this.verifyLive(sessionId, expectedSlug) && await isRunning(s.pid);
+  }
+
+  /** Exec panes may own the agent as their PTY root, without a shell child.
+   * Verify that exact armed root from fresh process metadata; never accept an
+   * arbitrary PID or infer its executable from pane text. */
+  async verifyOwnedRoot(sessionId: string, pid: number, expectedSlug: AgentSlug): Promise<boolean> {
+    if (this.shellPids.get(sessionId) !== pid) return false;
+    try {
+      const root = (await this.snapshot()).find(entry => entry.pid === pid);
+      return this.shellPids.get(sessionId) === pid && !!root &&
+        selectAgentProcess([{ ...root, ppid: -1 }], -1)?.slug === expectedSlug;
+    } catch { return false; }
+  }
+
   /** Drop all tracking for a session (died / interrupted / killed). */
   disarm(sessionId: string): void {
     this.generation.set(sessionId, (this.generation.get(sessionId) ?? 0) + 1);
     this.watcher.unwatch(AgentProcessTracker.watchKey(sessionId));
+    this.wsl.watcher?.unwatch(AgentProcessTracker.watchKey(sessionId));
     this.states.delete(sessionId);
     this.shellPids.delete(sessionId);
     this.lastFailedAt.delete(sessionId);
     this.lastRearmAt.delete(sessionId);
     this.forceQueued.delete(sessionId);
+    this.slugQueued.delete(sessionId);
+    this.slugProbeBlockedUntil.delete(sessionId);
   }
 
   private snapshot(): Promise<ProcessTreeEntry[]> {

@@ -1,22 +1,23 @@
+// Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/app/shell/Sidebar.tsx), MIT License, Copyright (c) 2026 Nick
 import { memo } from 'react';
-import type { FleetPane } from '../../stores/selectors/fleet';
-import { selectLatestCompletionEvidenceTask } from '../../stores/selectors/fleet';
+import type { FleetPane, FleetRow } from '../../stores/selectors/fleet';
+import { fleetRow, fleetTargetPtyId, selectLatestCompletionEvidenceTask } from '../../stores/selectors/fleet';
 import type { WorkTask } from '../../../shared/workTask';
 import type { Task } from '../../../shared/types';
 import { isVerifiedItem } from '../../../shared/completionEvidence';
 import { AGENT_STATUS_ICON } from '../Sidebar/agentStatusIcon';
 import { useT } from '../../hooks/useT';
-import { t } from '../../i18n';
+import { getLocale, t } from '../../i18n';
 import { useStore } from '../../stores';
-
-// Compact, scan-friendly cwd: keep the last two path segments. Mirrors the
-// sidebar's shortenPath so the cockpit reads the same as the workspace rows.
-function shortenPath(path: string, maxLen = 34): string {
-  if (!path || path.length <= maxLen) return path;
-  const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
-  if (parts.length <= 2) return path;
-  return `…/${parts.slice(-2).join('/')}`;
-}
+import { IconCheck, IconChevronDir, IconExternalLink } from '../icons';
+import { fleetTitle } from './fleetPresentation';
+import { nowDoingLine } from './nowDoing';
+import { fleetRequesterText } from '../../utils/fanoutProvenance';
+import { useShallow } from 'zustand/react/shallow';
+import { formatIdle, IDLE_SHOW_AFTER_MS } from '../../utils/idleTime';
+import { useUsageLimitNow } from '../Pane/UsageLimitChip';
+import { usageLimitFleetDetail, usageLimitView } from '../Pane/usageLimitPresentation';
+import { AGENT_IDENTITIES } from '../../../shared/agentIdentity';
 
 interface FleetCardProps {
   card: FleetPane;
@@ -24,9 +25,19 @@ interface FleetCardProps {
   /** A2: card를 인자로 받는다 — 부모가 안정적인 단일 콜백(useCallback)을 그대로
    *  내릴 수 있어 memo(FleetCard)가 실효한다(카드마다 새 화살표 생성 회피). */
   onJump: (card: FleetPane) => void;
-  /** S-C2 live output tail — last ~3 plaintext lines of this pane's buffer.
-   *  Only meaningful for terminal cards with a ptyId; already plaintext. */
-  tail?: string[];
+  /** The title of the open ticket this pane is working on; it names the row. */
+  ticketTitle?: string;
+  /** Section, detail and elapsed time from `groupFleetPanes`. Absent (tests,
+   *  stand-alone renders) → derived from the card alone. */
+  row?: FleetRow;
+  /** Status differs from what Fleet showed when it was last closed. */
+  changed?: boolean;
+  /** An error row's last error line from its terminal tail, if any. */
+  errorLine?: string;
+  /** A Check row (error, stopped, unconfirmed) opens its detail in place
+   *  instead of jumping; absent → it jumps like any row. */
+  onInspect?: (card: FleetPane) => void;
+  onFocus?: () => void;
   /** TASK-6 — per-pane agent resource attribution: summed RAM (bytes) of this
    *  pane's shell + descendant tree, and the heaviest child's image name. Only
    *  present on Windows with a live agent; undefined ⇒ no chip. */
@@ -53,6 +64,23 @@ function formatRss(bytes: number): string {
   return `${Math.round(mb)} MB`;
 }
 
+const AGENT_DISPLAY_BY_NAME = new Map<string, string>(
+  AGENT_IDENTITIES.flatMap((a) => [[a.slug, a.display], [a.display.toLowerCase(), a.display]]),
+);
+
+/** One name per agent: a terminal title or detector name that is a known
+ *  agent ("claude", "✳ Claude Code") reads as its display name. */
+export function agentDisplayName(raw: string): string {
+  const clean = raw.replace(/^[✳✻✽✶✢*]\s*/, '').trim();
+  return AGENT_DISPLAY_BY_NAME.get(clean.toLowerCase()) ?? clean;
+}
+
+/** An accessible name clips agent text so a long question does not drown it. */
+function clipForLabel(text: string): string {
+  const chars = Array.from(text);
+  return chars.length <= 80 ? text : `${chars.slice(0, 79).join('')}…`;
+}
+
 /**
  * 사이클 C — fan-out 미션 라인(순수 prop-구동, 테스트 가능). 매칭 미션이 없으면
  * null(기존 카드 확장 — 신규 UI 표면 아님). status로 색·취소선을 인코딩한다.
@@ -62,7 +90,7 @@ export function FleetCardMissionLine({ mission }: { mission: WorkTask | undefine
   const isOpen = mission.status === 'open';
   return (
     <div
-      className="flex items-center gap-1.5 min-w-0 text-caption font-mono"
+      className="flex items-center gap-1.5 min-w-0 text-[12px] font-mono"
       data-fleet-mission
       data-mission-status={mission.status}
       title={`Mission: ${mission.title} (${mission.status})`}
@@ -95,8 +123,8 @@ export function FleetCardEvidenceBadge({ task }: { task: Task | undefined }): Re
   const total = evidence.items.length;
   const verified = evidence.items.filter(isVerifiedItem).length;
   return (
-    <div
-      className="flex items-center gap-1 min-w-0 text-caption font-mono"
+    <span
+      className="flex items-center gap-1 min-w-0 text-[12px] font-mono"
       data-fleet-evidence
       data-evidence-verified={verified}
       data-evidence-total={total}
@@ -108,54 +136,31 @@ export function FleetCardEvidenceBadge({ task }: { task: Task | undefined }): Re
       <span
         className="flex-shrink-0"
         style={{ color: verified > 0 ? 'var(--accent-green)' : 'var(--text-muted)' }}
+        aria-hidden="true"
       >
-        ✓
+        <IconCheck size={12} />
       </span>
       <span className="truncate text-[var(--text-muted)]">
         evidence {verified}/{total}
       </span>
-    </div>
+    </span>
   );
 }
 
-/**
- * One agent in the Fleet View grid. Status badge reuses AGENT_STATUS_ICON so the
- * cockpit stays in lockstep with the sidebar dots. awaiting_input — the
- * unattended-loop money state — gets a yellow border + "needs your input"
- * affordance so a blocked agent is unmissable. Click jumps to its pane.
- */
-function FleetCard({ card, focused, onJump, tail, resource }: FleetCardProps) {
+/** One agent's row. Terminal output belongs in the detail area, never here. */
+function FleetCard({ card, focused, onJump, resource, row: rowProp, changed, onFocus, ticketTitle, errorLine, onInspect }: FleetCardProps) {
   const t = useT();
   const icon = AGENT_STATUS_ICON[card.agentStatus];
-  // 사이클 C — 이 카드의 워크스페이스가 fan-out 태스크의 전용 워크스페이스
-  // (paneGroupId)면 미션 title·status를 부가 표시한다. 좁은 셀렉터(자기
-  // paneGroupId 항목만)라 다른 미션 변경엔 리렌더되지 않고, 매칭이 없으면
-  // undefined(신규 UI 표면 없음 — 기존 카드 확장).
   const mission = useStore((s) => s.missionByPaneGroup[card.workspaceId]);
-  // NB3 trust surface — the most recent completed A2A task with evidence
-  // addressed to this pane (narrow, reference-stable read: the selector returns
-  // the store's own Task object, so an unchanged winner is Object.is-equal and
-  // never re-renders this memoized card). Undefined ⇒ no badge.
   const evidenceTask = useStore((s) =>
     selectLatestCompletionEvidenceTask(s.a2aTasks, card.workspaceId, card.paneId, card.isActivePane),
   );
-  const isAwaitingInput = card.agentStatus === 'awaiting_input';
-  const isIdle = card.agentStatus === 'idle';
-  // P2: a user rename wins so the cockpit reflects the same name as the composer
-  // / pane header; otherwise the existing agent name or surface title.
-  const displayName = card.paneLabel || card.agentName || card.title || t('surface.terminal');
-  // Hook-driven activity line (fleet-activity-line-hook). When present it is the
-  // card's primary status text — a meaningful one-liner ("✎ fleet.ts") instead
-  // of raw scrollback. The raw tail is the FALLBACK, shown only for terminals
-  // that have NO activity (Codex / Gemini / plain shells, or a Claude pane
-  // before its first PostToolUse). awaiting_input still wins the third row.
-  const activity = card.activity?.trim() || undefined;
-  const showTail =
-    !activity && card.surfaceType === 'terminal' && !!tail && tail.length > 0;
-  // X8 supervision chip: a declared/unattended agent shows it's armed (⟳, plus
-  // the restart count once it has restarted) or that the runaway guard tripped
-  // (⟳! red — the supervisor gave up, a human is needed). Mirrors the pane badge
-  // so the cockpit reads the same as the pane header. Absent → no chip.
+  const displayName = ticketTitle || fleetTitle(card, mission);
+  const role = useStore((s) => s.paneRole[card.paneId]);
+  // A fan-out task names who asked for it in every section, not only once it
+  // is ready to review. Undefined for a workspace that is not a task.
+  const requester = useStore(useShallow((s) => fleetRequesterText(s, card.workspaceId, t)));
+  const agentName = agentDisplayName(card.agentName || (card.surfaceType === 'terminal' ? card.title : card.surfaceType));
   const supervision = card.supervision;
   const supervisionStopped = supervision?.status === 'stopped';
   const supervisionLabel = supervision
@@ -163,143 +168,141 @@ function FleetCard({ card, focused, onJump, tail, resource }: FleetCardProps) {
         supervision.restartCount === 1 ? '' : 's'
       }`
     : '';
+  const row = rowProp ?? fleetRow(card);
+  // A waiting pane with no question is idle, not a request for input.
+  const isAwaitingInput = card.agentStatus === 'awaiting_input' || row.detailSource === 'question';
+  // A waiting pane with no question sits in Idle; label and colour it as idle
+  // so no red needs-you dot appears inside the Idle section.
+  const quietWaiting = card.agentStatus === 'waiting' && row.section === 'idle';
+  // Waiting out a usage limit: a clock, muted — not an error, not a request.
+  const usageWaiting = !!card.usageLimitWaiting && !card.unverifiable
+    && card.agentStatus !== 'running' && card.agentStatus !== 'awaiting_input';
+  const statusLabel = card.unverifiable ? t('fleet.status.unconfirmed')
+    : usageWaiting ? t('usageLimit.waiting')
+    : card.agentStatus === 'complete' ? t('fleet.status.turnComplete')
+    : quietWaiting ? t('workspace.agentIdle') : t(icon.labelKey);
+  // Unconfirmed reuses the sidebar's hollow accent ring (.sidebar-dot-unverifiable):
+  // the pane still claims to be working, nothing backs the claim.
+  const statusColor = card.unverifiable ? 'var(--accent)'
+    : usageWaiting ? 'var(--text-muted)'
+    : card.agentStatus === 'idle' || quietWaiting ? 'var(--text-sub)' : icon.dotVar;
+  // A pane held at its usage limit says so instead of a generic error detail.
+  const usageLimit = useStore((s) => s.usageLimits[fleetTargetPtyId(card)] ?? (card.ptyId ? s.usageLimits[card.ptyId] : undefined));
+  const limitNow = useUsageLimitNow(!!usageLimit);
+  // Kept past the turn's end, so a finished row can say what it did last.
+  const lastActivity = useStore((s) => s.surfaceLastActivity[fleetTargetPtyId(card)]);
+  const line = nowDoingLine(row, lastActivity, t, errorLine);
+  const detail = usageLimit
+    ? usageLimitFleetDetail(usageLimitView(usageLimit, limitNow, getLocale()), t)
+    : line.text;
+  const elapsed = row.idleForMs !== undefined && row.idleForMs >= IDLE_SHOW_AFTER_MS
+    ? formatIdle(row.idleForMs) : undefined;
+  const checks = !isAwaitingInput && card.agentStatus !== 'complete'
+    && (card.agentStatus === 'error' || !!card.unverifiable || supervisionStopped);
+  const action = isAwaitingInput ? t('fleet.action.respond')
+    : card.agentStatus === 'complete' ? t('fleet.action.result')
+    : checks ? t('fleet.action.inspect')
+    : t('fleet.action.open');
+  // Machine evidence (a tool line, an error line) reads in the activity mono.
+  const showActivity = line.kind === 'now' || line.kind === 'last' || line.kind === 'error';
+  // Name, status, place, and what it asks (or the error it printed), clipped:
+  // the verb and the rest of the row are one arrow key away in the detail.
+  const said = !usageLimit && (line.kind === 'question' || line.kind === 'error') ? clipForLabel(detail) : '';
 
   return (
     <button
       type="button"
       role="option"
       aria-selected={focused}
-      aria-label={`${displayName}, ${t(icon.labelKey)}, ${card.workspaceName}${supervision ? `, ${supervisionLabel}` : ''}`}
+      aria-label={[displayName, statusLabel, card.workspaceName, card.remote?.hostLabel,
+        changed ? t('fleet.changedSinceSeen') : '', said].filter(Boolean).join(', ')}
       tabIndex={focused ? 0 : -1}
-      onClick={() => onJump(card)}
+      onFocus={onFocus}
+      onClick={() => (checks && onInspect ? onInspect(card) : onJump(card))}
       data-fleet-card
       data-status={card.agentStatus}
+      data-unverifiable={card.unverifiable || undefined}
       data-pty-id={card.ptyId}
+      data-fleet-key={card.paneId}
       data-workspace-id={card.workspaceId}
       data-workspace-name={card.workspaceName}
-      className="group text-left flex flex-col gap-1.5 rounded-[7px] p-3 transition-[transform,box-shadow,border-color,background-color] duration-150 cursor-pointer outline-none hover:-translate-y-px hover:shadow-[0_2px_8px_rgba(0,0,0,0.25)] motion-reduce:transition-none motion-reduce:hover:translate-y-0"
-      style={{
-        backgroundColor: 'var(--bg-surface)',
-        border: `1px solid ${
-          focused ? 'var(--accent-blue)' : isAwaitingInput ? 'var(--accent-yellow)' : 'var(--bg-overlay)'
-        }`,
-        boxShadow: focused ? '0 0 0 1px var(--accent-blue)' : undefined,
-        opacity: isIdle ? 0.62 : 1,
-      }}
-      title={card.cwd ? `${card.workspaceName} · ${card.cwd}` : card.workspaceName}
+      className="wmux-fleet-card"
     >
-      {/* Header: status dot + name + status label */}
-      <div className="flex items-center gap-2 min-w-0">
-        <span
-          className={`w-2 h-2 rounded-full flex-shrink-0 ${icon.glowClass}`}
-          style={{ backgroundColor: icon.dotVar }}
-        />
-        <span className="flex-1 min-w-0 truncate text-body font-medium text-[var(--text-main)]">
-          {displayName}
-        </span>
-        {supervision && (
+      <span className="wmux-fleet-status" style={{ color: statusColor }}>
+        {usageWaiting ? (
+          <svg className="flex-none" width="10" height="10" viewBox="0 0 9 9" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" aria-hidden="true" data-shape="clock">
+            <circle cx="4.5" cy="4.5" r="3.6" />
+            <polyline points="4.5,2.5 4.5,4.6 5.9,5.5" />
+          </svg>
+        ) : (
           <span
-            data-fleet-supervision
-            data-supervision-status={supervision.status}
-            className="flex-shrink-0 text-[10px] font-mono"
-            style={{ color: supervisionStopped ? 'var(--accent-red)' : 'var(--text-subtle)' }}
-            title={supervisionLabel}
-          >
-            {`${supervisionStopped ? '⟳!' : '⟳'}${supervision.restartCount > 0 ? ` ${supervision.restartCount}` : ''}`}
-          </span>
+            aria-hidden="true"
+            className={`wmux-fleet-dot ${card.unverifiable ? 'is-unconfirmed' : icon.glowClass}`}
+            data-shape={icon.shape}
+            style={{ color: statusColor }}
+          >{icon.shape === 'cross' ? '×' : null}</span>
         )}
-        <span className="flex-shrink-0 text-[10px] font-mono" style={{ color: icon.dotVar }}>
-          {t(icon.labelKey)}
-        </span>
-      </div>
-
-      {/* Context line: workspace · cwd */}
-      <div className="flex items-center gap-1.5 min-w-0 text-caption font-mono text-[var(--text-muted)]">
-        <span className="truncate max-w-[48%]" title={card.workspaceName}>{card.workspaceName}</span>
-        {card.cwd && (
-          <>
-            <span className="opacity-50">·</span>
-            <span className="truncate flex-1" title={card.cwd}>{shortenPath(card.cwd)}</span>
-          </>
-        )}
-      </div>
-
-      {/* TASK-6 — per-pane agent resource chip. Quiet mono token (no new accent —
-          DESIGN.md restraint): "Claude · 370 MB". Present only on Windows with a
-          live descendant agent (resource.rss > 0); undefined / zero ⇒ no row. */}
-      {resource && resource.rss > 0 && (
-        <div
-          data-fleet-resource
-          data-rss-bytes={resource.rss}
-          className="flex items-center gap-1 min-w-0 text-caption font-mono text-[var(--text-muted)]"
-          title={`${agentLabel(resource.image)} — ${formatRss(resource.rss)} resident (shell + descendants)`}
-        >
-          <span className="truncate">
-            {agentLabel(resource.image)} · {formatRss(resource.rss)}
-          </span>
-        </div>
-      )}
-
-      {/* 사이클 C — 미션 라인(순수 prop-구동 서브컴포넌트). 이 카드가 fan-out
-          태스크의 워크스페이스면 title + status를 부가 표시(매칭 없으면 null). */}
-      <FleetCardMissionLine mission={mission} />
-
-      {/* NB3 trust surface — completion-evidence badge for the pane's most
-          recent completed A2A task (null when none). Sits under the mission line
-          because both describe delegated work; subordinate to the header. */}
-      <FleetCardEvidenceBadge task={evidenceTask} />
-
-      {/* Affordance row — only when there is something worth a third line. */}
-      {isAwaitingInput ? (
-        <div className="text-caption font-medium" style={{ color: 'var(--accent-yellow)' }}>
-          ⏸ {t('fleet.needsYourInput')}
-        </div>
-      ) : card.surfaceType !== 'terminal' ? (
-        <div className="text-caption font-mono text-[var(--text-subtle)] capitalize">
-          {card.surfaceType}
-        </div>
-      ) : null}
-
-      {/* Hook-driven activity line — the deterministic "what is it doing" string
-          (PostToolUse → summarizeActivity in main). Single truncated row so a
-          long path/command can never widen the card. Shown for any non-awaiting
-          card that has activity (the affordance owns the row when awaiting
-          input); it REPLACES the raw tail (showTail is false whenever activity
-          is present). data-fleet-activity exposes it for dogfood/tests. */}
-      {!isAwaitingInput && activity && (
-        <div
-          data-fleet-activity
-          className="block truncate font-mono text-caption leading-tight"
-          style={{ color: 'var(--text-subtle)' }}
-          title={activity}
-        >
-          {activity}
-        </div>
-      )}
-
-      {/* S-C2 live output tail — last ~3 lines of the pane's buffer. Already
-          plaintext (no xterm renderer needed); subordinate to the header. Each
-          line is its own truncated row so a long line can never widen / break
-          the card. Hidden entirely when there is no terminal output to show, OR
-          when the hook-driven activity line above is present (its fallback). */}
-      {showTail && (
-        <div
-          className="mt-0.5 flex flex-col font-mono text-[10px] leading-tight overflow-hidden"
-          style={{ color: 'var(--text-subtle)' }}
-          aria-hidden="true"
-        >
-          {tail.map((line, i) => (
-            <span key={i} className="block truncate whitespace-pre">
-              {line || ' '}
+        <span>{statusLabel}</span>
+      </span>
+      <span className="wmux-fleet-identity">
+        <span className="wmux-fleet-name" title={displayName}>
+          {card.remote && (
+            // #1343 — origin glyph: this agent runs on another host. Identical
+            // rendition to the sidebar roster's badge (#1163) so the same agent
+            // reads the same in both rosters: steel, not accent (DESIGN.md — a
+            // provenance marker must never spend an amber point), shape carries
+            // the meaning, host name lives in the label and the tooltip.
+            <span
+              data-fleet-remote
+              className="inline-flex mr-1 align-middle text-[var(--text-muted)]"
+              title={`@${card.remote.hostLabel}`}
+              aria-hidden="true"
+            >
+              <IconExternalLink size={10} />
             </span>
-          ))}
-        </div>
-      )}
+          )}
+          {displayName}
+          {changed && <span data-fleet-changed className="wmux-fleet-changed" aria-hidden="true" />}
+        </span>
+        <span className="wmux-fleet-context" title={card.cwd || card.workspaceName}>
+          {displayName !== card.workspaceName && <span>{card.workspaceName}</span>}
+          {agentName && agentName !== displayName && <span>{agentName}</span>}
+          {card.stashed && <span>{t('fleet.stashed')}</span>}
+          {/* The operator-assigned role (Role… in the row menu): plain text, not a state. */}
+          {role && <span data-fleet-chip="role" title={t('deck.fleetPreferredRole')}>{role}</span>}
+          {resource && resource.rss > 0 && (
+            <span data-fleet-resource data-rss-bytes={resource.rss} title={`${agentLabel(resource.image)}: ${formatRss(resource.rss)}`}>
+              {formatRss(resource.rss)}
+            </span>
+          )}
+          {supervision && (
+            <span data-fleet-supervision data-supervision-status={supervision.status}
+              style={{ color: supervisionStopped ? 'var(--accent-red)' : undefined }} title={supervisionLabel}>
+              {`${supervisionStopped ? '⟳!' : '⟳'}${supervision.restartCount > 0 ? ` ${supervision.restartCount}` : ''}`}
+            </span>
+          )}
+        </span>
+        {requester && <span className="wmux-fleet-requester" data-fleet-requester title={requester.text}>{requester.text}</span>}
+      </span>
+      <span className="wmux-fleet-progress">
+        <span className={`wmux-fleet-detail${showActivity && !usageLimit ? ' is-activity' : ''}${line.kind === 'question' && !usageLimit ? ' is-question' : ''}`}
+          data-fleet-activity={(showActivity && !usageLimit) || undefined}
+          data-fleet-now={usageLimit ? undefined : line.kind}
+          data-fleet-usage-limit={usageLimit ? 'true' : undefined}
+          title={usageLimit?.message ? `${detail}\n${usageLimit.message}` : detail}>
+          {/* The agent's own question reads as speech. */}
+          {line.kind === 'question' && !usageLimit ? `“${detail}”` : detail}
+        </span>
+        <span className="wmux-fleet-meta">
+          {card.agentStatus === 'complete' && <FleetCardEvidenceBadge task={evidenceTask} />}
+          {elapsed && <span data-fleet-elapsed>{elapsed}</span>}
+        </span>
+      </span>
+      <span className="wmux-fleet-action" aria-hidden="true">
+        <span>{action}</span><IconChevronDir dir="right" size={12} />
+      </span>
     </button>
   );
 }
 
-// A2: 그리드 자식 memo 방벽. 부모(FleetView)가 함대 갱신마다 리렌더돼도 이 카드의
-// props(card·focused·onJump·tail)가 참조상 같으면 리렌더를 건너뛴다. card/tail은
-// fleet 셀렉터가 값이 바뀐 pane에 대해서만 새 참조를 만들므로 얕은 비교로 실효.
 export default memo(FleetCard);

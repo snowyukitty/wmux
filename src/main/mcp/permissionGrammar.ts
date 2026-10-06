@@ -45,6 +45,11 @@ const KNOWN_CAPABILITIES = new Set<string>([
   // resetPermissions. These mutate browser state in ways page JS cannot, so it is
   // declared/approved on its own rather than riding on browser.evaluate.
   'browser.emulate',
+  // Desktop computer use. `observe` reads other apps (accessibility tree,
+  // screenshots); `control` injects mouse and keyboard input into them. Split
+  // so an approval to look never covers an approval to act.
+  'computer.observe',
+  'computer.control',
   // Agent-to-agent
   'a2a.send',
   'a2a.execute',
@@ -70,6 +75,11 @@ const KNOWN_CAPABILITIES = new Set<string>([
   // repository and remove a worktree, and one approval must not cover both.
   'task.read',
   'task.write',
+  // Scheduled runs (automation.list / automation.runs / automation.propose).
+  // Its own pair: a draft persists and later runs unattended once a human
+  // enables it, which neither a ledger nor a task grant should cover.
+  'automation.read',
+  'automation.write',
   // Plugin host UI contribution points (B-1). Enforced at contribution
   // registration time — the host refuses to mount the iframe/widget when
   // the capability is missing or the plugin isn't trusted; per-RPC
@@ -125,6 +135,13 @@ export function globToRegex(glob: string): RegExp {
   return new RegExp(`^${pattern}$`);
 }
 
+/**
+ * Capabilities whose methods carry no path the enforcer could match a glob
+ * against. A scoped grant for one would read as narrower than it is, so the
+ * grammar refuses it rather than letting it pass as unrestricted.
+ */
+const UNSCOPABLE_CAPABILITIES: ReadonlySet<string> = new Set(['automation.read', 'automation.write']);
+
 export function parsePermission(spec: unknown): PermissionParseResult {
   if (typeof spec !== 'string') {
     return { ok: false, error: 'permission must be a string' };
@@ -149,6 +166,9 @@ export function parsePermission(spec: unknown): PermissionParseResult {
   }
   if (pathGlob !== undefined && pathGlob.length === 0) {
     return { ok: false, error: `permission "${spec}" has empty path glob` };
+  }
+  if (pathGlob !== undefined && UNSCOPABLE_CAPABILITIES.has(capability)) {
+    return { ok: false, error: `capability "${capability}" takes no path glob` };
   }
 
   const parsed: ParsedPermission = { capability };

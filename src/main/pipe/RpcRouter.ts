@@ -8,6 +8,7 @@ import type {
 } from '../../shared/rpc';
 import { sanitizeClientDisplayName } from '../../shared/rpc';
 import { check as enforcerCheck } from '../mcp/PermissionEnforcer';
+import { isAlwaysEnforcedMethod } from '../mcp/methodCapabilityMap';
 import { isLocalExternalWireContext } from '../mcp/rpcProvenance';
 import { commanderTokenWorkspace } from '../deck/commanderTrust';
 import { COMMANDER_TEARDOWN_DENY } from '../../shared/commanderSurface';
@@ -182,9 +183,13 @@ export class RpcRouter {
   /**
    * Phase 2.2 enforcer wiring (shadow mode). main/index.ts injects a lookup
    * backed by PluginTrustStore.get; tests inject synchronous stubs. When
-   * unset, the enforcer runs with trust=undefined for every request (which
-   * is treated as legacy/grandfather → allow), making the router behave
-   * identically to pre-Phase-2.2 dispatch.
+   * unset, the enforcer runs with trust=undefined for every request. Before
+   * #1111 that meant legacy/grandfather → allow; now an envelope-less caller
+   * is REJECTED instead, while a named one falls through to the unconfirmed
+   * branch. Identity bootstrap aside, only these lanes allow without a
+   * record: the renderer `operator` bridge, a token-validated commander, and
+   * the curated name lanes on the external wire (first-party MCP hosts,
+   * `wmux-cli`, `wmux-hook-bridge`, `wmux-statusline`).
    */
   setTrustLookup(lookup: TrustLookup | undefined): void {
     this.trustLookup = lookup;
@@ -442,14 +447,15 @@ export class RpcRouter {
     }
 
     // Spec §2.2: external-wire requests without `clientName` are recorded as
-    // `legacy`. The trusted in-process surfaces are excluded: the renderer
-    // bridge (`operator`) and the iframe plugin host (`firstParty`) send no
-    // clientName by design, so counting them here drowned the wire signal in
-    // renderer polling (events.poll alone accounted for ~445k dogfood
+    // `legacy`. In-process dispatch is excluded by provenance, not by what it
+    // sends: the renderer bridge (`operator`) sends no clientName by design,
+    // and the iframe plugin host (`firstParty`) stamps its manifest name, but
+    // neither is wire traffic. Counting the renderer here drowned the wire
+    // signal in its polling (events.poll alone accounted for ~445k dogfood
     // entries) — and this counter is the evidence base for the #1111 close
-    // decision, which must see only envelope-less WIRE callers. The in-process
-    // lanes were never the grandfather's audience (#1139 exempts them at the
-    // enforcement points for the same reason). Two side-channels fire here:
+    // decision, which must see only envelope-less WIRE callers. The renderer
+    // bridge was never the grandfather's audience (#1139 exempts it at the
+    // enforcement point for the same reason). Two side-channels fire here:
     //
     //   1. Process-once trust-DB write (`legacyRecorder`) — one row per
     //      process in `~/.wmux/plugin-trust.json`. Enough to signal "this
@@ -490,9 +496,10 @@ export class RpcRouter {
     // Phase 2.2 enforcement (shadow mode in this commit).
     //
     // Trust lookup is awaited only when a clientName is present — the
-    // enforcer's first-line branches (identity bootstrap, no-clientName
-    // legacy path) don't need a record, so we save a microtask hop on
-    // every legacy / pre-handshake RPC.
+    // enforcer's first-line branches (identity bootstrap; the closed
+    // no-clientName lane and its in-process/commander exemptions, #1111)
+    // decide without a record, so we save a microtask hop on every
+    // envelope-less / pre-handshake RPC.
     //
     // Behaviour in this commit (pre-commit 3, shadow only): we call the
     // enforcer, record any non-allow outcome to the shadow sink, and THEN
@@ -539,8 +546,13 @@ export class RpcRouter {
     // Pre-commit 6: enforce-mode short-circuit. When mode is 'enforce',
     // a non-allow outcome turns into an RPC failure response — the handler
     // is NOT invoked. In 'shadow' mode (dogfood default), we still call
-    // the handler after logging, preserving pre-2.2 behavior.
-    if (outcome.kind !== 'allow' && this.enforcementMode === 'enforce') {
+    // the handler after logging, preserving pre-2.2 behavior — except for the
+    // always-enforced risk classes (desktop computer use), which, like the
+    // commander gate above, must never ride the shadow semantics.
+    if (
+      outcome.kind !== 'allow' &&
+      (this.enforcementMode === 'enforce' || isAlwaysEnforcedMethod(request.method))
+    ) {
       let rejection: RpcRejection = outcome.rejection;
       // For unconfirmed identity with a non-empty declaration, surface an
       // approval prompt and thread the synchronously-minted promptId into
@@ -635,6 +647,15 @@ function renderRejectionMessage(
     case 'identity-status':
       if (r.status === 'denied') {
         return `${r.method}: plugin is denied${observed}; edit ~/.wmux/plugin-trust.json to restore`;
+      }
+      if (r.status === 'legacy') {
+        // Two distinct callers land here and the remedy differs. No observed
+        // clientName = the closed envelope-less lane; an observed one = a
+        // trust row still carrying the grandfathered `legacy` status.
+        if (!observedClientName) {
+          return `${r.method}: requests without a clientName are not accepted — the legacy grandfather lane is closed (wmux#1111, announced for 2026-09-30). Send a clientName in the request envelope and call mcp.identify + mcp.declarePermissions — see docs/api/mcp-plugin-spec.md`;
+        }
+        return `${r.method}: this caller's trust row is still \`legacy\`${observed} and the legacy grandfather lane is closed (wmux#1111); call mcp.identify + mcp.declarePermissions to move it to unconfirmed and get an approval prompt`;
       }
       if (r.pendingApproval) {
         return `${r.method}: awaiting user approval (promptId=${r.pendingApproval.promptId})`;

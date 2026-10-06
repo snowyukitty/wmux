@@ -7,11 +7,12 @@ import type { PaneAddress } from '../../../hooks/a2aAddressing';
 
 type TestState = A2aSlice;
 
-function createTestStore() {
+function createTestStore(workspaces: unknown[] = []) {
   return create<TestState>()(
     immer((...args) => ({
       // @ts-expect-error — minimal test store doesn't match full StoreState
       ...createA2aSlice(...args),
+      workspaces,
     }))
   );
 }
@@ -509,9 +510,11 @@ describe('a2aSlice — applyDaemonTaskUpdate (캐시 verbatim, C6)', () => {
     const rejected = store.getState().updateTaskStatus(id, 'failed', 'ws-receiver');
     expect(rejected.ok).toBe(false);
     // verbatim 적용 경로는 데몬 커밋을 그대로 수용한다.
-    store.getState().applyDaemonTaskUpdate(makeTask(id, 'failed', '2026-07-07T01:00:00.000Z'));
+    // (A daemon commit is always later than the cached status; a snapshot older
+    // than the cache is skipped, see the stale-snapshot test.)
+    store.getState().applyDaemonTaskUpdate(makeTask(id, 'failed', '2999-07-07T01:00:00.000Z'));
     expect(store.getState().getTask(id)?.status.state).toBe('failed');
-    expect(store.getState().getTask(id)?.metadata.updatedAt).toBe('2026-07-07T01:00:00.000Z');
+    expect(store.getState().getTask(id)?.metadata.updatedAt).toBe('2999-07-07T01:00:00.000Z');
   });
 
   it('기존 태스크엔 status·updatedAt만 반영하고 렌더러 보유 히스토리를 보존한다', () => {
@@ -524,7 +527,7 @@ describe('a2aSlice — applyDaemonTaskUpdate (캐시 verbatim, C6)', () => {
       artifacts: [],
     });
     store.getState().addTaskMessage(id, makeMessage('increment'));
-    const committed = makeTask(id, 'working', '2026-07-07T02:00:00.000Z');
+    const committed = makeTask(id, 'working', '2999-07-07T02:00:00.000Z');
     committed.status = {
       ...committed.status,
       evidence: { summary: 'ev', items: [] },
@@ -622,7 +625,7 @@ describe('a2aSlice — updateTaskStatus 완료증거 게이트 (§6.M PR-B, 폴�
     store.getState().applyDaemonTaskUpdate({
       kind: 'task',
       id: taskId,
-      status: { state: 'failed', timestamp: '2026-07-08T00:00:00.000Z' },
+      status: { state: 'failed', timestamp: '2999-07-08T00:00:00.000Z' },
       history: [],
       artifacts: [],
       metadata: {
@@ -634,5 +637,51 @@ describe('a2aSlice — updateTaskStatus 완료증거 게이트 (§6.M PR-B, 폴�
       },
     });
     expect(store.getState().a2aTasks[taskId].status.state).toBe('failed'); // evidence 없이도 수용
+  });
+});
+
+describe('a2aSlice — #1598 orphaned receiver pane + receiver cancel', () => {
+  const addrPaneC: PaneAddress = { ptyId: 'pty-C', paneId: 'pane-C', surfaceId: 'surf-C' };
+  const leaf = (id: string) => ({ type: 'leaf', id, surfaces: [], activeSurfaceId: '' });
+
+  function makePinnedTask(store: ReturnType<typeof createTestStore>) {
+    return store.getState().createA2aTask({
+      title: 'Pane task',
+      from: { workspaceId: 'ws-receiver', name: 'Old session' },
+      to: { workspaceId: 'ws-receiver', name: 'Receiver', paneId: 'pane-B' },
+      history: [makeMessage('hello')],
+      artifacts: [],
+    });
+  }
+
+  it('a pane of the receiver workspace moves a task whose addressed pane is gone', () => {
+    const store = createTestStore([{ id: 'ws-receiver', rootPane: leaf('pane-C') }]);
+    const taskId = makePinnedTask(store);
+    const r = store.getState().updateTaskStatus(taskId, 'working', 'ws-receiver', addrPaneC);
+    expect(r.ok).toBe(true);
+    expect(store.getState().a2aTasks[taskId].status.state).toBe('working');
+  });
+
+  it('keeps the pane rule while the addressed pane is live, stashed included', () => {
+    const store = createTestStore([{ id: 'ws-receiver', rootPane: leaf('pane-C'), stashedPanes: [{ pane: leaf('pane-B') }] }]);
+    const taskId = makePinnedTask(store);
+    const r = store.getState().updateTaskStatus(taskId, 'working', 'ws-receiver', addrPaneC);
+    expect(r.error).toMatch(/not the addressed receiver pane/);
+  });
+
+  it('the receiver cancels with a reason; without one it is refused', () => {
+    const store = createTestStore();
+    const taskId = store.getState().createA2aTask({
+      title: 'T',
+      from: { workspaceId: 'ws-sender', name: 'Sender' },
+      to: { workspaceId: 'ws-receiver', name: 'Receiver' },
+      history: [makeMessage('hi')],
+      artifacts: [],
+    });
+    const bare = store.getState().updateTaskStatus(taskId, 'canceled', 'ws-receiver');
+    expect(bare.error).toMatch(/^cancel_reason_missing/);
+    const ok = store.getState().updateTaskStatus(taskId, 'canceled', 'ws-receiver', undefined, undefined, { summary: 'superseded', items: [] });
+    expect(ok.ok).toBe(true);
+    expect(store.getState().a2aTasks[taskId].status.state).toBe('canceled');
   });
 });

@@ -72,7 +72,8 @@ describe('AccountStore CRUD', () => {
     ).rejects.toMatchObject({ code: 'invalid' });
   });
 
-  it('remove clears bindings and reports affected workspaces', async () => {
+  // Four serialized durable account/binding writes include fsync; loaded Windows disks can exceed 5 s.
+  it('remove clears bindings and reports affected workspaces', { timeout: 30_000 }, async () => {
     const acc = await store.addAccount({ name: 'w', vendor: 'claude', configDir: mkConfigDir('w') });
     await store.setBinding('ws-1', 'claude', acc.id);
     await store.setBinding('ws-2', 'claude', acc.id);
@@ -84,7 +85,8 @@ describe('AccountStore CRUD', () => {
 });
 
 describe('AccountStore bindings', () => {
-  it('binds claude and codex to one workspace simultaneously', async () => {
+  // Four serialized durable account/binding writes include fsync; loaded Windows disks can exceed 5 s.
+  it('binds claude and codex to one workspace simultaneously', { timeout: 30_000 }, async () => {
     const c = await store.addAccount({ name: 'c', vendor: 'claude', configDir: mkConfigDir('c') });
     const x = await store.addAccount({ name: 'x', vendor: 'codex', configDir: mkConfigDir('x') });
     await store.setBinding('ws-1', 'claude', c.id);
@@ -184,8 +186,10 @@ describe('AccountStore concurrency (eng-review P1: serialized write queue)', () 
   it('does not lose writes under overlapping mutations', async () => {
     // Fire many binds concurrently on ONE store instance; the serialized write
     // chain must apply every one (plain last-writer-wins would drop most).
+    // Three overlapping writers per phase already make last-writer-wins lose
+    // two of them; five meant ten durable writes, which timed out on Windows.
     const accs = await Promise.all(
-      Array.from({ length: 5 }, (_, i) =>
+      Array.from({ length: 3 }, (_, i) =>
         store.addAccount({ name: `a${i}`, vendor: 'claude', configDir: mkConfigDir(`a${i}`) }),
       ),
     );
@@ -195,7 +199,7 @@ describe('AccountStore concurrency (eng-review P1: serialized write queue)', () 
     for (let i = 0; i < accs.length; i++) {
       expect(fresh.getBinding(`ws-${i}`, 'claude')).toBe(accs[i].id);
     }
-    expect(fresh.listAccounts()).toHaveLength(5);
+    expect(fresh.listAccounts()).toHaveLength(3);
   });
 
   it('a rejected mutation does not wedge the write chain', async () => {

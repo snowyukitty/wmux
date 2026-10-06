@@ -1,8 +1,8 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
 import { createWorkspaceSlice, type WorkspaceSlice } from '../workspaceSlice';
-import { createRemoteWorkspacesSlice, mergePaneSets, type RemoteWorkspacesSlice, type AttachedRemoteWorkspace } from '../remoteWorkspacesSlice';
+import { createRemoteWorkspacesSlice, mergePaneSets, isRemoteMirrorVisible, selectAttachedRemoteWorkspaces, type RemoteWorkspacesSlice, type AttachedRemoteWorkspace } from '../remoteWorkspacesSlice';
 import { createCompanySlice, type CompanySlice } from '../companySlice';
 import { createWorkspace, type SessionData } from '../../../../shared/types';
 
@@ -52,6 +52,86 @@ describe('remoteWorkspacesSlice', () => {
 
   beforeEach(() => {
     store = createTestStore();
+  });
+
+  // #1086 — rename + color are LOCAL aliases on the attachment descriptor.
+  // The node test env has no `window`, so persistence is untestable here; the
+  // store mutations and the descriptor round-trip are what matter.
+  it('rename sets and clears the local label alias', () => {
+    const remote = makeRemote();
+    store.getState().attachRemoteWorkspace(remote);
+    store.getState().renameRemoteWorkspace(remote.key, 'CTO-mirror');
+    expect(store.getState().remoteWorkspaces[0].label).toBe('CTO-mirror');
+    // A remote-side rename of the real name does not touch the alias.
+    store.getState().setRemoteWorkspacePanes(remote.key, [], 'Renamed on host');
+    expect(store.getState().remoteWorkspaces[0].label).toBe('CTO-mirror');
+    expect(store.getState().remoteWorkspaces[0].name).toBe('Renamed on host');
+    // Empty clears it — the remote snapshot name shows again.
+    store.getState().renameRemoteWorkspace(remote.key, '   ');
+    expect(store.getState().remoteWorkspaces[0].label).toBeUndefined();
+  });
+
+  it('color tag sets and clears like the local workspace grammar', () => {
+    const remote = makeRemote();
+    store.getState().attachRemoteWorkspace(remote);
+    store.getState().setRemoteWorkspaceColor(remote.key, 'rose');
+    expect(store.getState().remoteWorkspaces[0].color).toBe('rose');
+    store.getState().setRemoteWorkspaceColor(remote.key, undefined);
+    expect(store.getState().remoteWorkspaces[0].color).toBeUndefined();
+  });
+
+  it('unknown keys are ignored by both alias actions', () => {
+    store.getState().attachRemoteWorkspace(makeRemote());
+    store.getState().renameRemoteWorkspace('nope', 'x');
+    store.getState().setRemoteWorkspaceColor('nope', 'rose');
+    expect(store.getState().remoteWorkspaces).toHaveLength(1);
+    expect(store.getState().remoteWorkspaces[0].label).toBeUndefined();
+  });
+
+  it('#1086 — a re-attach keeps the user\'s rename and color tag', () => {
+    const remote = makeRemote();
+    store.getState().attachRemoteWorkspace(remote);
+    store.getState().renameRemoteWorkspace(remote.key, 'CTO-mirror');
+    store.getState().setRemoteWorkspaceColor(remote.key, 'rose');
+    // Re-attach the same key with a FRESH snapshot (no aliases on it), as the
+    // attach flow and the bootstrap path both do.
+    store.getState().attachRemoteWorkspace({ ...makeRemote(), panes: [{ sessionId: 's9' }] });
+    const entry = store.getState().remoteWorkspaces[0];
+    expect(entry.label).toBe('CTO-mirror');
+    expect(entry.color).toBe('rose');
+    // But a re-attach that CARRIES a label wins over the old one (forwarded
+    // aliases are not sticky-forever).
+    store.getState().attachRemoteWorkspace({ ...makeRemote(), label: 'new-name' });
+    expect(store.getState().remoteWorkspaces[0].label).toBe('new-name');
+  });
+
+  describe('#1086 — alias persistence', () => {
+    const attachmentsAdd = vi.fn(async () => true);
+    beforeEach(() => {
+      attachmentsAdd.mockClear();
+      vi.stubGlobal('window', { electronAPI: { remote: { attachmentsAdd } } });
+    });
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it('a re-attach persists the MERGED entry, so the aliases survive a reload', () => {
+      const remote = makeRemote();
+      store.getState().attachRemoteWorkspace(remote);
+      store.getState().renameRemoteWorkspace(remote.key, 'CTO-mirror');
+      store.getState().setRemoteWorkspaceColor(remote.key, 'red');
+      // Fresh snapshot, no aliases — what the attach modal hands over.
+      store.getState().attachRemoteWorkspace(makeRemote());
+      expect(attachmentsAdd).toHaveBeenLastCalledWith({
+        key: remote.key,
+        hostId: remote.hostId,
+        hostLabel: remote.hostLabel,
+        workspaceId: remote.workspaceId,
+        name: remote.name,
+        label: 'CTO-mirror',
+        color: 'red',
+      });
+    });
   });
 
   it('attach dedups by key and sets activeRemoteKey', () => {
@@ -252,6 +332,41 @@ describe('remoteWorkspacesSlice — live pane membership', () => {
     expect(store.getState().remoteWorkspaces[0].panes).toBe(before);
   });
 
+  // #1342 — this equality check decides whether a poll result is stored at all.
+  // The resume offer and its two liveness signals must be part of it: without
+  // them the chip's busy gate would answer from the FIRST snapshot forever and
+  // never learn that the agent came back.
+  it('setRemoteWorkspacePanes stores a change in the resume block or its liveness signals', () => {
+    const resume = { agent: 'claude', sessionId: 'conv-1', cwdMatches: true };
+    store.getState().setRemoteWorkspacePanes('host-1:ws-1', [
+      { sessionId: 'a', resume, commandRunning: false },
+      { sessionId: 'b' },
+    ]);
+    expect(store.getState().remoteWorkspaces[0].panes[0]).toMatchObject({ resume, commandRunning: false });
+
+    // The agent came back: only the liveness signal moved.
+    store.getState().setRemoteWorkspacePanes('host-1:ws-1', [
+      { sessionId: 'a', resume, commandRunning: true },
+      { sessionId: 'b' },
+    ]);
+    expect(store.getState().remoteWorkspaces[0].panes[0].commandRunning).toBe(true);
+
+    // A new conversation on the same pane.
+    store.getState().setRemoteWorkspacePanes('host-1:ws-1', [
+      { sessionId: 'a', resume: { ...resume, sessionId: 'conv-2' }, commandRunning: true },
+      { sessionId: 'b' },
+    ]);
+    expect(store.getState().remoteWorkspaces[0].panes[0].resume?.sessionId).toBe('conv-2');
+
+    // Identical snapshot still does not churn the array.
+    const before = store.getState().remoteWorkspaces[0].panes;
+    store.getState().setRemoteWorkspacePanes('host-1:ws-1', [
+      { sessionId: 'a', resume: { ...resume, sessionId: 'conv-2' }, commandRunning: true },
+      { sessionId: 'b' },
+    ]);
+    expect(store.getState().remoteWorkspaces[0].panes).toBe(before);
+  });
+
   it('setRemoteWorkspacePanes ignores an unknown key', () => {
     store.getState().setRemoteWorkspacePanes('host-1:gone', [{ sessionId: 'z' }]);
     expect(store.getState().remoteWorkspaces).toHaveLength(1);
@@ -363,5 +478,83 @@ describe('remoteWorkspacesSlice — restore', () => {
     expect(entry.panes.map((p) => p.sessionId)).toEqual(['a', 'b']);
     expect(entry.stale).toBeUndefined();
     expect(store.getState().activeRemoteKey).toBe('host-1:ws-1');
+  });
+});
+
+// #1329 — the ephemeral rows that give a remote-terminal SURFACE a liveness
+// feed without giving it a sidebar mirror or an on-disk descriptor.
+describe('remoteWorkspacesSlice — surface rows (#1329)', () => {
+  let store: ReturnType<typeof createTestStore>;
+  beforeEach(() => { store = createTestStore(); });
+
+  it('track adds an invisible row without selecting it', () => {
+    store.getState().trackRemoteSurfaceWorkspace(makeRemote({ panes: [], stale: true }));
+    const rows = store.getState().remoteWorkspaces;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].ephemeral).toBe(true);
+    expect(store.getState().activeRemoteKey).toBeNull();
+    // The one list both the sidebar and WorkspaceCenter render from.
+    expect(selectAttachedRemoteWorkspaces(store.getState())).toEqual([]);
+  });
+
+  it('track is additive — it never demotes a real attachment on the same key', () => {
+    store.getState().attachRemoteWorkspace(makeRemote({ label: 'my alias', panes: [{ sessionId: 'a' }] }));
+    store.getState().trackRemoteSurfaceWorkspace(makeRemote({ panes: [], stale: true }));
+    const rows = store.getState().remoteWorkspaces;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].ephemeral).toBeUndefined();
+    expect(rows[0].label).toBe('my alias');
+    expect(rows[0].panes.map((p) => p.sessionId)).toEqual(['a']);
+    expect(selectAttachedRemoteWorkspaces(store.getState())).toHaveLength(1);
+  });
+
+  it('track twice keeps ONE row — two panes on a host share one poller', () => {
+    store.getState().trackRemoteSurfaceWorkspace(makeRemote());
+    store.getState().trackRemoteSurfaceWorkspace(makeRemote({ name: 'again' }));
+    expect(store.getState().remoteWorkspaces).toHaveLength(1);
+    expect(store.getState().remoteWorkspaces[0].name).toBe('Remote WS');
+  });
+
+  it('attaching the same key afterwards PROMOTES the row to a visible mirror', () => {
+    store.getState().trackRemoteSurfaceWorkspace(makeRemote({ panes: [], stale: true }));
+    store.getState().attachRemoteWorkspace(makeRemote({ panes: [{ sessionId: 'a' }] }));
+    const rows = store.getState().remoteWorkspaces;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].ephemeral).toBeUndefined();
+    expect(selectAttachedRemoteWorkspaces(store.getState())).toHaveLength(1);
+    // …and prune must then leave it alone even with an empty keep-set.
+    store.getState().pruneRemoteSurfaceWorkspaces(new Set());
+    expect(store.getState().remoteWorkspaces).toHaveLength(1);
+  });
+
+  it('prune drops only ephemeral rows outside the keep-set', () => {
+    store.getState().attachRemoteWorkspace(makeRemote({ key: 'host-1:attached', workspaceId: 'attached' }));
+    store.getState().trackRemoteSurfaceWorkspace(makeRemote({ key: 'host-1:keep', workspaceId: 'keep' }));
+    store.getState().trackRemoteSurfaceWorkspace(makeRemote({ key: 'host-1:gone', workspaceId: 'gone' }));
+
+    store.getState().pruneRemoteSurfaceWorkspaces(new Set(['host-1:keep']));
+
+    expect(store.getState().remoteWorkspaces.map((r) => r.key).sort())
+      .toEqual(['host-1:attached', 'host-1:keep']);
+  });
+
+  it('prune is a no-op when nothing is doomed (stable array identity)', () => {
+    store.getState().trackRemoteSurfaceWorkspace(makeRemote());
+    const before = store.getState().remoteWorkspaces;
+    store.getState().pruneRemoteSurfaceWorkspaces(new Set(['host-1:ws-1']));
+    expect(store.getState().remoteWorkspaces).toBe(before);
+  });
+
+  it('prune clears a dangling activeRemoteKey rather than blanking the centre', () => {
+    store.getState().trackRemoteSurfaceWorkspace(makeRemote());
+    store.getState().setActiveRemoteKey('host-1:ws-1');
+    store.getState().pruneRemoteSurfaceWorkspaces(new Set());
+    expect(store.getState().activeRemoteKey).toBeNull();
+  });
+
+  it('an ephemeral row is never "the visible mirror" — the local tree stays up', () => {
+    store.getState().trackRemoteSurfaceWorkspace(makeRemote());
+    store.getState().setActiveRemoteKey('host-1:ws-1');
+    expect(isRemoteMirrorVisible(store.getState())).toBe(false);
   });
 });

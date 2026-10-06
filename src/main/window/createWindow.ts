@@ -1,19 +1,33 @@
-import { app, BrowserWindow, powerMonitor, shell } from 'electron';
+import { app, BrowserWindow, powerMonitor, screen, shell } from 'electron';
 import path from 'node:path';
 import { platformChoice } from '../../shared/platform';
 import { IPC } from '../../shared/constants';
 import { PLUGIN_PROTOCOL_SCHEME } from '../../shared/pluginHost';
 import { attachFlashFrameAutoClear } from './flashFrame';
 import { windowDisplayedReporter } from './windowDisplayed';
+import {
+  DEFAULT_WINDOW_SIZE,
+  MIN_WINDOW_SIZE,
+  loadWindowState,
+  planRestore,
+  saveWindowState,
+  saveWindowStateSync,
+  type RestorePlan,
+  type WindowState,
+} from './windowState';
 
 // OS-aware window-icon extension. Mirrors tray.ts so the same generated asset
 // set (icon.ico / icon.icns / icon.png) is used in both places.
 const iconExt = platformChoice<string>({ win: 'ico', mac: 'icns', linux: 'png', default: 'png' });
 const iconFile = `icon.${iconExt}`;
 
+// 'wasm-unsafe-eval' (#1641): the inline-image addon decodes sixel and the
+// iTerm2 image protocol's base64 with bundled WebAssembly, and Chromium
+// refuses to compile WebAssembly under a bare `script-src 'self'`. It allows
+// WebAssembly compilation only — eval() and new Function() stay blocked.
 export const MAIN_WINDOW_PRODUCTION_CSP = [
   "default-src 'self'",
-  "script-src 'self'",
+  "script-src 'self' 'wasm-unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data:",
   "connect-src 'self'",
@@ -85,26 +99,106 @@ export function loadMainRenderer(mainWindow: BrowserWindow): void {
  * leaves `deferLoad` unset because the daemon is already healthy by the
  * time activate fires.
  */
+/** How long the window must sit still before its placement is written (#1362).
+ *  Drag and resize fire continuously; one write per gesture is enough. */
+const WINDOW_STATE_SAVE_DEBOUNCE_MS = 300;
+
+/**
+ * Record the window's placement on move/resize (debounced) and on close.
+ *
+ * `getNormalBounds()` — never `getBounds()` — so a window closed while
+ * maximized or fullscreen still remembers the size to restore down to.
+ */
+function attachWindowStatePersistence(win: BrowserWindow): void {
+  const snapshot = (): WindowState => ({
+    bounds: win.getNormalBounds(),
+    maximized: win.isMaximized(),
+    fullScreen: win.isFullScreen(),
+  });
+
+  let timer: NodeJS.Timeout | null = null;
+  // Once the close snapshot is written it is final: a debounced write that
+  // fires afterwards would resurrect a stale placement.
+  let sealed = false;
+  const stop = (): void => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  const schedule = (): void => {
+    if (sealed) return;
+    // A minimized window reports isMaximized() === false and a normal-looking
+    // rectangle on Windows/Linux — saving then silently forgets that the user
+    // left it maximized. Keep the last good snapshot instead.
+    if (win.isMinimized()) return;
+    stop();
+    timer = setTimeout(() => {
+      timer = null;
+      if (sealed || win.isDestroyed() || win.isMinimized()) return;
+      void saveWindowState(snapshot()).catch(() => {
+        // Placement is a convenience; a failed write must not surface.
+      });
+    }, WINDOW_STATE_SAVE_DEBOUNCE_MS);
+  };
+
+  win.on('resize', schedule);
+  win.on('move', schedule);
+  win.on('maximize', schedule);
+  win.on('unmaximize', schedule);
+  // Restoring fullscreen flips isFullScreen() only once the transition lands,
+  // so the flag has to be re-read when these fire, not just on resize.
+  win.on('enter-full-screen', schedule);
+  win.on('leave-full-screen', schedule);
+
+  win.on('close', () => {
+    stop();
+    sealed = true;
+    try {
+      saveWindowStateSync(snapshot());
+    } catch {
+      // Never block the close on a placement write.
+    }
+  });
+  // A window destroyed without a `close` (renderer crash, forced teardown)
+  // must not leave the debounce timer holding the event loop.
+  win.on('closed', stop);
+}
+
 export function createWindow(opts: { deferLoad?: boolean } = {}): BrowserWindow {
+  // #1362 — restore the placement the user left the window in. Off-screen or
+  // corrupt saved state yields an empty plan and the 1280x800 default.
+  let plan: RestorePlan = { maximized: false, fullScreen: false };
+  try {
+    plan = planRestore(
+      loadWindowState(),
+      screen.getAllDisplays().map((d) => d.workArea),
+    );
+  } catch {
+    // Placement is a convenience; never let it block the window from opening.
+  }
+
   const mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 800,
-    minWidth: 800,
-    minHeight: 600,
+    width: plan.bounds?.width ?? DEFAULT_WINDOW_SIZE.width,
+    height: plan.bounds?.height ?? DEFAULT_WINDOW_SIZE.height,
+    ...(plan.bounds ? { x: plan.bounds.x, y: plan.bounds.y } : {}),
+    ...(plan.fullScreen ? { fullscreen: true } : {}),
+    minWidth: MIN_WINDOW_SIZE.width,
+    minHeight: MIN_WINDOW_SIZE.height,
     title: 'wmux',
     // Resolve via app.isPackaged (mirrors tray.ts) — not NODE_ENV, which isn't
     // reliably set and could send an unpackaged build to the packaged path.
     icon: app.isPackaged
       ? path.join(process.resourcesPath, iconFile)
       : path.join(__dirname, '../../assets', iconFile),
-    // Bridge redesign chrome (DESIGN.md "Window Chrome"). The default-frame +
+    // Bridge redesign chrome (DESIGN.md "Window: frame and sheet"). The default-frame +
     // visible File/Edit menu strip was the #1 "web page in an OS window"
-    // offender. The renderer draws a 36px custom titlebar (Titlebar.tsx);
+    // offender. The renderer draws a 40px custom titlebar (Titlebar.tsx);
     // the OS keeps drawing its own window controls:
     //   - Windows: titleBarOverlay → native, snap-layout-capable min/max/close
     //     drawn over the custom bar. Colors follow the theme via the
     //     window:setTitleBarOverlay IPC (registerHandlers.ts).
-    //   - macOS: 'hidden' keeps the traffic lights, nudged to center in 36px.
+    //   - macOS: 'hidden' keeps the traffic lights, nudged to center in 40px.
     //   - Linux: keep the native frame (titleBarStyle is ignored there; a
     //     frameless window would lose drag/resize with no replacement).
     // The menu bar is hidden, not removed — Alt still reveals it on demand and
@@ -114,23 +208,42 @@ export function createWindow(opts: { deferLoad?: boolean } = {}): BrowserWindow 
     // Cmd+Shift+R, Cmd+W, and the zoom keys, and silently beat the renderer to
     // them on macOS.
     autoHideMenuBar: true,
+    // Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/app/shell/TitleBar.tsx), MIT License, Copyright (c) 2026 Nick
     ...platformChoice<Partial<Electron.BrowserWindowConstructorOptions>>({
       win: {
         titleBarStyle: 'hidden',
-        // bgBase (not mantle): the overlay strip sits on the titlebar's right
-        // half, which is bgBase — the renderer re-pushes the live theme's
-        // value on boot/theme-change via window:setTitleBarOverlay anyway.
-        titleBarOverlay: { color: '#151517', symbolColor: '#A5A29C', height: 36 },
+        // The overlay strip sits on the window frame, so it starts in the
+        // default (Tint) theme's frame colour, --frame-bg #121015 — the
+        // renderer re-pushes the live theme's painted frame colour on
+        // boot/theme-change via window:setTitleBarOverlay (overlayColors()).
+        // The first paint uses the same colour so the controls never sit on
+        // a different shade before the renderer paints.
+        // Height 40 = uiZoom's CHROME_H at zoom 1 (the scaled resync uses it).
+        titleBarOverlay: { color: '#121015', symbolColor: '#C2BDC9', height: 40 },
+        backgroundColor: '#121015',
       },
       mac: {
         titleBarStyle: 'hidden',
-        trafficLightPosition: { x: 12, y: 11 },
+        // Centered in the 40px bar: macTrafficLightPosition(1) in uiZoom.ts.
+        trafficLightPosition: { x: 12, y: 13 },
+        // Window glass. Adapted from MonoCode (hardbeat920/monocode@6bd432ca,
+        // src-tauri/src/macos.rs), MIT License, Copyright (c) 2026 Nick: a
+        // behind-window material under a transparent window. The page decides
+        // what shows through — under a dark theme the renderer sets
+        // `data-glass` and tints only the chrome (globals.css); the workspace
+        // frame and terminals stay opaque, and a light theme paints the whole
+        // page opaque. The material also covers the first frame, so there is
+        // no white flash before the renderer paints.
+        vibrancy: 'under-window',
+        visualEffectState: 'active',
+        backgroundColor: '#00000000',
       },
-      default: {},
+      default: {
+        // Matches the Tint (default) theme's bgBase so the first paint
+        // doesn't flash a foreign color behind the renderer.
+        backgroundColor: '#1A171D',
+      },
     }),
-    // Matches the amber (default) theme's bgBase so the first paint doesn't
-    // flash a foreign color behind the renderer (was catppuccin '#1e1e2e').
-    backgroundColor: '#151517',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -138,6 +251,14 @@ export function createWindow(opts: { deferLoad?: boolean } = {}): BrowserWindow 
       webviewTag: true,
     },
   });
+
+  // Fullscreen is requested through the constructor (above) — calling
+  // setFullScreen() on a window that has not been shown yet is unreliable
+  // across platforms. Maximize has no constructor option and is safe here.
+  if (!plan.fullScreen && plan.maximized) {
+    mainWindow.maximize();
+  }
+  attachWindowStatePersistence(mainWindow);
 
   // macOS: native fullscreen hides the traffic lights, so the renderer's
   // titlebar must drop its 72px left reserve (and restore it on exit) — the

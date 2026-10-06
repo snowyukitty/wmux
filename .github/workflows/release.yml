@@ -29,6 +29,7 @@ jobs:
       contents: write
     outputs:
       version: ${{ steps.pkg.outputs.version }}
+      is_prerelease: ${{ steps.pkg.outputs.is_prerelease }}
     env:
       # NN2-T1 — SignPath Foundation (OSS) code signing. This non-secret gate
       # keeps signing steps no-op until SIGNPATH_API_TOKEN is configured, while
@@ -40,6 +41,11 @@ jobs:
       #      SIGNPATH_ARTIFACT_CONFIGURATION_SLUG (from the SignPath project UI)
       # See docs.signpath.io/trusted-build-systems/github.
       SIGNPATH_ENABLED: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+      # The computer-use helper is a separate SignPath artifact (an inner exe,
+      # signed before forge packages it), so it needs its own artifact
+      # configuration: repo VARIABLE SIGNPATH_HELPER_ARTIFACT_CONFIGURATION_SLUG.
+      # No-op until both are configured.
+      HELPER_SIGNING_ENABLED: ${{ secrets.SIGNPATH_API_TOKEN != '' && vars.SIGNPATH_HELPER_ARTIFACT_CONFIGURATION_SLUG != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -58,8 +64,103 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # ── Windows computer-use helper ──────────────────────────────────────
+      # Order is load-bearing (scripts/__tests__/computerHelperRelease.test.mjs
+      # enforces it): build -> sign -> stage -> make -> check. `make` bakes the
+      # staged exe's SHA-256 into the main bundle (vite.main.config.ts) and a
+      # packaged wmux refuses a helper that does not match it, so signing after
+      # staging would fail computer use closed for every user. The pin detects
+      # corruption, partial updates and antivirus tampering; it is not a
+      # security boundary (docs/computer-use-windows.md).
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build the computer-use helper
+        run: npm run build:computer-use-windows -- --no-stage
+
+      - name: Upload unsigned computer-use helper for signing
+        id: upload-helper-unsigned
+        if: env.HELPER_SIGNING_ENABLED == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wmux-computer-use-unsigned
+          path: native/computer-use-windows/dist/wmux-computer-use.exe
+          if-no-files-found: error
+
+      - name: Sign computer-use helper via SignPath
+        if: env.HELPER_SIGNING_ENABLED == 'true'
+        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_HELPER_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload-helper-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: out/signed-helper
+
+      # Only a release-signing policy with a Valid chain marks the helper
+      # release-signed. Without that mark a packaged wmux reports the helper as
+      # missing and computer use cannot be turned on (src/main/computer/helperPin.ts);
+      # a test-signed or unsigned helper still ships, for the dogfood.
+      - name: Replace the unsigned helper with the signed one
+        if: env.HELPER_SIGNING_ENABLED == 'true'
+        shell: pwsh
+        env:
+          SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          # SHA-1 thumbprint of the release signing certificate (repo variable);
+          # required for the release mark, so another valid certificate cannot
+          # stand in for ours.
+          EXPECTED_THUMBPRINT: ${{ vars.SIGNPATH_RELEASE_SIGNER_THUMBPRINT }}
+        run: |
+          # Exactly the file we uploaded, not the first match anywhere in the output.
+          $signed = "out/signed-helper/wmux-computer-use.exe"
+          if (-not (Test-Path -LiteralPath $signed -PathType Leaf)) { Write-Error "SignPath returned no $signed"; exit 1 }
+          $dest = "native/computer-use-windows/dist/wmux-computer-use.exe"
+          Copy-Item -LiteralPath $signed $dest -Force
+          $sig = Get-AuthenticodeSignature $dest
+          if (-not $sig.SignerCertificate) { Write-Error "Signed helper carries no signature: $($sig.Status)"; exit 1 }
+          if ($env:SIGNING_POLICY_SLUG -eq 'release-signing') {
+            if ($sig.Status -ne 'Valid') { Write-Error "Production helper signature is not Valid: $($sig.Status)"; exit 1 }
+            if (-not $env:EXPECTED_THUMBPRINT -or $sig.SignerCertificate.Thumbprint -ne $env:EXPECTED_THUMBPRINT.ToUpper()) {
+              Write-Error "Helper signer $($sig.SignerCertificate.Thumbprint) is not the expected release certificate"; exit 1
+            }
+            "WMUX_WIN_HELPER_RELEASE_SIGNED=true" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
+          Write-Host "Signed helper in place (status=$($sig.Status), publisher: $($sig.SignerCertificate.Subject))"
+
+      - name: Stage the computer-use helper
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/computer-use-windows" | Out-Null
+          Copy-Item "native/computer-use-windows/dist/wmux-computer-use.exe" "dist/computer-use-windows/wmux-computer-use.exe" -Force
+          $hash = (Get-FileHash "dist/computer-use-windows/wmux-computer-use.exe" -Algorithm SHA256).Hash.ToLower()
+          "WMUX_WIN_HELPER_SHA256=$hash" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host "Staged helper sha256=$hash (release-signed: $([bool]$env:WMUX_WIN_HELPER_RELEASE_SIGNED))"
+
       - name: Build & Make
         run: npm run make
+
+      # The packaged helper must be byte-identical to the one the main bundle
+      # pins, and the pin must be in the bundle: otherwise this build ships a
+      # wmux whose computer use can never start.
+      - name: Check the packaged computer-use helper
+        shell: pwsh
+        run: |
+          $helpers = @(Get-ChildItem out -Recurse -Filter "wmux-computer-use.exe" | Where-Object { $_.FullName -match '\\resources\\computer-use-windows\\' })
+          if ($helpers.Count -eq 0) { Write-Error "no computer-use helper in the packaged app"; exit 1 }
+          foreach ($h in $helpers) {
+            $hash = (Get-FileHash $h.FullName -Algorithm SHA256).Hash.ToLower()
+            if ($hash -ne $env:WMUX_WIN_HELPER_SHA256) { Write-Error "packaged helper $($h.FullName) hashes to $hash, staged $env:WMUX_WIN_HELPER_SHA256"; exit 1 }
+          }
+          $asar = Get-ChildItem out -Recurse -Filter "app.asar" | Select-Object -First 1
+          if (-not $asar) { Write-Error "no app.asar in the packaged app"; exit 1 }
+          if (-not (Select-String -Path $asar.FullName -SimpleMatch $env:WMUX_WIN_HELPER_SHA256 -Quiet)) {
+            Write-Error "the main bundle does not carry the helper's SHA-256 pin"; exit 1
+          }
+          Write-Host "Packaged helper matches the pin ($env:WMUX_WIN_HELPER_SHA256)"
 
       # ── Authenticode code signing (SignPath Foundation, OSS) ─────────────
       # No-op until SIGNPATH_ENABLED is true (see job env). Signs the prebuilt
@@ -111,11 +212,28 @@ jobs:
           }
           Write-Host "Signed Setup.exe in place (status=$($sig.Status), publisher: $($sig.SignerCertificate.Subject))"
 
+      # is_prerelease decides whether this run ships to existing users. A tag
+      # like v4.0.0-beta.1 becomes a GitHub prerelease that is never "latest",
+      # and skips Chocolatey and WinGet. update.electronjs.org ignores
+      # prereleases and the side-car manifests are read through the
+      # releases/latest alias, so no stable install is ever offered one.
+      #
+      # The package.json version counts too, not just the tag: a v4.0.0 tag on
+      # a tree still versioned 4.0.0-beta.1 would otherwise publish beta
+      # binaries as the latest release. On a dispatch (no tag) it is the only
+      # input, so the rehearsal skips what the tagged run would skip.
       - name: Get version from package.json
         id: pkg
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           $v = (Get-Content package.json | ConvertFrom-Json).version
           echo "version=$v" >> $env:GITHUB_OUTPUT
+          $tagPre = ($env:REF_TYPE -eq 'tag') -and $env:REF_NAME.Contains('-')
+          $pre = if ($tagPre -or $v.Contains('-')) { 'true' } else { 'false' }
+          echo "is_prerelease=$pre" >> $env:GITHUB_OUTPUT
+          Write-Host "version=$v ref=$env:REF_TYPE/$env:REF_NAME is_prerelease=$pre"
         shell: pwsh
 
       # Single canonical SHA-256 of the Setup.exe, consumed by BOTH the
@@ -231,8 +349,13 @@ jobs:
           body_path: out/release-notes.md
           generate_release_notes: true
           draft: false
+          prerelease: ${{ steps.pkg.outputs.is_prerelease == 'true' }}
+          make_latest: ${{ steps.pkg.outputs.is_prerelease != 'true' }}
 
+      # Chocolatey and WinGet have no beta channel we use: a prerelease pushed
+      # there reaches every user who runs an upgrade.
       - name: Build Chocolatey package
+        if: steps.pkg.outputs.is_prerelease != 'true'
         env:
           PKG_VERSION: ${{ steps.pkg.outputs.version }}
           SETUP_SHA256: ${{ steps.checksum.outputs.sha256 }}
@@ -249,7 +372,7 @@ jobs:
         shell: pwsh
 
       - name: Push to Chocolatey
-        if: github.event_name == 'push' && env.CHOCO_API_KEY != ''
+        if: github.event_name == 'push' && steps.pkg.outputs.is_prerelease != 'true' && env.CHOCO_API_KEY != ''
         continue-on-error: true
         run: choco push "out/choco/wmux.$env:PKG_VERSION.nupkg" --source https://push.chocolatey.org --api-key $env:CHOCO_API_KEY
         shell: pwsh
@@ -260,6 +383,7 @@ jobs:
   winget:
     name: Publish to WinGet
     needs: build
+    if: needs.build.outputs.is_prerelease != 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -343,6 +467,36 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
           rm -f "$RUNNER_TEMP/cert.p12"
 
+      # The computer-use helper is signed on its own, before forge packages it
+      # (native/computer-use-macos/build.sh): TCC grants bind to its identity,
+      # and forge's osxSign skips it so it never gets the Electron
+      # entitlements. Without the cert secret the helper is ad-hoc signed, and
+      # a packaged wmux refuses to spawn it (src/main/computer/verifyHelper.ts).
+      # The release runner's default Xcode must build Swift tools 5.9.
+      - name: Build the computer-use helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          IDENTITY=-
+          if [ -n "$APPLE_CERT_P12_BASE64" ]; then
+            # By SHA-1 and team, like the DMG signing in forge.config.ts: a name
+            # match could pick a stale or foreign-team certificate.
+            IDENTITY="$(security find-identity -v -p codesigning \
+              | awk -v team="($APPLE_TEAM_ID)" '/"Developer ID Application: / && index($0, team) { print $2 }' \
+              | sort -u)"
+            if [ "$(printf '%s\n' "$IDENTITY" | grep -c .)" -ne 1 ]; then
+              echo "::error::expected exactly one Developer ID Application identity for team $APPLE_TEAM_ID"
+              exit 1
+            fi
+          fi
+          xcrun swift --version
+          npm run build:computer-use-macos -- --identity "$IDENTITY"
+          if [ "$IDENTITY" = "-" ]; then
+            native/computer-use-macos/check-signature.sh "dist/computer-use-macos/wmux Computer Use.app"
+          else
+            native/computer-use-macos/check-signature.sh "dist/computer-use-macos/wmux Computer Use.app" --release
+          fi
+
       # Forge signs + notarizes inside `make` only when Apple creds are present
       # (see macSignConfig in forge.config.ts); otherwise it builds unsigned.
       #
@@ -353,6 +507,23 @@ jobs:
       - name: Build & Make
         run: npm run make
         timeout-minutes: 60
+
+      # The packaged helper must still carry its own signature: a forge change
+      # that re-signed it would hand it wmux's entitlements, and a missing one
+      # would ship a macOS build where computer use can never start.
+      - name: Check the packaged computer-use helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          HELPERS="$(find out -type d -name 'wmux Computer Use.app' -path '*/Contents/Resources/computer-use-macos/*')"
+          [ -n "$HELPERS" ] || { echo "::error::no computer-use helper in the packaged app"; exit 1; }
+          while IFS= read -r helper; do
+            if [ -n "$APPLE_CERT_P12_BASE64" ]; then
+              native/computer-use-macos/check-signature.sh "$helper" --release
+            else
+              native/computer-use-macos/check-signature.sh "$helper"
+            fi
+          done <<<"$HELPERS"
 
       # Append the .zip/.dmg to the release the `build` job already created.
       #
@@ -367,6 +538,17 @@ jobs:
       # salvages whatever did get made.
       #
       # continue-on-error: an upload hiccup must not fail the whole release.
+      - name: Upload macOS preview artifacts
+        if: always() && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wmux-macos-arm64
+          path: |
+            out/make/**/*.dmg
+            out/make/**/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload macOS artifacts to the release
         if: always() && github.event_name == 'push'
         continue-on-error: true
@@ -516,6 +698,18 @@ jobs:
 
       # Same reasoning as the macOS upload: deb/rpm/AppImage are made in
       # sequence, so one failing maker must not discard the ones that succeeded.
+      - name: Upload Linux preview artifacts
+        if: always() && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wmux-linux
+          path: |
+            out/make/**/*.deb
+            out/make/**/*.rpm
+            out/make/**/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload Linux artifacts to the release
         if: always() && github.event_name == 'push'
         continue-on-error: true

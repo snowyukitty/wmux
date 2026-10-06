@@ -20,6 +20,7 @@
 // and a denial must be reported instead of going quiet.
 
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as nodePath from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RpcContext } from '../../../../shared/rpc';
@@ -36,6 +37,8 @@ import { loadWorkspaceDecision } from '../../../deck/deckDecisionStore';
 import { registerFanOutRpc, FANOUT_WIRE_AGENT_CMD, FANOUT_IDEMPOTENCY_KEY_MAX_BYTES } from '../fanout.rpc';
 import type { FanOutRequest, FanOutResult, FanOutService, FanOutStatus } from '../../../worktask/FanOutService';
 import type { RpcRouter } from '../../RpcRouter';
+import { FanOutGuards } from '../../../worktask/fanoutGuards';
+import type { FanoutPreset } from '../../../../shared/fanoutPreset';
 
 const CALLER_WS = 'ws-caller';
 // Resolved to NATIVE form. The handler runs the caller's cwd through
@@ -79,12 +82,18 @@ interface Harness {
   moveCaller: (cwd: string | null) => void;
   /** The preview the approval prompt was actually raised with. */
   preview: () => string;
+  /** The `requireApproval` main sent with the last approval request. */
+  requireApprovalSent: () => unknown;
   /** Drop a completed key from the service's result LRU — what the real
    *  FanOutService does once 1000 newer fan-outs have finished. */
   forgetResult: (callerKey: string) => void;
   /** Answer a prompt that was left hanging — the "the user took their time"
    *  case the approval-time repo re-derivation is about. */
   approveHungPrompt: () => void;
+  /** Every renderer method called, in order. */
+  rendererCalls: () => string[];
+  /** Params of each fanout.resolveOrigin call. */
+  resolveOriginParams: () => Array<Record<string, unknown>>;
 }
 
 function setup(opts?: {
@@ -96,6 +105,15 @@ function setup(opts?: {
   /** What workspace.list reports as the commander workspace's active pty.
    *  '' models a workspace with no resolvable active pane. */
   commanderAnchorPtyId?: string;
+  /** Lineage/caps/audit store. Defaults to a fresh one in a temp dir. */
+  guards?: FanOutGuards;
+  /** Main's approval switch. Defaults to on, so the dialog tests stay dialog tests. */
+  requireApproval?: boolean;
+  /** Operator presets. Defaults to none. */
+  presets?: FanoutPreset[];
+  /** What the renderer answers to fanout.resolveOrigin. Defaults to pane
+   *  p1/s1 of the caller's workspace; 'throw' models a renderer miss. */
+  resolveOrigin?: unknown | 'throw';
 }): Harness {
   const commanderAnchorPtyId =
     opts?.commanderAnchorPtyId === undefined ? 'pty-1' : opts.commanderAnchorPtyId;
@@ -127,7 +145,9 @@ function setup(opts?: {
   });
 
   const statusOf = vi.fn((key: string): FanOutStatus => state.get(key) ?? { state: 'unknown' });
-  const service = { start, statusOf } as unknown as FanOutService;
+  // Only the fan-out 'k-wait' has tasks waiting on dependencies.
+  const cancelDependents = vi.fn((key: string): number | null => (key.endsWith('::k-wait') ? 2 : null));
+  const service = { start, statusOf, cancelDependents } as unknown as FanOutService;
 
   const ownerWs = opts?.ownerWorkspaceId === undefined ? CALLER_WS : opts.ownerWorkspaceId;
   let currentCwd = opts?.cwd === undefined ? CALLER_CWD : opts.cwd;
@@ -135,9 +155,21 @@ function setup(opts?: {
   const approval: ApprovalStub = opts?.approval ?? { approved: true, outcome: 'approved' };
   let approvals = 0;
   let lastPreview = '';
+  let lastRequireApproval: unknown;
   let releaseApproval: ((v: unknown) => void) | null = null;
+  const rendererCalls: string[] = [];
+  const resolveOriginParams: Array<Record<string, unknown>> = [];
+  const resolveOriginAnswer = opts && 'resolveOrigin' in opts
+    ? opts.resolveOrigin
+    : { origin: { kind: 'pane', paneId: 'p1', surfaceId: 's1', label: 'w1-1 · Claude Code' } };
 
   vi.mocked(sendToRenderer).mockImplementation(async (_win, method: string, p?: unknown) => {
+    rendererCalls.push(method);
+    if (method === 'fanout.resolveOrigin') {
+      resolveOriginParams.push({ ...(p as Record<string, unknown>) });
+      if (resolveOriginAnswer === 'throw') throw new Error('renderer unavailable');
+      return resolveOriginAnswer;
+    }
     if (method === 'input.findOwnerWorkspace') return ownerWs ? { workspaceId: ownerWs } : {};
     // A brain has no pty of its own, so it anchors on its workspace's ACTIVE
     // pane — which is what workspace.list reports as activePtyId. 'pty-1' here
@@ -161,6 +193,7 @@ function setup(opts?: {
     if (method === 'fanout.requestApproval') {
       approvals += 1;
       lastPreview = String((p as Record<string, unknown>)?.promptPreview ?? '');
+      lastRequireApproval = (p as Record<string, unknown>)?.requireApproval;
       if (approval === 'throw') throw new Error('renderer unavailable');
       // A prompt nobody has answered YET — the unattended case, and also the
       // handle a test uses to answer it late (approveHungPrompt).
@@ -183,7 +216,19 @@ function setup(opts?: {
     return { stdout: '', stderr: 'not a git repository', code: 128 };
   });
 
-  registerFanOutRpc(router, service, () => null);
+  const guards =
+    opts?.guards ??
+    new FanOutGuards({
+      dir: fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wmux-fanout-rpc-')),
+      countLiveTasks: () => 0,
+      ledgerTaskOwner: () => null,
+    });
+  registerFanOutRpc(router, service, () => null, {
+    guards,
+    workerPermissionMode: () => 'auto',
+    requireApproval: () => opts?.requireApproval ?? true,
+    presets: () => opts?.presets ?? [],
+  });
   const handler = handlers.get('task.fanout.start');
   if (!handler) throw new Error('task.fanout.start was not registered');
 
@@ -200,8 +245,11 @@ function setup(opts?: {
       currentCwd = next;
     },
     preview: () => lastPreview,
+    requireApprovalSent: () => lastRequireApproval,
     forgetResult: (callerKey) => state.delete(`${ownerWs}::${callerKey}`),
     approveHungPrompt: () => releaseApproval?.({ approved: true, outcome: 'approved' }),
+    rendererCalls: () => [...rendererCalls],
+    resolveOriginParams: () => [...resolveOriginParams],
   };
 }
 
@@ -234,6 +282,8 @@ describe('task.fanout.start — happy path (so the rejections below mean somethi
       status: 'accepted',
       taskCount: 2,
       repoPath: CALLER_REPO_ROOT,
+      ownerWorkspaceId: CALLER_WS,
+      // Deprecated alias, kept for older callers.
       workspaceId: CALLER_WS,
     });
     await h.flush();
@@ -280,6 +330,7 @@ describe('a commander brain is a verifiable caller without a pty', () => {
     await h.flush();
     expect(h.start).toHaveBeenCalledTimes(1);
     expect(h.request().verifiedWorkspaceId).toBe(CALLER_WS);
+    expect(h.request().caller).toEqual({ kind: 'orchestrator' });
   });
 
   it('ignores a senderPtyId a commander states — the token outranks it', async () => {
@@ -387,6 +438,65 @@ describe('roles choose the agent per task, without naming one', () => {
   });
 });
 
+describe('files and dependsOn travel with the tasks', () => {
+  it('forwards normalized scopes and dependencies, and shows them in the approval', async () => {
+    const h = setup();
+    await h.call(goodParams({ titles: ['a', 'b'], files: [['./src/a/'], ['src/b/**']], dependsOn: [[], [0]] }));
+    await h.flush();
+    expect(h.request().files).toEqual([['src/a'], ['src/b/**']]);
+    expect(h.request().dependsOn).toEqual([[], [0]]);
+    expect(h.preview()).toContain('[files: src/b/**] [after: task 1]');
+  });
+
+  it('refuses overlapping scopes and cycles before asking anyone', async () => {
+    const h = setup();
+    const overlap = await h.call(goodParams({ titles: ['a', 'b'], files: [['src'], ['src/x.ts']] }));
+    expect(errorOf(overlap).code).toBe('INVALID_ARGUMENT');
+    const cycle = await h.call(goodParams({ idempotencyKey: 'k-cycle', titles: ['a', 'b'], dependsOn: [[1], [0]] }));
+    expect(errorOf(cycle).code).toBe('INVALID_ARGUMENT');
+    expect(h.approvalCount()).toBe(0);
+  });
+
+  it('charges a dependent task on the hour when it starts, refunds it once, and settles the fan-out after the last one', async () => {
+    const guards = new FanOutGuards({
+      dir: fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wmux-fanout-rpc-')),
+      countLiveTasks: () => 0,
+      ledgerTaskOwner: () => null,
+    });
+    const commit = vi.spyOn(guards, 'commitStart');
+    const refund = vi.spyOn(guards, 'refundStart');
+    const settled = vi.spyOn(guards, 'settleStarted');
+    const h = setup({ guards, run: 'hang' });
+    await h.call(goodParams({ titles: ['a', 'b'], dependsOn: [[], [0]] }));
+    await h.flush();
+    expect(commit).toHaveBeenCalledWith(expect.any(String), 1);
+    h.finishRun({ ok: true, tasks: [{ index: 0, title: 'a', ok: true, workspaceId: 'ws-a' }, { index: 1, title: 'b', ok: false, pending: { waitingOn: [0] } }] });
+    await h.flush();
+    // Still waiting: the fan-out keeps its booking.
+    expect(settled).not.toHaveBeenCalled();
+    const req = h.request();
+    expect(req.beforeDeferredLaunch?.(1)).toEqual({ ok: true });
+    req.onDeferredLaunch?.({ index: 1, title: 'b', ok: false, error: 'spawn failed' }, { remaining: 0 });
+    req.onDeferredLaunch?.({ index: 1, title: 'b', ok: false, error: 'spawn failed' }, { remaining: 0 });
+    expect(refund).toHaveBeenCalledTimes(1);
+    expect(settled).toHaveBeenCalled();
+  });
+
+  it('lets the owner drop the tasks still waiting, by key', async () => {
+    const h = setup();
+    const res = await h.call(goodParams({ idempotencyKey: 'k-wait', cancelPending: true }));
+    expect(res).toMatchObject({ ok: true, status: 'pending_cancelled', dropped: 2 });
+    const none = await h.call(goodParams({ idempotencyKey: 'k-other', cancelPending: true }));
+    expect(errorOf(none).code).toBe('NOT_FOUND');
+  });
+
+  it('refuses an empty title when indices would shift', async () => {
+    const h = setup();
+    const res = await h.call(goodParams({ titles: ['a', ' ', 'c'], dependsOn: [[], [], [0]] }));
+    expect(errorOf(res).code).toBe('INVALID_ARGUMENT');
+  });
+});
+
 // ── accept-then-poll ──────────────────────────────────────────────────────
 //
 // The MCP client's RPC deadline is 10s (src/mcp/wmux-client.ts) and a single
@@ -428,14 +538,31 @@ describe('the caller is answered without waiting for the fan-out', () => {
 
     const result: FanOutResult = {
       ok: true,
-      tasks: [{ index: 0, title: 'first task', ok: true, taskId: 'wtask-1' }],
+      tasks: [
+        { index: 0, title: 'first task', ok: true, taskId: 'wtask-1', workspaceId: 'ws-task-1' },
+        { index: 1, title: 'second task', ok: true, taskId: 'wtask-2', workspaceId: 'ws-task-2' },
+      ],
     };
     h.finishRun(result);
     await h.flush();
 
-    expect(await h.call(goodParams())).toMatchObject({ ok: true, status: 'completed', result });
+    const done = await h.call(goodParams()) as { result?: FanOutResult };
+    expect(done).toMatchObject({ ok: true, status: 'completed', result });
+    // Each task names its OWN workspace — never the owner's.
+    expect(done.result?.tasks.map((t) => t.workspaceId)).toEqual(['ws-task-1', 'ws-task-2']);
+    expect(done.result?.tasks.map((t) => t.workspaceId)).not.toContain(CALLER_WS);
     // Three calls, ONE run: polling must never re-fan-out.
     expect(h.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('lifts a completed result\'s warnings onto the envelope (the MCP tool prints them as WARNING lines)', async () => {
+    const h = setup({ run: 'hang' });
+    await h.call(goodParams());
+    await h.flush();
+    const warnings = ['git fetch origin main failed (offline); tasks branched from the local HEAD'];
+    h.finishRun({ ok: true, tasks: [{ index: 0, title: 'first task', ok: true }], warnings });
+    await h.flush();
+    expect(await h.call(goodParams())).toMatchObject({ ok: true, status: 'completed', warnings });
   });
 
   it('reports awaiting_approval, and does not raise a second prompt for the same key', async () => {
@@ -486,8 +613,50 @@ describe('an evicted key can never restart a fan-out that already spawned', () =
     }
   }
 
+  /**
+   * The runaway brakes are not what this block tests, and the real store
+   * persists every fan-out (caps stamp, refund, audit line) to disk: 1100 of
+   * them meant thousands of file writes and renames, which timed out on
+   * Windows runners. This double admits every fan-out and touches no disk, so
+   * the flood exercises only the gate map and the result LRU.
+   */
+  function permissiveGuards(): FanOutGuards {
+    return {
+      fanoutOwnerOf: () => null,
+      reserve: () => ({ ok: true }),
+      release: () => undefined,
+      commitStart: () => undefined,
+      refundStart: () => undefined,
+      settleStarted: () => undefined,
+      appendAudit: () => undefined,
+    } as unknown as FanOutGuards;
+  }
+
+  it('keeps the same guarantees on the real guard store (small flood)', async () => {
+    // The flood below uses a permissive double, so this case runs a short one
+    // through the REAL store (temp dir): 13 two-task fan-outs are 26 tasks,
+    // past the 24-task hourly cap unless each unspawned task is refunded on
+    // disk, and the forgotten key answers expired instead of running again.
+    const guards = new FanOutGuards({
+      dir: fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wmux-fanout-rpc-')),
+      countLiveTasks: () => 0,
+      ledgerTaskOwner: () => null,
+    });
+    const h = setup({ guards });
+    await h.call(goodParams({ idempotencyKey: 'the-real-one' }));
+    await h.flush();
+    h.forgetResult('the-real-one');
+    await flood(h, 13);
+    expect(h.start).toHaveBeenCalledTimes(14);
+
+    const res = await h.call(goodParams({ idempotencyKey: 'the-real-one' }));
+    await h.flush();
+    expect(res).toMatchObject({ ok: false, status: 'expired' });
+    expect(h.start.mock.calls.filter((c) => (c[0] as FanOutRequest).idempotencyKey.endsWith('the-real-one'))).toHaveLength(1);
+  });
+
   it('answers expired — not a fresh request — after eviction pressure on both stores', async () => {
-    const h = setup();
+    const h = setup({ guards: permissiveGuards() });
     await h.call(goodParams({ idempotencyKey: 'the-real-one' }));
     await h.flush();
     expect(h.start).toHaveBeenCalledTimes(1);
@@ -505,7 +674,7 @@ describe('an evicted key can never restart a fan-out that already spawned', () =
   });
 
   it('keeps a denial terminal under the same pressure, instead of re-prompting', async () => {
-    const h = setup({ approval: { approved: false, outcome: 'declined' } });
+    const h = setup({ approval: { approved: false, outcome: 'declined' }, guards: permissiveGuards() });
     await h.call(goodParams({ idempotencyKey: 'denied-one' }));
     await h.flush();
     const before = h.approvalCount();
@@ -743,6 +912,45 @@ describe('R2 — the caller workspace is derived, not asserted', () => {
     await h.call(goodParams());
     await h.flush();
     expect(h.request().verifiedWorkspaceId).toBe(CALLER_WS);
+    // …and which pane asked, already resolved to its stable ids and name.
+    expect(h.request().caller).toEqual({ kind: 'pane', paneId: 'p1', surfaceId: 's1', label: 'w1-1 · Claude Code' });
+  });
+
+  // #1575 review — the requester is resolved ONCE, at request time, scoped to
+  // the owning workspace, before the approval prompt and any git work; the
+  // service then carries that origin to every spawn unchanged.
+  it('resolves the requesting pane once, in the owner workspace, before approval and git', async () => {
+    const h = setup();
+    await h.call(goodParams());
+    await h.flush();
+    expect(h.resolveOriginParams()).toEqual([{ ptyId: 'pty-1', workspaceId: CALLER_WS }]);
+    const calls = h.rendererCalls();
+    expect(calls.indexOf('fanout.resolveOrigin')).toBeGreaterThan(-1);
+    expect(calls.indexOf('fanout.resolveOrigin')).toBeLessThan(calls.indexOf('fanout.requestApproval'));
+    expect(calls.indexOf('fanout.resolveOrigin')).toBeLessThan(calls.indexOf('surface.list'));
+    // A poll on the same key never resolves again.
+    await h.call(goodParams());
+    expect(h.resolveOriginParams()).toHaveLength(1);
+  });
+
+  it('records no requester when the pane is not in the owner workspace, or the renderer cannot say', async () => {
+    // The renderer answers null for a ptyId whose pane lives elsewhere.
+    const elsewhere = setup({ resolveOrigin: { origin: null } });
+    await elsewhere.call(goodParams());
+    await elsewhere.flush();
+    expect(elsewhere.start).toHaveBeenCalledTimes(1);
+    expect(elsewhere.request().caller).toBeUndefined();
+    // A malformed or non-pane answer is not a pane requester either.
+    const forged = setup({ resolveOrigin: { origin: { kind: 'gui' } } });
+    await forged.call(goodParams());
+    await forged.flush();
+    expect(forged.request().caller).toBeUndefined();
+    // Display data only: a renderer miss never refuses the fan-out.
+    const miss = setup({ resolveOrigin: 'throw' });
+    await miss.call(goodParams());
+    await miss.flush();
+    expect(miss.start).toHaveBeenCalledTimes(1);
+    expect(miss.request().caller).toBeUndefined();
   });
 
   it('rejects a caller-supplied memberId', async () => {
@@ -1134,5 +1342,398 @@ describe('the accepted reply warns about a pending decision on the owner', () =>
       throw new Error('torn store');
     });
     expect(await setup().call(goodParams())).toMatchObject({ ok: true, status: 'accepted' });
+  });
+});
+
+// ─── Runaway brakes: depth-1, global caps, audit ──────────────────────────
+// Fan-out runs without a person in the loop by default, so these three are
+// what stop a loop. Each is asserted through the wire handler, not only the
+// store, because the ordering (before the poll branch, in the claim tick,
+// before the spawn) is the part a refactor would break.
+
+function guardsIn(dir: string, opts: { ledger?: (ws: string) => string | null; live?: () => number } = {}): FanOutGuards {
+  return new FanOutGuards({
+    dir,
+    countLiveTasks: opts.live ?? (() => 0),
+    ledgerTaskOwner: opts.ledger ?? (() => null),
+  });
+}
+
+function tmp(): string {
+  return fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wmux-fanout-brakes-'));
+}
+
+describe('task.fanout.start — depth-1', () => {
+  it('refuses a caller whose workspace carries the lineage stamp', async () => {
+    const g = guardsIn(tmp());
+    g.markTask(CALLER_WS, 'ws-brain');
+    const h = setup({ guards: g });
+    const err = errorOf(await h.call(goodParams()));
+    expect(err.code).toBe('NOT_AUTHORIZED');
+    expect(err.message).toMatch(/fan-out task of ws-brain/);
+    await h.flush();
+    expect(h.approvalCount()).toBe(0);
+    expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it('refuses a worker that marked its own ledger row failed (status-independent)', async () => {
+    // The ledger port answers for any status; there is no stamp at all here, so
+    // only the ledger fallback can refuse it.
+    const h = setup({ guards: guardsIn(tmp(), { ledger: (ws) => (ws === CALLER_WS ? 'ws-brain' : null) }) });
+    expect(errorOf(await h.call(goodParams())).code).toBe('NOT_AUTHORIZED');
+  });
+
+  it('refuses a commander bound to a stamped workspace too', async () => {
+    const g = guardsIn(tmp());
+    g.markTask(CALLER_WS, 'ws-brain');
+    const h = setup({ guards: g });
+    const res = await h.call(goodParams({ senderPtyId: undefined }), { origin: 'local', commanderWorkspace: CALLER_WS });
+    expect(errorOf(res).code).toBe('NOT_AUTHORIZED');
+  });
+
+  it('fails closed when the lineage store cannot be read', async () => {
+    const dir = tmp();
+    fs.writeFileSync(nodePath.join(dir, 'fanout-lineage.json'), 'garbage', 'utf8');
+    const h = setup({ guards: guardsIn(dir) });
+    const err = errorOf(await h.call(goodParams()));
+    expect(err.code).toBe('FAILED_PRECONDITION');
+    expect(err.message).toMatch(/lineage store/);
+    expect(h.start).not.toHaveBeenCalled();
+  });
+});
+
+describe('task.fanout.start — global caps', () => {
+  it('refuses with RESOURCE_EXHAUSTED and raises no approval prompt', async () => {
+    const h = setup({ guards: guardsIn(tmp(), { live: () => 7 }) });
+    const err = errorOf(await h.call(goodParams()));
+    expect(err.code).toBe('RESOURCE_EXHAUSTED');
+    expect(err.message).toMatch(/at most 8 fan-out tasks may be live/);
+    await h.flush();
+    expect(h.approvalCount()).toBe(0);
+  });
+
+  it('holds the reservation while one fan-out is awaiting approval', async () => {
+    const h = setup({ guards: guardsIn(tmp()), approval: 'hang' });
+    expect((await h.call(goodParams({ idempotencyKey: 'a', titles: ['1', '2', '3', '4', '5'] }))).status).toBe('accepted');
+    const err = errorOf(await h.call(goodParams({ idempotencyKey: 'b', titles: ['1', '2', '3', '4'] })));
+    expect(err.code).toBe('RESOURCE_EXHAUSTED');
+  });
+
+  it('gives the slots back when the fan-out is denied', async () => {
+    const g = guardsIn(tmp());
+    const denied = setup({ guards: g, approval: { approved: false, outcome: 'declined' } });
+    await denied.call(goodParams({ idempotencyKey: 'a', titles: ['1', '2', '3', '4', '5', '6', '7', '8'] }));
+    await denied.flush();
+    const next = setup({ guards: g });
+    expect((await next.call(goodParams({ idempotencyKey: 'b', titles: ['1', '2', '3', '4', '5', '6', '7', '8'] }))).status).toBe(
+      'accepted',
+    );
+  });
+});
+
+describe('task.fanout.start — audit record', () => {
+  it('records who, where, what (hashed) and that nobody approved it', async () => {
+    const dir = tmp();
+    const g = guardsIn(dir);
+    const h = setup({ guards: g, approval: { approved: true, outcome: 'auto' } });
+    await h.call(goodParams({ titles: ['a', 'b'], taskPrompts: ['pa', ''], roles: ['Builder'] }));
+    await h.flush();
+    await h.flush();
+    expect(h.start).toHaveBeenCalledTimes(1);
+    const [launched, rec] = g.recentAudit(2);
+    expect(launched).toMatchObject({ kind: 'launched', idempotencyKey: 'fanout-key-1', launched: [] });
+    expect(rec).toMatchObject({
+      idempotencyKey: 'fanout-key-1',
+      ownerWorkspaceId: CALLER_WS,
+      callerIdentity: 'pty',
+      repoPath: CALLER_REPO_ROOT,
+      titles: ['a', 'b'],
+      roles: ['Builder', ''],
+      approvedBy: 'auto',
+      workerPermissionMode: 'auto',
+    });
+    const { createHash } = await import('node:crypto');
+    const sha = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex');
+    expect(rec.promptSha256).toEqual([sha('do the thing\n\npa'), sha('do the thing')]);
+    // No prompt body in the log.
+    expect(fs.readFileSync(nodePath.join(dir, 'fanout-audit.jsonl'), 'utf8')).not.toMatch(/do the thing/);
+  });
+
+  it('marks a dialog approval as human', async () => {
+    const g = guardsIn(tmp());
+    const h = setup({ guards: g });
+    await h.call(goodParams());
+    await h.flush();
+    await h.flush();
+    expect(g.recentAudit(2).every((r) => r.approvedBy === 'human')).toBe(true);
+  });
+
+  it('does not run a fan-out whose audit record cannot be written', async () => {
+    const g = guardsIn(tmp());
+    vi.spyOn(g, 'appendAudit').mockImplementation(() => {
+      throw new Error('disk full');
+    });
+    const h = setup({ guards: g, approval: { approved: true, outcome: 'auto' } });
+    await h.call(goodParams());
+    await h.flush();
+    await h.flush();
+    expect(h.start).not.toHaveBeenCalled();
+    const polled = await h.call(goodParams());
+    expect(polled).toMatchObject({ status: 'denied', reason: 'audit-unavailable' });
+  });
+});
+
+describe('task.fanout.start — review follow-ups', () => {
+  it('lets main decide whether anyone is asked, and says so to the renderer', async () => {
+    const off = setup({ requireApproval: false, approval: { approved: true, outcome: 'auto' } });
+    await off.call(goodParams());
+    await off.flush();
+    expect(off.requireApprovalSent()).toBe(false);
+    const on = setup({ requireApproval: true });
+    await on.call(goodParams());
+    await on.flush();
+    expect(on.requireApprovalSent()).toBe(true);
+  });
+
+  it('shows the worker launch flags in what is approved', async () => {
+    const h = setup();
+    await h.call(goodParams());
+    await h.flush();
+    expect(h.preview()).toMatch(/claude workers launch with: --permission-mode auto --allowedTools "[^"]+" --disallowedTools "[^"]*mcp__wmux__fanout_start/);
+  });
+
+  it('holds the live cap against N concurrent callers with different keys', async () => {
+    const h = setup({ approval: 'hang' });
+    const results = await Promise.all(
+      [0, 1, 2, 3, 4].map((k) => h.call(goodParams({ idempotencyKey: `k${k}`, titles: ['a', 'b'] }))),
+    );
+    const accepted = results.filter((r) => r.status === 'accepted').length;
+    const refused = results.filter((r) => (r.error as { code?: string } | undefined)?.code === 'RESOURCE_EXHAUSTED').length;
+    expect(accepted).toBe(4);
+    expect(refused).toBe(1);
+  });
+
+  it('releases the reservation and records a denial when the detached run throws before spawning', async () => {
+    const g = guardsIn(tmp());
+    const h = setup({ guards: g });
+    // The approval-time repo re-derivation blows up (a git failure, not a
+    // non-repo answer) — nothing may stay booked or awaiting.
+    let calls = 0;
+    vi.mocked(git).mockImplementation(async () => {
+      calls += 1;
+      if (calls > 1) throw new Error('git exploded');
+      return { stdout: `${CALLER_REPO_ROOT}\n`, stderr: '', code: 0 };
+    });
+    await h.call(goodParams({ idempotencyKey: 'boom', titles: ['1', '2', '3', '4', '5', '6', '7', '8'] }));
+    await h.flush();
+    await h.flush();
+    expect(h.start).not.toHaveBeenCalled();
+    expect(await h.call(goodParams({ idempotencyKey: 'boom' }))).toMatchObject({ status: 'denied', reason: 'unavailable' });
+    // All 8 slots are free again.
+    const next = setup({ guards: g });
+    expect((await next.call(goodParams({ idempotencyKey: 'after', titles: ['1', '2', '3', '4', '5', '6', '7', '8'] }))).status).toBe(
+      'accepted',
+    );
+  });
+});
+
+// ── preset / agents: the caller picks a NAME, never a command ─────────────
+describe('task.fanout.start — preset and agents', () => {
+  const IMAGE: FanoutPreset = {
+    name: 'Image',
+    items: [{ agent: 'codex', model: 'gpt-5.5', unattended: true }, { agent: 'codex' }, { agent: 'grok' }],
+    worktree: false,
+  };
+  const CODE: FanoutPreset = { name: 'Pair', items: [{ agent: 'claude' }, { agent: 'codex' }], worktree: true };
+
+  it('still rejects a wire agentCmd (the CLI is chosen by name only)', async () => {
+    const h = setup({ presets: [IMAGE] });
+    const err = errorOf(await h.call(goodParams({ agentCmd: 'codex', preset: 'Image' })));
+    expect(err.code).toBe('INVALID_ARGUMENT');
+    expect(err.message).toMatch(/agentCmd/);
+    await h.flush();
+    expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unknown preset and lists the available names', async () => {
+    const h = setup({ presets: [IMAGE, CODE] });
+    const err = errorOf(await h.call(goodParams({ preset: 'Nope' })));
+    expect(err.code).toBe('INVALID_ARGUMENT');
+    expect(err.message).toMatch(/unknown preset "Nope"; available presets: Image, Pair/);
+  });
+
+  it('refuses a preset when none are configured, saying where to add one', async () => {
+    const h = setup({ presets: [] });
+    const err = errorOf(await h.call(goodParams({ preset: 'Image' })));
+    expect(err.message).toMatch(/available presets: \(none/);
+  });
+
+  it.each([
+    [{ roles: ['Builder', 'Reviewer'], preset: 'Image' }, /roles and preset/],
+    [{ roles: ['Builder'], agents: [{ agent: 'codex' }, { agent: 'codex' }] }, /roles and agents/],
+    [{ preset: 'Image', agents: [{ agent: 'codex' }, { agent: 'codex' }] }, /preset and agents/],
+  ])('refuses two selectors at once (%j)', async (extra, re) => {
+    const h = setup({ presets: [IMAGE] });
+    const err = errorOf(await h.call(goodParams(extra)));
+    expect(err.code).toBe('INVALID_ARGUMENT');
+    expect(err.message).toMatch(re);
+    await h.flush();
+    expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it.each(['--dangerously-skip-permissions', 'a;b', 'x y', '-m', '$(id)'])('refuses agents[].model %j', async (model) => {
+    const h = setup();
+    const err = errorOf(await h.call(goodParams({ agents: [{ agent: 'codex', model }, { agent: 'codex' }] })));
+    expect(err.code).toBe('INVALID_ARGUMENT');
+    expect(err.message).toMatch(/agents\[0\]: model/);
+    expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ agent: 'bash' }, /unknown agent "bash"/],
+    [{ agent: 'codex --yolo' }, /unknown agent/],
+    [{ agent: 'gemini' }, /not available for fan-out/],
+    [{ agent: 'codex', args: '--x' }, /unknown field "args"/],
+    [{ agent: 'codex', unattended: true }, /unknown field "unattended"/],
+  ])('refuses agents[] entry %j', async (entry, re) => {
+    const h = setup();
+    const err = errorOf(await h.call(goodParams({ agents: [entry, { agent: 'claude' }] })));
+    expect(err.message).toMatch(re);
+  });
+
+  it('refuses an empty title alongside agents, instead of shifting later tasks onto the wrong agent', async () => {
+    const h = setup();
+    const err = errorOf(await h.call(goodParams({ titles: ['', 'a'], agents: [{ agent: 'codex' }] })));
+    expect(err.code).toBe('INVALID_ARGUMENT');
+    expect(err.message).toMatch(/every title must be a non-empty string/);
+    const h2 = setup({ presets: [IMAGE] });
+    expect(errorOf(await h2.call(goodParams({ titles: ['a', '  '], preset: 'Image' }))).message).toMatch(/non-empty/);
+  });
+
+  it('gives back the hourly quota for tasks that never got a workspace', async () => {
+    const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wmux-fanout-refund-'));
+    const g = new FanOutGuards({ dir, countLiveTasks: () => 0, ledgerTaskOwner: () => null });
+    const h = setup({ guards: g, presets: [IMAGE], requireApproval: false });
+    // The harness service returns { ok: true, tasks: [] }: nothing spawned.
+    await h.call(goodParams({ preset: 'Image' }));
+    await h.flush();
+    await h.flush();
+    const caps = JSON.parse(fs.readFileSync(nodePath.join(dir, 'fanout-caps.json'), 'utf8')) as { starts: unknown[] };
+    expect(caps.starts).toEqual([]);
+  });
+
+  it('treats an empty roles array as not given', async () => {
+    const h = setup({ presets: [IMAGE] });
+    const res = await h.call(goodParams({ preset: 'Image', roles: [] }));
+    expect(res).toMatchObject({ ok: true, status: 'accepted' });
+  });
+
+  it('drops the claude flag line from the preview when no task runs claude', async () => {
+    const h = setup();
+    await h.call(goodParams({ agents: [{ agent: 'codex' }, { agent: 'grok' }] }));
+    await h.flush();
+    expect(h.preview()).not.toMatch(/claude workers launch with/);
+  });
+
+  it('refuses agents[] whose length does not match the titles', async () => {
+    const h = setup();
+    const err = errorOf(await h.call(goodParams({ agents: [{ agent: 'codex' }] })));
+    expect(err.message).toMatch(/agents has 1 entries but there are 2 titles/);
+  });
+
+  it('refuses more titles than preset rows (no silent cycling)', async () => {
+    const h = setup({ presets: [CODE] });
+    const err = errorOf(await h.call(goodParams({ preset: 'Pair', titles: ['a', 'b', 'c'] })));
+    expect(err.message).toMatch(/has 2 agent row\(s\) but 3 titles/);
+  });
+
+  it('hands the service the caller agents index-aligned, never a command', async () => {
+    const h = setup();
+    const res = await h.call(goodParams({ agents: [{ agent: 'codex', model: 'gpt-5.5' }, { agent: 'grok' }] }));
+    expect(res).toMatchObject({ ok: true, status: 'accepted' });
+    await h.flush();
+    expect(h.request().agents).toEqual([{ agent: 'codex', model: 'gpt-5.5' }, { agent: 'grok' }]);
+    expect(h.request().agentCmd).toBe(FANOUT_WIRE_AGENT_CMD);
+    expect(h.request().worktree).toBeUndefined();
+    expect(h.preview()).toMatch(/\[agent: codex -c projects\.<task folder>\.trust_level=trusted --model gpt-5\.5\]/);
+  });
+
+  it('carries a per-task effort to the service and names it in the preview', async () => {
+    const h = setup();
+    const res = await h.call(goodParams({ agents: [{ agent: 'claude', effort: 'medium' }, { agent: 'codex', effort: 'low' }] }));
+    expect(res).toMatchObject({ ok: true, status: 'accepted' });
+    expect((res as { warnings?: unknown }).warnings).toBeUndefined();
+    await h.flush();
+    expect(h.request().agents).toEqual([{ agent: 'claude', effort: 'medium' }, { agent: 'codex', effort: 'low' }]);
+    expect(h.preview()).toMatch(/\[agent: codex -c projects\.<task folder>\.trust_level=trusted effort low\]/);
+  });
+
+  it('ignores effort on an agent without an effort flag, with a warning instead of a refusal', async () => {
+    const h = setup();
+    const res = await h.call(goodParams({ agents: [{ agent: 'agy', effort: 'low' }, { agent: 'grok', effort: 'high' }] }));
+    expect(res).toMatchObject({ ok: true, status: 'accepted' });
+    const warnings = (res as { warnings: string[] }).warnings;
+    expect(warnings[0]).toMatch(/^agents\[0\]: agy takes its effort in the model id/);
+    expect(warnings[1]).toMatch(/^agents\[1\]: grok has no verified effort flag/);
+    await h.flush();
+    expect(h.request().agents).toEqual([{ agent: 'agy' }, { agent: 'grok' }]);
+  });
+
+  it('refuses a non-string effort as INVALID_ARGUMENT, not a thrown error', async () => {
+    const h = setup();
+    const err = errorOf(await h.call(goodParams({ agents: [{ agent: 'claude', effort: { toString: 1 } }, { agent: 'claude' }] })));
+    expect(err.code).toBe('INVALID_ARGUMENT');
+    expect(err.message).toMatch(/agents\[0\]: effort "<object>" is not one lowercase word/);
+  });
+
+  it('refuses an effort that is not one lowercase word', async () => {
+    const h = setup();
+    const err = errorOf(await h.call(goodParams({ agents: [{ agent: 'claude', effort: 'High; rm' }, { agent: 'claude' }] })));
+    expect(err.code).toBe('INVALID_ARGUMENT');
+    expect(err.message).toMatch(/agents\[0\]: effort "High; rm" is not one lowercase word/);
+    expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it('matches the preset name case-insensitively and uses its rows in order', async () => {
+    const h = setup({ presets: [IMAGE] });
+    await h.call(goodParams({ preset: 'image', titles: ['one', 'two'] }));
+    await h.flush();
+    expect(h.request().agents).toEqual([{ agent: 'codex', model: 'gpt-5.5', unattended: true }, { agent: 'codex' }]);
+    expect(h.request().worktree).toBe(false);
+    expect(h.request().outputFolder).toBe('image');
+    // The approval preview names the real CLI and the unattended flags.
+    expect(h.preview()).toMatch(
+      /\[agent: codex -c projects\.<task folder>\.trust_level=trusted --model gpt-5\.5 -a never -s workspace-write\]/,
+    );
+    expect(h.preview()).toMatch(/no worktree/);
+  });
+
+  it('worktree:false needs no repository: a non-repo caller is accepted', async () => {
+    const outside = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wmux-fanout-norepo-'));
+    const h = setup({ presets: [IMAGE], cwd: outside });
+    const res = await h.call(goodParams({ preset: 'Image' }));
+    expect(res).toMatchObject({ ok: true, status: 'accepted', repoPath: fs.realpathSync(outside) });
+    await h.flush();
+    expect(h.start).toHaveBeenCalledTimes(1);
+    expect(h.request().repoPath).toBe(fs.realpathSync(outside));
+  });
+
+  it('a worktree preset still requires the repository', async () => {
+    const h = setup({ presets: [CODE], cwd: nodePath.resolve('/not/a/repo') });
+    const err = errorOf(await h.call(goodParams({ preset: 'Pair' })));
+    expect(err.code).toBe('FAILED_PRECONDITION');
+    expect(err.message).toMatch(/not inside a git repository/);
+  });
+
+  it('the depth guard refuses fan-out from a worktree:false worker', async () => {
+    // A codex worker in an output folder is still a stamped task workspace —
+    // the lineage stamp is written by the same pty.create path.
+    const g = new FanOutGuards({ dir: fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wmux-fanout-d1-')), countLiveTasks: () => 0, ledgerTaskOwner: () => null });
+    g.markTask(CALLER_WS, 'ws-brain');
+    const h = setup({ guards: g, presets: [IMAGE] });
+    const err = errorOf(await h.call(goodParams({ preset: 'Image' })));
+    expect(err.code).toBe('NOT_AUTHORIZED');
+    expect(err.message).toMatch(/fan-out task of ws-brain/);
+    expect(h.start).not.toHaveBeenCalled();
   });
 });

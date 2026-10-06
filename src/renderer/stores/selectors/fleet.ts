@@ -2,7 +2,11 @@ import type { AgentStatus, Task, PaneLeaf, Surface } from '../../../shared/types
 import { getLeafPanes, getWorkspaceLeafPanes } from '../../../shared/paneUtils';
 import { stashedPaneLiveness } from '../../../shared/paneStash';
 import { isBrainPtyId } from '../../../shared/constants';
+import { remoteAgentKey } from '../../../shared/remoteHosts';
+import type { AttachedRemoteWorkspace } from '../slices/remoteWorkspacesSlice';
 import type { StoreState } from '../index';
+import { flattenAgentText } from '../../../shared/assistantPreview';
+import type { WorkTask } from '../../../shared/workTask';
 
 // ─── S-C1 Fleet View — derived "all agents, all workspaces" model ────────────
 //
@@ -29,7 +33,7 @@ export interface FleetPane {
   paneLabel?: string;
   cwd?: string;
   title: string;
-  surfaceType: 'terminal' | 'browser' | 'editor' | 'diff' | 'git' | 'review' | 'remote-terminal';
+  surfaceType: 'terminal' | 'browser' | 'editor' | 'diff' | 'git' | 'review' | 'remote-terminal' | 'placeholder';
   /** True when this leaf is its workspace's active pane (badge fidelity hint). */
   isActivePane: boolean;
   /**
@@ -49,6 +53,12 @@ export interface FleetPane {
    * human is needed).
    */
   supervision?: { status: 'armed' | 'stopped'; restartCount: number };
+  /**
+   * The pane is quietly waiting out a provider usage limit (shared/usageLimit):
+   * its `error` is not counted as attention and the row reads "Waiting". Unset
+   * once the hold ends, so a reset that passed without a release is attention again.
+   */
+  usageLimitWaiting?: true;
   /**
    * True when this pane is stashed (#977) — owned and running, but not in the
    * layout. Fleet is deliberately layout-independent (README: "every roster in
@@ -70,6 +80,34 @@ export interface FleetPane {
   /** Milliseconds since this pane's last activity stamp. Only set when
    *  `unverifiable` — it is that state's evidence, and its label. */
   staleForMs?: number;
+  /**
+   * #1343 — this row is an agent session running on a REMOTE host, mirrored in
+   * as a remote-terminal surface. Present only when the caller supplied
+   * `remoteWorkspaces` AND a live (non-stale) host entry carries agent
+   * metadata for the session. `ptyId` is then the synthetic
+   * `remote:{hostId}:{sessionId}` key, never a local ptyId.
+   *
+   * Consumers that COMMAND panes (DeckFleet) must not list these: a remote
+   * pane is only drivable through the host's own input API, not the local
+   * input path. They already exclude them twice over — by not passing
+   * `remoteWorkspaces` at all, and by filtering on `surfaceType === 'terminal'`
+   * (a remote row keeps `surfaceType: 'remote-terminal'`).
+   */
+  remote?: { hostId: string; hostLabel: string };
+  /**
+   * The local ptyId of the BACKGROUND tab whose attention status won this
+   * row's rollup (a background tab awaiting input while the active tab is
+   * idle). Set only when it differs from `ptyId`. Whatever acts on or reads
+   * the row's urgent state — its question, its last message, a Message verb,
+   * a jump — targets this pty (`fleetTargetPtyId`), not the active tab.
+   */
+  attentionPtyId?: string;
+}
+
+/** The pty a row's urgent state lives on: the winning background tab, else
+ *  the active surface. */
+export function fleetTargetPtyId(pane: Pick<FleetPane, 'ptyId' | 'attentionPtyId'>): string {
+  return pane.attentionPtyId ?? pane.ptyId;
 }
 
 /** Minimal store surface the selector reads — keeps the fixture trivial and the
@@ -81,6 +119,9 @@ export type FleetSelectorState = Pick<StoreState, 'workspaces' | 'surfaceAgentSt
   /** X8 supervision mirror (per-ptyId). Optional so existing fixtures stay
    *  terse; the live FleetView always passes the real map. */
   supervisionByPtyId?: StoreState['supervisionByPtyId'];
+  /** ptyIds quietly waiting out a usage limit (usageLimitSlice). Optional so
+   *  existing fixtures stay terse. */
+  usageLimitWaiting?: StoreState['usageLimitWaiting'];
   /** Hook-driven 'running' inputs (orca-style). Both optional so existing
    *  fixtures/tests get the pre-existing behavior (no hook-freshness); the live
    *  store always provides them. `agentClockMs` is the read-time clock so a
@@ -109,6 +150,10 @@ export type FleetSelectorState = Pick<StoreState, 'workspaces' | 'surfaceAgentSt
    *  `surfaceActivityAt`, which is evidence and decays at HOOK_RUNNING_TTL_MS.
    *  Optional so existing fixtures stay terse. */
   surfaceTurnOpenAt?: StoreState['surfaceTurnOpenAt'];
+  /** #1463 — ptyId → when its last turn ended (complete/waiting/error). Activity evidence
+   *  older than this belongs to the finished turn (see isHookRunning).
+   *  Optional so existing fixtures stay terse. */
+  surfaceTurnEndAt?: StoreState['surfaceTurnEndAt'];
   /**
    * PRECOMPUTED hook-'running' verdicts, ptyId → true. Supplied instead of
    * `agentClockMs` by a consumer that must not re-run on every clock tick: the
@@ -123,7 +168,51 @@ export type FleetSelectorState = Pick<StoreState, 'workspaces' | 'surfaceAgentSt
    * selector derives it inline from the clock, exactly as before.
    */
   hookRunningByPtyId?: Record<string, boolean>;
+  /**
+   * #1343 — attached remote-host mirrors. Supplied ONLY by consumers that
+   * should see remote agents (Fleet View, the titlebar vitals chip). Left out,
+   * remote-terminal surfaces derive exactly as before: an anonymous idle row
+   * with an empty ptyId. See FleetPane.remote.
+   */
+  remoteWorkspaces?: AttachedRemoteWorkspace[];
+  /** ptyId → the agent's last reported message (the Fleet row's one-line
+   *  detail for finished and idle turns). Optional so existing fixtures stay
+   *  terse; the live store always provides it. */
+  surfaceLastMessage?: StoreState['surfaceLastMessage'];
 };
+
+/**
+ * The agent metadata a remote-terminal surface can claim, or undefined.
+ *
+ * Shared by the sidebar roster (#1163) and the fleet pass (#1343) so the two
+ * can never disagree about which remote sessions count as agents.
+ *
+ * Two rules, both load-bearing:
+ *   - Search EVERY entry on the host, not just the first: multiple attached
+ *     workspaces per host are supported (the dedup key is hostId:workspaceId),
+ *     so a session in the host's second workspace must still resolve.
+ *   - A STALE entry (host unreachable) keeps its last pane snapshot for the
+ *     mirror, but its agent status is frozen at the last successful poll —
+ *     counting it would report a disconnected agent as live (or as needing
+ *     you) indefinitely. No live metadata, no agent.
+ */
+export function resolveRemoteAgent(
+  remoteWorkspaces: AttachedRemoteWorkspace[] | undefined,
+  hostId: string | undefined,
+  sessionId: string | undefined,
+): { agentName: string; status: AgentStatus; hostLabel: string } | undefined {
+  if (!remoteWorkspaces || !hostId || !sessionId) return undefined;
+  const attached = remoteWorkspaces.find(
+    (r) => r.hostId === hostId && !r.stale && r.panes.some((p) => p.sessionId === sessionId),
+  );
+  const pane = attached?.panes.find((p) => p.sessionId === sessionId);
+  if (!pane?.agentName) return undefined;
+  return {
+    agentName: pane.agentName,
+    status: pane.agentStatus ?? 'idle',
+    hostLabel: attached?.hostLabel ?? hostId,
+  };
+}
 
 /**
  * How long after a pane's last PostToolUse hook it still counts as 'running'
@@ -158,9 +247,16 @@ export function isHookRunning(args: {
   turnOpenAt: number | undefined;
   /** The reactive decay clock (`state.agentClockMs`). */
   agentClockMs: number | undefined;
+  /** `surfaceTurnEndAt[ptyId]` — when the last turn ended (complete/waiting/error). */
+  turnEndAt?: number;
 }): boolean {
-  const { activityAt, turnOpenAt, agentClockMs } = args;
+  const { activityAt, turnOpenAt, agentClockMs, turnEndAt } = args;
   if (turnOpenAt !== undefined && turnOpenAt > 0) return true;
+  // #1463 — evidence from BEFORE the turn's own end is about the finished
+  // turn. Counting it repainted a seen, finished pane 'running' for the rest
+  // of the TTL in Fleet while the roster showed it finished. Any new running
+  // edge drops `turnEndAt` (setSurfaceAgentStatus), so fresh work still counts.
+  if (turnEndAt !== undefined && activityAt !== undefined && activityAt <= turnEndAt) return false;
   return (
     activityAt !== undefined
     && activityAt > 0
@@ -287,6 +383,47 @@ const STATUS_RANK: Record<AgentStatus, number> = {
 };
 
 /**
+ * One surface's attention status — the per-surface input to every fleet
+ * roll-up, shared with the deck mirror so the two cannot disagree.
+ *
+ * Two kinds of attention, and #1509 is the difference between them:
+ *   - UNREAD (`surfaceAgentStatus`): "something happened you have not looked
+ *     at". Pane.tsx deletes it while the pane is focused, and that is right
+ *     for a finished turn.
+ *   - AWAITING A HUMAN: a dialog is open and the agent is blocked on it.
+ *     Looking at it does not answer it, so it must outlive the focus clear.
+ *     The pane's own lifecycle status (`surfaceAgent[pty].status`) carries
+ *     it until THAT pane reports something else, whichever pane is focused.
+ * Only `awaiting_input` is read from the lifecycle status; a viewed
+ * complete / waiting / error stays cleared.
+ */
+export function surfaceAttentionStatus(
+  state: Pick<FleetSelectorState, 'surfaceAgentStatus' | 'surfaceAgent' | 'surfacePendingQuestion' | 'usageLimitWaiting'>,
+  ptyId: string,
+): AgentStatus | undefined {
+  // #1168 — a transcript-derived pending question outranks whatever the stop
+  // payload settled this surface to, exactly as it does in
+  // workspaceAgentRoster.
+  if (state.surfacePendingQuestion?.[ptyId]?.trim()) return 'awaiting_input';
+  if (state.surfaceAgent?.[ptyId]?.status === 'awaiting_input') return 'awaiting_input';
+  const status = state.surfaceAgentStatus[ptyId];
+  return isQuietUsageLimitError(state.usageLimitWaiting, ptyId, status) ? undefined : status;
+}
+
+/**
+ * A turn that died on a provider usage limit leaves `error`. While the hold
+ * stands that is a pane waiting on a clock, not on the user: it is no
+ * attention status at all. Owner decision 2026-10-03.
+ */
+export function isQuietUsageLimitError(
+  waiting: Record<string, true> | undefined,
+  ptyId: string | undefined,
+  status: AgentStatus | undefined,
+): boolean {
+  return status === 'error' && !!ptyId && waiting?.[ptyId] === true;
+}
+
+/**
  * Status fidelity (S-C1 v1, confirmed scope):
  * `surfaceAgentStatus` only retains the ATTENTION statuses
  * (complete / waiting / awaiting_input / error) keyed per-ptyId — see paneSlice
@@ -344,6 +481,7 @@ export function selectHookRunningByPtyId(state: FleetSelectorState): Record<stri
       activityAt: activity[ptyId],
       turnOpenAt: turnOpen[ptyId],
       agentClockMs: state.agentClockMs,
+      turnEndAt: state.surfaceTurnEndAt?.[ptyId],
     })) {
       // Only TRUE entries are kept: a shallow compare over a map that also
       // carried `false` would change identity for every pane that ever ran.
@@ -368,6 +506,20 @@ export function selectFleetPanes(state: FleetSelectorState): FleetPane[] {
         ? pickStashedRepresentativeSurface(leaf, state.surfaceAgent ?? {})
         : leaf.surfaces.find((s) => s.id === leaf.activeSurfaceId) ?? leaf.surfaces[0];
       const ptyId = surf?.ptyId ?? '';
+      // #1343 — a remote-terminal surface has ptyId '' by contract and is
+      // invisible to every local PTY-keyed map below, so without this it lands
+      // as an anonymous idle card. Resolve it against the attached host mirror
+      // instead, with the same rules the sidebar roster uses.
+      //
+      // IDENTITY is keyed on the leaf's ACTIVE surface, like every other field
+      // on this row: this pass is one row per leaf, the roster is one row per
+      // surface, so a background tab's agent NAME does not reach the card —
+      // exactly as it does not for a background local agent. Its STATUS does,
+      // through the rollup below.
+      const remoteAgent =
+        surf?.surfaceType === 'remote-terminal'
+          ? resolveRemoteAgent(state.remoteWorkspaces, surf.remoteHostId, surf.remoteSessionId)
+          : undefined;
       // The orchestrator's own brain pty is never a fleet member. It should
       // never reach a surface at all (pty.list filters it), so this is the
       // belt to that braces: every roster in the app — DeckFleet, FleetView,
@@ -381,18 +533,43 @@ export function selectFleetPanes(state: FleetSelectorState): FleetPane[] {
       // is idle), so a multi-tab pane that needs the user is never silently
       // shown as idle. The card otherwise stays keyed on the active surface.
       let attention: AgentStatus | undefined;
+      // The local pty that set `attention` (undefined when a remote tab won).
+      let attentionPty: string | undefined;
+      // #1343 — the same rollup over the leaf's REMOTE tabs, tracked separately
+      // so a remote row is never given a local agent's status (and vice versa)
+      // while both still reach the workspace dot and the vitals chip.
+      let remoteAttention: AgentStatus | undefined;
       for (const s of leaf.surfaces) {
-        if (!s.ptyId) continue;
-        // #1168 — a transcript-derived pending question outranks whatever the
-        // stop payload settled this surface to, exactly as it does in
-        // workspaceAgentRoster. Without it a payload carrying `complete`
-        // alongside an unanswered question painted a green "nothing to see"
-        // dot over a red roster row that was printing the question.
-        const st = state.surfacePendingQuestion?.[s.ptyId]?.trim()
-          ? 'awaiting_input'
-          : state.surfaceAgentStatus[s.ptyId];
-        if (st && (attention === undefined || STATUS_RANK[st] < STATUS_RANK[attention])) {
+        if (!s.ptyId) {
+          // A remote tab has no ptyId, so the PTY-keyed scan below can never
+          // see it. Without this a remote agent asking for the user from a
+          // BACKGROUND tab is visible in the sidebar roster (which is per
+          // surface) and nowhere else — the exact split this issue exists to
+          // close, just one tab deeper.
+          const rs = s.surfaceType === 'remote-terminal'
+            ? resolveRemoteAgent(state.remoteWorkspaces, s.remoteHostId, s.remoteSessionId)?.status
+            : undefined;
+          if (rs && (remoteAttention === undefined || STATUS_RANK[rs] < STATUS_RANK[remoteAttention])) {
+            remoteAttention = rs;
+          }
+          if (rs && (attention === undefined || STATUS_RANK[rs] < STATUS_RANK[attention])) {
+            attention = rs;
+            attentionPty = undefined;
+          }
+          continue;
+        }
+        // #1168 / #1509 — see surfaceAttentionStatus: a pending question or an
+        // open dialog is attention whether or not the pane has been looked at.
+        const st = surfaceAttentionStatus(state, s.ptyId);
+        // On a tie the active surface wins: equal urgency gives no reason to
+        // point the row (detail, Message, Jump) at a background tab.
+        if (st && (
+          attention === undefined
+          || STATUS_RANK[st] < STATUS_RANK[attention]
+          || (STATUS_RANK[st] === STATUS_RANK[attention] && s.ptyId === ptyId)
+        )) {
           attention = st;
+          attentionPty = s.ptyId;
         }
       }
       // Resolution order (most → least authoritative):
@@ -427,8 +604,13 @@ export function selectFleetPanes(state: FleetSelectorState): FleetPane[] {
       // `error` is still inherited here, but no longer as its ONLY carrier:
       // it is an ATTENTION status now, so the per-pty attention scan above
       // reaches it on background panes too.
+      // #1509 — 'awaiting_input' is vetoed for the same reason as 'running':
+      // the per-pty scan above carries it on the pane that raised it, so the
+      // shared slot could only add it to a same-named sibling as well.
       const metaStatus =
-        isActivePane && metaMatchesPane && wsMeta?.agentStatus !== 'running'
+        isActivePane && metaMatchesPane
+          && wsMeta?.agentStatus !== 'running' && wsMeta?.agentStatus !== 'awaiting_input'
+          && !isQuietUsageLimitError(state.usageLimitWaiting, ptyId, wsMeta?.agentStatus)
           ? wsMeta?.agentStatus
           : undefined;
       const activityAt = ptyId ? state.surfaceActivityAt?.[ptyId] : undefined;
@@ -443,7 +625,12 @@ export function selectFleetPanes(state: FleetSelectorState): FleetPane[] {
       const turnOpen = turnOpenAt !== undefined && turnOpenAt > 0;
       const hookRunning = state.hookRunningByPtyId
         ? (!!ptyId && state.hookRunningByPtyId[ptyId] === true)
-        : isHookRunning({ activityAt, turnOpenAt, agentClockMs: state.agentClockMs });
+        : isHookRunning({
+          activityAt,
+          turnOpenAt,
+          agentClockMs: state.agentClockMs,
+          turnEndAt: ptyId ? state.surfaceTurnEndAt?.[ptyId] : undefined,
+        });
       // #1168 — a stashed pane whose every terminal surface has lost its pty is
       // a session the daemon has confirmed gone. The roster reports that as
       // `error` / needs-you and offers recovery; this pass had no liveness
@@ -493,9 +680,18 @@ export function selectFleetPanes(state: FleetSelectorState): FleetPane[] {
         workspaceName: ws.name,
         paneId: leaf.id,
         surfaceId: surf?.id ?? '',
-        ptyId,
-        agentStatus: status,
-        agentName: isActivePane && metaMatchesPane ? wsMeta?.agentName : undefined,
+        // The synthetic remote key, so a remote row has a stable non-empty
+        // identity for consumers that key on ptyId. It is never a local ptyId,
+        // so the PTY-keyed reads below still all miss — which is correct: the
+        // host snapshot has no hooks, no activity line, no supervision.
+        ptyId: remoteAgent ? remoteAgentKey(surf?.remoteHostId ?? '', surf?.remoteSessionId ?? '') : ptyId,
+        // The host poll IS the whole signal for a remote agent: no latch and no
+        // workspace-metadata inheritance apply to it, only the rollup over this
+        // leaf's own remote tabs.
+        agentStatus: remoteAgent ? (remoteAttention ?? remoteAgent.status) : status,
+        agentName: remoteAgent
+          ? remoteAgent.agentName
+          : isActivePane && metaMatchesPane ? wsMeta?.agentName : undefined,
         paneLabel: state.paneLabel?.[leaf.id],
         cwd: surf?.cwd,
         title: surf?.title ?? '',
@@ -509,9 +705,16 @@ export function selectFleetPanes(state: FleetSelectorState): FleetPane[] {
         // pane badge). Only supervised panes have an entry; unsupervised →
         // undefined. An unspawned surface (empty ptyId) never carries one.
         supervision: ptyId ? state.supervisionByPtyId?.[ptyId] : undefined,
+        ...(ptyId && state.usageLimitWaiting?.[ptyId] ? { usageLimitWaiting: true as const } : {}),
         unverifiable,
         ...(unverifiable ? { staleForMs } : {}),
         ...(stashed ? { stashed: true } : {}),
+        ...(remoteAgent
+          ? { remote: { hostId: surf?.remoteHostId ?? '', hostLabel: remoteAgent.hostLabel } }
+          : {}),
+        ...(!remoteAgent && !stashedExited && attentionPty && attentionPty !== ptyId
+          ? { attentionPtyId: attentionPty }
+          : {}),
       });
     }
   }
@@ -729,5 +932,516 @@ function workspaceRollups(state: FleetSelectorState): WorkspaceRollups {
   }
   const out = { status, unverifiableByWorkspace, unverifiableByPty };
   rollupCache.set(state, out);
+  return out;
+}
+
+/** The agent's last reported message for a pty, trimmed; undefined when the
+ *  pty has no message. */
+export function selectSurfaceLastMessage(
+  state: Pick<FleetSelectorState, 'surfaceLastMessage'>,
+  ptyId: string,
+): string | undefined {
+  if (!ptyId) return undefined;
+  return state.surfaceLastMessage?.[ptyId]?.trim() || undefined;
+}
+
+// ─── Fleet attention board — needs you / running / idle ──────────────────────
+//
+// The single source for which section a Fleet row lands in and which one-line
+// detail it shows. Pure over the fleet rows plus a small context so a non-UI
+// consumer (an MCP tool) can reuse the exact same triage.
+
+export type FleetSection = 'needsYou' | 'finished' | 'running' | 'idle';
+
+/** Fallback detail keys — the renderer translates them. */
+export type FleetDetailKey =
+  | 'fleet.needsYourInput'
+  | 'fleet.detail.error'
+  | 'fleet.detail.unconfirmed'
+  | 'fleet.detail.supervisionStopped'
+  | 'fleet.detail.complete'
+  | 'fleet.detail.running'
+  | 'fleet.detail.idle';
+
+export interface FleetRow {
+  pane: FleetPane;
+  section: FleetSection;
+  /** Reported text for the row (question, last message, tool activity). */
+  detail?: string;
+  /** Where `detail` came from; undefined when the row shows `detailKey`. */
+  detailSource?: 'question' | 'lastMessage' | 'activity';
+  /** Translation key shown when there is no reported text. */
+  detailKey: FleetDetailKey;
+  /** Milliseconds since the pane's last activity/output/turn stamp; undefined
+   *  when none of them exists (no elapsed time shown, sorted last). */
+  idleForMs?: number;
+}
+
+export interface FleetGroups {
+  needsYou: FleetRow[];
+  /** Turns that ended and have not been looked at — a look, not a decision. */
+  finished: FleetRow[];
+  running: FleetRow[];
+  idle: FleetRow[];
+}
+
+export type FleetGroupContext = Pick<
+  FleetSelectorState,
+  'surfacePendingQuestion' | 'surfaceLastMessage' | 'surfaceActivityAt' | 'surfaceTurnOpenAt'
+> & {
+  /** Read-time clock for elapsed time. Absent → no elapsed time on any row. */
+  now?: number;
+  /** ptyId → last terminal output stamp (paneSlice.surfaceOutputAt). */
+  surfaceOutputAt?: Record<string, number>;
+  /** 'attention' ranks by status then recency; 'workspace' keeps input order. */
+  sortMode?: FleetSortMode;
+};
+
+/** Elapsed ms since the newest of the pane's activity / output / turn stamps;
+ *  undefined when none exists (never NaN). */
+export function fleetIdleForMs(ptyId: string, ctx: FleetGroupContext): number | undefined {
+  if (!ptyId || ctx.now === undefined) return undefined;
+  let newest: number | undefined;
+  for (const stamp of [ctx.surfaceActivityAt?.[ptyId], ctx.surfaceOutputAt?.[ptyId], ctx.surfaceTurnOpenAt?.[ptyId]]) {
+    if (typeof stamp === 'number' && Number.isFinite(stamp) && (newest === undefined || stamp > newest)) newest = stamp;
+  }
+  return newest === undefined ? undefined : Math.max(0, ctx.now - newest);
+}
+
+/**
+ * #1481 glance board — the one attention classification both surfaces use.
+ * Fleet folds it into its sections (sectionOfAttentionClass); the sidebar
+ * sorts workspaces by it. Order of urgency: needs you → error (a failed turn,
+ * its own tier so an old error never sinks below a fresh finish) → finished
+ * (a turn that ended and has not been looked at: `complete` is retained until
+ * the pane is focused) → running → unconfirmed (running, but silent past the
+ * hook window) → idle.
+ */
+export type FleetAttentionClass = 'needsYou' | 'error' | 'finished' | 'running' | 'unconfirmed' | 'idle';
+
+export const ATTENTION_CLASS_RANK: Record<FleetAttentionClass, number> = {
+  needsYou: 0,
+  error: 1,
+  finished: 2,
+  running: 3,
+  unconfirmed: 4,
+  idle: 5,
+};
+
+export function fleetAttentionClass(
+  pane: Pick<FleetPane, 'agentStatus' | 'unverifiable' | 'supervision'>,
+  question?: string,
+): FleetAttentionClass {
+  if (pane.supervision?.status === 'stopped') return 'needsYou';
+  if (pane.unverifiable) return 'unconfirmed';
+  switch (pane.agentStatus) {
+    case 'awaiting_input':
+      return 'needsYou';
+    case 'error':
+      return 'error';
+    case 'waiting':
+      return question ? 'needsYou' : 'idle';
+    case 'complete':
+      return 'finished';
+    case 'running':
+      return 'running';
+    default:
+      return 'idle';
+  }
+}
+
+/** Fleet's section for a class. Needs you holds what waits on a person
+ *  (input, errors, stopped supervision, unconfirmed); a finished turn is a
+ *  look, not a decision, so it has its own section. Errors are their own
+ *  class for the sidebar's order and word, and still a Needs you row here. */
+export function sectionOfAttentionClass(cls: FleetAttentionClass): FleetSection {
+  if (cls === 'running') return 'running';
+  if (cls === 'idle') return 'idle';
+  if (cls === 'finished') return 'finished';
+  return 'needsYou';
+}
+
+/** Newest activity / output / turn stamp for a pty, or 0. */
+export function newestPaneStamp(
+  ptyId: string,
+  ctx: Pick<FleetGroupContext, 'surfaceActivityAt' | 'surfaceOutputAt' | 'surfaceTurnOpenAt'>,
+): number {
+  if (!ptyId) return 0;
+  let newest = 0;
+  for (const stamp of [ctx.surfaceActivityAt?.[ptyId], ctx.surfaceOutputAt?.[ptyId], ctx.surfaceTurnOpenAt?.[ptyId]]) {
+    if (typeof stamp === 'number' && Number.isFinite(stamp) && stamp > newest) newest = stamp;
+  }
+  return newest;
+}
+
+/**
+ * Agent rows only — the filter the titlebar vitals and Fleet apply, widened
+ * for the glance board: a pane whose ACTIVE tab is a browser but whose
+ * terminal tab behind it carries an attention status (attentionPtyId) is an
+ * agent pane too, or a background agent waiting on you would drop out.
+ */
+export function isFleetAgentPane(p: Pick<FleetPane, 'remote' | 'ptyId' | 'surfaceType' | 'attentionPtyId'>): boolean {
+  if (p.remote) return true;
+  if (p.attentionPtyId) return true;
+  return p.ptyId !== '' && p.surfaceType === 'terminal';
+}
+
+/**
+ * #1481 glance board — workspace id → sort score for the Attention order:
+ * the most urgent class among its agent panes, then (within the class) the
+ * newest stamp of those panes, floored to the minute so the subscription does
+ * not change on every byte. Lower score sorts first. Workspaces with no agent
+ * pane score as idle with no stamp.
+ */
+const attentionCache = new WeakMap<object, { scores: Record<string, number>; classes: Record<string, FleetAttentionClass> }>();
+
+export function selectWorkspaceAttentionScores(
+  state: FleetSelectorState & { surfaceOutputAt?: Record<string, number> },
+): Record<string, number> {
+  return workspaceAttention(state).scores;
+}
+
+/** workspace id → its most urgent attention class (idle when it has no agent). */
+export function selectWorkspaceAttentionClasses(
+  state: FleetSelectorState & { surfaceOutputAt?: Record<string, number> },
+): Record<string, FleetAttentionClass> {
+  return workspaceAttention(state).classes;
+}
+
+// One pass per store state, shared by every row and the order (the sidebar
+// reads it from many subscribers on the same write).
+function workspaceAttention(
+  state: FleetSelectorState & { surfaceOutputAt?: Record<string, number> },
+): { scores: Record<string, number>; classes: Record<string, FleetAttentionClass> } {
+  const cached = attentionCache.get(state);
+  if (cached) return cached;
+  const best: Record<string, { rank: number; at: number; cls: FleetAttentionClass }> = {};
+  for (const pane of selectFleetPanes(state)) {
+    if (!isFleetAgentPane(pane)) continue;
+    const target = fleetTargetPtyId(pane);
+    const question = target ? state.surfacePendingQuestion?.[target]?.trim() || undefined : undefined;
+    const cls = fleetAttentionClass(pane, question);
+    const rank = ATTENTION_CLASS_RANK[cls];
+    const at = Math.floor(newestPaneStamp(target, state) / 60_000);
+    const cur = best[pane.workspaceId];
+    if (!cur || rank < cur.rank || (rank === cur.rank && at > cur.at)) best[pane.workspaceId] = { rank, at, cls };
+  }
+  const scores: Record<string, number> = {};
+  const classes: Record<string, FleetAttentionClass> = {};
+  for (const ws of state.workspaces) {
+    scores[ws.id] = attentionScore(best[ws.id]?.rank ?? ATTENTION_CLASS_RANK.idle, best[ws.id]?.at ?? 0);
+    classes[ws.id] = best[ws.id]?.cls ?? 'idle';
+  }
+  const out = { scores, classes };
+  attentionCache.set(state, out);
+  return out;
+}
+
+/** rank first, then newer minute first — one comparable number. */
+export function attentionScore(rank: number, atMinute: number): number {
+  return rank * 1e9 + (1e9 - 1 - Math.max(0, Math.min(atMinute, 1e9 - 1)));
+}
+
+/**
+ * An attached remote workspace's Attention score, on the same scale as
+ * selectWorkspaceAttentionScores: the most urgent class among its agent panes.
+ * Only panes that name an agent count (resolveRemoteAgent's rule), and there
+ * is no pending question from the host, so plain `waiting` is idle — as it is
+ * for a local remote-terminal tab. A stale (or refused) mirror scores as idle:
+ * its statuses are frozen at the last successful poll. The host sends no
+ * stamps, so a remote row sorts after local rows of the same class.
+ */
+export function remoteWorkspaceAttentionClass(
+  rw: Pick<AttachedRemoteWorkspace, 'panes' | 'stale' | 'authRejected' | 'insecureTransport'>,
+): FleetAttentionClass {
+  let best: FleetAttentionClass = 'idle';
+  if (!rw.stale && !rw.authRejected && !rw.insecureTransport) {
+    for (const p of rw.panes) {
+      if (!p.agentName) continue;
+      const c = fleetAttentionClass({ agentStatus: p.agentStatus ?? 'idle', unverifiable: false });
+      if (ATTENTION_CLASS_RANK[c] < ATTENTION_CLASS_RANK[best]) best = c;
+    }
+  }
+  return best;
+}
+
+/** The class above as a score, so the row sorts by what it shows. */
+export function remoteWorkspaceAttentionScore(
+  rw: Pick<AttachedRemoteWorkspace, 'panes' | 'stale' | 'authRejected' | 'insecureTransport'>,
+): number {
+  return attentionScore(ATTENTION_CLASS_RANK[remoteWorkspaceAttentionClass(rw)], 0);
+}
+
+/** One row's section and detail — `groupFleetPanes` without the grouping. */
+export function fleetRow(pane: FleetPane, ctx: FleetGroupContext = {}): FleetRow {
+  const target = fleetTargetPtyId(pane);
+  const question = target ? ctx.surfacePendingQuestion?.[target]?.trim() || undefined : undefined;
+  const lastMessage = selectSurfaceLastMessage(ctx, target);
+  // Agent-authored; flattened at display time so bidi / zero-width characters
+  // cannot reorder how a tool path reads.
+  const activity = pane.surfaceType === 'terminal' ? flattenAgentText(pane.activity ?? '') || undefined : undefined;
+  const idleForMs = fleetIdleForMs(target, ctx);
+  const base = { pane, idleForMs };
+  // #1481 glance board — the section comes from the shared class, so the
+  // sidebar (which sorts by class) and Fleet (which groups by section) cannot
+  // read one pane two ways.
+  const section = sectionOfAttentionClass(fleetAttentionClass(pane, question));
+  if (pane.supervision?.status === 'stopped') {
+    return { ...base, section, detailKey: 'fleet.detail.supervisionStopped' };
+  }
+  if (pane.unverifiable) {
+    return { ...base, section, detailKey: 'fleet.detail.unconfirmed' };
+  }
+  switch (pane.agentStatus) {
+    case 'awaiting_input':
+      return question
+        ? { ...base, section, detail: question, detailSource: 'question', detailKey: 'fleet.needsYourInput' }
+        : { ...base, section, detailKey: 'fleet.needsYourInput' };
+    case 'waiting':
+      return question
+        ? { ...base, section, detail: question, detailSource: 'question', detailKey: 'fleet.needsYourInput' }
+        : lastMessage
+          ? { ...base, section, detail: lastMessage, detailSource: 'lastMessage', detailKey: 'fleet.detail.idle' }
+          : { ...base, section, detailKey: 'fleet.detail.idle' };
+    case 'error':
+      return { ...base, section, detailKey: 'fleet.detail.error' };
+    case 'complete':
+      return lastMessage
+        ? { ...base, section, detail: lastMessage, detailSource: 'lastMessage', detailKey: 'fleet.detail.complete' }
+        : { ...base, section, detailKey: 'fleet.detail.complete' };
+    case 'running':
+      return activity
+        ? { ...base, section, detail: activity, detailSource: 'activity', detailKey: 'fleet.detail.running' }
+        : { ...base, section, detailKey: 'fleet.detail.running' };
+    default:
+      return lastMessage
+        ? { ...base, section, detail: lastMessage, detailSource: 'lastMessage', detailKey: 'fleet.detail.idle' }
+        : { ...base, section, detailKey: 'fleet.detail.idle' };
+  }
+}
+
+/** Order inside Needs you: decisions first (a request for input), then an
+ *  error, then a stopped supervisor, then an unconfirmed turn. */
+function needsYouRank(row: FleetRow): number {
+  if (row.pane.supervision?.status === 'stopped') return 2;
+  if (row.pane.unverifiable) return 3;
+  switch (row.pane.agentStatus) {
+    case 'awaiting_input':
+    case 'waiting':
+      return 0;
+    case 'error':
+      return 1;
+    default:
+      return 4;
+  }
+}
+
+/**
+ * Group fleet rows into the four attention-board sections. Within a section
+ * ('attention' mode): Needs you ranks by severity (needsYouRank), the other
+ * sections by STATUS_RANK; then the most recent activity first, rows with no
+ * timestamps last, then input order. 'workspace' mode keeps the input
+ * (sidebar) order inside each section.
+ */
+export function groupFleetPanes(panes: FleetPane[], ctx: FleetGroupContext = {}): FleetGroups {
+  const groups: FleetGroups = { needsYou: [], finished: [], running: [], idle: [] };
+  const order = new Map<FleetRow, number>();
+  panes.forEach((pane, index) => {
+    const row = fleetRow(pane, ctx);
+    order.set(row, index);
+    groups[row.section].push(row);
+  });
+  if (ctx.sortMode !== 'workspace') {
+    const compare = (a: FleetRow, b: FleetRow): number => {
+      const r = a.section === 'needsYou'
+        ? needsYouRank(a) - needsYouRank(b)
+        : STATUS_RANK[a.pane.agentStatus] - STATUS_RANK[b.pane.agentStatus];
+      if (r !== 0) return r;
+      const ai = a.idleForMs;
+      const bi = b.idleForMs;
+      if (ai !== undefined && bi !== undefined && ai !== bi) return ai - bi;
+      if (ai === undefined && bi !== undefined) return 1;
+      if (ai !== undefined && bi === undefined) return -1;
+      return (order.get(a) ?? 0) - (order.get(b) ?? 0);
+    };
+    groups.needsYou.sort(compare);
+    groups.finished.sort(compare);
+    groups.running.sort(compare);
+    groups.idle.sort(compare);
+  }
+  return groups;
+}
+
+/** A terminal's application name is context, not a task title. Never invent
+ * a task from output; use the user's label, mission, or terminal title. */
+export function fleetTitle(pane: FleetPane, mission?: WorkTask): string {
+  if (pane.paneLabel?.trim()) return pane.paneLabel.trim();
+  if (mission?.title.trim()) return mission.title.trim();
+  const title = pane.title.replace(/^[✳✻✽✶✢*]\s*/, '').trim();
+  const generic = /^(claude(?: code)?|codex(?: cli)?|gemini(?: cli)?|agy|antigravity(?: cli)?|terminal|shell|zsh|bash|pwsh|powershell|cmd(?:\.exe)?)$/i;
+  if (title && !generic.test(title) && title.toLowerCase() !== pane.agentName?.toLowerCase()) return title;
+  return pane.workspaceName;
+}
+
+/** Everything the Fleet board reads. The two precomputed maps are optional:
+ *  FleetView subscribes to them shallowly (so the 2 s decay clock does not
+ *  re-derive the board) and passes them in; a caller holding the live store
+ *  omits them and they are derived from the same state here. */
+export type FleetBoardState = FleetSelectorState & Pick<StoreState, 'surfaceOutputAt'> & Partial<Pick<StoreState, 'moa' | 'moaHqSeed'>> & {
+  /** Produced by `selectUnverifiablePaneMinutes`; derived when absent. */
+  unverifiablePaneMinutes?: Record<string, number>;
+};
+
+export interface FleetBoard {
+  panes: FleetPane[];
+  groups: FleetGroups;
+}
+
+/**
+ * The Fleet attention board — the rows and sections the Fleet overlay shows.
+ * The one place its inputs are assembled, so the overlay and the fleet.triage
+ * RPC (an agent asking "who needs me?") cannot disagree.
+ */
+export function selectFleetBoard(
+  state: FleetBoardState,
+  opts: { now: number; sortMode: FleetSortMode },
+): FleetBoard {
+  const panes = fleetBoardPanes(
+    state,
+    state.hookRunningByPtyId ?? selectHookRunningByPtyId(state),
+    state.unverifiablePaneMinutes ?? selectUnverifiablePaneMinutes(state),
+  );
+  const groups = groupFleetPanes(panes, {
+    now: opts.now,
+    surfaceActivityAt: state.surfaceActivityAt,
+    surfaceOutputAt: state.surfaceOutputAt,
+    surfaceTurnOpenAt: state.surfaceTurnOpenAt,
+    surfacePendingQuestion: state.surfacePendingQuestion,
+    surfaceLastMessage: state.surfaceLastMessage,
+    sortMode: opts.sortMode,
+  });
+  return { panes, groups };
+}
+
+/** The workspace Fleet leaves off as Moa's: the known HQ, whether or not Moa
+ *  is on. Main may report no HQ id while Moa is off, so the remembered one
+ *  (the seed) still counts: Moa's own terminal is never a worker. */
+export function fleetHqId(state: Pick<FleetBoardState, 'moa' | 'moaHqSeed'>): string | null {
+  return state.moa?.hq.workspaceId ?? state.moaHqSeed ?? null;
+}
+
+/** The board's rows before grouping — shared by the board and its counts so
+ *  both read the same panes with the same liveness inputs. Moa's HQ workspace
+ *  is left out: Moa is the main bot, not a worker on the board, and what it
+ *  waits on reaches the operator through its own panel ("Waiting on you" and
+ *  its permission card). `selectFleetPanes` itself keeps the HQ, since the
+ *  workspace mirror (pane_list) and per-workspace roll-ups read it. */
+function fleetBoardPanes(
+  state: FleetBoardState,
+  hookRunningByPtyId: Record<string, boolean>,
+  unverifiable: Record<string, number>,
+): FleetPane[] {
+  const surfaceAgent = state.surfaceAgent ?? {};
+  const hq = fleetHqId(state);
+  // Use the same turn/liveness inputs as the sidebar and Deck roster. Missing
+  // these optional inputs silently classified active hook-driven turns as idle.
+  return selectFleetPanes({
+    workspaces: state.workspaces,
+    surfaceAgentStatus: state.surfaceAgentStatus,
+    surfaceActivity: state.surfaceActivity,
+    paneLabel: state.paneLabel,
+    supervisionByPtyId: state.supervisionByPtyId,
+    usageLimitWaiting: state.usageLimitWaiting,
+    surfaceAgent: state.surfaceAgent,
+    surfacePendingQuestion: state.surfacePendingQuestion,
+    surfaceActivityAt: state.surfaceActivityAt,
+    surfaceTurnOpenAt: state.surfaceTurnOpenAt,
+    commandRunningByPtyId: state.commandRunningByPtyId,
+    agentAliveByPtyId: state.agentAliveByPtyId,
+    hookRunningByPtyId,
+    remoteWorkspaces: state.remoteWorkspaces,
+  }).filter((pane) => pane.workspaceId !== hq).map((pane) => ({
+    ...pane,
+    agentName: surfaceAgent[pane.ptyId]?.name || pane.agentName,
+    unverifiable: !!unverifiable[pane.ptyId],
+  }));
+}
+
+export interface FleetSectionCounts {
+  needsYou: number;
+  running: number;
+}
+
+function sameKeys(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  const ak = Object.keys(a);
+  if (ak.length !== Object.keys(b).length) return false;
+  return ak.every((k) => Object.is(a[k], b[k]));
+}
+
+// One slot: the live store is the only caller that cares about the hit rate.
+let sectionCountsMemo: { inputs: unknown[]; hook: Record<string, boolean>; unverifiable: Record<string, number>; out: FleetSectionCounts } | undefined;
+
+/**
+ * How many rows the Fleet board has in Needs you and Running — the sidebar's
+ * Fleet shortcut shows these. Same panes as the board (fleetBoardPanes) and the
+ * same per-row section rule as `fleetRow`, but counted only: no detail text,
+ * no grouping, no sort. Finished turns are their own section, so they do not
+ * count as needs you; unconfirmed rows do, as on the board.
+ *
+ * The sidebar is always mounted and the store changes on every output chunk,
+ * so the pass is memoized on the inputs that can move a section — not on the
+ * root state. Output stamps and last messages never move one; the decay clock
+ * reaches a section only through the two derived maps, compared shallowly.
+ */
+export function selectFleetSectionCounts(state: FleetBoardState): FleetSectionCounts {
+  const hook = state.hookRunningByPtyId ?? selectHookRunningByPtyId(state);
+  const unverifiable = state.unverifiablePaneMinutes ?? selectUnverifiablePaneMinutes(state);
+  const inputs = [
+    state.workspaces, state.surfaceAgentStatus, state.surfaceActivity, state.paneLabel,
+    state.supervisionByPtyId, state.surfaceAgent, state.surfacePendingQuestion, state.surfaceActivityAt,
+    state.surfaceTurnOpenAt, state.commandRunningByPtyId, state.agentAliveByPtyId, state.remoteWorkspaces,
+    state.usageLimitWaiting, fleetHqId(state),
+  ];
+  const memo = sectionCountsMemo;
+  if (memo && inputs.every((value, i) => Object.is(value, memo.inputs[i]))
+      && sameKeys(hook, memo.hook) && sameKeys(unverifiable, memo.unverifiable)) {
+    return memo.out;
+  }
+  const out: FleetSectionCounts = { needsYou: 0, running: 0 };
+  for (const pane of fleetBoardPanes(state, hook, unverifiable)) {
+    const target = fleetTargetPtyId(pane);
+    const question = target ? state.surfacePendingQuestion?.[target]?.trim() || undefined : undefined;
+    const section = sectionOfAttentionClass(fleetAttentionClass(pane, question));
+    if (section === 'needsYou') out.needsYou++;
+    else if (section === 'running') out.running++;
+  }
+  // Keep the previous object when nothing changed, so a shallow subscriber
+  // never re-renders on an equal count.
+  const kept = memo && memo.out.needsYou === out.needsYou && memo.out.running === out.running ? memo.out : out;
+  sectionCountsMemo = { inputs, hook, unverifiable, out: kept };
+  return kept;
+}
+
+/**
+ * #1481 — workspace id → newest activity/output stamp across ALL its terminal
+ * surfaces (stashed included), floored to the minute, for the sidebar's
+ * "Recent activity" order. Minute granularity so a shallow-compared
+ * subscription does not re-sort the list on every byte of output.
+ */
+export function selectAllWorkspaceLastActivityMinute(state: FleetSelectorState & {
+  surfaceOutputAt?: Record<string, number>;
+}): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const ws of state.workspaces) {
+    let last = 0;
+    for (const leaf of getWorkspaceLeafPanes(ws)) {
+      for (const surf of leaf.surfaces) {
+        if (!surf.ptyId) continue;
+        const at = Math.max(state.surfaceActivityAt?.[surf.ptyId] ?? 0, state.surfaceOutputAt?.[surf.ptyId] ?? 0);
+        if (at > last) last = at;
+      }
+    }
+    out[ws.id] = Math.floor(last / 60_000);
+  }
   return out;
 }

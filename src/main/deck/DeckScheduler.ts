@@ -17,7 +17,7 @@
 
 import {
   loadDeckSchedules,
-  saveDeckSchedules,
+  mutateDeckSchedules,
   dueSchedules,
   advanceAfterRun,
   type DeckSchedule,
@@ -47,6 +47,8 @@ export interface DeckSchedulerDeps {
   /** Store dir override (tests). */
   dir?: string;
 }
+
+const RETRYABLE_CODES: ReadonlySet<string> = new Set(['busy', 'rate_limited', 'hq_unknown', 'hq_missing']);
 
 export class DeckScheduler {
   private readonly deps: Required<Pick<DeckSchedulerDeps, 'runTurn'>> &
@@ -97,17 +99,22 @@ export class DeckScheduler {
         try {
           // dueSchedules guarantees workspaceId is present.
           const r = await this.deps.runTurn(scheduledPrompt(s), s.workspaceId ?? '');
-          result = r.ok ? 'ok' : r.code === 'busy' ? 'busy' : 'error';
+          // Transient refusals stay due, like busy, and retry: the HQ turn cap
+          // (rate_limited), and an HQ not yet observed or currently missing
+          // (a due one-shot must not be consumed before the renderer's first
+          // mirror push, or while the HQ workspace is away).
+          result = r.ok ? 'ok' : RETRYABLE_CODES.has(r.code ?? '') ? 'busy' : 'error';
         } catch {
           result = 'error';
         }
         // Read-modify-write against the CURRENT store: the schedule may have
         // been edited or deleted while the turn ran.
-        const fresh = loadDeckSchedules(this.deps.dir);
-        const idx = fresh.findIndex((x) => x.id === s.id);
-        if (idx === -1) continue; // deleted mid-turn — nothing to advance
-        fresh[idx] = advanceAfterRun(fresh[idx], result, (this.deps.now ?? Date.now)());
-        await saveDeckSchedules(fresh, this.deps.dir);
+        await mutateDeckSchedules((fresh) => {
+          const idx = fresh.findIndex((x) => x.id === s.id);
+          if (idx === -1) return null; // deleted mid-turn — nothing to advance
+          fresh[idx] = advanceAfterRun(fresh[idx], result, (this.deps.now ?? Date.now)());
+          return fresh;
+        }, this.deps.dir);
         // busy is PER-WORKSPACE now (M1.5): a busy orchestrator in one
         // workspace must not starve another workspace's due schedules, so
         // keep iterating — the busy one stays due and retries next tick.

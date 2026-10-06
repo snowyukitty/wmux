@@ -1,3 +1,4 @@
+// Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/features/sessions/ui/Composer.tsx), MIT License, Copyright (c) 2026 Nick
 // ─── Command Deck — "New session" chip ──────────────────────────────────────
 //
 // Replaces this workspace's orchestrator with a fresh one: the live brain is
@@ -60,6 +61,26 @@ export interface NewSessionChipProps {
   t?: (key: string) => string;
 }
 
+/** Clear the brain, then wake a fresh one. Shared by the chip and Moa's
+ *  options menu; never rejects. */
+export async function startNewSession(api: NewSessionApi, workspaceId: string): Promise<void> {
+  try {
+    const res = await api.clear(workspaceId);
+    // Only wake a clear that actually happened. Waking a failed clear would
+    // spin the OLD conversation back up and read as "the button did
+    // nothing, twice".
+    if (res?.ok) {
+      await api.wake(workspaceId).catch(() => {
+        /* best-effort: a busy/rejected wake still leaves a fresh brain
+           ready for the operator's next message */
+      });
+    }
+  } catch {
+    /* the deck surfaces brain errors on its own stream; a failed clear
+       leaves the existing conversation untouched, which is the safe end */
+  }
+}
+
 /** How long the armed state waits for the second click before disarming. */
 const ARM_TIMEOUT_MS = 4000;
 
@@ -109,25 +130,7 @@ export function NewSessionChip({
     }
     disarm();
     setRunning(true);
-    void (async () => {
-      try {
-        const res = await api.clear(workspaceId);
-        // Only wake a clear that actually happened. Waking a failed clear would
-        // spin the OLD conversation back up and read as "the button did
-        // nothing, twice".
-        if (res?.ok) {
-          await api.wake(workspaceId).catch(() => {
-            /* best-effort: a busy/rejected wake still leaves a fresh brain
-               ready for the operator's next message */
-          });
-        }
-      } catch {
-        /* the deck surfaces brain errors on its own stream; a failed clear
-           leaves the existing conversation untouched, which is the safe end */
-      } finally {
-        setRunning(false);
-      }
-    })();
+    void startNewSession(api, workspaceId).finally(() => setRunning(false));
   }, [armed, running, api, workspaceId, disarm, clearDisarm]);
 
   if (!workspaceId) return null;
@@ -152,12 +155,13 @@ export function NewSessionChip({
       // (DESIGN.md: AI-directed actions stay neutral at rest) — nothing is
       // destroyed by arming. Red only once ARMED, which is the one click that
       // commits: DESIGN.md reserves solid red for the final confirm.
+      // A neutral 26px filled chip; armed keeps the destructive red label.
       className={
         armed
-          ? `px-2.5 py-1 rounded-md text-[12px] font-semibold text-[var(--accent-red)] bg-[rgba(var(--bg-surface-rgb),0.6)] transition-colors disabled:opacity-40 ${FOCUS_RING}`
-          : `px-2.5 py-1 rounded-md text-[12px] font-semibold text-[var(--text-sub)] bg-[rgba(var(--bg-surface-rgb),0.6)] hover:text-[var(--accent-amber)] transition-colors disabled:opacity-40 ${FOCUS_RING}`
+          ? `h-[26px] px-2 rounded-md text-[12px] font-medium text-[var(--accent-red)] bg-[var(--selection)] hover:bg-[var(--selection-hover)] transition-colors disabled:opacity-40 ${FOCUS_RING}`
+          : `h-[26px] px-2 rounded-md text-[12px] text-[color-mix(in_srgb,var(--text-main)_70%,transparent)] bg-[var(--selection)] hover:bg-[var(--selection-hover)] hover:text-[var(--text-main)] transition-colors disabled:opacity-40 ${FOCUS_RING}`
       }
-      {...(armed ? tokenAttrs('danger', 'text') : tokenAttrs('textSub', 'text'))}
+      {...(armed ? tokenAttrs('danger', 'text') : tokenAttrs('textMain', 'text'))}
     >
       {armed ? confirmLabel : label}
     </button>

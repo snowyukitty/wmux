@@ -16,6 +16,16 @@ const execFileAsync = promisify(execFile);
  * every buffer save, and the whole point of the badge is "do I have local
  * work here". `--no-optional-locks` keeps the subprocess from ever touching
  * the index lock, so it can never collide with a user-driven git operation.
+ *
+ * `--ignore-submodules=dirty` skips scanning each submodule's work tree. A
+ * direct submodule whose checked-out commit differs from the recorded one
+ * still counts as dirty; uncommitted edits inside a submodule, and a nested
+ * submodule's own pointer changes, do not. The flag also overrides
+ * `submodule.<name>.ignore` / `diff.ignoreSubmodules`, so the badge can count
+ * pointer changes that the user's own `git status` hides. Without it,
+ * status recurses into every submodule: 73 s in a repo with 66 nested
+ * submodules (227 ms with it), far past GIT_TIMEOUT_MS, so the call never
+ * succeeded and every TTL window spawned another one.
  */
 
 const TTL_MS = 15_000;
@@ -55,6 +65,14 @@ export function parsePorcelainV2(stdout: string): GitSyncStatus {
     }
   }
   return { dirty, ahead, behind, hasUpstream };
+}
+
+/** Parse `git diff --shortstat` ("3 files changed, 84 insertions(+), 31
+ *  deletions(-)"). Exported for tests. */
+export function parseShortstat(stdout: string): { added: number; removed: number } {
+  const added = /(\d+) insertions?\(\+\)/.exec(stdout);
+  const removed = /(\d+) deletions?\(-\)/.exec(stdout);
+  return { added: added ? Number(added[1]) : 0, removed: removed ? Number(removed[1]) : 0 };
 }
 
 export class GitSyncStatusCache {
@@ -118,24 +136,40 @@ export class GitSyncStatusCache {
   }
 
   private async fetch(cwd: string): Promise<GitSyncStatus | null> {
+    const opts = {
+      cwd,
+      timeout: GIT_TIMEOUT_MS,
+      env: { ...getExecEnv(), GIT_OPTIONAL_LOCKS: '0', NO_COLOR: '1' },
+      windowsHide: true,
+      // A pathological repo (thousands of untracked files) must truncate,
+      // not reject — 10 MB covers ~100k paths.
+      maxBuffer: 10 * 1024 * 1024,
+    };
+    let status: GitSyncStatus;
     try {
       const { stdout } = await this.exec(
         'git',
-        ['--no-optional-locks', 'status', '--porcelain=v2', '--branch'],
-        {
-          cwd,
-          timeout: GIT_TIMEOUT_MS,
-          env: { ...getExecEnv(), GIT_OPTIONAL_LOCKS: '0', NO_COLOR: '1' },
-          windowsHide: true,
-          // A pathological repo (thousands of untracked files) must truncate,
-          // not reject — 10 MB covers ~100k paths.
-          maxBuffer: 10 * 1024 * 1024,
-        },
+        ['--no-optional-locks', 'status', '--porcelain=v2', '--branch', '--ignore-submodules=dirty'],
+        opts,
       );
-      return parsePorcelainV2(stdout);
+      status = parsePorcelainV2(stdout);
     } catch {
       // Not a repo / git missing / timeout — quiet absence.
       return null;
+    }
+    if (status.dirty === 0) return { ...status, added: 0, removed: 0 };
+    try {
+      // The sidebar card's +N / −M: tracked changes vs HEAD. Read-only, no
+      // index lock (same posture as the status call above).
+      const { stdout } = await this.exec(
+        'git',
+        ['--no-optional-locks', 'diff', 'HEAD', '--shortstat', '--ignore-submodules=dirty'],
+        // parseShortstat reads git's English summary; a translated one would not match.
+        { ...opts, env: { ...opts.env, LC_ALL: 'C' } },
+      );
+      return { ...status, ...parseShortstat(stdout) };
+    } catch {
+      return status;
     }
   }
 }

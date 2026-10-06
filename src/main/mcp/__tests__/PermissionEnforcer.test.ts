@@ -40,18 +40,142 @@ describe('PermissionEnforcer.check — identity bootstrap', () => {
   });
 });
 
-describe('PermissionEnforcer.check — legacy (no clientName)', () => {
-  it('allows when ctx.clientName is missing', () => {
+// #1111 Stage 3: the grandfather lane is closed. Both enforcement points —
+// the missing-clientName check and the `legacy` trust status — reject, and
+// they are asserted together here because the rule is that they move together.
+describe('PermissionEnforcer.check — grandfather lane closed (#1111)', () => {
+  it('rejects when ctx.clientName is missing', () => {
     const out = check({ method: 'pane.list', params: {}, ctx: ctx(), trust: undefined });
-    expect(out).toEqual({ kind: 'allow' });
+    expect(out).toEqual({
+      kind: 'reject',
+      rejection: {
+        reason: 'identity-status',
+        method: 'pane.list',
+        capability: 'pane.read',
+        status: 'legacy',
+      },
+    });
   });
 
-  it('allows when trust.status === legacy', () => {
+  it('rejects when trust.status === legacy', () => {
     const out = check({
       method: 'pane.list',
       params: {},
       ctx: ctx('p1'),
       trust: trust({ name: 'p1', status: 'legacy' }),
+    });
+    expect(out).toEqual({
+      kind: 'reject',
+      rejection: {
+        reason: 'identity-status',
+        method: 'pane.list',
+        capability: 'pane.read',
+        status: 'legacy',
+      },
+    });
+  });
+
+  it('offers no approval path — an anonymous caller has no identity to approve', () => {
+    const out = check({ method: 'pane.list', params: {}, ctx: ctx(), trust: undefined });
+    if (out.kind !== 'reject') throw new Error('expected reject');
+    if (out.rejection.reason !== 'identity-status') throw new Error('expected identity-status');
+    expect(out.rejection.pendingApproval).toBeUndefined();
+  });
+
+  it('no longer bypasses the capability gate: wmux.internal is rejected too', () => {
+    // The lane used to return `allow` before the capability was ever checked,
+    // which made 32 wmux.internal methods reachable without an envelope.
+    const out = check({ method: 'surface.close', params: { id: 's1' }, ctx: ctx(), trust: undefined });
+    expect(out.kind).toBe('reject');
+  });
+
+  it('still allows identity bootstrap without a clientName so callers can migrate', () => {
+    for (const method of ['mcp.identify', 'system.identify'] as const) {
+      expect(check({ method, params: {}, ctx: ctx(), trust: undefined })).toEqual({ kind: 'allow' });
+    }
+  });
+
+  // P1 regression guard: the renderer IPC bridge (src/main/index.ts
+  // `invokeRendererRpc`) dispatches with `{ operator: true }` and NO
+  // clientName, so before #1111 every renderer-bridged RPC rode the very
+  // grandfather this issue closes. Closing it without this exemption would
+  // reject the entire wmux UI under the production enforce-mode default —
+  // invisible in shadow mode, which is the dev/test default.
+  it('exempts the in-process renderer operator lane (no clientName)', () => {
+    const out = check({
+      method: 'pane.list',
+      params: {},
+      ctx: { origin: 'local', operator: true, firstParty: true },
+      trust: undefined,
+    });
+    expect(out).toEqual({ kind: 'allow' });
+  });
+
+  // Only `operator` is exempt. The plugin host (the one other `firstParty`
+  // source) always sends its manifest name, so an envelope-less firstParty
+  // dispatch is not a real caller today — and exempting it would let a future
+  // one skip the capability gate, reserved lifecycle methods included.
+  it('rejects an envelope-less firstParty dispatch (not exempt, unlike operator)', () => {
+    for (const method of ['pane.list', 'workspace.close', 'company.destroy'] as const) {
+      const out = check({
+        method,
+        params: {},
+        ctx: { origin: 'local', firstParty: true },
+        trust: undefined,
+      });
+      expect(out.kind, `${method} must not pass envelope-less on firstParty alone`).toBe('reject');
+      if (out.kind !== 'reject') throw new Error('expected reject');
+      if (out.rejection.reason !== 'identity-status') throw new Error('expected identity-status');
+      expect(out.rejection.status).toBe('legacy');
+    }
+  });
+
+  // What the plugin host actually sends: firstParty WITH its manifest name.
+  // That caller meets the normal trust ladder, exactly as before the close.
+  it('sends a named firstParty dispatch through the normal trust ladder', () => {
+    const hosted: RpcContext = { origin: 'local', firstParty: true, clientName: 'hello-panel' };
+    const unknown = check({ method: 'pane.list', params: {}, ctx: hosted, trust: undefined });
+    expect(unknown.kind).toBe('reject');
+    if (unknown.kind !== 'reject' || unknown.rejection.reason !== 'identity-status') {
+      throw new Error('expected identity-status');
+    }
+    expect(unknown.rejection.status).toBe('unconfirmed');
+
+    const trusted = trust({ name: 'hello-panel', status: 'trusted', declaredCapabilities: ['pane.read'] });
+    expect(check({ method: 'pane.list', params: {}, ctx: hosted, trust: trusted })).toEqual({ kind: 'allow' });
+    const undeclared = check({ method: 'input.send', params: {}, ctx: hosted, trust: trusted });
+    expect(undeclared.kind).toBe('reject');
+    if (undeclared.kind === 'reject') expect(undeclared.rejection.reason).toBe('capability-not-declared');
+  });
+
+  it('does NOT exempt an external-wire caller (the flags are not forgeable)', () => {
+    const out = check({
+      method: 'pane.list',
+      params: {},
+      ctx: { origin: 'local', externalWire: true },
+      trust: undefined,
+    });
+    expect(out.kind).toBe('reject');
+  });
+
+  // The commander lane's auth is the validated token, not the clientName, so
+  // a commander with empty clientInfo must reach its check BEFORE the close.
+  it('exempts a token-validated commander with no clientName', () => {
+    const out = check({
+      method: 'pane.list',
+      params: {},
+      ctx: { origin: 'local', commanderWorkspace: 'ws-1' },
+      trust: undefined,
+    });
+    expect(out).toEqual({ kind: 'allow' });
+  });
+
+  it('named, trusted callers are unaffected', () => {
+    const out = check({
+      method: 'pane.list',
+      params: {},
+      ctx: ctx('p1'),
+      trust: trust({ name: 'p1', status: 'trusted', declaredCapabilities: ['pane.read'] }),
     });
     expect(out).toEqual({ kind: 'allow' });
   });

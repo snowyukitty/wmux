@@ -1,3 +1,7 @@
+import { isWslShell, resolveWslCwd, type WslTarget, type ResolvedWslCwd } from '../../shared/wsl';
+import { buildWslInjection } from '../../shared/wslIntegration';
+import { BASH_INIT } from '../../daemon/shell-integration';
+import { getWmuxDir } from '../../daemon/config';
 import * as pty from 'node-pty';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -14,6 +18,7 @@ import { isWindows, parseWindowsBuildNumber } from '../../shared/platform';
 import { shouldUseBundledConpty, spawnWithConptyPolicy } from '../../shared/conptyWindows';
 import { ShellDetector } from '../../shared/ShellDetector';
 import { forgetPtyShell, recordPtyShell } from './ptyShellRegistry';
+import { windowsPowerShellPolicyArgs } from '../../shared/pwshExecutionPolicy';
 
 export type ShellType = 'powershell' | 'bash' | 'cmd' | 'unknown';
 
@@ -21,6 +26,7 @@ export interface PTYInstance {
   id: string;
   process: pty.IPty;
   shell: string;
+  cwd?: string;
   /**
    * Workspace this PTY belongs to. Captured at create time so the EventBus
    * can scope process.* events without consulting the renderer state.
@@ -86,6 +92,7 @@ export class PTYManager {
   buildHookInjection(
     shellType: ShellType,
     env: Record<string, string>,
+    shellPath = '',
   ): { args: string[]; env: Record<string, string> } {
     const hooksDir = this.getShellHooksDir();
     const args: string[] = [];
@@ -97,7 +104,9 @@ export class PTYManager {
           env[ENV_KEYS.SHELL_HOOK] = hookPath;
           // Use -NoExit -Command to dot-source the hook script
           // Quoting with single quotes inside double quotes handles spaces in path
-          args.push('-NoExit', '-Command', `. '${hookPath}'`);
+          // #1620: a factory-default Windows client runs Restricted, which
+          // refuses the dot-source. Policy args must precede -Command.
+          args.push('-NoExit', ...windowsPowerShellPolicyArgs(shellPath), '-Command', `. '${hookPath}'`);
         }
         break;
       }
@@ -128,9 +137,83 @@ export class PTYManager {
     return { args, env };
   }
 
-  create(options?: {
+  private createGeneration = 0;
+
+  create(options?: Parameters<PTYManager['spawnPrepared']>[0]): PTYInstance {
+    if (isWslShell(options?.shell || this.getDefaultShell())) throw new Error('WSL creation requires createAsync');
+    return this.spawnPrepared(options);
+  }
+
+  async createAsync(options?: Parameters<PTYManager['spawnPrepared']>[0]): Promise<PTYInstance> {
+    const shell = options?.shell || this.getDefaultShell();
+    if (!isWslShell(shell)) return this.create(options);
+    const generation = this.createGeneration;
+    // Reserve the id before the (slow) WSL probe so dispose(id) inside the
+    // pending window cancels the spawn instead of leaving an orphan PTY.
+    const id = `pty-${++this.nextId}`;
+    this.pendingCreates.add(id);
+    // #1305 — dispose(id) only helps someone who KNOWS the id, and the id is
+    // what the create has not returned yet. The surface is the handle the
+    // caller does have: it named the surface in the request, and it is the
+    // surface closing that wants the spawn cancelled. ALL of them, not the
+    // newest: a surface can have two probes in flight (a respawn started while
+    // the first was still resolving), and its close means none of them should
+    // reach a spawn (review: CodeRabbit).
+    const surfaceId = options?.surfaceId;
+    if (surfaceId) {
+      const forSurface = this.pendingCreatesBySurface.get(surfaceId) ?? new Set<string>();
+      forSurface.add(id);
+      this.pendingCreatesBySurface.set(surfaceId, forSurface);
+    }
+    try {
+      const wsl = await resolveWslCwd(shell, options?.cwd, options?.wslTarget, undefined, options?.shellArgs);
+      if (generation !== this.createGeneration || !this.pendingCreates.has(id)) throw new Error('PTY creation cancelled');
+      return this.spawnPrepared({ ...options, shell }, wsl, id);
+    } finally {
+      this.pendingCreates.delete(id);
+      if (surfaceId) {
+        const forSurface = this.pendingCreatesBySurface.get(surfaceId);
+        forSurface?.delete(id);
+        if (forSurface?.size === 0) this.pendingCreatesBySurface.delete(surfaceId);
+      }
+    }
+  }
+
+  /**
+   * #1305 — cancel a create this surface still has in flight, before it spawns.
+   *
+   * True when one was pending and is now cancelled; false when there is nothing
+   * to cancel, which is the ordinary answer: a create that already resolved is
+   * the caller's own pty to `dispose`, and in daemon mode no local create was
+   * ever reserved. Cancelling is not the only guard, just the early one — a
+   * caller that loses this race still gets an id back and must dispose it.
+   */
+  cancelPendingCreate(surfaceId: string): boolean {
+    const forSurface = this.pendingCreatesBySurface.get(surfaceId);
+    if (!forSurface) return false;
+    let cancelled = false;
+    for (const id of forSurface) {
+      if (this.pendingCreates.delete(id)) cancelled = true;
+    }
+    this.pendingCreatesBySurface.delete(surfaceId);
+    return cancelled;
+  }
+
+  /** Ids reserved by createAsync whose WSL probe has not finished yet. */
+  private pendingCreates = new Set<string>();
+  /** #1305 — surfaceId → every id `pendingCreates` has reserved for it. */
+  private pendingCreatesBySurface = new Map<string, Set<string>>();
+
+  private spawnPrepared(options?: {
     shell?: string;
+    /**
+     * #1103 — validated WSL distro selection (`['-d', '<name>']`), prepended
+     * in front of any hook-injection args so wsl.exe parses it as its own
+     * flag. The IPC boundary has already enforced the exact shape.
+     */
+    shellArgs?: string[];
     cwd?: string;
+    wslTarget?: WslTarget;
     cols?: number;
     rows?: number;
     workspaceId?: string;
@@ -143,15 +226,16 @@ export class PTYManager {
      * 'user-shell'만 env 투과, 나머지·미지정은 fail-closed로 gated.
      */
     spawnKind?: SpawnKind;
-  }): PTYInstance {
+  }, wsl?: ResolvedWslCwd, reservedId?: string): PTYInstance {
     if (this.instances.size >= MAX_PTY_INSTANCES) {
       throw new Error('Maximum PTY instances reached');
     }
-    const id = `pty-${++this.nextId}`;
+    const id = reservedId ?? `pty-${++this.nextId}`;
     const shell = options?.shell || this.getDefaultShell();
     // Same reason as the daemon spawn path: a caller-supplied cwd may carry a
     // leading `~` that no shell expanded.
-    const cwd = options?.cwd ? expandTilde(options.cwd) : os.homedir();
+    const cwd = wsl?.cwd ?? (options?.cwd ? expandTilde(options.cwd) : os.homedir());
+    const hostCwd = wsl ? os.homedir() : cwd;
 
     // Filter out sensitive and build-only variables to prevent leaking
     // internal state to child processes. Shared with DaemonSessionManager
@@ -210,7 +294,10 @@ export class PTYManager {
 
     // Detect shell type and inject hook
     const shellType = this.detectShellType(shell);
-    const hookInjection = this.buildHookInjection(shellType, env);
+    const hookInjection = wsl
+      ? buildWslInjection({ target: wsl.target, cwd, env, integrationDir: getWmuxDir(), bashInit: BASH_INIT })
+      : this.buildHookInjection(shellType, env, shell);
+    const spawnArgs = wsl ? hookInjection.args : [...(options?.shellArgs ?? []), ...hookInjection.args];
 
     // node-pty throws synchronously on a missing/invalid shell binary or an
     // unreadable cwd (common on macOS/Linux where the shell path differs from
@@ -226,11 +313,11 @@ export class PTYManager {
     const useConptyDll = shouldUseBundledConpty(process.platform, parseWindowsBuildNumber(os.release()));
     try {
       ptyProcess = spawnWithConptyPolicy(
-        (useBundled) => pty.spawn(shell, hookInjection.args, {
+        (useBundled) => pty.spawn(shell, spawnArgs, {
           name: 'xterm-256color',
           cols: options?.cols || 80,
           rows: options?.rows || 24,
-          cwd,
+          cwd: hostCwd,
           env: hookInjection.env,
           useConpty: true,
           ...(useBundled ? { useConptyDll: true } : {}),
@@ -250,6 +337,7 @@ export class PTYManager {
       id,
       process: ptyProcess,
       shell,
+      cwd,
       ...(options?.workspaceId ? { workspaceId: options.workspaceId } : {}),
     };
     this.instances.set(id, instance);
@@ -287,7 +375,15 @@ export class PTYManager {
     const instance = this.instances.get(id);
     if (instance) {
       instance.process.write(data);
+      this.inputObserver?.(id, data);
     }
+  }
+
+  /** Sees every write in local PTY mode (workspace settle activity). In daemon
+   *  mode the daemon reports typed input itself. */
+  private inputObserver: ((id: string, data: string) => void) | null = null;
+  setInputObserver(observer: ((id: string, data: string) => void) | null): void {
+    this.inputObserver = observer;
   }
 
   resize(id: string, cols: number, rows: number): void {
@@ -298,6 +394,7 @@ export class PTYManager {
   }
 
   dispose(id: string): void {
+    this.pendingCreates.delete(id);
     const instance = this.instances.get(id);
     if (instance) {
       this.removePidMap(instance.process.pid);
@@ -337,6 +434,7 @@ export class PTYManager {
   }
 
   disposeAll(): void {
+    this.createGeneration++;
     for (const id of Array.from(this.instances.keys())) {
       this.dispose(id);
     }

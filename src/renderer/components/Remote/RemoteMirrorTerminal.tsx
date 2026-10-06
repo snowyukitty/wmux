@@ -3,22 +3,37 @@ import { Terminal } from '@xterm/xterm';
 import { useT } from '../../hooks/useT';
 import { sanitizeTitle } from '../../../main/pty/titleDetect';
 import { applyUnicodeWidthModel } from '../../../shared/terminalUnicode';
-import { computeMirrorFontSize, mirrorFitKey, MAX_FIT_PASSES } from './mirrorFit';
-import { decideMirrorKeyWithRepeat } from './mirrorInput';
+import {
+  computeMirrorFontSize, computeMirrorGeometry, mirrorFitKey, mirrorResizeRequestKey,
+  mirrorCeilingCellKey, shouldRequestRemoteResize, classifyResizeRefusal, resizeRetryDelayMs,
+  planExternalReopen, initialExternalResizeState, DESK_PROBE_INTERVAL_MS,
+  MAX_FIT_PASSES, MIN_MIRROR_FONT_SIZE,
+} from './mirrorFit';
+import { createMirrorGestureTracker, decideMirrorKeyWithRepeat, shouldHonorMirrorClipboardWrite } from './mirrorInput';
 import { foldRemoteKeyboardState, INITIAL_REMOTE_KEYBOARD_STATE } from './keyboardProtocol';
 import { useStore } from '../../stores';
 import { terminalFontFamilyCss } from '../../utils/terminalFont';
 import { createAutoSelectionCopy } from '../../utils/autoSelectionCopy';
 import { pastePtyChunked } from '../../utils/clipboardChunk';
-import { copySelectionWithFeedback } from '../../hooks/useTerminal';
+import { copySelectionWithFeedback, showCopyToastText } from '../../hooks/useTerminal';
+import { t as translate } from '../../i18n';
 import { XTERM_THEMES, extractXtermColors, type BuiltinThemeId, type ThemeId } from '../../themes';
 import { resolveMinimumContrastRatio } from '../../tailwindPalette';
+import { createOsc8LinkHandler, isLoopbackHref } from '../../terminal/osc8LinkHandler';
+import { installAltClickTrackingGuard } from '../../utils/altClickUnderMouseTracking';
+import { createOsc52Handler } from '../../utils/osc52Clipboard';
+import { gateUserInput, type UserInputTerminal } from '../../../shared/terminal/userInputGate';
+import { installShellPromptModeReset, shellPromptModeResetFor } from '../../../shared/terminal/shellPromptModeReset';
+import { fitsHeld, onFitsReleased } from '../../utils/layoutTransitionGate';
 
 export interface RemoteMirrorTerminalProps {
   /** null while the pane attach is still in flight. */
   attachId: string | null;
   /** Set when the attach itself failed (e.g. a rejected paneAttach). */
   error?: string;
+  /** The attach was refused because the host is on plain http to another
+   *  machine: show the needs-HTTPS line and take no input. */
+  insecureTransport?: boolean;
   /** True when the remote host was started without --allow-input — writes
    *  must be swallowed locally rather than silently dropped server-side. */
   readOnly?: boolean;
@@ -29,6 +44,12 @@ export interface RemoteMirrorTerminalProps {
    *  it up. Optional: RemoteWorkspaceView's mirror-grid cells have no
    *  per-surface title to update and pass nothing. */
   onTitleChange?: (title: string) => void;
+  /** The paired host's label, named in the toast when the remote app sets
+   *  the local clipboard. */
+  hostLabel?: string;
+  /** The paired host's id — flags the host's rows when it rejects the
+   *  credential, so the workspace view and the sidebar say so too. */
+  hostId?: string;
 }
 
 /** Decode a base64 payload into raw bytes and hand it to xterm as-is — the
@@ -40,61 +61,37 @@ function decodeBase64Bytes(b64: string): Uint8Array {
   return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 }
 
-/**
- * Answers xterm generates BY ITSELF in response to a device query, which it
- * delivers through the same `onData` a user's keystrokes come out of.
- *
- * A mirror must never answer: the machine that owns the pane has its own
- * terminal, that one is the authoritative responder, and a second answer is a
- * line of garbage typed into a live remote shell. (HeadlessSnapshot avoids the
- * whole problem by never wiring `onData` at all — a mirror cannot, because it
- * also has to carry real typing.)
- *
- * Matching by SHAPE is what makes this safe to apply to the live stream and not
- * just to a replay: no key or key combination xterm encodes produces any of
- * these. Arrows and function keys end in `A`–`H`, `~`, or an uppercase letter;
- * a reply ends in lowercase `c`, `n`, `y`, `t`, or the specific `R` of a cursor
- * report, and the DCS/OSC forms have no keyboard analogue at all.
- *
- * The stronger fix is upstream: neutralise the QUERIES so no reply is ever
- * generated (xterm's `parser.registerCsiHandler` can swallow DA/DSR/DECRQM
- * before the default handler answers), or have the daemon strip them from the
- * bytes it fans out. Both are larger than this pane and out of scope here.
- */
-// eslint-disable-next-line no-control-regex
-const DEVICE_REPLY_RE = new RegExp(
-  '^(?:' +
-    // Device attributes (DA1/DA2/DA3) and device status / cursor position.
-    '\\x1b\\[[?>=]?[0-9;]*[cnR]' +
-    // DECRPM — "mode Ps is currently Pm".
-    '|\\x1b\\[\\?[0-9;]*\\$y' +
-    // Window / text-area reports (CSI 8 ; rows ; cols t and friends).
-    '|\\x1b\\[[0-9;]+t' +
-    // DCS replies: DECRQSS, XTVERSION, DA3.
-    '|\\x1bP[^\\x1b]*\\x1b\\\\' +
-    // OSC colour reports (`rgb:....` under BEL or ST).
-    '|\\x1b\\][0-9;]*;?rgb:[^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)' +
-    ')$',
-);
-
-export function isDeviceReply(data: string): boolean {
-  return DEVICE_REPLY_RE.test(data);
-}
-
 /** Trailing debounce for box-size-driven fits. A divider drag emits a resize
  *  every frame; restyling the font that often re-measures the character and
  *  clears xterm's width cache, once per mirror, six mirrors deep. */
 const FIT_DEBOUNCE_MS = 150;
 
+/** Mirrors `WebTerminalServer`'s own floor for `POST /api/sessions/:id/resize`
+ *  (`MIN_REQUESTED_COLS`/`MIN_REQUESTED_ROWS`) — asking for less only earns a
+ *  400 the daemon would otherwise have to spend a round trip explaining. */
+const MIN_REMOTE_RESIZE_COLS = 40;
+const MIN_REMOTE_RESIZE_ROWS = 8;
+
 /**
- * One @xterm/xterm mirror of a single remote pane. Read-mostly: the remote's
- * own geometry events (meta on attach, resize afterwards) are the ONLY thing
- * that drives `term.resize()` — this component never calls a resize API back
- * toward the remote (geometry has a single owner, the remote daemon). A
- * container/remote aspect mismatch is letterboxed by the parent's CSS, not by
- * resizing the terminal.
+ * One @xterm/xterm mirror of a single remote pane.
+ *
+ * Geometry has a single WRITER — `term.resize()` is only ever called from the
+ * remote's own events (meta on attach, resize afterwards), never predicted
+ * locally — but, since #1322, this component is no longer read-only about
+ * geometry: `runFit` also asks the remote daemon to resize its PTY to fill the
+ * box, through the same `POST /api/sessions/:id/resize` route the phone
+ * companion already uses (#766, `RemoteHostClient.resizeSession`). That
+ * request can be refused (`409 desk-owns-size` — a desk viewer on the REMOTE
+ * host currently owns the size) or simply fail (host offline); either way this
+ * component falls back to the original behaviour, `computeMirrorFontSize`
+ * shrinking (never growing past) the local font until the remote's ACTUAL
+ * grid fits the box, letterboxed by the parent's CSS for whatever residue is
+ * left. So a container/remote aspect mismatch is resolved by a real PTY
+ * resize when the daemon grants one, and by local font-shrink + letterbox
+ * when it does not — the fallback is not a regression, it is what made this
+ * safe to ship without a protocol bump.
  */
-export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitleChange }: RemoteMirrorTerminalProps) {
+export default function RemoteMirrorTerminal({ attachId, error, insecureTransport = false, readOnly, onTitleChange, hostLabel, hostId }: RemoteMirrorTerminalProps) {
   const t = useT();
   // Ref, same reason as readOnlyRef below: the title subscription is wired
   // once inside the mount-only effect, and a parent re-render passing a new
@@ -107,6 +104,11 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
   const termRef = useRef<Terminal | null>(null);
   const [exited, setExited] = useState(false);
   const [disconnected, setDisconnected] = useState(false);
+  /** The stream ended because the host rejected this computer's credential —
+   *  says "pair again" instead of the generic connection-lost line. */
+  const [authRejected, setAuthRejected] = useState(false);
+  /** The host is on plain http to another machine: its token is never sent. */
+  const [insecure, setInsecure] = useState(false);
   // Read via ref inside the attach-lifecycle effect below so a readOnly
   // flip (allowInput probe resolving after mount) doesn't tear down and
   // re-subscribe the whole attach — only paneWrite needs the live value.
@@ -117,7 +119,13 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
    * and nothing renders from it.
    */
   const remoteKeyboardRef = useRef(INITIAL_REMOTE_KEYBOARD_STATE);
-  readOnlyRef.current = readOnly;
+  // A host that rejected the credential takes no input either: swallow it
+  // locally instead of POSTing writes the host will refuse.
+  readOnlyRef.current = readOnly || authRejected || insecure || insecureTransport;
+  const hostIdRef = useRef(hostId);
+  hostIdRef.current = hostId;
+  const hostLabelRef = useRef(hostLabel);
+  hostLabelRef.current = hostLabel;
   // Same reason: the key handler is installed once, at mount, and needs the
   // CURRENT attach to write to. Listing `attachId` in that effect's deps would
   // re-create the terminal on every reconnect and drop the mirrored scrollback.
@@ -126,9 +134,9 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
 
   /**
    * How many snapshot repaints are currently being fed to the parser. Second
-   * line of defence behind {@link isDeviceReply}: a reply shape that list does
-   * not know about still cannot escape during a replay, which is where a
-   * snapshot's worth of queries arrives at once.
+   * line of defence behind {@link gateUserInput}: should the user-input signal
+   * ever be unavailable, a replay — where a snapshot's worth of queries arrives
+   * at once — still cannot answer.
    *
    * A COUNT, not a flag. xterm parses a large write in ~12 ms slices, so a
    * second repaint can start while the first is still being consumed — and with
@@ -206,10 +214,158 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
   const fitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** When the pending timer is due. A later request never postpones it. */
   const fitDueAtRef = useRef(0);
+  /** A fit pass skipped while a layout transition held fits. */
+  const fitHeldDebtRef = useRef(false);
   /** The user's terminal font size is the fit's UPPER BOUND, not its output —
    *  read through a ref so the fit callback can stay identity-stable. */
   const maxFontSizeRef = useRef(terminalFontSize);
   maxFontSizeRef.current = terminalFontSize;
+
+  /**
+   * The resize request, decided once per {@link mirrorResizeRequestKey} — box
+   * size, font ceiling, face, pixel ratio — never per remote grid: a grant
+   * changes the remote grid, and a decision keyed on it re-armed itself on
+   * every grant (see mirrorFit.ts). `consumed` is the key whose decision is
+   * done: asked and answered (granted, or refused for good), or nothing to ask.
+   */
+  const consumedRequestKeyRef = useRef<string | null>(null);
+  /** The request key the latest fit pass computed. */
+  const currentRequestKeyRef = useRef<string | null>(null);
+  /** The request on the wire or waiting to be retried. Identity-compared: a
+   *  reply for anything but the current object is stale. */
+  const inflightRef = useRef<{ key: string } | null>(null);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const deskProbeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const externalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Grids that are the echo of this mirror's own latest request (asked for,
+   *  and what the host applied). A resize carrying one of them is our grant
+   *  coming back, and must never re-open the decision. */
+  const echoGridsRef = useRef<Set<string>>(new Set());
+  /** When the host last granted a request of ours. */
+  const lastGrantAtRef = useRef(-Infinity);
+  const externalStateRef = useRef(initialExternalResizeState());
+
+  /** Cell size measured while the mirror was drawn at the font ceiling, keyed
+   *  by {@link mirrorCeilingCellKey}. xterm's cell size is a staircase in the
+   *  font size, so a request is only ever computed from this measurement —
+   *  never extrapolated from a shrunk font. */
+  const ceilingCellRef = useRef<{ key: string; width: number; height: number } | null>(null);
+
+  /** Whether the remote's grid has arrived (a meta, or the first resize).
+   *  Before it, `term.cols` is xterm's default and a request would be noise. */
+  const gridKnownRef = useRef(false);
+
+  const clearRequestTimers = useCallback(() => {
+    for (const ref of [retryTimerRef, deskProbeTimerRef, externalTimerRef]) {
+      if (ref.current !== null) {
+        clearTimeout(ref.current);
+        ref.current = null;
+      }
+    }
+  }, []);
+
+  /** Forget every decision, e.g. for a new attach. */
+  const resetRequestState = useCallback(() => {
+    clearRequestTimers();
+    consumedRequestKeyRef.current = null;
+    inflightRef.current = null;
+    echoGridsRef.current = new Set();
+    lastGrantAtRef.current = -Infinity;
+    externalStateRef.current = initialExternalResizeState();
+  }, [clearRequestTimers]);
+
+  /** Re-open the decision for the current key, unless a request is already
+   *  out for it, and run a fit pass to make it. */
+  const reopenDecision = useCallback(() => {
+    if (inflightRef.current && inflightRef.current.key === currentRequestKeyRef.current) return;
+    consumedRequestKeyRef.current = null;
+    scheduleFitRef.current();
+  }, []);
+
+  /**
+   * Ask the remote daemon to resize the PTY to `cols × rows` — the preferred
+   * fix for a box/grid mismatch, with font-shrink covering the box meanwhile.
+   * The grant itself reaches the mirror through `onPaneResize`; the reply here
+   * only decides whether this key's decision is done:
+   * - accepted: done.
+   * - `desk-owns-size`: done, but asked again every DESK_PROBE_INTERVAL_MS
+   *   while nothing changes, because the host sends no event when its own
+   *   window stops showing the pane.
+   * - rate-limited / transient: retried with backoff while the attach and the
+   *   key are still current; done once the backoff runs out.
+   * - anything else: done.
+   */
+  const sendResizeRequest = useCallback((key: string, cols: number, rows: number, attempt: number) => {
+    const id = attachIdRef.current;
+    const remote = window.electronAPI?.remote;
+    if (!id || !remote?.paneResize) return;
+    const request = { key };
+    inflightRef.current = request;
+    echoGridsRef.current = new Set([`${cols}x${rows}`]);
+    const current = () =>
+      inflightRef.current === request && attachIdRef.current === id && currentRequestKeyRef.current === key;
+    const settle = (res: { ok: true; cols: number; rows: number } | { ok: false; reason: string }) => {
+      if (!current()) {
+        if (inflightRef.current === request) {
+          inflightRef.current = null;
+          scheduleFitRef.current();
+        }
+        return;
+      }
+      inflightRef.current = null;
+      if (res.ok) {
+        echoGridsRef.current.add(`${res.cols}x${res.rows}`);
+        lastGrantAtRef.current = Date.now();
+        consumedRequestKeyRef.current = key;
+        return;
+      }
+      const kind = classifyResizeRefusal(res.reason);
+      if (kind === 'retry') {
+        const delay = resizeRetryDelayMs(attempt);
+        if (delay !== null) {
+          inflightRef.current = request;
+          retryTimerRef.current = setTimeout(() => {
+            retryTimerRef.current = null;
+            if (!current()) {
+              if (inflightRef.current === request) inflightRef.current = null;
+              scheduleFitRef.current();
+              return;
+            }
+            sendResizeRequestRef.current(key, cols, rows, attempt + 1);
+          }, delay);
+          return;
+        }
+      }
+      consumedRequestKeyRef.current = key;
+      if (kind === 'desk') {
+        if (deskProbeTimerRef.current !== null) clearTimeout(deskProbeTimerRef.current);
+        deskProbeTimerRef.current = setTimeout(() => {
+          deskProbeTimerRef.current = null;
+          if (attachIdRef.current === id && consumedRequestKeyRef.current === key) reopenDecision();
+        }, DESK_PROBE_INTERVAL_MS);
+      }
+    };
+    remote.paneResize(id, cols, rows).then(
+      settle,
+      (err: unknown) => settle({ ok: false, reason: err instanceof Error ? err.message : String(err) }),
+    );
+  }, [reopenDecision]);
+  const sendResizeRequestRef = useRef(sendResizeRequest);
+  sendResizeRequestRef.current = sendResizeRequest;
+
+  /** A resize this mirror did not ask for: the host's own window, or another
+   *  viewer. Re-open the decision once, rate-limited, and yield to a party that
+   *  keeps overriding our grants (see planExternalReopen). */
+  const noteExternalResize = useCallback(() => {
+    const delay = planExternalReopen(externalStateRef.current, Date.now(), lastGrantAtRef.current);
+    if (delay === null) return;
+    if (externalTimerRef.current !== null) clearTimeout(externalTimerRef.current);
+    externalTimerRef.current = setTimeout(() => {
+      externalTimerRef.current = null;
+      externalStateRef.current.lastReopenAt = Date.now();
+      reopenDecision();
+    }, delay);
+  }, [reopenDecision]);
 
   /**
    * One measure→decide→apply pass, run from an animation frame so it lands
@@ -239,6 +395,90 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
       maxFontSize: maxFontSizeRef.current,
       fontFamily: terminalFontFamilyRef.current,
     });
+    // Remember the real cell size whenever the mirror is drawn at the ceiling.
+    // Same clamp computeMirrorGeometry applies, so the two agree on "ceiling".
+    const dpr = window.devicePixelRatio || 1;
+    const ceiling = Math.max(MIN_MIRROR_FONT_SIZE, maxFontSizeRef.current);
+    const ceilingKey = mirrorCeilingCellKey({
+      ceilingFontSize: ceiling,
+      fontFamily: terminalFontFamilyRef.current,
+      devicePixelRatio: dpr,
+    });
+    if (
+      term.options.fontSize === ceiling &&
+      term.cols > 0 && term.rows > 0 &&
+      screen.offsetWidth > 0 && screen.offsetHeight > 0
+    ) {
+      ceilingCellRef.current = {
+        key: ceilingKey,
+        width: screen.offsetWidth / term.cols,
+        height: screen.offsetHeight / term.rows,
+      };
+    }
+
+    // The resize request: decided once per box size, not once per remote grid.
+    const requestKey = mirrorResizeRequestKey({
+      boxWidth,
+      boxHeight,
+      maxFontSize: maxFontSizeRef.current,
+      fontFamily: terminalFontFamilyRef.current,
+      devicePixelRatio: dpr,
+    });
+    if (requestKey !== currentRequestKeyRef.current) {
+      // The user changed something on this side: a fresh decision, and any
+      // standing yield to another viewer or pending desk probe is void.
+      currentRequestKeyRef.current = requestKey;
+      externalStateRef.current = initialExternalResizeState();
+      clearRequestTimers();
+    }
+    const pending = inflightRef.current !== null && inflightRef.current.key === requestKey;
+    if (
+      gridKnownRef.current && !pending &&
+      requestKey !== consumedRequestKeyRef.current &&
+      boxWidth > 0 && boxHeight > 0
+    ) {
+      const cell = ceilingCellRef.current && ceilingCellRef.current.key === ceilingKey
+        ? ceilingCellRef.current
+        : null;
+      if (!cell) {
+        // Measure before deciding: draw at the ceiling for one pass, and let
+        // the fit start over from there. Deciding from an extrapolation
+        // instead would spend this key on a grid a cell or two off.
+        if (term.options.fontSize !== ceiling && screen.offsetWidth > 0 && screen.offsetHeight > 0) {
+          term.options.fontSize = ceiling;
+          state.boxKey = '';
+          scheduleFit();
+          return;
+        }
+      } else {
+        const ideal = computeMirrorGeometry({
+          boxWidth,
+          boxHeight,
+          cols: term.cols,
+          rows: term.rows,
+          renderedWidth: screen.offsetWidth,
+          renderedHeight: screen.offsetHeight,
+          currentFontSize: term.options.fontSize ?? maxFontSizeRef.current,
+          maxFontSize: maxFontSizeRef.current,
+          ceilingCell: cell,
+        });
+        if (ideal) {
+          // Only worth a round trip (and a SIGWINCH on the remote) when the grid
+          // is off by more than the font fit can absorb.
+          if (
+            shouldRequestRemoteResize(ideal, term.cols, term.rows) &&
+            ideal.cols >= MIN_REMOTE_RESIZE_COLS && ideal.rows >= MIN_REMOTE_RESIZE_ROWS
+          ) {
+            sendResizeRequest(requestKey, ideal.cols, ideal.rows, 0);
+          } else {
+            consumedRequestKeyRef.current = requestKey;
+            inflightRef.current = null;
+            clearRequestTimers();
+          }
+        }
+      }
+    }
+
     if (boxKey !== state.boxKey) {
       state.boxKey = boxKey;
       state.settled = undefined;
@@ -249,6 +489,25 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
     state.passes += 1;
 
     const currentFontSize = term.options.fontSize ?? maxFontSizeRef.current;
+    // With the ceiling cell measured, "does the grid fit at the user's font?"
+    // has an exact answer. Take it: the linear prediction below, made from a
+    // shrunk font's cells, can land half a point short, and the shrink-only
+    // guard would then hold the mirror below the configured font for good.
+    const measuredCell = ceilingCellRef.current && ceilingCellRef.current.key === ceilingKey
+      ? ceilingCellRef.current
+      : null;
+    if (
+      measuredCell &&
+      term.cols * measuredCell.width <= boxWidth &&
+      term.rows * measuredCell.height <= boxHeight
+    ) {
+      state.settled = ceiling;
+      if (currentFontSize !== ceiling) {
+        term.options.fontSize = ceiling;
+        scheduleFit();
+      }
+      return;
+    }
     const { fontSize } = computeMirrorFontSize({
       boxWidth,
       boxHeight,
@@ -304,10 +563,23 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
       fitTimerRef.current = null;
       fitFrameRef.current = requestAnimationFrame(() => {
         fitFrameRef.current = null;
+        // An animated layout change (the sidebar toggle) holds fits: a pass
+        // now would ask the remote for a mid-animation grid. The release
+        // below runs the one pass instead.
+        if (fitsHeld()) {
+          fitHeldDebtRef.current = true;
+          return;
+        }
         runFit();
       });
     }, delayMs);
   }, [runFit]);
+
+  useEffect(() => onFitsReleased(() => {
+    if (!fitHeldDebtRef.current) return;
+    fitHeldDebtRef.current = false;
+    scheduleFit();
+  }), [scheduleFit]);
 
   // Re-fit when the box changes size. A mirror in a non-active workspace lives
   // inside `display:none` (WorkspaceCenter's hidden-but-alive rule), where every
@@ -317,7 +589,15 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
   useEffect(() => {
     const box = boxRef.current;
     if (!box || typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(() => scheduleFit(FIT_DEBOUNCE_MS));
+    // Through the layout-transition gate: ticks during a held transition
+    // become one fit on release, never one remote resize per frame.
+    const ro = new ResizeObserver(() => {
+      if (fitsHeld()) {
+        fitHeldDebtRef.current = true;
+        return;
+      }
+      scheduleFit(FIT_DEBOUNCE_MS);
+    });
     ro.observe(box);
     return () => ro.disconnect();
   }, [scheduleFit]);
@@ -335,6 +615,32 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
   // SSE stream and re-attaches it. Same discipline as `readOnlyRef`.
   const scheduleFitRef = useRef(scheduleFit);
   scheduleFitRef.current = scheduleFit;
+  const noteExternalResizeRef = useRef(noteExternalResize);
+  noteExternalResizeRef.current = noteExternalResize;
+
+  // Request timers die with the component, like the fit's own.
+  useEffect(() => clearRequestTimers, [clearRequestTimers]);
+
+  // Moving the window to a display with another pixel ratio changes every cell
+  // size: the measured ceiling cell is void and the box needs a new decision
+  // (the request key carries the ratio). `resolution` only matches one exact
+  // value, so the query is re-armed for the new ratio on every change.
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return;
+    let mql: MediaQueryList | null = null;
+    const onChange = () => {
+      ceilingCellRef.current = null;
+      arm();
+      scheduleFit();
+    };
+    const arm = () => {
+      mql?.removeEventListener('change', onChange);
+      mql = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+      mql.addEventListener('change', onChange);
+    };
+    arm();
+    return () => mql?.removeEventListener('change', onChange);
+  }, [scheduleFit]);
 
   // Mount the xterm instance once, for the lifetime of this component.
   //
@@ -361,6 +667,22 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
       // is the one wrapping the whole main area. One attached remote workspace
       // would take the entire local pane grid down with it.
       allowProposedApi: true,
+      // #1437: same as a local pane — a writable mirror forwards the remote
+      // app's mouse tracking, so Option+drag is the Mac user's only way to
+      // select. installAltClickTrackingGuard below keeps Option+click from
+      // typing arrow keys into that app.
+      macOptionClickForcesSelection: true,
+      // #1271: without this, OSC 8 links fall back to xterm's window.open()
+      // of about:blank, which the window-open policy denies, so a confirmed
+      // click did nothing. Same confirmation handler as a local pane, but the
+      // destination came from a REMOTE PTY: never open it in a local browser
+      // pane, and refuse loopback hosts outright, since `localhost` there
+      // names the remote machine and here would aim requests at local
+      // services.
+      linkHandler: createOsc8LinkHandler(
+        (_event, href) => { void window.electronAPI?.shell?.openExternal(href); },
+        (href) => !isLoopbackHref(href),
+      ),
     });
     // The width model, BEFORE open() — same order as the local pane.
     //
@@ -412,6 +734,7 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
       ev.stopPropagation();
     };
     if (isMac) container.addEventListener('paste', blockNativePaste, true);
+    const detachAltClickGuard = installAltClickTrackingGuard(container, term);
 
     // Auto-copy on selection, debounced exactly like a local pane's. Silent on
     // failure: the explicit Ctrl+C path surfaces its own error when retried.
@@ -421,6 +744,66 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
     const selectionDisposable = term.onSelectionChange(() => {
       autoCopy.onSelection(term.getSelection());
     });
+
+    // OSC 52 clipboard-write bridge, gated. With mouse tracking on (Claude Code
+    // fullscreen, vim, tmux) a drag never becomes an xterm selection: the remote
+    // app draws its own highlight and, on mouse-up, asks the terminal to copy by
+    // emitting OSC 52. A local pane bridges that (useTerminal.ts); a mirror did
+    // not, so xterm dropped the request and nothing — not auto-copy, not ⌘C,
+    // not Ctrl+Shift+C, which all need an xterm selection — reached the local
+    // clipboard. These bytes come from another machine, though, so a write is
+    // honoured only right after a completed mouse drag in THIS mirror (see
+    // createMirrorGestureTracker and shouldHonorMirrorClipboardWrite).
+    // Keyboard input never opens the window, so a keyboard-driven yank in the
+    // remote app is not honoured here. `repaintDepthRef` is the mirror's replay
+    // mute: an attach/reconnect snapshot is stored output, and a write inside
+    // it is an old copy, not a new one.
+    //
+    // Mouse events rather than pointer capture: capturing on the container
+    // would retarget xterm's own drag events away from its screen element.
+    // A lost mouseup is handled by disarming instead (see the tracker).
+    const gestures = createMirrorGestureTracker();
+    const onPressInside = (e: MouseEvent): void => {
+      if (e.button === 0) gestures.pressInside(Date.now());
+    };
+    const onPressAnywhere = (e: MouseEvent): void => {
+      if (!(e.target instanceof Node) || !container.contains(e.target)) gestures.cancel();
+    };
+    const onRelease = (): void => { gestures.release(Date.now()); };
+    const onDisarm = (): void => { gestures.cancel(); };
+    const onVisibility = (): void => { if (document.visibilityState === 'hidden') gestures.cancel(); };
+    container.addEventListener('mousedown', onPressInside, true);
+    window.addEventListener('mousedown', onPressAnywhere, true);
+    window.addEventListener('mouseup', onRelease, true);
+    window.addEventListener('pointercancel', onDisarm, true);
+    window.addEventListener('blur', onDisarm);
+    document.addEventListener('visibilitychange', onVisibility);
+    // #1792: mouse / focus modes a killed TUI left armed are cleared once the
+    // remote shell prints its prompt, so this mirror stops POSTing reports
+    // into that shell. Same guard as the local panes (useTerminal).
+    installShellPromptModeReset(term);
+    const osc52Disposable = term.parser.registerOscHandler(52, createOsc52Handler({
+      isReplaying: () => !shouldHonorMirrorClipboardWrite({
+        now: Date.now(),
+        lastGestureAt: gestures.completedAt(),
+        replaying: repaintDepthRef.current > 0,
+        readOnly: readOnlyRef.current === true,
+        visible: typeof container.checkVisibility === 'function' ? container.checkVisibility() : container.isConnected,
+      }),
+      writeClipboard: (text) => {
+        // One gesture, one write: a host cannot follow the user's copy with a
+        // second, different payload inside the same window.
+        gestures.consume();
+        // Never silent: say which machine just set this one's clipboard.
+        const label = hostLabelRef.current;
+        showCopyToastText(label
+          ? translate('remote.clipboardCopiedFrom', { host: label })
+          : translate('remote.clipboardCopiedFromRemote'));
+        // Fire-and-forget, as on a local pane: the app already showed its own
+        // "copied" feedback and has no channel for a rejection.
+        void window.clipboardAPI.writeText(text).catch(() => { /* size cap / lock — nothing to report */ });
+      },
+    }));
 
     // #1086/#1091 — xterm's own parser already extracts the OSC 0/2 payload
     // (icon title / window title); sanitize it exactly like PTYBridge does
@@ -488,6 +871,14 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
     scheduleFitRef.current();
     return () => {
       if (isMac) container.removeEventListener('paste', blockNativePaste, true);
+      detachAltClickGuard();
+      container.removeEventListener('mousedown', onPressInside, true);
+      window.removeEventListener('mousedown', onPressAnywhere, true);
+      window.removeEventListener('mouseup', onRelease, true);
+      window.removeEventListener('pointercancel', onDisarm, true);
+      window.removeEventListener('blur', onDisarm);
+      document.removeEventListener('visibilitychange', onVisibility);
+      osc52Disposable.dispose();
       selectionDisposable.dispose();
       titleDisposable.dispose();
       // Cancels a debounced write that would otherwise fire against a disposed
@@ -529,6 +920,12 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
     if (!attachId) return;
     setExited(false);
     setDisconnected(false);
+    setAuthRejected(false);
+    // A fresh attachId is a different session (or a reconnect to the same
+    // one) — either way, whatever this component last asked THAT session's
+    // daemon to resize to says nothing about this one.
+    resetRequestState();
+    gridKnownRef.current = false;
     const remote = window.electronAPI?.remote;
     if (!remote) return;
 
@@ -537,7 +934,14 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
       const term = termRef.current;
       if (!term) return;
       term.reset();
+      // #1794: a new stream starts here; the prompt-mode guard forgets the old one.
+      shellPromptModeResetFor(term)?.reset();
       term.resize(e.cols, e.rows);
+      // A fresh attach or a reconnect: the grid is new information, so the box
+      // gets one decision against it. (A grant arrives as onPaneResize, below,
+      // and deliberately does not reset this.)
+      gridKnownRef.current = true;
+      resetRequestState();
       repaintDepthRef.current += 1;
       try {
         const snapshot = decodeBase64Bytes(e.snapshotB64);
@@ -566,7 +970,17 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
     // repaints itself on SIGWINCH; those bytes arrive through onPaneData.
     const offResize = remote.onPaneResize((e) => {
       if (e.attachId !== attachId) return;
-      termRef.current?.resize(e.cols, e.rows);
+      const term = termRef.current;
+      const before = term ? `${term.cols}x${term.rows}` : '';
+      term?.resize(e.cols, e.rows);
+      const grid = `${e.cols}x${e.rows}`;
+      // A missed meta (a viewer that joined late) must not block requests
+      // until the next reconnect: any geometry from the remote is the grid.
+      if (!gridKnownRef.current) {
+        gridKnownRef.current = true;
+      } else if (grid !== before && !echoGridsRef.current.has(grid)) {
+        noteExternalResizeRef.current();
+      }
       scheduleFitRef.current();
     });
     const offData = remote.onPaneData((e) => {
@@ -587,17 +1001,38 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
     });
     const offError = remote.onPaneError((e) => {
       if (e.attachId !== attachId) return;
-      setDisconnected(true);
+      if (e.reason === 'auth-rejected') {
+        readOnlyRef.current = true; // before the re-render: the next key is already swallowed
+        setAuthRejected(true);
+        if (hostIdRef.current) useStore.getState().setRemoteHostAuthRejected(hostIdRef.current, true);
+      } else if (e.reason === 'insecure-transport') {
+        readOnlyRef.current = true;
+        setInsecure(true);
+        if (hostIdRef.current) useStore.getState().setRemoteHostInsecure(hostIdRef.current, true);
+      } else {
+        setDisconnected(true);
+      }
     });
-    const dataDisposable = termRef.current?.onData((data) => {
-      if (readOnlyRef.current) return; // read-only host — swallow locally, don't POST a write that'll be rejected
-      // A query answer xterm produced on its own, from a replayed snapshot OR
-      // from live output — the remote app sends `ESC[6n` mid-session too, and
-      // gating only the repaint left that path answering. See isDeviceReply.
-      if (isDeviceReply(data)) return;
-      if (repaintDepthRef.current > 0) return;
-      remote.paneWrite(attachId, data);
-    });
+    // Answers xterm generates BY ITSELF to device queries in the output come
+    // out of the same `onData` as the user's keystrokes. A mirror must never
+    // send them: the machine that owns the pane has its own terminal, that one
+    // is the authoritative responder, and a second answer is a line of garbage
+    // typed into a live remote shell. (HeadlessSnapshot avoids the problem by
+    // never wiring `onData` — a mirror cannot, it also carries real typing.)
+    // That holds for live output too (the remote app sends `ESC[6n`
+    // mid-session), not just a replay. `gateUserInput` tells the two apart by
+    // xterm's own user-input signal, not by shape: a modified F3 is byte for
+    // byte a cursor report.
+    const userInput = termRef.current
+      ? gateUserInput(termRef.current as unknown as UserInputTerminal, (data) => {
+        if (readOnlyRef.current) return; // read-only host — swallow locally, don't POST a write that'll be rejected
+        if (repaintDepthRef.current > 0) return;
+        // #1794: reports of leaked modes whose reset has not applied yet.
+        if (termRef.current && shellPromptModeResetFor(termRef.current)?.dropsReport(data)) return;
+        remote.paneWrite(attachId, data);
+      })
+      : null;
+    const dataDisposable = userInput ? termRef.current?.onData(userInput) : undefined;
 
     return () => {
       offMeta();
@@ -606,6 +1041,7 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
       offExit();
       offError();
       dataDisposable?.dispose();
+      userInput?.dispose();
       remote.paneDetach(attachId).catch(() => { /* best-effort teardown — nothing for the caller to act on */ });
     };
   }, [attachId]);
@@ -623,7 +1059,7 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
     // the single frame between a remote resize and the fit that answers it.
     <div ref={boxRef} className="relative w-full h-full min-h-0 min-w-0 overflow-hidden">
       <div ref={containerRef} className="absolute inset-0 overflow-hidden" />
-      {error && (
+      {error && !insecureTransport && (
         <div
           className="absolute inset-0 flex items-center justify-center text-[11px] font-mono px-2 text-center"
           style={{ color: 'var(--accent-red)', background: 'var(--bg-base)' }}
@@ -645,6 +1081,17 @@ export default function RemoteMirrorTerminal({ attachId, error, readOnly, onTitl
           style={{ color: 'var(--accent-red)', background: 'var(--bg-overlay-scrim, rgba(0, 0, 0, 0.55))' }}
         >
           {t('remote.disconnected')}
+        </div>
+      )}
+      {(authRejected || insecure || insecureTransport) && (
+        <div
+          role="alert"
+          className="absolute bottom-0 left-0 right-0 px-2 py-1 text-[10px] font-mono"
+          style={{ color: 'var(--accent-red)', background: 'var(--bg-overlay-scrim, rgba(0, 0, 0, 0.55))' }}
+        >
+          {insecure || insecureTransport
+            ? t('remote.insecureHost', { host: hostLabel || t('remote.hostFallback') })
+            : t('remote.authRejected', { host: hostLabel || t('remote.hostFallback') })}
         </div>
       )}
     </div>

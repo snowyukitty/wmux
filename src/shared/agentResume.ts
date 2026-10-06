@@ -60,7 +60,13 @@ const RESUME_BY_LAUNCHER: Readonly<Record<string, ResumeGrammar>> = {
  * (permission stage) rather than via {@link toResumeCommand}.
  */
 export function resumeGrammarFor(agent: string): ResumeGrammar | undefined {
-  return RESUME_BY_LAUNCHER[agent];
+  // Own-property check, not a bare index: a plain object literal answers
+  // `constructor` / `toString` with something truthy off its prototype, and a
+  // slug now reaches here from ANOTHER machine (#1342). Without this, such a
+  // slug passes as a resumable agent and then has no `withId` to call.
+  return Object.prototype.hasOwnProperty.call(RESUME_BY_LAUNCHER, agent)
+    ? RESUME_BY_LAUNCHER[agent]
+    : undefined;
 }
 
 /**
@@ -70,7 +76,7 @@ export function resumeGrammarFor(agent: string): ResumeGrammar | undefined {
  * on resume, or a `--dangerously-skip-permissions` workflow drops back to prompts
  * after a reboot.
  */
-export type PermissionMode = 'bypassPermissions' | 'acceptEdits' | 'plan' | 'default';
+export type PermissionMode = 'bypassPermissions' | 'acceptEdits' | 'plan' | 'auto' | 'default';
 
 /**
  * permissionMode → the launch flag that re-enables it. `default` maps to no flag
@@ -81,6 +87,7 @@ export const PERMISSION_FLAG: Readonly<Record<PermissionMode, string>> = {
   bypassPermissions: '--dangerously-skip-permissions',
   acceptEdits: '--permission-mode acceptEdits',
   plan: '--permission-mode plan',
+  auto: '--permission-mode auto',
   default: '',
 };
 
@@ -148,6 +155,21 @@ export interface ResumeBinding {
   transcriptPath?: string;
   /** Capture time (ms). Staleness is decided by existence-probe, not a TTL. */
   ts: number;
+}
+
+/**
+ * Whether a resume binding read from disk, or received over the wire, has the
+ * fields its consumers read without a check: a non-empty agent, session id and
+ * folder (`cwd`). A stored binding failing this is skipped, never used.
+ */
+export function isUsableResumeBinding(binding: unknown): binding is ResumeBinding {
+  if (binding === null || typeof binding !== 'object') return false;
+  const b = binding as Record<string, unknown>;
+  return (
+    typeof b.agent === 'string' && b.agent.length > 0
+    && typeof b.sessionId === 'string' && b.sessionId.length > 0
+    && typeof b.cwd === 'string' && b.cwd.length > 0
+  );
 }
 
 /**
@@ -222,6 +244,30 @@ export function tokenize(command: string): Token[] {
 export function launcherStem(firstToken: string): string {
   const base = firstToken.split(/[\\/]/).pop() ?? '';
   return base.toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/, '');
+}
+
+/**
+ * True when `next` must NOT replace `prev`: both belong to the same transcript
+ * agent, `prev` already points at a real transcript, and `next` names a
+ * DIFFERENT session that has no transcript yet.
+ *
+ * - claude: a SessionStart fires before its transcript exists (F9) and carries
+ *   the provisional id; a reboot in between would `--resume <wrong id>`.
+ * - codex (#1624): during the first turn Codex also completes an internal
+ *   title-generation thread that never gets a rollout. Its notify inherits the
+ *   pane env, so it arrives pane-exact and would otherwise clobber the real
+ *   session and leave the pane `no-transcript-path`.
+ *
+ * A genuine session switch (`/new`, resume) still rebinds: transcript discovery
+ * re-applies the new id WITH its path the moment its transcript exists.
+ */
+export function isProvisionalCapture(prev: ResumeBinding | undefined, next: ResumeBinding): boolean {
+  return !!prev
+    && (next.agent === 'claude' || next.agent === 'codex')
+    && prev.agent === next.agent
+    && !!prev.transcriptPath
+    && !next.transcriptPath
+    && prev.sessionId !== next.sessionId;
 }
 
 /**

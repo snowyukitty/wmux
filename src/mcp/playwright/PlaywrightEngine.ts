@@ -6,6 +6,7 @@ import { isMac } from '../../shared/platform';
 import { formatMacosError, MACOS_ERRORS } from '../../shared/errors/macos';
 import type { BrowserBackend } from '../../shared/browserBackend';
 import { EXTERNAL_BACKEND_UNSUPPORTED_MESSAGE } from '../../shared/browserBackend';
+import { AgentWindowScopeError } from '../../shared/liveWriteScope';
 import {
   assertBrowserTargetScope,
   isWorkspaceScopeUnresolvedError,
@@ -15,6 +16,11 @@ import {
 } from './browserScope';
 import { attachPageCapture } from './pageCapture';
 import { reassertUserAgentEmulation } from './ua-emulation';
+import {
+  getOpenerKey,
+  openSurfaceForConnection,
+  resolveDefaultSurface,
+} from './surfaceRouting';
 
 export { WORKSPACE_SCOPE_UNRESOLVED_CODE } from './browserScope';
 
@@ -28,6 +34,20 @@ interface CdpTargetInfo {
    * page. See resolveCallerSurface().
    */
   workspaceId?: string;
+  /**
+   * Whether the CALLING connection opened this surface, as main recorded it.
+   * Absent when nobody claims it — restored after a restart, opened by a
+   * person, or opened before openers were recorded. Used by surfaceRouting to
+   * keep an unsaid target on the caller's own surface.
+   */
+  opener?: 'mine' | 'other';
+  /**
+   * Live Chrome only: whether the calling workspace may WRITE to this tab
+   * ('agent' = wmux opened it for this workspace, 'borrowed' = the user lent
+   * it). Main seeds only those two kinds into this list, so a live target that
+   * is ABSENT from it is one the agent may read but not drive.
+   */
+  owner?: 'agent' | 'borrowed' | 'user';
 }
 
 interface CdpInfoResponse {
@@ -67,6 +87,15 @@ interface CdpInfoResponse {
    * /json surface behind it.
    */
   wsEndpoint?: string;
+  /**
+   * Live Chrome only: the write-scope policy in force (the agent-window
+   * policy). 'agent' means writes are confined to the workspace's own tabs plus
+   * lent ones; 'all' is the operator opt-out that restores full write exposure.
+   * Absent on every other backend and on an older main — both read as "no gate
+   * to apply here", which is correct: a dedicated instance can only address tabs
+   * wmux opened.
+   */
+  liveWriteScope?: 'agent' | 'all';
   targets: CdpTargetInfo[];
 }
 
@@ -287,6 +316,38 @@ export class PlaywrightEngine {
     if (info.workspaceBackend) {
       this.workspaceBackend = info.workspaceBackend;
     }
+    // Same rule for the live write-scope marker: only a present value moves it.
+    // It is the ONE signal that tells this lane it is on Live Chrome and has a
+    // gate to apply — wsEndpoint cannot serve, because main withholds that from
+    // callers it will not hand an attach primitive to, and "withheld" would then
+    // read as "no policy".
+    if (info.liveWriteScope) {
+      this.liveWriteScope = info.liveWriteScope;
+    }
+  }
+
+  /** The live write-scope policy as main last reported it. undefined until a
+   *  cdp.info response has said, and on every non-live backend. */
+  private liveWriteScope: 'agent' | 'all' | undefined;
+
+  /**
+   * Is this workspace on Live Chrome with writes confined to the agent window?
+   *
+   * For a tool whose mutation is not per-tab at all — a cookie write lands on
+   * the whole browser profile, every tab and site — the per-tab ownership gate
+   * proves nothing, so the tool asks this instead and refuses outright. Asked
+   * fresh (one cdp.info round trip) because the policy is the operator's and
+   * can have moved since it was cached; an unreachable main keeps the last
+   * answer, which on a fresh engine is "not live".
+   */
+  async isLiveWriteConfined(workspaceId: string): Promise<boolean> {
+    try {
+      const info = (await sendRpc('browser.cdp.info', { workspaceId })) as CdpInfoResponse;
+      this.cacheShellUrl(info);
+    } catch {
+      /* keep the cached answer */
+    }
+    return this.liveWriteScope === 'agent';
   }
 
   /**
@@ -395,6 +456,10 @@ export class PlaywrightEngine {
     // Drop the cached backend marker for the same reason — it is re-learned
     // from the next cdp.info response (#517).
     this.workspaceBackend = undefined;
+    // Re-learned from the next cdp.info response, like the backend marker. A
+    // stale 'agent' would gate a builtin session; a stale 'all' would un-gate a
+    // live one, which is the direction that matters.
+    this.liveWriteScope = undefined;
     this.connectedWorkspaceId = undefined;
     if (s) {
       await s.detach().catch(() => { /* session may already be gone */ });
@@ -509,14 +574,18 @@ export class PlaywrightEngine {
    * reused by its lease and fallback RPCs (#695). This avoids a second identity
    * lookup and also scopes explicit-surface discovery on the main side.
    */
-  private async getPage(surfaceId?: string, workspaceId?: string): Promise<Page | null> {
+  private async getPage(
+    surfaceId?: string,
+    workspaceId?: string,
+    knownNoSurface?: boolean,
+  ): Promise<Page | null> {
     // Resolve the selection context (which workspace/surface this call targets)
     // BEFORE consulting any shared state, so the lock, fast-fail latch, and
     // auto-open latch are all scoped to THIS caller's workspace and can never
     // bleed into another's (#554). Context resolution needs only the control
     // RPC (browser.cdp.info); the CDP browser connection happens in
     // _getPageImpl as before.
-    const ctx = await this.resolveSelectionContext(surfaceId, workspaceId);
+    const ctx = await this.resolveSelectionContext(surfaceId, workspaceId, knownNoSurface);
 
     // External-backend contract (#517): the caller's workspace delegates opens
     // to the OS browser and owns no builtin webview target (callerHasNoSurface,
@@ -554,9 +623,20 @@ export class PlaywrightEngine {
    * verified workspace and optional surface in one required object makes a
    * dropped workspaceId a compile error at every tool call site.
    */
-  async getPageForScope(scope: BrowserTargetScope): Promise<Page | null> {
+  async getPageForScope(
+    scope: BrowserTargetScope,
+    // Live Chrome confines WRITES to the agent's own tabs plus lent ones, and
+    // this lane drives many of them (fill / select / upload / type) straight
+    // over CDP without main ever seeing the call — so the gate has to run here
+    // too. Default 'read' keeps every existing call site byte-identical; a
+    // mutating tool passes 'write' explicitly.
+    opts: { intent?: 'read' | 'write' } = {},
+  ): Promise<Page | null> {
     assertBrowserTargetScope(scope);
-    const page = await this.getPage(scope.surfaceId, scope.workspaceId);
+    const page = await this.getPage(scope.surfaceId, scope.workspaceId, scope.noSurface === true);
+    if (page && opts.intent === 'write') {
+      await this.assertLiveWriteAllowed(page, scope);
+    }
     // Chrome backend: main's webContents-side lifecycle capture cannot see
     // these tabs, so mirror navigations/closes engine-side (dogfood P1 — the
     // #1063 inline events went silent under 'chrome').
@@ -586,6 +666,71 @@ export class PlaywrightEngine {
     // place a re-send covers them all. A no-op when nothing is emulated.
     if (page) await reassertUserAgentEmulation(page);
     return page;
+  }
+
+  /**
+   * Refuse a write to a live tab this workspace does not own.
+   *
+   * Ownership is asked of MAIN, never decided here: main holds the map of which
+   * tabs wmux opened and which the user lent, and browser.cdp.info reports
+   * exactly those two kinds for the calling workspace. So a resolved target that
+   * is absent from that list is a tab the agent may read and must not drive -
+   * including a tab another workspace opened, which from here is indistinguish-
+   * able from the user's own, and should be.
+   *
+   * Only ever runs on live (the marker is absent elsewhere), and only for a
+   * write. A failure to READ the answer is a refusal: an ownership check that
+   * cannot be made is not a check.
+   *
+   * Cost, accepted rather than hidden: one cdp.info round trip plus a throwaway
+   * CDP session per gated write (and main answers it with a Target.getTargets of
+   * its own). A cached owned-id set would remove that, and would then have to be
+   * invalidated on every borrow, return, open and close, in a process that does
+   * not see most of them — a cache that goes stale in the permissive direction
+   * here hands an agent a tab the user took back. Measured need first, cache
+   * second.
+   */
+  private async assertLiveWriteAllowed(page: Page, scope: BrowserTargetScope): Promise<void> {
+    if (this.liveWriteScope !== 'agent') return;
+    // The label stands in for a method name: this lane covers a dozen mutating
+    // tools, and naming the wrong one would be worse than naming none.
+    const label = 'this tool call';
+    // No pinned surface and no readable target id leaves nothing to name, so the
+    // hint tells the agent where ids come from instead of inventing one.
+    const unknownId = scope.surfaceId ?? '<id from browser_tabs list>';
+    const targetId = await this.targetIdOf(page);
+    if (!targetId) throw new AgentWindowScopeError(label, unknownId);
+    let info: CdpInfoResponse;
+    try {
+      info = (await sendRpc('browser.cdp.info', { workspaceId: scope.workspaceId })) as CdpInfoResponse;
+    } catch {
+      throw new AgentWindowScopeError(label, targetId);
+    }
+    this.cacheShellUrl(info);
+    // The policy can have been switched to 'all' since the value was cached;
+    // this response is the current one, so honour it rather than the memory.
+    if (info.liveWriteScope !== 'agent') return;
+    const row = info.targets.find((t) => t.targetId === targetId || t.surfaceId === targetId);
+    if (row && row.owner !== 'user') return;
+    throw new AgentWindowScopeError(label, targetId);
+  }
+
+  /** A Page's CDP target id, over a throwaway session (client-side Pages expose
+   *  none). null when the page is gone or will not answer. */
+  private async targetIdOf(page: Page): Promise<string | null> {
+    try {
+      const session = await page.context().newCDPSession(page);
+      try {
+        const { targetInfo } = (await session.send('Target.getTargetInfo')) as {
+          targetInfo?: { targetId?: string };
+        };
+        return typeof targetInfo?.targetId === 'string' ? targetInfo.targetId : null;
+      } finally {
+        await session.detach().catch(() => { /* best-effort */ });
+      }
+    } catch {
+      return null;
+    }
   }
 
   /** Backend marker for tool-side path choices; resolves via one cdp.info
@@ -691,58 +836,41 @@ export class PlaywrightEngine {
     }
     if (!workspaceId) throw workspaceScopeUnresolved('workspace identity resolved to an empty id');
 
-    let info: CdpInfoResponse;
+    // One router for both entry points (surfaceRouting): the tool layer
+    // resolves the default before it takes a lease, and a direct engine call
+    // lands here — they must not be able to disagree about which surface a
+    // caller that named none is on.
+    let resolved: { kind: 'surface'; surfaceId: string } | { kind: 'none' };
     try {
-      // Pass our resolved workspace so main filters `targets` server-side
-      // (#580, Option 1). The response then carries only our own targets.
-      info = (await sendRpc('browser.cdp.info', { workspaceId })) as CdpInfoResponse;
+      resolved = await resolveDefaultSurface(workspaceId, {
+        // The response is the only place shellUrl and the backend marker
+        // arrive, so the router hands it back rather than making this a second
+        // round trip.
+        onInfo: (info) => this.cacheShellUrl(info as CdpInfoResponse),
+      });
     } catch (err) {
-      throw workspaceScopeUnresolved(
-        `browser.cdp.info unavailable: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      // Re-raise the router's refusal in this engine's own words: the message
+      // carries the remedy an agent reads, and it is logged on the way out.
+      if (isWorkspaceScopeUnresolvedError(err)) {
+        const reason = (err as Error).message.replace(
+          new RegExp(`^${WORKSPACE_SCOPE_UNRESOLVED_CODE}:\\s*`),
+          '',
+        );
+        throw workspaceScopeUnresolved(reason);
+      }
+      throw err;
     }
-    this.cacheShellUrl(info);
-
-    // A main that honored the scope request marks the response `targetsScoped`.
-    // Then an empty list unambiguously means "we own no live target" (kind:
-    // 'none'), and a present one is already ours — no client-side filter needed.
-    if (info.targetsScoped) {
-      const own = this.newestTarget(info.targets);
-      return own
-        ? { kind: 'surface', surfaceId: own.surfaceId, workspaceId }
-        : { kind: 'none', workspaceId };
-    }
-
-    // Legacy path: an older main ignored the param and returned every target.
-    //
-    // An EMPTY list from such a main is unambiguous no matter who it belongs to
-    // — there is no live guest anywhere — so it is 'none' (auto-open our own),
-    // which is what the old leniency was really protecting: a single-workspace
-    // setup with nothing to cross into.
-    if (info.targets.length === 0) return { kind: 'none', workspaceId };
-
-    // Targets exist but if NONE carry a workspaceId we cannot scope at all —
-    // and an unscopeable selection is a cross-workspace selection, so refuse.
-    // Matches how browser_tabs reports a main too old to scope
-    // (BROWSER_TABS_UNSUPPORTED) rather than falling back to something
-    // workspace-blind.
-    const anyTagged = info.targets.some(
-      (t) => typeof t.workspaceId === 'string' && t.workspaceId.length > 0,
-    );
-    if (!anyTagged) {
-      throw workspaceScopeUnresolved(
-        'the connected wmux main does not tag browser targets with a workspace',
-      );
-    }
-
-    const own = this.newestTarget(info.targets, workspaceId);
-    if (own) return { kind: 'surface', surfaceId: own.surfaceId, workspaceId };
-    return { kind: 'none', workspaceId };
+    return resolved.kind === 'surface'
+      ? { kind: 'surface', surfaceId: resolved.surfaceId, workspaceId }
+      : { kind: 'none', workspaceId };
   }
 
   /**
-   * The DEFAULT target when the caller pins no surfaceId: its MOST RECENTLY
-   * opened surface, never the oldest. listTargets() on both backends preserves
+   * The MOST RECENTLY opened surface of a target list, never the oldest.
+   * Still the tie-breaker inside selectRegisteredTarget; the default target of
+   * a call that named no surfaceId is decided one level up, per connection
+   * (surfaceRouting), because "newest in the workspace" is another agent's tab
+   * as often as it is the caller's. listTargets() on both backends preserves
    * creation order — the managers iterate their surface Map in insertion order —
    * so the last entry a workspace owns is the newest. Picking targets[0] (the
    * oldest) silently drove a leftover tab from a previous run: `browser_tabs new`
@@ -773,6 +901,7 @@ export class PlaywrightEngine {
   private async resolveSelectionContext(
     explicitSurfaceId?: string,
     workspaceId?: string,
+    knownNoSurface?: boolean,
   ): Promise<{ key: string; surfaceId?: string; callerHasNoSurface: boolean; workspaceId?: string }> {
     if (explicitSurfaceId) {
       return {
@@ -782,11 +911,43 @@ export class PlaywrightEngine {
         ...(workspaceId && { workspaceId }),
       };
     }
+    // The tool layer already resolved this caller to "nothing of mine exists"
+    // and said so. Re-asking would repeat a control-plane round trip that on
+    // an empty workspace costs main's full registration grace — twice per
+    // call, for the same answer.
+    if (knownNoSurface && workspaceId) {
+      return { key: this.contextKey(workspaceId), surfaceId: undefined, callerHasNoSurface: true, workspaceId };
+    }
     const owned = await this.resolveCallerSurface(workspaceId);
     if (owned.kind === 'surface') {
-      return { key: `ws:${owned.workspaceId}`, surfaceId: owned.surfaceId, callerHasNoSurface: false, workspaceId: owned.workspaceId };
+      return {
+        key: `ws:${owned.workspaceId}:surf:${owned.surfaceId}`,
+        surfaceId: owned.surfaceId,
+        callerHasNoSurface: false,
+        workspaceId: owned.workspaceId,
+      };
     }
-    return { key: `ws:${owned.workspaceId}`, surfaceId: undefined, callerHasNoSurface: true, workspaceId: owned.workspaceId };
+    return {
+      key: this.contextKey(owned.workspaceId),
+      surfaceId: undefined,
+      callerHasNoSurface: true,
+      workspaceId: owned.workspaceId,
+    };
+  }
+
+  /**
+   * The key for "this connection, in this workspace, with no surface yet".
+   *
+   * Per CONNECTION, not per workspace. The in-flight lock, the fast-fail latch
+   * and the auto-open latch all hang off this key, and two connections sharing
+   * one meant B could be handed A's in-flight page promise, A's discovery
+   * failure fast-failed B for ten seconds, and A's one-shot auto-open
+   * suppressed B's — the same "two agents, one default" confusion this routing
+   * exists to end, one layer down. A resolved surface needs no such marker:
+   * the surface id already distinguishes them.
+   */
+  private contextKey(workspaceId?: string): string {
+    return `ws:${workspaceId ?? ''}:conn:${getOpenerKey()}`;
   }
 
   private async _getPageImpl(
@@ -956,19 +1117,25 @@ export class PlaywrightEngine {
   }
 
   /**
-   * Issue the auto-open browser.open RPC, pinned to the calling session's
-   * workspace. Fails closed: when no resolver is wired or identity cannot be
-   * resolved, NO RPC is sent (returns false) — a workspace-less browser.open
-   * would let the renderer fall back to the UI-active workspace (#190). The
-   * caller then proceeds to the normal "no page" retry/error path, surfacing
-   * the existing "Call browser_open first" guidance to the user.
-   */
-  /**
+   * Open a surface for the caller, pinned to the calling session's workspace.
+   * Fails closed: when no resolver is wired or identity cannot be resolved, NO
+   * RPC is sent (returns null) — a workspace-less open would let the renderer
+   * fall back to the UI-active workspace (#190). The caller then proceeds to
+   * the normal "no page" retry/error path, surfacing the existing "Call
+   * browser_open first" guidance to the user.
+   *
+   * `browser.tabs new`, not `browser.open`: on the builtin backend an open
+   * REUSES the workspace's first browser surface when one exists, which is how
+   * an auto-open for agent B used to hand back agent A's tab. `new` always
+   * creates, on every backend, so the surface this returns is the caller's own.
+   * An older main without the tabs method falls back to the open path.
+   *
    * @returns the surface that was opened (`surfaceId` absent if the reply did
    *   not name one), or null when the attempt was skipped fail-closed.
    *
    * The surfaceId matters: it is the ONE selection this engine can make without
-   * having to prove anything, because we are the ones who just asked for it.
+   * having to prove anything, because we are the ones who just asked for it —
+   * and it becomes this connection's pin, so the calls that follow stay on it.
    */
   private async attemptAutoOpen(resolvedWorkspaceId?: string): Promise<{ surfaceId?: string } | null> {
     let workspaceId = resolvedWorkspaceId;
@@ -991,8 +1158,9 @@ export class PlaywrightEngine {
       console.error('[PlaywrightEngine] Auto-open skipped: empty workspace id');
       return null;
     }
-    const reply = (await sendRpc('browser.open', { workspaceId })) as { surfaceId?: unknown } | undefined;
-    const surfaceId = typeof reply?.surfaceId === 'string' && reply.surfaceId ? reply.surfaceId : undefined;
+    // One open for both lanes (surfaceRouting): this one, and the RPC lane's
+    // own fallback (d) in browserScope. It pins what it opens.
+    const surfaceId = (await openSurfaceForConnection(workspaceId)) ?? undefined;
     return surfaceId ? { surfaceId } : {};
   }
 

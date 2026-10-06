@@ -6,6 +6,8 @@
 import type { PaneLeaf } from '../../shared/types';
 import { getLeafPanes } from '../../shared/paneUtils';
 import { isBrainPtyId } from '../../shared/constants';
+import type { AgentSlug } from '../../shared/agentIdentity';
+import { resolveAgentSlug, submitProfileForAgent, type SubmitAssurance } from '../../shared/ptyMessageDelivery';
 
 export type PaneAddress = { ptyId: string; paneId: string; surfaceId: string };
 
@@ -387,3 +389,282 @@ export function maxSideMessages(history: ReadonlyArray<{ kind: string; role?: st
  *  costs nothing to honor: continue by having the human open a fresh task
  *  that references this one. */
 export const REPLY_ROUND_CAP = 5;
+
+// ---------------------------------------------------------------------------
+// Delivery receipt honesty (#1337)
+// ---------------------------------------------------------------------------
+//
+// `notified: true` has only ever meant "a pane with a live pty was resolved and
+// written to". It has never meant "the receiving agent started a turn": the
+// paste write's result is discarded, the Enter that submits it goes out on a
+// timer AFTER the RPC has already answered, and no signal comes back from the
+// composer either way.
+//
+// For a Claude Code pane that gap is small enough to ignore: a CR into its
+// composer submits. For a Codex CLI pane it is the whole bug in #1337 — the
+// nudge landed in the composer, the agent never woke, and the sender got the
+// same receipt a woken agent produces, so it waited on a turn that was never
+// going to start.
+//
+// So the receipt now carries what wmux actually proved. `notified` keeps its
+// meaning (a push signal WAS written — no existing consumer breaks) and
+// `submit` says whether the Enter can be claimed as a real submit.
+//
+//   submit: 'assured'      a Claude Code pane that is not sitting on a dialog.
+//   submit: 'unverified'   everyone else: Codex, any other agent, a pane whose
+//                          agent could not be named, and a Claude pane at
+//                          `awaiting_input` (there the CR answers the dialog
+//                          rather than starting a turn). The bytes went out;
+//                          what the composer did with them is not observable.
+
+/** Guidance shipped alongside `submit: 'unverified'`. Names the concrete next
+ *  action, like every other `delivery.hint` on this path. */
+export const UNVERIFIED_SUBMIT_HINT =
+  'The nudge was written into the target pane, but wmux cannot confirm that agent submitted ' +
+  'it (only an idle Claude Code pane reports turn start). Do not block on a turn starting: the ' +
+  'task is stored, the receiver can poll a2a_task_query, and a human may need to press Enter in ' +
+  'that pane.';
+
+/**
+ * The `submit` / `hint` half of a successful `delivery` record, for a write
+ * that actually reached a pty. Takes the agent of THAT pty (see `ptyAgent` in
+ * useRpcBridge) rather than the caller's liveness metadata, which can name a
+ * workspace-level agent that does not own the pane the bytes went to.
+ *
+ * Split out of useRpcBridge so it is unit testable and so both send branches
+ * cannot drift apart.
+ */
+export function submitReceiptFields(
+  pane: { name?: string; status?: string },
+): { submit: SubmitAssurance; hint?: string } {
+  const { assurance } = submitProfileForAgent(pane.name, pane.status);
+  return assurance === 'assured'
+    ? { submit: assurance }
+    : { submit: assurance, hint: UNVERIFIED_SUBMIT_HINT };
+}
+
+// ---------------------------------------------------------------------------
+// Unaddressed delivery target (#1336)
+// ---------------------------------------------------------------------------
+//
+// A send with no pane_id/surface_id used to fall straight through to
+// `activePaneTerminalPty` — "whatever pane is active". In a workspace running
+// an agent next to a plain shell that is not merely the wrong tab: the body is
+// bracket-pasted AND submitted, so a natural-language task is handed to a shell
+// prompt, which runs it line by line as commands. The reporter's PowerShell
+// only threw a parser error, but the mechanism is "arbitrary text executed as
+// shell input in the wrong place".
+//
+// So an unaddressed send resolves against the DETECTED AGENTS instead:
+//   - exactly one agent pane  → deliver there, wherever focus happens to be
+//   - more than one           → refuse, and name the candidates (the caller
+//                               picks one; a2a_discover carries the same list)
+//   - none                    → 'no_agent'; the caller writes NOTHING to that
+//                               workspace (see the no-paste rule below)
+// An explicit pane_id/surface_id is unaffected — it never reaches this.
+//
+// Why 'no_agent' means "write nothing" rather than "paste without Enter":
+// a body left sitting in a shell's input buffer is the same hazard deferred,
+// not removed — the next Enter a human presses in that pane (or the one after
+// several parked messages have piled up) runs exactly the natural-language
+// text this change exists to keep out of a shell. And "no Enter" is not even
+// a guarantee: a shell that does not enable bracketed-paste mode executes
+// embedded newlines as they arrive. The task is still stored and teed onto the
+// EventBus, so nothing is lost — only the blind write is.
+
+/** Candidate scan input. `agentAlive`/`commandRunning` are the process-truth
+ *  maps (#1210): `false` means the TUI is known GONE, and the detected-agent
+ *  entry that has not been cleared yet is stale. Without this a pane whose
+ *  agent exited seconds ago is picked as "the one agent pane" and handed a
+ *  submitted body — #1336 again, now with the focus safety net removed. */
+export type PaneLivenessMaps = {
+  agentAlive?: Record<string, boolean>;
+  commandRunning?: Record<string, boolean>;
+};
+
+/**
+ * The canonical agent slug of the TUI running in `ptyId`, or undefined when
+ * the pane is not a detected, still-live agent. Decides whether an A2A
+ * envelope may keep its body's real newlines (see `A2aFormatOptions`).
+ *
+ * Only a known slug counts: DECSET 2004 (bracketed paste) is NOT a signal,
+ * because shells turn it on too, and a shell runs each pasted line as its own
+ * command once the paste is submitted. A brain pty is not a TUI at all.
+ *
+ * Liveness must be POSITIVELY confirmed. A surfaceAgent entry outlives its
+ * agent until a liveness snapshot clears it (#1210), and both maps are often
+ * empty (no process attribution, no shell integration), so "not known gone"
+ * would hand a multi-line body to a shell that just got its prompt back. The
+ * entry's status is not used either: it is as stale as the entry. Unknown
+ * means fold.
+ */
+export function detectedAgentTuiSlug(
+  ptyId: string,
+  surfaceAgent: Record<string, { name: string; slug?: string } | undefined>,
+  liveness: PaneLivenessMaps = {},
+): AgentSlug | undefined {
+  if (!ptyId || isBrainPtyId(ptyId)) return undefined;
+  const alive = liveness.agentAlive?.[ptyId];
+  const running = liveness.commandRunning?.[ptyId];
+  if (alive === false || running === false) return undefined;
+  if (alive !== true && running !== true) return undefined;
+  const agent = surfaceAgent[ptyId];
+  if (!agent) return undefined;
+  return resolveAgentSlug(agent.slug) ?? resolveAgentSlug(agent.name);
+}
+
+export type AgentPaneCandidate = {
+  paneId: string;
+  surfaceId: string;
+  ptyId: string;
+  agentName: string;
+  paneTitle: string | null;
+};
+
+export type UnaddressedDelivery =
+  /** Exactly one detected agent pane — deliver (and submit) there. */
+  | { kind: 'agent'; address: PaneAddress }
+  /** Several agent panes and no address: the caller must choose. */
+  | { kind: 'ambiguous'; candidates: AgentPaneCandidate[] }
+  /** No detected agent: nothing may be written to this workspace's panes. */
+  | { kind: 'no_agent' };
+
+/**
+ * Does `ptyId` carry a detected agent that is not known to be gone? The test
+ * every A2A PTY write must pass, whether the pane was picked from an
+ * unaddressed send or named explicitly (#1489: an explicit pane_id, a pinned
+ * task anchor or `silent:false` used to skip it and paste into a shell). A
+ * brain pty is not a pane a human or agent can be addressed at; see the same
+ * guard in decideReplyDelivery.
+ */
+export function paneHasDetectedAgent(
+  ptyId: string,
+  surfaceAgent: Record<string, { name: string } | undefined>,
+  liveness: PaneLivenessMaps = {},
+): boolean {
+  if (!ptyId || isBrainPtyId(ptyId)) return false;
+  if (!surfaceAgent[ptyId]?.name) return false;
+  if (liveness.agentAlive?.[ptyId] === false) return false;
+  if (liveness.commandRunning?.[ptyId] === false) return false;
+  return true;
+}
+
+/**
+ * @param visibleLeaves the target's VISIBLE pane tree (getLeafPanes(rootPane)),
+ * never the workspace-wide list. A stashed pane is off-screen: counting it
+ * would turn a workspace with one visible agent into an ambiguous refusal, and
+ * picking it would deliver where nobody is looking.
+ */
+export function resolveUnaddressedDelivery(
+  visibleLeaves: PaneLeaf[],
+  surfaceAgent: Record<string, { name: string; status: string } | undefined>,
+  liveness: PaneLivenessMaps = {},
+): UnaddressedDelivery {
+  const candidates: AgentPaneCandidate[] = [];
+  for (const leaf of visibleLeaves) {
+    for (const s of leaf.surfaces) {
+      if (s.surfaceType === 'browser' || !s.ptyId) continue;
+      if (!paneHasDetectedAgent(s.ptyId, surfaceAgent, liveness)) continue;
+      candidates.push({
+        paneId: leaf.id,
+        surfaceId: s.id,
+        ptyId: s.ptyId,
+        agentName: surfaceAgent[s.ptyId]?.name ?? '',
+        // Same source as a2a_discover's `paneTitle` (#1018) — untrusted
+        // pane-chosen text; sanitized at render time, see describeAmbiguousDelivery.
+        paneTitle: s.title?.trim() || null,
+      });
+    }
+  }
+  if (candidates.length === 1) {
+    const c = candidates[0];
+    return { kind: 'agent', address: { ptyId: c.ptyId, paneId: c.paneId, surfaceId: c.surfaceId } };
+  }
+  if (candidates.length > 1) return { kind: 'ambiguous', candidates };
+  return { kind: 'no_agent' };
+}
+
+/** Candidates named in a refusal before it is summarized. A workspace can hold
+ *  far more agent panes than a caller can act on, and every name in the list is
+ *  pane-chosen text arriving in the CALLER's context. */
+const AMBIGUOUS_LIST_CAP = 8;
+const PANE_TITLE_CAP = 40;
+
+/** Pane-chosen text, made safe to hand back to the calling agent: control
+ *  characters (newlines included, which could forge a new instruction line) are
+ *  dropped and the rest is truncated. Same defensive posture as the nudge's
+ *  sanitizeA2aName — the title is DATA, and a long one must not be able to
+ *  inflate an error payload either. */
+function sanitizePaneTitle(title: string): string {
+  // eslint-disable-next-line no-control-regex
+  const flat = title.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+  return flat.length > PANE_TITLE_CAP ? `${flat.slice(0, PANE_TITLE_CAP - 1)}…` : flat;
+}
+
+/** Refusal text for an unaddressed send into a multi-agent workspace. Names
+ *  the candidates so the caller can re-send addressed without a round trip
+ *  through a2a_discover. When one pane holds two agent surfaces, pane_id alone
+ *  cannot separate them, so those candidates are named by surface_id too. */
+export function describeAmbiguousDelivery(
+  targetName: string,
+  candidates: ReadonlyArray<AgentPaneCandidate>,
+): string {
+  // The workspace name is user-set and neither normalized nor capped at its
+  // source, so it gets the same treatment as the pane-chosen text below.
+  const target = sanitizePaneTitle(targetName);
+  const paneCounts = new Map<string, number>();
+  for (const c of candidates) paneCounts.set(c.paneId, (paneCounts.get(c.paneId) ?? 0) + 1);
+  const shown = candidates.slice(0, AMBIGUOUS_LIST_CAP);
+  const list = shown
+    .map((c) => {
+      const title = c.paneTitle ? ` — "${sanitizePaneTitle(c.paneTitle)}"` : '';
+      // Two agent surfaces in one pane: pane_id would resolve to whichever is
+      // that pane's active surface, i.e. a coin flip between two agents.
+      const addr = (paneCounts.get(c.paneId) ?? 0) > 1
+        ? `pane_id=${c.paneId} surface_id=${c.surfaceId}`
+        : `pane_id=${c.paneId}`;
+      return `${addr} (${sanitizePaneTitle(c.agentName)}${title})`;
+    })
+    .join(', ');
+  const more = candidates.length > shown.length
+    ? ` (+${candidates.length - shown.length} more — call a2a_discover for the full list)`
+    : '';
+  return (
+    `target "${target}" runs ${candidates.length} agent panes and no pane_id/surface_id was given. ` +
+    `Re-send addressing one of: ${list}${more}. (Delivering to whichever pane is focused could paste the ` +
+    'message into the wrong agent — or into a plain shell, which would run it as commands.)'
+  );
+}
+
+/**
+ * May workspace-level agent metadata stand in for a failed per-pane resolution?
+ *
+ * Only when there is exactly ONE terminal pane to write to. That is the case
+ * the ws-metadata fallback exists for — detection has not landed per pane (or
+ * the pane is remote), and "the active pane" and "the pane the metadata
+ * describes" are necessarily the same pane. With two or more panes they are
+ * not, and "workspace metadata says an agent lives here somewhere" is no
+ * evidence at all about the pane that happens to be focused: that is how a
+ * plain shell gets written to, which is the whole of #1336.
+ */
+export function wsMetadataMayStandIn(visibleLeaves: PaneLeaf[]): boolean {
+  let terminals = 0;
+  for (const leaf of visibleLeaves) {
+    for (const s of leaf.surfaces) {
+      if (s.surfaceType === 'browser' || !s.ptyId) continue;
+      if (isBrainPtyId(s.ptyId)) continue;
+      terminals++;
+      if (terminals > 1) return false;
+    }
+  }
+  return terminals === 1;
+}
+
+/** `delivery.hint` for a target whose visible panes carry no detected agent. */
+export const NO_AGENT_PANE_HINT =
+  'Nothing was written to the target: none of its visible panes is running a detected agent, and pasting a ' +
+  'message body into a plain shell prompt is how it ends up executed as commands. The task is stored and on ' +
+  'the event bus — the receiver can still find it with a2a_task_query. This holds for an explicit ' +
+  'pane_id/surface_id and for silent:false too: only a pane with a detected agent is ever written to. If an ' +
+  'agent IS running there, detection may not have landed yet (re-send once it is detected), or its pane is ' +
+  'stashed (address that pane with pane_id/surface_id from a2a_discover).';

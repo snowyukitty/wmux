@@ -23,8 +23,10 @@ import type { DaemonClient } from '../../DaemonClient';
 import type { RpcMethod } from '../../../shared/rpc';
 import { TaskWorktreeManager, metaDirForWorktree } from '../../worktask/TaskWorktreeManager';
 import { TaskCloseService } from '../../worktask/TaskCloseService';
+import { isPidAlive, sessionsStartedIn, stopSessionsInDir } from '../../worktask/stopSessionsInDir';
 import { TaskPrService } from '../../worktask/TaskPrService';
 import { WorktaskScanService, type ScanOpenTask } from '../../worktask/WorktaskScanService';
+import { deletePhoneBranch, removePhoneWorktree } from '../../worktask/PhoneWorktreeRemoval';
 import { prStatusCache } from '../../metadata/PrStatusCache';
 import { getWmuxHomeDir } from '../../../shared/constants';
 import { sanitizePtyText } from '../../../shared/types';
@@ -41,6 +43,8 @@ interface ProjectionTask {
   worktreePath?: string;
   paneGroupId?: string;
   prUrl?: string;
+  /** worktree:false fan-out output folder (never removed by close/cleanup). */
+  outputDir?: string;
   /** Detach-close marker — when present, the task is closed but its worktree/branch/PTY are still alive as an independent task. */
   detachedAt?: number;
 }
@@ -71,7 +75,26 @@ export function registerWorktaskHandlers(
   // 유지해야 하므로(index.lock 경합 차단) 재사용한다. fan-out과는 별도 인스턴스지만
   // 크로스 인스턴스 worktree add/remove 경합은 git 자체의 index.lock이 backstop.
   const worktrees = new TaskWorktreeManager();
-  const closeService = new TaskCloseService({ daemon: daemonPort, worktrees });
+  const closeService = new TaskCloseService({
+    daemon: daemonPort,
+    worktrees,
+    // A pane still running inside the worktree holds files that make the removal partial on Windows.
+    stopPanesIn: async (worktreePath) => {
+      const dc = getDaemonClient();
+      if (!dc) throw new Error('Daemon not connected');
+      const stopped = await stopSessionsInDir(worktreePath, {
+        listSessions: async () => {
+          const sessions = await dc.rpc('daemon.listSessions', {});
+          return Array.isArray(sessions) ? sessions : [];
+        },
+        destroySession: async (id) => { await dc.rpc('daemon.destroySession', { id }); },
+        isAlive: isPidAlive,
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+        log: (message) => console.warn(message),
+      });
+      if (stopped.length > 0) console.log(`[worktask] stopped ${stopped.length} pane(s) inside ${worktreePath} before removing it`);
+    },
+  });
   const prService = new TaskPrService({ daemon: daemonPort, cache: prStatusCache });
   const scanService = new WorktaskScanService();
   onServices?.({ close: closeService, pr: prService });
@@ -85,7 +108,7 @@ export function registerWorktaskHandlers(
       if (error) return { ok: false, taskId: '', reason: 'error' as const, error };
 
       const task = await resolveTask(daemonPort, taskId, verifiedWorkspaceId);
-      if (!task) return { ok: false, taskId, reason: 'error' as const, error: 'task:close: 태스크를 찾을 수 없음(projection 부재)' };
+      if (!task) return { ok: false, taskId, reason: 'error' as const, error: 'task:close: task not found (not in the task list).' };
 
       // F3 — close-only 라우팅: worktreePath 부재(미물질화 CX4) / 디스크 결측
       // (fs.existsSync false) / 본 repo 해석 불가(worktree 손상)면 remove 단계를
@@ -120,12 +143,12 @@ export function registerWorktaskHandlers(
       if (error) return { ok: false, reason: 'error' as const, error };
 
       const task = await resolveTask(daemonPort, taskId, verifiedWorkspaceId);
-      if (!task) return { ok: false, reason: 'error' as const, error: 'task:create-pr: 태스크를 찾을 수 없음' };
+      if (!task) return { ok: false, reason: 'error' as const, error: 'task:create-pr: task not found.' };
       if (!task.worktreePath || !task.branch) {
         return {
           ok: false,
           reason: 'error' as const,
-          error: 'task:create-pr: 미물질화 태스크(worktree·branch 부재)는 PR을 생성할 수 없습니다',
+          error: 'task:create-pr: this task has no worktree or branch yet, so there is nothing to open a PR from.',
         };
       }
       return prService.createPr({
@@ -169,6 +192,7 @@ export function registerWorktaskHandlers(
           title: t.title,
           ownerWorkspaceId: verifiedWorkspaceId,
           ...(t.worktreePath ? { worktreePath: t.worktreePath } : {}),
+          ...(t.outputDir ? { outputDir: t.outputDir } : {}),
           ...(detached ? { detached: true } : {}),
         });
       }
@@ -186,6 +210,7 @@ export function registerWorktaskHandlers(
           // 다른 부모의 태스크는 렌더러가 실어준 owner를 그대로 쓴다(없으면 요청 owner).
           ownerWorkspaceId: typeof kt.ownerWorkspaceId === 'string' ? kt.ownerWorkspaceId : verifiedWorkspaceId,
           ...(typeof kt.worktreePath === 'string' ? { worktreePath: kt.worktreePath } : {}),
+          ...(typeof kt.outputDir === 'string' && kt.outputDir ? { outputDir: kt.outputDir } : {}),
         });
       }
       const result = await scanService.scan([...byId.values()]);
@@ -228,11 +253,64 @@ export function registerWorktaskHandlers(
     }),
   );
 
+  // ── worktask:count-panes ─────────────────────────────────────────────
+  // The close confirm says how many panes the close will stop. Read-only.
+  ipcMain.removeHandler(IPC.WORKTASK_COUNT_PANES);
+  ipcMain.handle(
+    IPC.WORKTASK_COUNT_PANES,
+    wrapHandler(IPC.WORKTASK_COUNT_PANES, async (_event, raw: unknown) => {
+      const paths = Array.isArray(raw) ? raw.filter((p): p is string => typeof p === 'string' && isUnderWorktreeRoot(p)) : [];
+      const dc = getDaemonClient();
+      if (!dc || paths.length === 0) return 0;
+      const ids = await sessionsStartedIn(paths, {
+        listSessions: async () => {
+          const sessions = await dc.rpc('daemon.listSessions', {});
+          return Array.isArray(sessions) ? sessions : [];
+        },
+      });
+      return ids.length;
+    }),
+  );
+
+  // ── worktask:remove-phone / worktask:delete-phone-branch ─────────────
+  // A phone worktree has no task to close; it is removed by its path, which
+  // PhoneWorktreeRemoval checks against the one shape the daemon creates.
+  ipcMain.removeHandler(IPC.WORKTASK_REMOVE_PHONE);
+  ipcMain.handle(
+    IPC.WORKTASK_REMOVE_PHONE,
+    wrapHandler(IPC.WORKTASK_REMOVE_PHONE, async (_event, raw: unknown) => {
+      const r = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+      if (typeof r.worktreePath !== 'string') return { ok: false as const, reason: 'invalid' as const };
+      return removePhoneWorktree(r.worktreePath, r.force === true, {
+        root: path.join(getWmuxHomeDir(), 'worktrees'),
+        livePaneCwds: async () => {
+          const dc = getDaemonClient();
+          if (!dc) throw new Error('Daemon not connected');
+          const sessions = (await dc.rpc('daemon.listSessions', {})) as Array<{ cwd?: string; spawnCwd?: string }>;
+          return (Array.isArray(sessions) ? sessions : []).flatMap((s) =>
+            [s.cwd, s.spawnCwd].filter((c): c is string => typeof c === 'string' && c.length > 0));
+        },
+      }).catch((error: unknown) => ({ ok: false as const, reason: 'error' as const, error: error instanceof Error ? error.message : String(error) }));
+    }),
+  );
+  ipcMain.removeHandler(IPC.WORKTASK_DELETE_PHONE_BRANCH);
+  ipcMain.handle(
+    IPC.WORKTASK_DELETE_PHONE_BRANCH,
+    wrapHandler(IPC.WORKTASK_DELETE_PHONE_BRANCH, async (_event, raw: unknown) => {
+      const r = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+      if (typeof r.repo !== 'string' || typeof r.branch !== 'string') return { ok: false, error: 'invalid request' };
+      return deletePhoneBranch(r.repo, r.branch);
+    }),
+  );
+
   return () => {
     ipcMain.removeHandler(IPC.TASK_CLOSE);
     ipcMain.removeHandler(IPC.TASK_CREATE_PR);
     ipcMain.removeHandler(IPC.WORKTASK_SCAN);
     ipcMain.removeHandler(IPC.WORKTASK_REFIRE);
+    ipcMain.removeHandler(IPC.WORKTASK_COUNT_PANES);
+    ipcMain.removeHandler(IPC.WORKTASK_REMOVE_PHONE);
+    ipcMain.removeHandler(IPC.WORKTASK_DELETE_PHONE_BRANCH);
   };
 }
 
@@ -247,12 +325,12 @@ function isUnderWorktreeRoot(worktreePath: string): boolean {
 
 /** {taskId, verifiedWorkspaceId} 방어적 파싱(렌더러 신뢰이나 형태 검증). */
 function parseTaskRef(raw: unknown): { taskId: string; verifiedWorkspaceId: string; error?: string } {
-  if (!raw || typeof raw !== 'object') return { taskId: '', verifiedWorkspaceId: '', error: '요청 객체가 필요합니다' };
+  if (!raw || typeof raw !== 'object') return { taskId: '', verifiedWorkspaceId: '', error: 'A request object is required.' };
   const r = raw as Record<string, unknown>;
   const taskId = typeof r.taskId === 'string' ? r.taskId : '';
   const verifiedWorkspaceId = typeof r.verifiedWorkspaceId === 'string' ? r.verifiedWorkspaceId : '';
-  if (!taskId) return { taskId, verifiedWorkspaceId, error: 'taskId가 필요합니다' };
-  if (!verifiedWorkspaceId) return { taskId, verifiedWorkspaceId, error: 'verifiedWorkspaceId가 필요합니다' };
+  if (!taskId) return { taskId, verifiedWorkspaceId, error: 'taskId is required.' };
+  if (!verifiedWorkspaceId) return { taskId, verifiedWorkspaceId, error: 'verifiedWorkspaceId is required.' };
   return { taskId, verifiedWorkspaceId };
 }
 

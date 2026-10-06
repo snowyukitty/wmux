@@ -37,6 +37,8 @@ export interface PaneActionItem {
   onSelect: () => void;
   /** Draw a divider above this item (zoom, matching the cluster's border-l). */
   separatorBefore?: boolean;
+  /** Opens a submenu: aria-haspopup="menu" and a trailing ›. */
+  hasPopup?: boolean;
 }
 
 interface PaneActionsMenuProps {
@@ -50,6 +52,15 @@ interface PaneActionsMenuProps {
   triggerRef?: React.RefObject<HTMLElement | null>;
   items: PaneActionItem[];
   onClose: () => void;
+  /** Non-interactive text under the items (e.g. the version line). */
+  footer?: React.ReactNode;
+  /** Replaces onClose for Escape (a submenu steps back to its parent). */
+  onEscape?: () => void;
+  /** The item focused on open, by key. Default: the first item. */
+  initialFocusKey?: string;
+  /** Where focus returns on close, instead of wherever it was on open (a
+   *  submenu opened from a menu that is gone by then). */
+  restoreFocusTo?: React.RefObject<HTMLElement | null>;
 }
 
 /** Item box: px-2.5 py-1.5 around a 12px line — matches ContextMenu's MenuItem.
@@ -60,7 +71,7 @@ const ESTIMATED_ITEM_HEIGHT = 27;
  *  this width puts the menu's left edge at the cursor (see SurfaceTabs). */
 export const PANE_ACTIONS_MENU_WIDTH = 216;
 
-export default function PaneActionsMenu({ anchor, triggerRef, items, onClose }: PaneActionsMenuProps) {
+export default function PaneActionsMenu({ anchor, triggerRef, items, onClose, footer, onEscape, initialFocusKey, restoreFocusTo }: PaneActionsMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const firstItemRef = useRef<HTMLButtonElement>(null);
   // Where focus was when the menu opened — nulled by the outside-click closer,
@@ -80,7 +91,7 @@ export default function PaneActionsMenu({ anchor, triggerRef, items, onClose }: 
     if (!el) return;
     const measured = el.getBoundingClientRect().height;
     setHeight((prev) => (Math.abs(prev - measured) < 1 ? prev : measured));
-  }, [items.length]);
+  }, [items.length, footer]);
 
   // Close on window resize — native menu behavior. The anchor this menu was
   // placed against has moved, and re-placing against its stale rect would pin
@@ -108,8 +119,11 @@ export default function PaneActionsMenu({ anchor, triggerRef, items, onClose }: 
   // focus() on a detached element is a no-op, and the next Tab starts from the
   // document as it always did.
   useEffect(() => {
-    restoreFocusRef.current = document.activeElement;
-    firstItemRef.current?.focus();
+    restoreFocusRef.current = restoreFocusTo?.current ?? document.activeElement;
+    const initial = initialFocusKey
+      ? menuRef.current?.querySelector<HTMLButtonElement>(`[data-pane-menu-action="${initialFocusKey}"]`)
+      : null;
+    (initial ?? firstItemRef.current)?.focus();
     return () => {
       const el = restoreFocusRef.current;
       if (el instanceof HTMLElement) el.focus();
@@ -134,7 +148,11 @@ export default function PaneActionsMenu({ anchor, triggerRef, items, onClose }: 
       : e.key === 'End' ? buttons.length - 1
       : e.key === 'ArrowDown' ? (current + 1) % buttons.length
       : current <= 0 ? buttons.length - 1 : current - 1;
+    // scrollIntoView keeps the focused item visible now that the menu can
+    // scroll (long template lists cap at 70vh). Optional call: jsdom does not
+    // implement it.
     buttons[next].focus();
+    buttons[next].scrollIntoView?.({ block: 'nearest' });
   };
 
   useEffect(() => {
@@ -142,7 +160,7 @@ export default function PaneActionsMenu({ anchor, triggerRef, items, onClose }: 
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
-        onClose();
+        (onEscape ?? onClose)();
       }
     };
     const onDown = (e: MouseEvent) => {
@@ -166,7 +184,7 @@ export default function PaneActionsMenu({ anchor, triggerRef, items, onClose }: 
       document.removeEventListener('keydown', onKey, true);
       document.removeEventListener('mousedown', onDown);
     };
-  }, [onClose, triggerRef]);
+  }, [onClose, onEscape, triggerRef]);
 
   const pos = placePopover(anchor, { width: PANE_ACTIONS_MENU_WIDTH, height });
 
@@ -181,12 +199,19 @@ export default function PaneActionsMenu({ anchor, triggerRef, items, onClose }: 
         top: pos.top,
         left: pos.left,
         width: PANE_ACTIONS_MENU_WIDTH,
+        // #1237 — the snap-to-layout entries grow this menu by one row per
+        // saved template; without a cap, a template hoarder pushes items past
+        // the viewport (placePopover flips, it does not shrink). The cap is
+        // 70vh and the list scrolls; the keyboard walk already handles
+        // offscreen items via scrollIntoView.
+        maxHeight: '70vh',
+        overflowY: 'auto',
         zIndex: 'var(--z-popover-top)',
         background: 'var(--bg-surface)',
         border: '1px solid color-mix(in srgb, var(--text-main) 9%, transparent)',
         borderRadius: 8,
-        boxShadow:
-          '0 12px 32px rgba(0, 0, 0, 0.45), inset 0 1px 0 color-mix(in srgb, var(--text-main) 5%, transparent)',
+        // Flat drop shadow only — no inset top highlight (mono: no bevels).
+        boxShadow: '0 12px 32px rgba(0, 0, 0, 0.45)',
       }}
       onClick={(e) => e.stopPropagation()}
     >
@@ -205,13 +230,14 @@ export default function PaneActionsMenu({ anchor, triggerRef, items, onClose }: 
             // buttons and is undefined inside a menu.
             role={item.active !== undefined ? 'menuitemcheckbox' : 'menuitem'}
             aria-checked={item.active}
+            aria-haspopup={item.hasPopup ? 'menu' : undefined}
             data-pane-menu-action={item.key}
             // aria-disabled, not disabled: a disabled button drops out of the
             // tab order, so a keyboard user cannot reach it to READ why it is
             // unavailable. Same call the cluster's stash button makes.
             aria-disabled={item.disabled || undefined}
             title={item.title}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-xs text-left rounded-[5px] transition-colors hover:bg-[color-mix(in_srgb,var(--accent-blue)_14%,transparent)] ${
+            className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-xs text-left rounded-md transition-colors hover:bg-[var(--selection-hover)] ${
               item.disabled ? 'opacity-40' : ''
             }`}
             style={{ color: item.active ? 'var(--accent-blue)' : 'var(--text-main)' }}
@@ -235,9 +261,21 @@ export default function PaneActionsMenu({ anchor, triggerRef, items, onClose }: 
                 {item.shortcut}
               </span>
             )}
+            {item.hasPopup && (
+              <span aria-hidden="true" className="ml-2 shrink-0" style={{ color: 'var(--text-subtle)' }}>›</span>
+            )}
           </button>
         </div>
       ))}
+      {footer && (
+        <div
+          className="mt-1 mx-2 pt-1.5 pb-1 border-t text-[11px] truncate"
+          style={{ borderColor: 'var(--bg-overlay)', color: 'var(--text-subtle)' }}
+          data-pane-menu-footer
+        >
+          {footer}
+        </div>
+      )}
     </div>,
     document.body,
   );

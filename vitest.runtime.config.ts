@@ -9,5 +9,8 @@ export default defineConfig({
     ],
     environment: 'node',
     fileParallelism: false,
+    // Same temp HOME + data suffix as the parallel lane: runtime tests spawn real
+    // sessions whose shell integration writes under the wmux data dir.
+    setupFiles: ['./src/test-utils/isolateDataDir.ts'],
   },
 });

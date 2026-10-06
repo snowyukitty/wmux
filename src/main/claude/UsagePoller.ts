@@ -1,8 +1,8 @@
 // Anthropic 5h/7d usage poller. Wraps loadClaudeCredential + fetchUsage
 // behind a lifecycle the main process can start/stop/refresh on demand.
 //
-// Cadence: 1 hour default (matches `openwong2kim/claude-token-check`).
-// Configurable via constructor injection so tests can run on millisecond
+// Cadence: 15 min default. The usage endpoint is a read that spends no
+// model quota, so a tighter cadence is cheap. Configurable via constructor injection so tests can run on millisecond
 // scales. The poller is opt-in — the user must flip the Settings toggle
 // before `start()` is called. While off, this module does ZERO disk
 // reads and ZERO network requests.
@@ -28,6 +28,9 @@
 //     last error. The interval KEEPS RUNNING; next tick is the retry.
 //     Avoids the failure mode where a transient outage permanently
 //     darkens the StatusBar widget.
+//   - 429 → emit 'http-error' and back off: automatic ticks are skipped
+//     until Retry-After has passed, or, without one, for an exponential
+//     delay (5, 10, 20, 40 min…) capped at 60 min. A success resets it.
 //
 // Window visibility: `setWindowVisible(isVisible)` lets main hook the
 // BrowserWindow `'show'` / `'hide'` events. When the window has been
@@ -36,7 +39,8 @@
 // triggers an immediate catch-up fetch.
 
 import { loadClaudeCredential, type LoadResult } from './claudeCredential';
-import { fetchUsage, UsageApiException, type UsageSnapshot } from './UsageApi';
+import { fetchUsage, rateLimitBackoffMs, UsageApiException, type UsageSnapshot } from './UsageApi';
+import { mergeLive, type UsageUpdate } from './usageMerge';
 
 export type PollerStatus =
   /** Toggle is off; nothing happening. */
@@ -73,7 +77,7 @@ export interface PollerState {
 }
 
 export interface PollerOptions {
-  /** Interval between polls in ms. Default 1h. */
+  /** Interval between polls in ms. Default 15 min. */
   intervalMs?: number;
   /** Skip a tick if the window has been hidden longer than this. Default 30 min. */
   hiddenSkipThresholdMs?: number;
@@ -99,9 +103,11 @@ export interface PollerOptions {
   loadCredential?: () => Promise<LoadResult>;
 }
 
-const ONE_HOUR_MS = 60 * 60 * 1000;
+const FIFTEEN_MIN_MS = 15 * 60 * 1000;
 const THIRTY_MIN_MS = 30 * 60 * 1000;
 const FIVE_MIN_MS = 5 * 60 * 1000;
+/** With a fresh live sample, HTTP still runs every this-many poll intervals. */
+const LIVE_HTTP_EVERY_TICKS = 3;
 
 /**
  * Owns a single in-process interval. The poller is created once and
@@ -140,6 +146,10 @@ export class UsagePoller {
    *  outage, an org policy since reverted) still gets one retry per
    *  normal poll period — never more traffic than a healthy poller. */
   private rejectedAtMs = 0;
+  /** 429 backoff: automatic ticks before this instant send nothing. */
+  private rateLimitedUntilMs = 0;
+  /** 429s in a row, for the exponential step. Reset by any success. */
+  private consecutiveRateLimits = 0;
   private inflight = false;
   /** The run currently in flight, so a tick that must not be dropped
    *  can wait the slot out instead of returning. */
@@ -157,11 +167,18 @@ export class UsagePoller {
   private windowVisible = true;
   private windowHiddenAtMs = 0;
   private disposed = false;
+  /** When the last live statusline sample was accepted (Unix ms). While it
+   *  is younger than `intervalMs`, automatic ticks slow HTTP down. */
+  private liveAtMs = 0;
+  /** When the last HTTP request was sent (Unix ms). Even with a fresh live
+   *  sample, one goes out every LIVE_HTTP_EVERY_TICKS intervals so scoped
+   *  limits and the credential status stay current. */
+  private httpAtMs = 0;
 
   private readonly listeners = new Set<(state: PollerState) => void>();
 
   constructor(opts: PollerOptions = {}) {
-    this.intervalMs = opts.intervalMs ?? ONE_HOUR_MS;
+    this.intervalMs = opts.intervalMs ?? FIFTEEN_MIN_MS;
     this.hiddenSkipThresholdMs = opts.hiddenSkipThresholdMs ?? THIRTY_MIN_MS;
     // Never slower than the poll it replaces: the recheck exists to
     // shorten the time a wrong "Token expired" stays on screen, and a
@@ -177,7 +194,7 @@ export class UsagePoller {
   }
 
   /** Idempotent. Starts the interval AND triggers an immediate fetch
-   *  so the first snapshot doesn't sit blank for an hour. */
+   *  so the first snapshot doesn't sit blank for a whole interval. */
   start(): void {
     if (this.disposed) return;
     if (this.timer) return;
@@ -187,6 +204,7 @@ export class UsagePoller {
     // session.
     this.generation += 1;
     this.clearRejection();
+    this.clearRateLimit();
     this.arm(this.intervalMs);
     // Immediate first fetch (deliberate: don't make the user wait for
     // the interval). `setTimeout(fn, 0)` rather than queueMicrotask so
@@ -219,6 +237,7 @@ export class UsagePoller {
     // waiter queued on it stands down instead of taking the slot.
     this.generation += 1;
     this.clearRejection();
+    this.clearRateLimit();
     if (this.state.status !== 'idle') {
       this.setState({ status: 'idle' });
     }
@@ -262,7 +281,7 @@ export class UsagePoller {
     } else {
       this.windowHiddenAtMs = 0;
       // Window came back — kick a fresh fetch so the user doesn't wait
-      // up to an hour for the next tick.
+      // up to a full interval for the next tick.
       if (this.timer && !this.disposed) {
         void this.tick();
       }
@@ -282,13 +301,36 @@ export class UsagePoller {
     return this.state;
   }
 
+  /** Live `rate_limits` from a default-account Claude Code statusline
+   *  (`usage.rateLimits`). Merged by reset time, so a stale sample never
+   *  overwrites a newer window. While the meter is off the value is stored
+   *  without notifying anyone; `start()` publishes it. */
+  ingestLive(update: UsageUpdate): boolean {
+    if (this.disposed) return false;
+    const merged = mergeLive(this.state.snapshot, update, this.now());
+    if (!merged) return false;
+    this.liveAtMs = this.now();
+    if (merged === this.state.snapshot) return true;
+    if (!this.timer) {
+      this.state = { ...this.state, snapshot: merged };
+      return true;
+    }
+    // A credential verdict (token missing / refused) is HTTP's to clear; the
+    // live numbers still show underneath it.
+    const keepStatus = this.state.status === 'unauthorized' || this.state.status === 'token-missing';
+    this.setState(keepStatus
+      ? { snapshot: merged }
+      : { status: 'ok', snapshot: merged, lastError: null });
+    return true;
+  }
+
   dispose(): void {
     this.disposed = true;
     this.stop();
     this.listeners.clear();
   }
 
-  /** Single poll iteration. Guarded against re-entry so a 1h interval
+  /** Single poll iteration. Guarded against re-entry so an interval
    *  tick can't overlap a slow in-flight fetch. */
   private async tick(opts: { force?: boolean } = {}): Promise<void> {
     if (this.disposed) return;
@@ -352,6 +394,22 @@ export class UsagePoller {
         return;
       }
     }
+    // 429 backoff — automatic ticks (interval, window-show kick) wait it
+    // out; a manual refresh is an explicit ask and goes through.
+    if (!opts.force && this.now() < this.rateLimitedUntilMs) return;
+    // A live statusline sample is as fresh as anything HTTP would say, so
+    // while one is recent automatic ticks only fetch every few intervals (for
+    // scoped limits and the credential status). A session that just started
+    // still has to publish what was stored while it was off.
+    if (
+      !opts.force
+      && this.liveAtMs > 0 && this.now() - this.liveAtMs < this.intervalMs
+      && this.now() - this.httpAtMs < LIVE_HTTP_EVERY_TICKS * this.intervalMs
+      && this.state.snapshot
+    ) {
+      if (this.state.status === 'idle') this.setState({ status: 'ok', lastError: null });
+      return;
+    }
     this.inflight = true;
     this.inflightGeneration = generation;
     const run = this.runTick(opts, generation);
@@ -403,8 +461,8 @@ export class UsagePoller {
     ) {
       // The same token Anthropic already refused, asked about less than
       // a normal poll period ago. Nothing on disk has changed, so the
-      // answer would almost certainly be the same 401 — leave the state
-      // as it is and spend no request. The next tick re-reads the
+      // answer would almost certainly be the same 401 — restore the
+      // known rejection status and spend no request. The next tick re-reads the
       // credential, which is the whole point of staying armed.
       //
       // Two bounds, because a 401 has two possible causes:
@@ -424,20 +482,25 @@ export class UsagePoller {
       // that fails once moves the status off 'unauthorized' while the
       // credential underneath is unchanged, and the skip would then
       // release early and re-send the token it exists to withhold.
-      // Nor does the pin strand any other status: every one of them
-      // recovers by way of a *different* credential, and a different
-      // token fails this comparison on the first tick that reads it.
+      this.setState({
+        status: 'unauthorized',
+        lastError: 'HTTP 401/403',
+        subscriptionType: credential.subscriptionType,
+      });
       return;
     }
     // Past the skip, so whatever the pin was pointing at is no longer
     // the operative credential.
     this.clearRejection();
+    this.httpAtMs = this.now();
     try {
-      const snapshot = await fetchUsage(credential.accessToken, this.fetchImpl);
+      const fetched = await fetchUsage(credential.accessToken, this.fetchImpl);
       if (this.isStale(generation)) return;
+      this.clearRateLimit();
+      // HTTP is authoritative: it replaces whatever live samples built up.
       this.setState({
         status: 'ok',
-        snapshot,
+        snapshot: fetched,
         lastError: null,
         subscriptionType: credential.subscriptionType,
       });
@@ -458,6 +521,17 @@ export class UsagePoller {
           this.setState({
             status: 'unauthorized',
             lastError: 'HTTP 401/403',
+            subscriptionType: credential.subscriptionType,
+          });
+          return;
+        }
+        if (err.detail.kind === 'rate-limited') {
+          this.consecutiveRateLimits += 1;
+          this.rateLimitedUntilMs =
+            this.now() + rateLimitBackoffMs(this.consecutiveRateLimits, err.detail.retryAfterMs);
+          this.setState({
+            status: 'http-error',
+            lastError: 'HTTP 429 rate limited',
             subscriptionType: credential.subscriptionType,
           });
           return;
@@ -510,6 +584,11 @@ export class UsagePoller {
   private clearRejection(): void {
     this.rejectedAccessToken = null;
     this.rejectedAtMs = 0;
+  }
+
+  private clearRateLimit(): void {
+    this.rateLimitedUntilMs = 0;
+    this.consecutiveRateLimits = 0;
   }
 
   /** The period the interval should be running at right now: fast while

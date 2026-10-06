@@ -25,6 +25,7 @@
  * in-flight 중복=거부.
  */
 
+import { allowAgyTrustFor } from '../agents/agyTrust';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
@@ -34,10 +35,16 @@ import {
   WORKTASK_META_FILENAME,
   type WorkTaskMetaStamp,
 } from '../../shared/workTask';
-import { TaskWorktreeManager } from './TaskWorktreeManager';
+import * as crypto from 'node:crypto';
+import { TaskWorktreeManager, taskIdSuffix } from './TaskWorktreeManager';
+import { getWmuxHomeDir } from '../../shared/constants';
+import { type FanoutAgentChoice } from '../../shared/fanoutPreset';
+import { sanitizeFanoutOrigin, type FanoutOrigin } from '../../shared/fanoutOrigin';
 import type { TaskWorktreePlan } from './TaskWorktreeManager';
 import type { ProjectConfigState } from '../../shared/wmuxProjectConfig';
 import { getTaskLedger, rememberMissionChannel, noteWorkTaskClosed } from '../deck/taskLedgerHost';
+import type { TaskLedger } from '../../daemon/ledger/TaskLedger';
+import { validateFanoutTaskGraph, type FanoutTaskGraph } from '../../shared/fanoutTaskGraph';
 import {
   FANOUT_TASK_PORT_ENV,
   assignFanoutPorts,
@@ -46,14 +53,18 @@ import {
   runFanoutSetup,
   type FanoutSetupSkipReason,
 } from './fanoutEnvironment';
+import { workerTempEnv } from './fanoutTempDir';
 import { inheritTaskAutonomy } from './taskAutonomy';
-import { commandChoosesModel } from '../../shared/orchestratorRole';
+import { getFanOutGuards, type FanOutGuards } from './fanoutGuards';
+import { loadFanoutWorkerPermissionMode } from './fanoutWorkerPolicy';
+import { commandChoosesModel, promptFlagForLauncher } from '../../shared/orchestratorRole';
 import {
   MODEL_ENV_MARKER,
   WORKER_GATEWAY_ENV,
   WORKER_MODEL_ENV,
   isSimpleLaunchCommand,
   splitModelEnvMarker,
+  type FanoutWorkerPermissionMode,
 } from '../../shared/workerLaunch';
 import {
   clearFirstRunPrompts,
@@ -85,7 +96,7 @@ export const WORKER_DELIVERY_PREAMBLE = `
 
 You are running in a wmux pane. When this task is done and you go idle:
 
-- A **task sent to you** (\`a2a_task_send\`) IS pasted into your prompt — it starts a new turn on its own.
+- A **task sent to you** (\`send_message\`) IS pasted into your prompt — it starts a new turn on its own.
 - A **channel mention that pins your pane** is pasted the same way, at your next idle moment.
 - A channel post that mentions only your *workspace* — or that mentions nobody — is **not** pasted. It raises an unread badge and nothing else.
 
@@ -122,6 +133,24 @@ export interface FanOutRendererPort {
      *  renderer rewrites the launch command through the same applyRoleBinding
      *  path a human-opened pane uses. Absent = launch the command as given. */
     role?: string;
+    /** Depth-1 lineage: the workspace that fanned this task out. The renderer
+     *  hands it to pty.create, whose main-side handler stamps it BEFORE the
+     *  PTY (and the agent) exists; a failed stamp fails the spawn. */
+    fanoutTaskOf?: string;
+    /** Who asked for this task, resolved ONCE when the fan-out was requested
+     *  (FanOutRequest.caller) and sent unchanged with every task: the renderer
+     *  hands it to pty.create, which stamps it with the owner. Never
+     *  re-resolved at spawn time, so a pane that closes or rebinds mid-fan-out
+     *  cannot split its tasks or hand them to another pane. */
+    fanoutOrigin?: FanoutOrigin;
+    /** The operator's worker permission mode (main-side setting). The renderer
+     *  appends the matching flag and the worker allow-list AFTER the role
+     *  rewrite, and only when the final launcher is claude. */
+    workerPermissionMode?: FanoutWorkerPermissionMode;
+    /** Preset row / caller `agents[k]`: which verified CLI (and model) this
+     *  task runs on. Data, not a command — the renderer re-validates it and
+     *  turns it into a RoleBinding on the same rewrite path a role uses. */
+    agentChoice?: FanoutAgentChoice;
   }): Promise<
     | {
         workspaceId: string;
@@ -151,6 +180,10 @@ export interface FanOutRequest {
   prompt: string;
   /** 태스크별 title(길이 = N). N은 title 배열 길이로 결정한다. */
   titles: string[];
+  /** Per-task branch name, index-aligned with `titles` (optional; absent =
+   *  `wtask/{slug}-{id}`). The Git page's "Start in a new worktree" names
+   *  its branch issue-<n>-<slug>. */
+  branches?: string[];
   /** 태스크별 개별 프롬프트(titles와 인덱스 정렬, 옵셔널). 유효 프롬프트는
    *  `공통 + "\n\n" + 개별`(빈 쪽 생략)로 결합된다. **공통·개별이 둘 다 비어도
    *  거부하지 않는다** — worktree·브랜치·에이전트 페인만 열고(환경만 조성) 프롬프트는
@@ -172,11 +205,57 @@ export interface FanOutRequest {
    * bindings the operator configured; it cannot invent a command.
    */
   roles?: string[];
+  /**
+   * Per-task agent choice, index-aligned with `titles` — from an operator
+   * preset or a caller's `agents[]`, already validated against the closed
+   * table in shared/fanoutPreset.ts. Mutually exclusive with `roles`.
+   */
+  agents?: FanoutAgentChoice[];
+  /**
+   * false = no git worktree (preset option). Each task gets its own folder
+   * under `<wmux data>/outputs/<outputFolder>/<batch>/`, no branch, no fetch,
+   * no wmux.json setup. Absent = true.
+   */
+  worktree?: boolean;
+  /** worktree:false only — the folder under outputs/ (one path segment). */
+  outputFolder?: string;
   /** 렌더러 신뢰 신원(channelLocal과 동일 trust basis — 프로세스 경계). */
   verifiedWorkspaceId: string;
   /** 미션 채널 멤버 좌표(생성자 memberId — 기본 verifiedWorkspaceId). */
   memberId?: string;
+  /** Worker permission mode, read once by the caller so the audit record and
+   *  every task agree. Absent → read once from the Settings store per run. */
+  workerPermissionMode?: FanoutWorkerPermissionMode;
+  /** Who asked: the GUI dialog, the orchestrator, or a pane — already
+   *  resolved to its stable ids and name by the caller (the pipe resolves a
+   *  pane at request time). Stamped as-is on every task's lineage. */
+  caller?: FanoutOrigin;
+  /** Per-task write scope (globs), index-aligned with `titles`. Overlapping
+   *  scopes refuse the whole fan-out; a task's scope is stated in its prompt. */
+  files?: string[][];
+  /** Per-task dependencies (indices into `titles`). A dependent task is not
+   *  spawned with the others: its worktree and agent come only once every
+   *  dependency's ledger row is review_requested or completed. */
+  dependsOn?: number[][];
+  /** Asked right before a dependent task spawns — the caller's cap check for
+   *  a start that happens long after the fan-out was accepted. A refusal
+   *  drops the task with the given message. */
+  beforeDeferredLaunch?: (index: number) => { ok: true } | { ok: false; message: string };
+  /** Called once per dependent task when it settles (launched, failed, or
+   *  dropped), so the caller can record it the way it recorded the first wave.
+   *  `remaining` is how many still wait; 0 means this fan-out is fully settled. */
+  onDeferredLaunch?: (task: FanOutTaskResult, info: { remaining: number; outputBatchDir?: string }) => void;
 }
+
+/** How long a dependent task may wait before it is dropped. A dependency whose
+ *  ledger row never moves (a worker that died, a row that was never written)
+ *  would otherwise hold its dependents — and their live-cap slots — forever. */
+export const FANOUT_DEPENDENCY_WAIT_MS = 12 * 60 * 60 * 1000;
+
+/** A dependency counts as done at either of these ledger states. `completed`
+ *  alone would deadlock any fan-out whose owner is a pane: only a brain can
+ *  set it. `review_requested` is the worker's own "done, gate passed". */
+const DEPENDENCY_DONE_STATUSES: readonly string[] = ['review_requested', 'completed'];
 
 /** 태스크 단위 결과(리포트 — 상태 구분). */
 export interface FanOutTaskResult {
@@ -194,6 +273,11 @@ export interface FanOutTaskResult {
   initialCommand?: string;
   worktreePath?: string;
   branch?: string;
+  /** worktree:false — the task's own output folder (its cwd). Never removed by
+   *  close, cleanup or the scan. */
+  outputDir?: string;
+  /** The agent CLI this task was asked to run on (preset/agents), when not the default. */
+  agent?: string;
   /** 실패 사유(ok=false). */
   error?: string;
   /** ④ task.update가 커밋되지 못함(미물질화 — §2 크래시 창 계약). */
@@ -214,6 +298,10 @@ export interface FanOutTaskResult {
   /** A-1 — the first-run screen is STILL on the worker's pane: it needs a human
    *  keypress, and the task's ledger row was moved to `input_required`. */
   firstRunStuck?: boolean;
+  /** dependsOn — not spawned yet: waiting for these task indices. Replaced in
+   *  the cached result by the real task result once it launches (or is
+   *  dropped because a dependency failed or was cancelled). */
+  pending?: { waitingOn: number[] };
 }
 
 export interface FanOutResult {
@@ -229,6 +317,12 @@ export interface FanOutResult {
    *  privileged/inverted bounds, or wider than the cap), so no task got a
    *  WMUX_TASK_PORT. Distinct from "no range declared", which reports nothing. */
   portRangeInvalid?: true;
+  /** T3 — conditions that did not stop the fan-out but the caller should know,
+   *  e.g. the tasks branched from the local HEAD because origin's default
+   *  branch could not be fetched. */
+  warnings?: string[];
+  /** worktree:false — the batch folder holding every task's output folder. */
+  outputBatchDir?: string;
 }
 
 export interface FanOutServiceOptions {
@@ -248,6 +342,47 @@ export interface FanOutServiceOptions {
   /** F15 — how long after a clean watch to look once more for the model error.
    *  Negative disables the re-check entirely. */
   firstRunRecheckMs?: number;
+  /** Depth-1 lineage + live-cap store. Injected in tests; defaults to the
+   *  hosted one. */
+  lineage?: Pick<FanOutGuards, 'markTask' | 'taskSettled'>;
+  /** Worker permission mode reader. Injected in tests; defaults to the
+   *  main-side Settings store. */
+  workerPermissionMode?: () => FanoutWorkerPermissionMode;
+  /** Root the worktree:false output folders go under. Tests point it at a tmp
+   *  dir; production is `<wmux data>/outputs`. */
+  outputsRoot?: string;
+  /** dependsOn — the ledger whose transitions release dependent tasks.
+   *  Injected in tests; defaults to the hosted one. */
+  ledger?: Pick<TaskLedger, 'get' | 'onTransition'>;
+  /** dependsOn — wait deadline (tests shorten it). */
+  dependencyWaitMs?: number;
+  /** Per-worker private temp dir (TMPDIR/TMP/TEMP). Absent = feature off
+   *  (tests); production wires the fanoutTempDir module. */
+  workerTempDirs?: WorkerTempDirPort;
+}
+
+/** Create / hand over / discard a worker's private temp dir. */
+export interface WorkerTempDirPort {
+  /** Make a fresh owner-only dir and return its absolute path. */
+  create(): string;
+  /** Hand the dir to the sweep: `owner` is the task workspace id, or
+   *  `task:<taskId>` when the spawn failed and no workspace exists. */
+  register(owner: string, dir: string): void;
+  /** No pane was ever created for the dir — remove it now. */
+  remove(dir: string): void;
+}
+
+/** `<wmux data>/outputs` — where worktree:false tasks write. */
+export function defaultOutputsRoot(): string {
+  return path.join(getWmuxHomeDir(), 'outputs');
+}
+
+/** A batch folder name: sortable time + entropy. Never the caller's
+ *  idempotency key, which is free text and not a path segment. */
+function outputBatchName(now: Date = new Date()): string {
+  const p = (n: number): string => String(n).padStart(2, '0');
+  const stamp = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`;
+  return `${stamp}-${crypto.randomBytes(3).toString('hex')}`;
 }
 
 /**
@@ -278,6 +413,17 @@ export class FanOutService {
   private readonly firstRunRecheckMs: number;
   /** F15 — deferred re-checks still in flight (tests await them). */
   private pendingRechecks: Promise<void>[] = [];
+  /** Depth-1 lineage + live-cap store (absent = the hosted one). */
+  private readonly lineage?: Pick<FanOutGuards, 'markTask' | 'taskSettled'>;
+  private readonly workerPermissionMode: () => FanoutWorkerPermissionMode;
+  private readonly outputsRoot: string;
+  private readonly ledger?: Pick<TaskLedger, 'get' | 'onTransition'>;
+  private readonly dependencyWaitMs: number;
+  /** dependsOn — late launches still in flight (tests await them). */
+  private pendingLaunches: Promise<void>[] = [];
+  /** dependsOn — fan-out key → drop its still-waiting tasks. */
+  private readonly waitingDependents = new Map<string, (reason: string) => number>();
+  private readonly workerTempDirs?: WorkerTempDirPort;
 
   /** §2 G1 멱등: 키 → 완료 결과 LRU. 동일 키 재호출은 직전 결과 반환. */
   private readonly results = new Map<string, FanOutResult>();
@@ -293,6 +439,29 @@ export class FanOutService {
     this.autonomy = opts.autonomy;
     this.firstRunOptions = opts.firstRunOptions;
     this.firstRunRecheckMs = opts.firstRunRecheckMs ?? FIRST_RUN_MODEL_RECHECK_MS;
+    this.lineage = opts.lineage;
+    this.workerPermissionMode = opts.workerPermissionMode ?? (() => loadFanoutWorkerPermissionMode());
+    this.outputsRoot = opts.outputsRoot ?? defaultOutputsRoot();
+    this.workerTempDirs = opts.workerTempDirs;
+    this.ledger = opts.ledger;
+    this.dependencyWaitMs = opts.dependencyWaitMs ?? FANOUT_DEPENDENCY_WAIT_MS;
+  }
+
+  /** Drop every task of fan-out `key` still waiting on its dependencies (one
+   *  already spawning finishes). Returns how many were dropped, or null when
+   *  nothing of that fan-out is waiting. */
+  cancelDependents(key: string, reason: string): number | null {
+    const cancel = this.waitingDependents.get(key);
+    return cancel ? cancel(reason) : null;
+  }
+
+  /** Tests: settle every dependent launch started so far. */
+  async drainDeferredLaunches(): Promise<void> {
+    while (this.pendingLaunches.length > 0) {
+      const batch = this.pendingLaunches;
+      this.pendingLaunches = [];
+      await Promise.all(batch);
+    }
   }
 
   /**
@@ -354,11 +523,13 @@ export class FanOutService {
     // role도 같은 이유로 필터 전에 묶는다 — 뒤에서 원본 인덱스로 읽으면 빈 title
     // 하나에 역할이 통째로 밀려 다른 태스크가 남의 에이전트·모델로 뜬다.
     const rawRoles = Array.isArray(req.roles) ? req.roles : [];
+    const rawAgents = Array.isArray(req.agents) ? req.agents : [];
     const entries = req.titles
       .map((t, k) => ({
         title: typeof t === 'string' ? t.trim() : '',
         taskPrompt: typeof rawPrompts[k] === 'string' ? rawPrompts[k].trim() : '',
         role: typeof rawRoles[k] === 'string' ? rawRoles[k].trim() : '',
+        agent: rawAgents[k] as FanoutAgentChoice | undefined,
       }))
       .filter((e) => e.title.length > 0);
     const n = entries.length;
@@ -368,6 +539,13 @@ export class FanOutService {
     if (n > FANOUT_MAX_TASKS) {
       return { ok: false, error: `fanout:start: task count ${n} exceeds cap ${FANOUT_MAX_TASKS}`, tasks: [] };
     }
+    // files[k] / dependsOn[k] are indices into the titles AS SENT, so a dropped
+    // empty title would shift every later task onto its neighbour's scope.
+    if ((req.files !== undefined || req.dependsOn !== undefined) && n !== req.titles.length) {
+      return { ok: false, error: 'fanout:start: with files or dependsOn every title must be non-empty', tasks: [] };
+    }
+    const graph = validateFanoutTaskGraph(req.files, req.dependsOn, n);
+    if ('error' in graph) return { ok: false, error: `fanout:start: ${graph.error}`, tasks: [] };
     const sharedPrompt = (typeof req.prompt === 'string' ? req.prompt : '').trim();
     // 태스크 유효 프롬프트 = 공통 + 개별(빈 쪽 생략). 둘 다 비어도 거부하지 않는다 —
     // "환경만 조성"(worktree·브랜치·워크스페이스만 열고 프롬프트는 사람이 직접 입력)도
@@ -393,20 +571,36 @@ export class FanOutService {
     const agentCmd = typeof req.agentCmd === 'string' && req.agentCmd.trim().length > 0 ? req.agentCmd.trim() : 'claude';
     const memberId = req.memberId && req.memberId.length > 0 ? req.memberId : verifiedWorkspaceId;
 
+    if (req.worktree === false) {
+      return this.runOutputTasks(req, entries, effectivePrompts, verifiedWorkspaceId, agentCmd, memberId, graph);
+    }
+
     // ── ⓪ 프리플라이트(§2 — repo 유효성 1회 선검증. 부적격이면 태스크 생성 0) ──
     // repo 유효성·bare·submodule·LFS는 taskId 독립이라 첫 항목에서 확정된다. 하지만
     // slug 파생·경로 길이·branch 충돌은 title별로 달라지므로(F3 2모델 리뷰) titles
     // 전체를 선검증한다 — 부적격이 하나라도 있으면 mission.start 전에 N개 전부 거부해
     // "부적격이면 태스크 생성 0" 계약을 이행한다. 실 taskId는 아직 없으므로 인덱스별
     // 자리표시자로 slug/경로/branch를 파생·검증한다.
+    let repoRoot = '';
     for (const [k, preflightTitle] of titles.entries()) {
       const placeholder = `wtask-preflight-${String(k).padStart(8, '0')}`;
       const pf = await this.worktrees.preflight(req.repoPath, preflightTitle, placeholder, {
         checkBranchConflict: true,
+        ...(req.branches?.[k] ? { branch: req.branches[k] } : {}),
       });
       if (!pf.ok) {
         return { ok: false, error: `fanout preflight failed (task ${k + 1}): ${pf.error}`, tasks: [] };
       }
+      repoRoot = pf.plan.repoRoot;
+    }
+
+    // ── T3 base: origin's default branch, fetched once for the whole fan-out ──
+    // Every task branches from the same freshly fetched ref, not from whatever
+    // the owner happens to have checked out. A failure is a warning, not a
+    // refusal: the tasks then branch from HEAD, as they did before.
+    const base = await this.worktrees.resolveBase(repoRoot);
+    if (base.error) {
+      return { ok: false, error: `fanout preflight failed: ${base.error}`, tasks: [] };
     }
 
     // ── T2 per-repo fan-out environment(포트 창·setup 훅) ──
@@ -414,37 +608,313 @@ export class FanOutService {
     // 전에 전부 확정한다 — 태스크 k가 뜬 뒤 k+1이 같은 창을 다시 스캔하면 아직
     // 바인드되지 않은 포트를 중복 배정할 수 있기 때문이다.
     const env = await this.resolveEnvironment(req.repoPath, n);
+    const workerMode = req.workerPermissionMode ?? this.workerPermissionMode();
+    const requester = sanitizeFanoutOrigin(req.caller);
 
     // ── 태스크 순차 처리(직렬 큐가 이미 강제하지만, 스폰 부하도 직렬로) ──
+    const common = (k: number) => ({
+      index: k,
+      title: titles[k],
+      prompt: effectivePrompts[k],
+      agentCmd,
+      repoPath: req.repoPath,
+      verifiedWorkspaceId,
+      memberId,
+      missionIdemKey: `${req.idempotencyKey}-${k}`,
+      ...(entries[k].role ? { role: entries[k].role } : {}),
+      ...(entries[k].agent ? { agentChoice: entries[k].agent } : {}),
+      ...(req.branches?.[k] ? { branch: req.branches[k] } : {}),
+      workerMode,
+      requester,
+    });
     const tasks: FanOutTaskResult[] = [];
-    for (const [k, title] of titles.entries()) {
-      const missionIdemKey = `${req.idempotencyKey}-${k}`;
+    for (const k of titles.keys()) {
+      if (graph.dependsOn[k].length > 0) {
+        tasks.push({ index: k, title: titles[k], ok: false, pending: { waitingOn: graph.dependsOn[k] } });
+        continue;
+      }
       const r = await this.spawnOne({
-        index: k,
-        title,
-        prompt: effectivePrompts[k],
-        agentCmd,
-        repoPath: req.repoPath,
-        verifiedWorkspaceId,
-        memberId,
-        missionIdemKey,
+        ...common(k),
         port: env.ports[k],
         setupCommand: env.setupCommand,
-        ...(entries[k].role ? { role: entries[k].role } : {}),
+        baseOid: base.oid,
+        baseWarning: base.warning,
+        taskNote: taskGraphNote(k, graph, tasks),
       });
       tasks.push(r);
+      // This task is through its spawn: from here its stamped workspace (if
+      // it got one) is what the live cap counts, not the in-flight booking.
+      (this.lineage ?? getFanOutGuards()).taskSettled(req.idempotencyKey);
     }
 
     // 배정됐지만 태스크가 뜨지 못한 포트는 창에 돌려준다(예약 TTL을 기다리지 않게).
+    // A waiting task gives its port back too: it may wait for hours, past the
+    // reservation, and takes a fresh one when it launches.
     releaseFanoutPorts(tasks.filter((t) => !t.ok).map((t) => env.ports[t.index]));
 
-    const allOk = tasks.every((t) => t.ok);
-    return {
-      ok: allOk,
+    const warnings = base.warning ? [base.warning] : [];
+    const result: FanOutResult = {
+      ok: tasks.every((t) => t.ok || t.pending),
       tasks,
       ...(env.setupSkipped ? { setupSkipped: env.setupSkipped } : {}),
       ...(env.portRangeInvalid ? { portRangeInvalid: true as const } : {}),
     };
+    // A dependent task is spawned like the first wave, except that its base
+    // is fetched again at launch: whatever its dependencies merged by then is
+    // what it should build on (see taskGraphNote for the unmerged case).
+    this.scheduleDependents(req, result, graph, warnings, async (k) => {
+      const lateBase = await this.worktrees.resolveBase(repoRoot);
+      if (lateBase.error) {
+        return { index: k, title: titles[k], ok: false, error: `base resolve failed: ${lateBase.error}` };
+      }
+      const lateEnv = await this.resolveEnvironment(req.repoPath, 1);
+      // What the first wave reports at the top level, a late task reports the
+      // same way: the caller re-polls the result, not a per-task field.
+      const late = [
+        lateBase.warning,
+        lateEnv.setupSkipped ? `task ${k + 1}: the repository's fanout.setup hook did not run (${lateEnv.setupSkipped})` : undefined,
+        lateEnv.portRangeInvalid ? `task ${k + 1}: the repository's fanout.portRange is invalid, so no WMUX_TASK_PORT was assigned` : undefined,
+      ];
+      for (const w of late) if (w) addWarning(result, w);
+      let r: FanOutTaskResult | undefined;
+      try {
+        r = await this.spawnOne({
+          ...common(k),
+          port: lateEnv.ports[0],
+          setupCommand: lateEnv.setupCommand,
+          baseOid: lateBase.oid,
+          baseWarning: lateBase.warning,
+          taskNote: taskGraphNote(k, graph, result.tasks),
+        });
+        return r;
+      } finally {
+        if (!r?.ok) releaseFanoutPorts([lateEnv.ports[0]]);
+      }
+    });
+    if (warnings.length > 0) result.warnings = warnings;
+    return result;
+  }
+
+  /**
+   * dependsOn — hold every task that has dependencies and launch it once each
+   * dependency's ledger row reaches a DEPENDENCY_DONE_STATUSES state. A
+   * dependency that failed to spawn, or whose row is cancelled, drops its
+   * dependents (transitively) with an error instead. `failed` is retryable in
+   * the ledger, so it keeps them waiting — up to the wait deadline, after
+   * which every task still waiting is dropped. The owner can drop them sooner
+   * with cancelDependents.
+   *
+   * The waiting state lives in this process only: a restart drops it, and the
+   * result says so. A waiting task keeps its live-cap booking until it
+   * settles, and each task settles exactly once.
+   */
+  private scheduleDependents(
+    req: FanOutRequest,
+    result: FanOutResult,
+    graph: FanoutTaskGraph,
+    warnings: string[],
+    launch: (k: number) => Promise<FanOutTaskResult>,
+  ): void {
+    const waiting = result.tasks.filter((t) => t.pending).length;
+    if (waiting === 0) return;
+    const hours = Math.round((this.dependencyWaitMs / 3_600_000) * 10) / 10;
+    warnings.push(
+      `${waiting} task(s) wait for their dependencies and launch when each one reaches review_requested or completed. ` +
+        `They are dropped after ${hours}h of waiting, or when the same call is repeated with cancelPending. ` +
+        'The wait lives in this wmux session: quitting wmux drops the tasks that have not launched yet.',
+    );
+    const key = req.idempotencyKey;
+    const ledger = this.ledger ?? getTaskLedger();
+    const guards = this.lineage ?? getFanOutGuards();
+    /** Queued behind the one-at-a-time chain, or spawning right now. */
+    const queued = new Set<number>();
+    const spawning = new Set<number>();
+    let unsubscribe: (() => void) | null = null;
+    let chain: Promise<void> = Promise.resolve();
+    const remaining = (): number => result.tasks.filter((t) => t.pending).length;
+
+    const finish = (): void => {
+      unsubscribe?.();
+      unsubscribe = null;
+      clearTimeout(deadline);
+      if (this.waitingDependents.get(key) === cancel) this.waitingDependents.delete(key);
+    };
+    /** The ONE place a waiting task leaves `pending` — once per index. */
+    const settle = (k: number, r: FanOutTaskResult): void => {
+      if (!result.tasks[k]?.pending) return;
+      result.tasks[k] = r;
+      result.ok = result.tasks.every((t) => t.ok || t.pending);
+      guards.taskSettled(key);
+      const left = remaining();
+      try {
+        req.onDeferredLaunch?.(r, { remaining: left, ...(result.outputBatchDir ? { outputBatchDir: result.outputBatchDir } : {}) });
+      } catch (err) {
+        console.warn(`[fanout] deferred-launch callback failed: ${String(err)}`);
+      }
+      if (left === 0) finish();
+    };
+    const drop = (k: number, why: string): void =>
+      settle(k, { index: k, title: result.tasks[k].title, ok: false, error: `not launched: ${why}` });
+    /** 'ready', 'wait', or the reason the task will never launch. A reason
+     *  found on ANY dependency wins over a wait on another one. */
+    const verdict = (k: number): 'ready' | 'wait' | string => {
+      let wait = false;
+      for (const j of graph.dependsOn[k]) {
+        const dep = result.tasks[j];
+        if (dep.pending) {
+          wait = true;
+          continue;
+        }
+        if (!dep.ok || !dep.taskId) return `dependency (index ${j}) did not launch`;
+        const status = ledger.get(dep.taskId)?.status;
+        if (status === 'cancelled') return `dependency (index ${j}) was cancelled`;
+        if (!status || !DEPENDENCY_DONE_STATUSES.includes(status)) wait = true;
+      }
+      return wait ? 'wait' : 'ready';
+    };
+    const pump = (): void => {
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const t of result.tasks) {
+          if (!t.pending || queued.has(t.index)) continue;
+          const v = verdict(t.index);
+          if (v === 'wait') continue;
+          if (v !== 'ready') {
+            drop(t.index, v);
+            changed = true;
+            continue;
+          }
+          const k = t.index;
+          queued.add(k);
+          // One late spawn at a time, like the first wave.
+          const step = chain
+            .then(async () => {
+              // Re-checked at the head of the queue: while it waited behind an
+              // earlier spawn, a dependency may have been sent back to work,
+              // cancelled, or this task dropped.
+              if (!result.tasks[k]?.pending) return;
+              const again = verdict(k);
+              if (again === 'wait') return;
+              if (again !== 'ready') return drop(k, again);
+              const gate = req.beforeDeferredLaunch?.(k) ?? { ok: true as const };
+              if (!gate.ok) return drop(k, gate.message);
+              spawning.add(k);
+              let r: FanOutTaskResult;
+              try {
+                r = await launch(k);
+              } catch (err) {
+                r = { index: k, title: result.tasks[k].title, ok: false, error: `late spawn threw: ${(err as Error).message}` };
+              }
+              spawning.delete(k);
+              settle(k, r);
+            })
+            .catch((err: unknown) => {
+              console.warn(`[fanout] dependent launch failed: ${String(err)}`);
+            })
+            .finally(() => {
+              queued.delete(k);
+              this.pendingLaunches = this.pendingLaunches.filter((p) => p !== step);
+              if (remaining() > 0) pump();
+            });
+          chain = step;
+          this.pendingLaunches.push(step);
+        }
+      }
+    };
+    const cancel = (reason: string): number => {
+      let n = 0;
+      for (const t of result.tasks) {
+        if (t.pending && !spawning.has(t.index)) {
+          drop(t.index, reason);
+          n++;
+        }
+      }
+      return n;
+    };
+    const deadline = setTimeout(() => cancel(`its dependencies did not finish within ${hours}h`), this.dependencyWaitMs);
+    deadline.unref?.();
+    this.waitingDependents.set(key, cancel);
+    unsubscribe = ledger.onTransition(() => {
+      try {
+        pump();
+      } catch (err) {
+        console.warn(`[fanout] dependent scheduling failed: ${String(err)}`);
+      }
+    });
+    pump();
+  }
+
+  /**
+   * worktree:false — N tasks that each get their own FOLDER instead of a git
+   * worktree: `<outputs>/<folder>/<batch>/<k>-<agent>-<taskId suffix>/`.
+   *
+   * No repository is involved, so there is nothing to preflight, no origin to
+   * fetch and no wmux.json to trust (the T2 port window and setup hook are
+   * repository features). The batch folder is new per fan-out and each task
+   * folder is created with a non-recursive mkdir, so two tasks — even two on
+   * the same agent — can never share one. prompt.md/task.json go to the batch's
+   * `.meta/<task folder>/`, outside the folder the agent writes into.
+   *
+   * Everything after the folder is the worktree path unchanged: mission,
+   * spawn (same renderer path, same lineage stamp and caps), ledger, channel.
+   */
+  private async runOutputTasks(
+    req: FanOutRequest,
+    entries: { title: string; taskPrompt: string; role: string; agent?: FanoutAgentChoice }[],
+    effectivePrompts: string[],
+    verifiedWorkspaceId: string,
+    agentCmd: string,
+    memberId: string,
+    graph: FanoutTaskGraph,
+  ): Promise<FanOutResult> {
+    const folder = typeof req.outputFolder === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(req.outputFolder)
+      ? req.outputFolder
+      : 'fanout';
+    let batchDir = path.join(this.outputsRoot, folder, outputBatchName());
+    try {
+      fs.mkdirSync(path.join(this.outputsRoot, folder), { recursive: true });
+      fs.mkdirSync(batchDir); // non-recursive: an existing batch is a collision, not a merge
+      // Realpath'd: this is the pane's cwd, and a CLI that keys per-folder
+      // trust on its realpath'd cwd (codex) must see the same string wmux
+      // trusted for it — /tmp vs /private/tmp on macOS is enough to miss.
+      batchDir = fs.realpathSync(batchDir);
+    } catch (err) {
+      return { ok: false, error: `fanout: could not create the output folder ${batchDir}: ${(err as Error).message}`, tasks: [] };
+    }
+    const workerMode = req.workerPermissionMode ?? this.workerPermissionMode();
+    const requester = sanitizeFanoutOrigin(req.caller);
+    const tasks: FanOutTaskResult[] = [];
+    const spawnAt = (k: number, done: FanOutTaskResult[]): Promise<FanOutTaskResult> =>
+      this.spawnOne({
+        index: k,
+        title: entries[k].title,
+        prompt: effectivePrompts[k],
+        agentCmd,
+        repoPath: '',
+        verifiedWorkspaceId,
+        memberId,
+        missionIdemKey: `${req.idempotencyKey}-${k}`,
+        output: { batchDir },
+        ...(entries[k].role ? { role: entries[k].role } : {}),
+        ...(entries[k].agent ? { agentChoice: entries[k].agent } : {}),
+        workerMode,
+        requester,
+        taskNote: taskGraphNote(k, graph, done),
+      });
+    for (const k of entries.keys()) {
+      if (graph.dependsOn[k].length > 0) {
+        tasks.push({ index: k, title: entries[k].title, ok: false, pending: { waitingOn: graph.dependsOn[k] } });
+        continue;
+      }
+      tasks.push(await spawnAt(k, tasks));
+      (this.lineage ?? getFanOutGuards()).taskSettled(req.idempotencyKey);
+    }
+    const result: FanOutResult = { ok: tasks.every((t) => t.ok || t.pending), tasks, outputBatchDir: batchDir };
+    const warnings: string[] = [];
+    this.scheduleDependents(req, result, graph, warnings, (k) => spawnAt(k, result.tasks));
+    if (warnings.length > 0) result.warnings = warnings;
+    return result;
   }
 
   /**
@@ -516,8 +986,25 @@ export class FanOutService {
     setupCommand?: string;
     /** Orchestrator role for this task's pane (absent = unroled). */
     role?: string;
+    /** The task branch's name (absent = wtask/{slug}-{id}). */
+    branch?: string;
+    /** T3 — commit the task branch starts from (absent = HEAD). */
+    baseOid?: string;
+    /** T3 — why the base is not a fresh origin commit; posted to the mission channel. */
+    baseWarning?: string;
+    workerMode: FanoutWorkerPermissionMode;
+    /** Preset row / caller agents[k] (absent = the default agent). */
+    agentChoice?: FanoutAgentChoice;
+    /** worktree:false — create an output folder in this batch instead of a worktree. */
+    output?: { batchDir: string };
+    /** Who asked (see FanOutRequest.caller) — the same origin for every task
+     *  of one fan-out. */
+    requester?: FanoutOrigin;
+    /** Write scope / dependency notes (taskGraphNote); '' = none. */
+    taskNote?: string;
   }): Promise<FanOutTaskResult> {
     const base: FanOutTaskResult = { index: ctx.index, title: ctx.title, ok: false };
+    if (ctx.agentChoice) base.agent = ctx.agentChoice.agent;
 
     // ① mission.start — taskId·channelId 획득(멱등키 전달).
     let taskId: string;
@@ -542,39 +1029,109 @@ export class FanOutService {
 
     // ② worktree 생성(전용 루트·직렬 큐). 프리플라이트를 태스크별 taskId로 재실행해
     //    실 slug·경로를 확정한다(bare/submodule/LFS는 이미 ⓪에서 걸렸으니 재확인은 저렴).
-    const pf = await this.worktrees.preflight(ctx.repoPath, ctx.title, taskId);
-    if (!pf.ok) {
-      await this.compensate(taskId, ctx.verifiedWorkspaceId);
-      return { ...base, error: `worktree preflight failed: ${pf.error}` };
+    // worktree:false takes the other branch: a fresh folder in the batch.
+    let cwd: string;
+    let metaDir: string;
+    let plan: TaskWorktreePlan | undefined;
+    if (ctx.output) {
+      const leaf = `${ctx.index + 1}-${ctx.agentChoice?.agent ?? 'agent'}-${taskIdSuffix(taskId)}`;
+      cwd = path.join(ctx.output.batchDir, leaf);
+      metaDir = path.join(ctx.output.batchDir, '.meta', leaf);
+      try {
+        fs.mkdirSync(cwd); // non-recursive: an existing folder is a collision
+      } catch (err) {
+        await this.compensate(taskId, ctx.verifiedWorkspaceId);
+        return { ...base, error: `output folder create failed: ${(err as Error).message}` };
+      }
+      base.outputDir = cwd;
+    } else {
+      const pf = await this.worktrees.preflight(ctx.repoPath, ctx.title, taskId, ctx.branch ? { branch: ctx.branch } : undefined);
+      if (!pf.ok) {
+        await this.compensate(taskId, ctx.verifiedWorkspaceId);
+        return { ...base, error: `worktree preflight failed: ${pf.error}` };
+      }
+      plan = pf.plan;
+      const created = await this.worktrees.createWorktree(plan, ctx.baseOid);
+      if (!created.ok) {
+        await this.compensate(taskId, ctx.verifiedWorkspaceId);
+        return { ...base, error: `worktree create failed: ${created.error}` };
+      }
+      base.worktreePath = plan.worktreePath;
+      base.branch = plan.branch;
+      cwd = plan.worktreePath;
+      metaDir = plan.metaDir;
     }
-    const plan: TaskWorktreePlan = pf.plan;
-    const created = await this.worktrees.createWorktree(plan);
-    if (!created.ok) {
-      await this.compensate(taskId, ctx.verifiedWorkspaceId);
-      return { ...base, error: `worktree create failed: ${created.error}` };
-    }
-    base.worktreePath = plan.worktreePath;
-    base.branch = plan.branch;
+    // A failure after this point keeps the folder: the worktree is preserved
+    // for the J3 cleanup; an output folder is never removed by wmux at all.
+    const preserved = plan ? { preservedWorktree: plan.worktreePath } : {};
 
     // 프롬프트 파일(비었으면 생략 — §7 "환경만 조성") + task.json 스탬프를 태스크 메타
     // 디렉토리(worktree 밖 — diff 청정성 §4)에 쓴다. task.json(J3 §1 CL5)은 projection
     // GC 이후에도 전용 루트의 worktree를 taskId·title로 역추적하게 하는 디스크 정본
     // 사이드카다.
+    // Private temp dir for this worker (TMPDIR/TMP/TEMP), made before the
+    // prompt so the prompt can name it. A failure costs isolation, not the
+    // task: the worker falls back to the system temp dir.
+    let tempDir: string | undefined;
+    if (this.workerTempDirs) {
+      try {
+        tempDir = this.workerTempDirs.create();
+      } catch (err) {
+        console.warn(`[fanout] worker temp dir create failed: ${(err as Error).message}`);
+      }
+    }
+    // Before the spawn: no pane can exist yet, so the dir goes at once.
+    const discardTempDir = (): void => {
+      if (tempDir) this.workerTempDirs?.remove(tempDir);
+    };
+    // At or after the spawn: a failed spawn can still leave a live session
+    // (the daemon created it, then the attach failed), so the sweep decides,
+    // and it keeps any dir a live session still uses.
+    const handOverTempDir = (owner: string): void => {
+      if (!tempDir) return;
+      try {
+        this.workerTempDirs?.register(owner, tempDir);
+      } catch (err) {
+        // Unregistered = never swept: a leaked dir under the system temp root.
+        console.warn(`[fanout] could not register worker temp dir ${tempDir}: ${String(err)}`);
+      }
+    };
+
     let promptPath: string | undefined;
     try {
-      fs.mkdirSync(plan.metaDir, { recursive: true });
-      if (ctx.prompt.length > 0) {
-        promptPath = path.join(plan.metaDir, 'prompt.md');
+      fs.mkdirSync(metaDir, { recursive: true });
+      // A declared scope or dependency is written even with no prompt: the
+      // worker must know what it may edit before it edits anything.
+      const taskNote = ctx.taskNote ?? '';
+      if (ctx.prompt.length > 0 || taskNote.length > 0) {
+        promptPath = path.join(metaDir, 'prompt.md');
         // A3: the caller's prompt verbatim, then the delivery contract (see
         // WORKER_DELIVERY_PREAMBLE). 프롬프트 없이 여는 "환경만 조성" 경로는
         // 파일 자체가 없으므로 계약문도 붙지 않는다 — 사람이 직접 입력한다.
-        fs.writeFileSync(promptPath, ctx.prompt + WORKER_DELIVERY_PREAMBLE, 'utf8');
+        // worktree:false — the agent is told where its files go, since the
+        // folder is the only thing the owner looks at afterwards.
+        const outputNote = ctx.output
+          ? `\n\n---\n\nWrite every file you produce into your current directory (${cwd}); that folder is what gets compared. It is not a git repository — there is no branch to commit to.`
+          : '';
+        // Wording adapted from MonoCode (hardbeat920/monocode@6bd432ca,
+        // src/features/orchestration/model/orchestration.ts), MIT License,
+        // Copyright (c) 2026 Nick.
+        const tempNote = tempDir
+          ? `\n\n---\n\nYour private scratch directory is ${tempDir}; TMPDIR, TMP and TEMP point there. Put temporary helpers and test output there, not anywhere else outside the project.`
+          : '';
+        fs.writeFileSync(promptPath, ctx.prompt + outputNote + taskNote + tempNote + WORKER_DELIVERY_PREAMBLE, 'utf8');
       }
-      const stamp: WorkTaskMetaStamp = { taskId, title: ctx.title, createdAt: Date.now() };
-      fs.writeFileSync(path.join(plan.metaDir, WORKTASK_META_FILENAME), JSON.stringify(stamp), 'utf8');
+      const stamp: WorkTaskMetaStamp = {
+        taskId,
+        title: ctx.title,
+        createdAt: Date.now(),
+        ...(ctx.baseOid ? { baseOid: ctx.baseOid } : {}),
+      };
+      fs.writeFileSync(path.join(metaDir, WORKTASK_META_FILENAME), JSON.stringify(stamp), 'utf8');
     } catch (err) {
+      discardTempDir();
       await this.compensate(taskId, ctx.verifiedWorkspaceId, plan);
-      return { ...base, error: `prompt file write failed: ${(err as Error).message}`, preservedWorktree: plan.worktreePath };
+      return { ...base, error: `prompt file write failed: ${(err as Error).message}`, ...preserved };
     }
 
     // T2 — 태스크 환경 변수(포트). 훅과 에이전트 페인이 같은 값을 본다.
@@ -583,15 +1140,17 @@ export class FanOutService {
       taskEnv[FANOUT_TASK_PORT_ENV] = String(ctx.port);
       base.port = ctx.port;
     }
+    if (tempDir) Object.assign(taskEnv, workerTempEnv(tempDir));
 
     // T2 — worktree setup 훅(신뢰된 wmux.json에서만 도달). 에이전트 기동 **전**에
     // 돌린다. 실패는 태스크 실패로 취급하고 페인을 열지 않는다 — 의존성이 안 깔린
     // worktree에서 에이전트를 띄우면 그 사실을 발견하는 데 한 턴을 태운다.
-    if (ctx.setupCommand !== undefined) {
+    if (ctx.setupCommand !== undefined && plan) {
       const setupRun = await runFanoutSetup(ctx.setupCommand, plan.worktreePath, taskEnv);
       if (!setupRun.ok) {
         // 이 태스크만 보상한다 — 훅 타임아웃/실패는 fan-out 전체를 접지 않고,
         // 호출부 루프가 다음 태스크를 그대로 이어간다.
+        discardTempDir();
         await this.compensate(taskId, ctx.verifiedWorkspaceId, plan);
         // 페인이 뜨지 않았으니 포트는 이 태스크의 것이 아니다 — 결과에서 뺀다
         // (run()이 예약도 함께 반납한다).
@@ -619,19 +1178,31 @@ export class FanOutService {
     // shell line, not an agent). Keyed on the command main is sending: a role
     // binding may still swap the launcher in the renderer, which is why the
     // post-spawn watch below keys on the command that was actually launched.
-    const paneEnv = { ...taskEnv, ...firstRunEnvForAgent(ctx.agentCmd) };
+    // A preset/agents choice names the real CLI; the command main sends still
+    // starts with the default one (the renderer swaps it), so key on the choice.
+    const paneEnv = { ...taskEnv, ...firstRunEnvForAgent(ctx.agentChoice?.agent ?? ctx.agentCmd) };
     let workspaceId: string;
+    // The renderer resolves the final launcher (a role binding may make it agy)
+    // and asks main to pre-trust this folder for agy; main agrees only while
+    // this spawn is in flight (main/agents/agyTrust). Siblings that are gone are
+    // pruned from agy's list on the same write.
+    const releaseAgyTrust = allowAgyTrustFor(cwd, path.dirname(cwd));
     try {
       const spawned = await this.renderer.spawnWorkspace({
         name: wsName,
-        cwd: plan.worktreePath,
+        cwd,
         initialCommand,
         ...(Object.keys(paneEnv).length > 0 ? { env: paneEnv } : {}),
         ...(ctx.role ? { role: ctx.role } : {}),
+        ...(ctx.agentChoice ? { agentChoice: ctx.agentChoice } : {}),
+        fanoutTaskOf: ctx.verifiedWorkspaceId,
+        ...(ctx.requester ? { fanoutOrigin: ctx.requester } : {}),
+        workerPermissionMode: ctx.workerMode,
       });
       if ('error' in spawned) {
+        handOverTempDir(`task:${taskId}`);
         await this.compensate(taskId, ctx.verifiedWorkspaceId, plan);
-        return { ...base, error: `renderer spawn failed: ${spawned.error}`, preservedWorktree: plan.worktreePath };
+        return { ...base, error: `renderer spawn failed: ${spawned.error}`, ...preserved };
       }
       workspaceId = spawned.workspaceId;
       // ptyId는 옵셔널(핸드셰이크가 싣지 못하면 부재) — §3 onExhausted 토스트 매핑용.
@@ -640,10 +1211,25 @@ export class FanOutService {
       // 한다 — 아니면 재발사가 역할의 에이전트·모델을 조용히 잃는다.
       if (spawned.initialCommand) base.initialCommand = spawned.initialCommand;
     } catch (err) {
+      // A timeout does not prove the pane never spawned either.
+      handOverTempDir(`task:${taskId}`);
       await this.compensate(taskId, ctx.verifiedWorkspaceId, plan);
-      return { ...base, error: `renderer spawn threw: ${(err as Error).message}`, preservedWorktree: plan.worktreePath };
+      return { ...base, error: `renderer spawn threw: ${(err as Error).message}`, ...preserved };
+    } finally {
+      releaseAgyTrust();
     }
     base.workspaceId = workspaceId;
+    handOverTempDir(workspaceId);
+    // The renderer already stamped the lineage before the agent launched; this
+    // second write is idempotent and covers a renderer that did not. It carries
+    // the same origin the spawn did and never replaces one already recorded.
+    try {
+      const lineage = this.lineage ?? getFanOutGuards();
+      if (ctx.requester) lineage.markTask(workspaceId, ctx.verifiedWorkspaceId, ctx.requester);
+      else lineage.markTask(workspaceId, ctx.verifiedWorkspaceId);
+    } catch (err) {
+      console.warn(`[fanout] could not confirm the lineage stamp for ${workspaceId}: ${String(err)}`);
+    }
 
     // ④ task.update — 물질화 커밋({branch, worktreePath, paneGroupId=workspaceId}).
     // 이 RPC는 MCP 도구 표면은 없지만 파이프 라우터 등록으로 first-party 클라이언트에
@@ -653,8 +1239,7 @@ export class FanOutService {
       const updated = (await this.daemon.rpc('task.mission.update', {
         taskId,
         verifiedWorkspaceId: ctx.verifiedWorkspaceId,
-        branch: plan.branch,
-        worktreePath: plan.worktreePath,
+        ...(plan ? { branch: plan.branch, worktreePath: plan.worktreePath } : { outputDir: cwd }),
         paneGroupId: workspaceId,
       })) as { ok?: boolean; error?: unknown };
       if (!updated?.ok) {
@@ -699,6 +1284,22 @@ export class FanOutService {
       if (!invited?.ok) channelDisconnected = true;
     } catch {
       channelDisconnected = true;
+    }
+
+    // T3 — the worker should know its base is not a fresh origin commit. Posted
+    // as the owner, after the invite so the worker is a member; best-effort.
+    if (ctx.baseWarning) {
+      try {
+        await this.daemon.rpc('a2a.channel.post', {
+          channelId,
+          sender: { workspaceId: ctx.verifiedWorkspaceId, memberId: ctx.verifiedWorkspaceId },
+          text: `[fan-out] base warning: ${ctx.baseWarning}`,
+          verifiedWorkspaceId: ctx.verifiedWorkspaceId,
+          clientMsgId: `${ctx.missionIdemKey}-base-warning`,
+        });
+      } catch {
+        // best-effort — the fan-out result carries the same warning.
+      }
     }
 
     // A-1 — the worker is up; make sure it is not sitting on a first-run screen.
@@ -862,6 +1463,45 @@ export class FanOutService {
   }
 }
 
+/** Append a warning to a result once (late launches add theirs after the
+ *  result was first returned). */
+function addWarning(result: FanOutResult, warning: string): void {
+  const list = result.warnings ?? (result.warnings = []);
+  if (!list.includes(warning)) list.push(warning);
+}
+
+/**
+ * The prompt section for a task's write scope and dependencies ('' when it has
+ * neither). `done` holds the results so far, so a dependency's branch is named
+ * when it has one.
+ */
+export function taskGraphNote(k: number, graph: FanoutTaskGraph, done: FanOutTaskResult[]): string {
+  let note = '';
+  const scope = graph.files[k] ?? [];
+  if (scope.length > 0) {
+    note +=
+      '\n\n---\n\n## Your write scope\n\n' +
+      `Edit only paths matching: ${scope.map((g) => `\`${g}\``).join(', ')} (relative to the repository root). ` +
+      'Other tasks of this fan-out own the rest of the repository and are working at the same time. ' +
+      'If the job needs a change outside your scope, do not make it: set your ledger row to input_required and name the path.';
+  }
+  const deps = graph.dependsOn[k] ?? [];
+  if (deps.length > 0) {
+    const lines = deps.map((j) => {
+      const d = done[j];
+      const branch = d?.branch ? ` — branch \`${d.branch}\`` : d?.outputDir ? ` — folder \`${d.outputDir}\`` : '';
+      return `- task ${j + 1}: ${d?.title ?? '(unknown)'}${branch}`;
+    });
+    note +=
+      '\n\n---\n\n## Tasks this one builds on\n\n' +
+      'This task was started only after these tasks of the same fan-out handed in their work (review requested or completed):\n\n' +
+      lines.join('\n') +
+      '\n\nYour checkout starts from a freshly fetched origin commit, so their changes are in it only if they were already merged. ' +
+      'If they are not, merge their branches (local to this repository) before building on them.';
+  }
+  return note;
+}
+
 /** 에러 값 표시(문자열/객체 방어). */
 function describeErr(err: unknown): string {
   if (err === undefined || err === null) return 'unknown';
@@ -874,8 +1514,53 @@ function describeErr(err: unknown): string {
 }
 
 /**
+ * #1490 — the PowerShell pipeline stage that turns the prompt file's text into
+ * the string PowerShell hands to the agent as ONE intact argv entry.
+ *
+ * Windows PowerShell 5.1 (and 7.x with `$PSNativeCommandArgumentPassing` unset
+ * or `Legacy`) builds a native command line without escaping embedded `"`: it
+ * wraps the value in quotes only when it finds whitespace at an even count of
+ * `"` characters, and passes it verbatim otherwise. A prompt such as
+ * `Fix the "login page" bug` therefore reached the agent split at the inner
+ * quotes, and everything after the first piece — the wmux preamble included —
+ * was lost.
+ *
+ * The two legacy binders count quotes differently, so each gets its own escape
+ * (both verified against powershell.exe 5.1 and pwsh 7.6 in Legacy mode):
+ *  - 5.1 counts every `"`, escaped or not, so a `\"` escape flips the parity and
+ *    the value goes out unwrapped. The stage quotes the value itself: `"…"`
+ *    around it, each `"` inside written as `""` (the C runtime's in-quotes
+ *    escape — two quote characters, so the parity never changes and 5.1 never
+ *    adds a second pair). Backslashes in front of a quote, and at the end of
+ *    the value, are doubled.
+ *  - 6+ skips a `"` that follows a backslash, which breaks `""` after a
+ *    backslash but makes the usual `\"` escape safe: no escaped quote is
+ *    counted, so the binder wraps the value itself — and doubles its trailing
+ *    backslashes itself, so only the ones in front of a quote are doubled here.
+ * 7.3+ in `Standard` or `Windows` mode escapes arguments correctly on its own,
+ * so the text passes through untouched there. 6.0–7.2 have only the legacy
+ * binder and are assumed to match 7.6's Legacy mode; they were not run. The
+ * variable is read with Get-Variable because 5.1 does not define it and a
+ * profile's Set-StrictMode would make a bare `$PSNativeCommandArgumentPassing`
+ * throw — the worker would not launch at all. The quote character is
+ * spelled `[char]34` / `\x22` so the whole `"$(…)"` stays one quoted word for
+ * the launch-line tokenizers (workerLaunch.spans, agentResume.tokenize). `\z`,
+ * not `$`: `$` also matches before a final newline.
+ *
+ * Known gap: 7.3+ `Windows` mode still uses the legacy rules for `.cmd`/`.bat`
+ * launchers (an npm shim without its `.ps1`), and the text passes through
+ * unescaped there.
+ */
+const PS_LEGACY_ARGV_QUOTE =
+  "ForEach-Object { if ((Get-Variable PSNativeCommandArgumentPassing -ValueOnly -ErrorAction Ignore) -in 'Standard', 'Windows') { $_ } " +
+  "elseif ($PSVersionTable.PSVersion.Major -ge 6) { $_ -replace '(\\\\*)\\x22', ('$1$1\\{0}' -f [char]34) } " +
+  "else { '{0}{1}{0}' -f [char]34, ($_ -replace '(\\\\*)\\x22', ('$1$1{0}{0}' -f [char]34) -replace '(\\\\+)\\z', '$1$1') } }";
+
+/**
  * initialCommand 조립(§4 D4). POSIX `{agentCmd} "$(cat '{path}')"` / Windows PowerShell
- * `{agentCmd} "$(Get-Content -Raw -LiteralPath '{path}')"`. 프롬프트 본문은 파일 안이라
+ * `{agentCmd} "$(Get-Content -Raw -Encoding UTF8 -LiteralPath '{path}' | …)"` — `-Encoding
+ * UTF8` because 5.1 reads a BOM-less file in the ANSI code page (#1490), and the
+ * pipeline stage is {@link PS_LEGACY_ARGV_QUOTE}. 프롬프트 본문은 파일 안이라
  * 쿼팅 표면이 경로에 한정된다 — 경로를 셸 단일따옴표로 감싸 공백·`$`·백틱·따옴표가
  * 셸에 재해석되지 않게 한다(F1 3모델 리뷰 conf10). sanitizePtyText가 `$()`·따옴표를
  * 보존함은 §4 C9 테스트로 확정.
@@ -891,11 +1576,16 @@ export function buildInitialCommand(
   platform: NodeJS.Platform = process.platform,
 ): string {
   if (promptPath === undefined) return agentCmd;
+  // A CLI that refuses a positional first prompt (agy) gets its prompt flag
+  // right before the argument, so a launcher typed in the Fan-out dialog runs
+  // the same `agy -i "<prompt>"` a role swap produces.
+  const promptFlag = promptFlagForLauncher(agentCmd);
+  if (promptFlag) agentCmd = `${agentCmd} ${promptFlag}`;
   if (platform === 'win32') {
     // PowerShell 단일따옴표 리터럴: 내부 `'`는 `''`로 이스케이프. -LiteralPath로
     // glob·경로 특수문자 해석까지 봉쇄.
     const escaped = promptPath.replace(/'/g, "''");
-    return `${agentCmd} "$(Get-Content -Raw -LiteralPath '${escaped}')"`;
+    return `${agentCmd} "$(Get-Content -Raw -Encoding UTF8 -LiteralPath '${escaped}' | ${PS_LEGACY_ARGV_QUOTE})"`;
   }
   // POSIX 단일따옴표 리터럴: 내부 `'`는 `'\''`(닫고-이스케이프-열기)로 처리.
   const escaped = promptPath.replace(/'/g, "'\\''");

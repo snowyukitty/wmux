@@ -1,5 +1,6 @@
-import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import { lazy, Suspense, useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import { useTerminal, copySelectionWithFeedback, getPaneSyncUi, subscribePaneSyncUi, type ContextMenuEvent, type PaneSyncUiState } from '../../hooks/useTerminal';
+import { handoffTargetForPty, isOurHandoffDrag, takeHandoffDrop } from '../Git/handoffDrag';
 import { useStore } from '../../stores';
 import { t } from '../../i18n';
 import { useIpc } from '../../hooks/useIpc';
@@ -9,6 +10,8 @@ import { pasteClipboardImage } from '../../utils/imagePaste';
 import { openTerminalUrl } from '../../utils/browserPaneActions';
 import { terminalFontFamilyCss } from '../../utils/terminalFont';
 import { isFileDrag } from '../../../shared/dragDrop';
+import type { FixedGeometry } from '../../terminal/fixedGeometryFit';
+import { findLeafBySurfaceId } from '../../../shared/paneUtils';
 import ViCopyMode from './ViCopyMode';
 import SearchBar from './SearchBar';
 import BookmarkIndicator from './BookmarkIndicator';
@@ -16,9 +19,12 @@ import ContextMenu from './ContextMenu';
 import ScrollToBottomButton from './ScrollToBottomButton';
 import '@xterm/xterm/css/xterm.css';
 
+const ChatView = lazy(() => import('../Chat/ChatView'));
+
 const EMPTY_BOOKMARKS: number[] = [];
 
 interface TerminalProps {
+  chatView?: boolean;
   ptyId?: string;
   shell?: string;
   cwd?: string;
@@ -45,9 +51,12 @@ interface TerminalProps {
   workspaceId?: string;
   /** ID of the surface this terminal occupies. Sent as WMUX_SURFACE_ID. */
   surfaceId?: string;
+  /** Grid owned elsewhere — see useTerminal's `fixedGeometry`. Only the
+   *  browser build (wmux web) sets it; the desktop never does. */
+  fixedGeometry?: FixedGeometry | null;
 }
 
-export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, onPtyCreated, isActive = true, visible, isWorkspaceVisible = true, scrollbackFile, workspaceId: ownerWorkspaceId, surfaceId: ownerSurfaceId }: TerminalProps) {
+export default function TerminalComponent({ chatView = false, ptyId: externalPtyId, shell, cwd, onPtyCreated, isActive = true, visible, isWorkspaceVisible = true, scrollbackFile, workspaceId: ownerWorkspaceId, surfaceId: ownerSurfaceId, fixedGeometry }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [ptyId, setPtyId] = useState<string | null>(externalPtyId || null);
   const creatingRef = useRef(false);
@@ -176,7 +185,7 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
       window.electronAPI.pty.create(withWorkspaceProfile(withDefaultShell({
         shell,
         ...(deadPaneRecovery
-          ? { recoveryCwds: { spawnCwd: deadPaneRecovery.spawnCwd, cwd: deadPaneRecovery.cwd } }
+          ? { recoveryCwds: { spawnCwd: deadPaneRecovery.spawnCwd, cwd: deadPaneRecovery.cwd, wslTarget: deadPaneRecovery.wslTarget, args: deadPaneRecovery.args, sourceSessionId: deadPaneRecovery.sourceSessionId } }
           : { cwd: respawnCwd }),
         cols,
         rows,
@@ -198,7 +207,9 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
         return;
       }
       if (cancelled) {
-        // 이미 unmount됨 — PTY 정리
+        // Already unmounted — clean the pty up. Reached only when the cancel
+        // below lost the race (the spawn had already happened), which is why
+        // both exist: one stops the spawn, this one undoes it.
         window.electronAPI.pty.dispose(result.data.id);
         return;
       }
@@ -224,7 +235,22 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
       }
     });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      // #1305 — the dispose above can only run once the create resolves, and a
+      // local-mode WSL create sits in a cwd probe first: closing the surface
+      // during that window spawned a whole shell just to kill it, and a window
+      // that goes away before the promise settles never killed it at all. Ask
+      // for the pending create to be dropped before it spawns. Best effort by
+      // design — a create that already spawned answers false and is handled by
+      // the dispose above.
+      // Optional-chain style guard, as at reportViewerVisibility: a packaged
+      // app updated under a running renderer can leave a preload that does not
+      // expose the method yet.
+      if (surfaceId && typeof window.electronAPI.pty.cancelCreate === 'function') {
+        void window.electronAPI.pty.cancelCreate(surfaceId);
+      }
+    };
   }, [externalPtyId, shell, cwd, deadPaneRecovery]); // onPtyCreated 제거 (stale closure 방지)
 
   // isVisible = workspace is shown AND this surface tab is the active one.
@@ -239,15 +265,96 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
   // `isActive` for the stacked/tab case (one tab visible at a time).
   const shown = visible ?? isActive;
   const isVisible = isWorkspaceVisible && shown;
-  const { terminal: terminalRef, findNext, findPrevious, clearSearch } = useTerminal(containerRef, { ptyId, isVisible, scrollbackFile, onFirstData: scrollbackFile ? handleFirstData : undefined, onContextMenu: handleContextMenu });
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  // #1305 — the failure Retry cannot clear: the pane's WSL directory is gone,
+  // so every attempt reopens the same missing directory. Tracked separately
+  // from the message because it is what decides whether a second action exists,
+  // and the message is agent/distro text that must never be parsed for it.
+  const [recoveryCwdMissing, setRecoveryCwdMissing] = useState(false);
+  const [retryingRecovery, setRetryingRecovery] = useState(false);
+  useEffect(() => { setRecoveryError(null); setRecoveryCwdMissing(false); }, [ptyId]);
+  const handleRecoveryError = useCallback((message: string | null, info?: { cwdMissing?: boolean }) => {
+    setRecoveryError(message);
+    setRecoveryCwdMissing(message !== null && info?.cwdMissing === true);
+  }, []);
+  const retryRecovery = async () => {
+    if (!ptyId || retryingRecovery) return;
+    setRetryingRecovery(true);
+    try {
+      // Reuse the hook's full attach path, including geometry and unmuting.
+      await retryConnection();
+    } catch (error) { setRecoveryError(String(error)); }
+    finally { setRetryingRecovery(false); }
+  };
+  /**
+   * #1305 — the explicit way out: promote the SAME pane (same id, same
+   * scrollback) in the home directory, without resuming the conversation that
+   * belonged to the directory that is gone. Never automatic — landing in home
+   * silently would resume an unrelated project's conversation.
+   */
+  const startFreshRecovery = async () => {
+    if (!ptyId || retryingRecovery) return;
+    setRetryingRecovery(true);
+    try {
+      const promoted = await window.electronAPI.pty.promote(ptyId, { fresh: true });
+      if (!promoted.success) {
+        setRecoveryError(promoted.error || 'Could not start a fresh session in the home directory.');
+        return;
+      }
+      // The pane exists again under its own id; attach to it the way Retry
+      // does, which is also what clears this banner on success.
+      await retryConnection();
+    } catch (error) { setRecoveryError(String(error)); }
+    finally { setRetryingRecovery(false); }
+  };
+  const { terminal: terminalRef, terminalInstance, findNext, findPrevious, clearSearch, retryConnection } = useTerminal(containerRef, { onRecoveryError: handleRecoveryError, ptyId, isVisible, scrollbackFile, onFirstData: scrollbackFile ? handleFirstData : undefined, onContextMenu: handleContextMenu,
+    // Only the pane-surface terminal owns ⌘G / Ctrl+G: useComposeShortcut
+    // acts on the active leaf's pty, which is what this component renders.
+    // FloatingPane and Deck's BrainTerminalEmbed deliberately do NOT opt in —
+    // there the key stays a pane byte rather than dying between the two
+    // gates (#1280 review).
+    ownsComposeShortcut: true,
+    fixedGeometry });
 
-  const showViCopyMode = viCopyModeActive && isActive && terminalRef.current !== null;
-  const showSearchBar = searchBarVisible && isActive;
+  // terminalInstance (state, #1256) — not terminalRef.current (a render-time
+  // snapshot): the ref is populated after this render ran, so a snapshot read
+  // here sees null until an unrelated re-render happens.
+  const showViCopyMode = !chatView && viCopyModeActive && isActive && terminalInstance !== null;
+  // #1266 — `isActive` means "selected tab INSIDE this pane", not "this pane
+  // has focus". `searchBarVisible` is a single global flag, so gating on
+  // `isActive` alone put a search bar in every pane at once and meant the bar
+  // never unmounted when the user moved to another pane: the abandoned pane
+  // kept its cached term and went on re-creating highlight decorations on
+  // every later chunk of output, at coordinates that no longer matched
+  // anything. Gate on real pane focus so exactly one bar is up and leaving a
+  // pane genuinely ends its search.
+  const isPaneFocused = useStore((s) => {
+    if (!ownerSurfaceId) return true;
+    const ws = s.workspaces.find((w) => w.id === (ownerWorkspaceId ?? s.activeWorkspaceId));
+    if (!ws) return true;
+    const leaf = findLeafBySurfaceId(ws.rootPane, ownerSurfaceId);
+    // Surfaces we cannot place (stashed panes, transitional trees) keep the
+    // previous behaviour rather than losing their search bar.
+    return leaf ? leaf.id === ws.activePaneId : true;
+  });
+  const showSearchBar = !chatView && searchBarVisible && isActive && isPaneFocused;
 
   const handleCloseSearch = () => {
     clearSearch();
     setSearchBarVisible(false);
   };
+
+  // #1266 — the bar can go away without handleCloseSearch ever running:
+  // toggling it off globally, switching to another surface in this pane, or
+  // (with the focus gate above) moving to another pane. In every one of
+  // those the addon would otherwise keep its cached term and its
+  // onWriteParsed hook, re-creating highlight decorations on every later
+  // chunk of output with no UI left to dismiss them. Tear them down whenever
+  // the bar goes away, for any reason.
+  useEffect(() => {
+    if (showSearchBar) return;
+    clearSearch();
+  }, [showSearchBar, clearSearch]);
 
   const handleCopy = useCallback(() => {
     if (ctxMenu?.selectedText) {
@@ -303,6 +410,13 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
   const handleTerminalDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     if (!ptyId) return;
     if (isFileDrag(e.dataTransfer)) return;
+    // An issue / PR from the Git page: this pane's agent takes it, after a
+    // confirm step. Its text is never pasted from the drag.
+    if (isOurHandoffDrag(e.dataTransfer)) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      return;
+    }
     if (!useStore.getState().terminalTextDropDragActive) return;
     if (!e.dataTransfer.types.includes('text/plain')) return;
     e.preventDefault();
@@ -312,6 +426,16 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
   const handleTerminalDrop = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     if (!ptyId) return;
     if (isFileDrag(e.dataTransfer)) return;
+    if (isOurHandoffDrag(e.dataTransfer)) {
+      e.preventDefault();
+      const taken = takeHandoffDrop(e.dataTransfer);
+      const st = useStore.getState();
+      const target = taken ? handoffTargetForPty(st, ptyId) : null;
+      if (taken && target) {
+        st.setGitHandoff({ item: taken.item, target, repo: taken.repo, anchor: { x: e.clientX, y: e.clientY } });
+      }
+      return;
+    }
     if (!useStore.getState().terminalTextDropDragActive) return;
     const text = e.dataTransfer.getData('text/plain');
     if (!text) return;
@@ -368,6 +492,39 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
         position: 'relative',
       }}
     >
+      {chatView && shown && isWorkspaceVisible && (
+        <div className="absolute inset-0 z-10 bg-[var(--bg-base)]" data-chat-surface>
+          <Suspense fallback={<div className="wmux-chat-empty">{t('chat.loading')}</div>}>
+            {ptyId ? <ChatView ptyId={ptyId} active={isWorkspaceVisible && shown}
+              onTerminal={() => { if (ownerSurfaceId) useStore.getState().setSurfaceViewMode(ownerSurfaceId, 'terminal'); }} />
+              : <div className="wmux-chat-empty" role="status">{t('chat.loading')}</div>}
+          </Suspense>
+        </div>
+      )}
+      {recoveryError && (
+        <div role="alert" className="absolute inset-x-2 top-2 z-20 rounded border border-[var(--border)] bg-[var(--bg-base)] p-3 text-sm text-[var(--text-primary)]">
+          <p className="break-words">{recoveryError}</p>
+          <p className="mt-1 text-[var(--text-muted)]">Your session and saved scrollback are retained.</p>
+          {/* Two neutral actions, never an accent one: the banner is already an
+              alert, and a filled warm button here would spend the surface's one
+              primary on the riskier of the two (DESIGN.md — amber diet, one
+              filled button per surface). Order carries the hierarchy instead:
+              Retry is the default, starting fresh is the deliberate second. */}
+          <div className="mt-2 flex gap-2">
+            <button type="button" disabled={retryingRecovery} onClick={() => void retryRecovery()}
+              className="rounded border border-[var(--border)] px-3 py-1 disabled:opacity-50">
+              {retryingRecovery ? 'Reconnecting…' : 'Retry connection'}
+            </button>
+            {recoveryCwdMissing && (
+              <button type="button" disabled={retryingRecovery} onClick={() => void startFreshRecovery()}
+                title="Reopen this pane in your home directory, without resuming the recorded conversation"
+                className="rounded border border-[var(--border)] px-3 py-1 text-[var(--text-muted)] disabled:opacity-50">
+                Start fresh in home
+              </button>
+            )}
+          </div>
+        </div>
+      )}
       {/* Session restore overlay */}
       {restoring && (
         <div className="absolute inset-0 flex items-center justify-center text-[var(--text-muted)] text-sm font-mono z-10 pointer-events-none">
@@ -390,21 +547,29 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
           clash with the SurfaceTabs drag-export feature. */}
       <div
         ref={containerRef}
+        inert={chatView}
+        aria-hidden={chatView || undefined}
         draggable={false}
         onDragOver={handleTerminalDragOver}
         onDrop={handleTerminalDrop}
-        style={{ width: '100%', height: '100%', padding: '4px' }}
+        style={{ width: '100%', height: '100%', padding: '4px', visibility: chatView ? 'hidden' : undefined }}
       />
 
-      {/* Scrollback bookmark markers on the left edge */}
+      {/* Scrollback bookmark markers on the left edge. #1256: bound to the
+          state-published instance — a render-time terminalRef.current snapshot
+          goes null/stale when the mount effect swaps the terminal without a
+          re-render (fresh creation, adoption). */}
       <BookmarkIndicator
-        terminal={terminalRef.current}
+        terminal={terminalInstance}
         bookmarks={bookmarks}
         containerRef={containerRef}
       />
 
-      {/* Floating scroll-to-bottom button — appears only when scrolled up */}
-      <ScrollToBottomButton terminal={terminalRef.current} />
+      {/* Floating scroll-to-bottom button — appears only when scrolled up.
+          #1256: same live-instance binding as BookmarkIndicator above; the
+          button's subscriptions and click handler must track the real
+          terminal or scrolling/clicking silently no-ops. */}
+      <ScrollToBottomButton terminal={terminalInstance} />
 
       {/* Search bar overlay */}
       {showSearchBar && (

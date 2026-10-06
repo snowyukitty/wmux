@@ -17,6 +17,7 @@ The focused PTY is the creation target. The popover also lists schedules from ot
 - Delivery is daemon-only. Local fallback mode cannot prove child-process identity strongly enough for unattended terminal input, so it fails closed and leaves schedules queued.
 - Incarnation-bound delivery uses a versioned internal daemon method. During an app/daemon rolling upgrade, either side treats an older peer as temporarily unavailable instead of falling back to legacy unbound delivery.
 - At delivery time, the daemon verifies canonical agent identity again. This prevents a prompt prepared for Codex, for example, from executing as a shell command after Codex exits.
+- Delivery requires a live agent process the daemon has attributed to the pane, not just a name. A hook or the terminal's banner text can still label a pane after its agent exits, and a shell back at its prompt means the agent already returned, so both refuse. The daemon checks the process again right before the paste and before Enter. In a WSL pane, the agent's own hook tells the daemon which Linux process it is, and the daemon checks that process inside the distro (same boot, same start time, not stopped). Claude Code reports at session start; Codex reports when its first turn ends, so a Codex pane can be scheduled once it has answered once. An agent the daemon cannot attribute (for example one running inside tmux or a container) cannot be scheduled.
 - A verified `idle`, `waiting`, or `complete` agent is ready. Running turns, approval prompts, and PTYs with input in the previous three seconds stay due and retry later.
 - Prompts use sanitized bracketed paste, followed by a separate submit write. During that delay the daemon re-verifies identity, post-paste state, and the input revision; its own paste echo cannot cancel a valid idle delivery, while concurrent human input cancels Enter and records an error instead of submitting mixed text. Multiline prompts use the same protected delivery path as other structured wmux messages.
 - A successful one-shot is disabled. A repeating schedule advances to its next future occurrence rather than replaying every missed interval.
@@ -31,6 +32,8 @@ If the daemon cannot verify the session, Resume fails and the row stays paused
 with its binding intact. Reconnect and choose Resume again; wmux rechecks the
 identity before enabling it. An unavailable lookup alone does not mean the
 session changed, and it does not require deleting and recreating the schedule.
+If no identifiable session returns, the row stays paused. Delete it if you know
+the intended session is gone; wmux does not infer a replacement from missing state.
 
 Session schedules are different from **Command Deck schedules**. Deck schedules begin a new orchestrator turn for a workspace. Session schedules write only to one existing agent conversation and therefore use stricter PTY and agent-identity checks.
 

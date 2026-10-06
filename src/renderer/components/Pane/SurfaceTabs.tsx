@@ -3,20 +3,58 @@ import type { AgentStatus, Surface, Workspace } from '../../../shared/types';
 import { useT } from '../../hooks/useT';
 import { useDaemonModeActive } from '../../hooks/useDaemonMode';
 import { useStore } from '../../stores';
+import { surfaceAttentionStatus } from '../../stores/selectors/fleet';
 import {
   buildExportPayload,
   buildPaneMarkdown,
 } from '../../utils/sessionInfoMarkdown';
 import { tokenAttrs } from '../../themes';
+import UsageLimitChip from './UsageLimitChip';
 import { computePaneAutoName, paneDisplayName } from '../../utils/paneNaming';
 import { findPane } from '../../../shared/paneUtils';
 import PaneDragGrip from './PaneDragGrip';
 import { FOCUS_RING } from '../focusRing';
 import { HIT_TARGET_24 } from '../hitArea';
-import { IconSplitRight, IconSplitDown, IconBrowser, IconExternalLink, IconEyeOff, IconPencil } from '../icons';
+import { IconSplitRight, IconSplitDown, IconBrowser, IconExternalLink, IconEyeOff, IconPencil, IconGrid } from '../icons';
 import { displayPath } from '../../utils/displayPath';
 import { workspaceColorHex } from '../../../shared/workspaceColors';
 import PaneActionsMenu, { PANE_ACTIONS_MENU_WIDTH, type PaneActionItem } from './PaneActionsMenu';
+import {
+  bindingEnforcesModel, bindingEnforcesSkipPermissions, bindingSkipPermissionsFlag, type RoleBinding,
+} from '../../../shared/orchestratorRole';
+import { paneHeaderTailGap } from './paneChrome';
+
+/** D2 — only a terminal surface can launch an agent, so only a terminal surface
+ *  may claim a role-enforced model. An undefined `surfaceType` is a legacy
+ *  terminal (the field postdates the original Surface shape). */
+export function isTerminalSurfaceType(surfaceType: string | undefined): boolean {
+  return surfaceType === undefined || surfaceType === 'terminal';
+}
+
+/**
+ * D2 — may this pane display a "role-enforced launch" badge?
+ *
+ * Both halves are load-bearing and neither is obvious at the call site, which is
+ * why this is a named predicate rather than an inline `&&`:
+ *  - the binding must REALLY put the model or the skip-permissions flag on the
+ *    launch (bindingEnforcesModel / bindingEnforcesSkipPermissions). A
+ *    model-only binding, or one naming an agent whose `--model` grammar wmux has
+ *    not verified, is stored and shown in Settings but never applied — badging it
+ *    would tell the operator a pane is pinned to a model while the launch goes
+ *    out on the default. A role that skips permission prompts is badged even
+ *    without a model (#1681): that is the launch an operator most needs to see.
+ *  - the surface must be a terminal, since nothing else launches an agent.
+ *
+ * The name predates the skip half; the badge is still the "enforced model"
+ * badge in the header width arithmetic (paneHeaderExtraChromeWidth).
+ */
+export function showsEnforcedModelBadge(opts: {
+  binding: RoleBinding | undefined;
+  surfaceType: string | undefined;
+}): boolean {
+  return (bindingEnforcesModel(opts.binding) || bindingEnforcesSkipPermissions(opts.binding))
+    && isTerminalSurfaceType(opts.surfaceType);
+}
 
 /** Rendered width (px) of the pane-action half of the cluster (split / browser /
  *  stash / zoom).
@@ -103,10 +141,57 @@ export const PANE_ACTIONS_MIN_PANE_WIDTH = PANE_ACTIONS_CLUSTER_WIDTH + MIN_TAB_
  * 0 is a genuinely hidden pane (a background workspace), which also keeps the
  * cluster so it is correct the instant it becomes visible.
  */
-export function paneActionsMode(width: number | null): PaneActionsMode {
+export function paneActionsMode(
+  width: number | null,
+  /** Width of the OTHER shrink-0 chrome this header is carrying — the view
+   *  toggle and the model badge. See paneHeaderExtraChromeWidth. */
+  extraChrome = 0,
+): PaneActionsMode {
   if (width === null || width === 0) return 'full';
-  return width >= PANE_ACTIONS_MIN_PANE_WIDTH ? 'full' : 'overflow';
+  return width >= PANE_ACTIONS_MIN_PANE_WIDTH + extraChrome ? 'full' : 'overflow';
 }
+
+/** Rendered width of the Terminal/Chat toggle: two 11px labels in 7px side
+ *  padding, a 2px gap and the group's own 5px margins. Its widest translation
+ *  decides it, so this is a measured ceiling, not a computed sum. */
+export const CHAT_TOGGLE_WIDTH = 84;
+
+/** The floor the enforced-model badge occupies even fully truncated: 5px of
+ *  padding and a 1px border on each side. `min-width: 0` zeroes a flex item's
+ *  CONTENT box, never its padding, so this much is unavoidable while the badge
+ *  is drawn at all — and it is exactly what pushed the action cluster off the
+ *  end of a 248px header before this was counted. */
+export const ENFORCED_MODEL_BADGE_MIN_WIDTH = 12;
+
+/**
+ * How much shrink-0 chrome the header carries BESIDES the action cluster.
+ *
+ * The affordability threshold used to be `cluster + a readable tab strip`,
+ * which was the whole header back when it was the whole header. The view
+ * toggle and the model badge are shrink-0 too, so when they are present the
+ * same width buys less: at 248px — comfortably "full" by the old threshold — a
+ * pane carrying both pushed the cluster 11px past its own right edge, and the
+ * clipped button was the ⋮/zoom corner, the way out of a narrow pane.
+ *
+ * The badge contributes only its truncated floor, because it is shrinkable:
+ * it gives up its own width first, and only what it cannot give up counts.
+ */
+export function paneHeaderExtraChromeWidth(opts: {
+  chatToggle: boolean;
+  enforcedModelBadge: boolean;
+  /** The active pane is held at a usage limit (UsageLimitChip is drawn). */
+  usageLimitChip?: boolean;
+}): number {
+  return (opts.chatToggle ? CHAT_TOGGLE_WIDTH : 0)
+    + (opts.enforcedModelBadge ? ENFORCED_MODEL_BADGE_MIN_WIDTH : 0)
+    + (opts.usageLimitChip ? USAGE_LIMIT_CHIP_COMPACT_WIDTH : 0);
+}
+
+/** The usage-limit chip in its compact form: clock glyph + countdown. */
+export const USAGE_LIMIT_CHIP_COMPACT_WIDTH = 64;
+/** Rough ceiling of the full chip (label, reset text, toggle and ×). Below
+ *  `cluster + tab strip + other chrome + this`, the chip draws compact. */
+export const USAGE_LIMIT_CHIP_FULL_WIDTH = 300;
 
 /** Whether a pane of `width` can afford the full cluster. Kept as its own
  *  predicate because that is the question the badge offset and the tests ask;
@@ -177,6 +262,12 @@ export function surfaceTabTooltip(
 }
 
 /** Append a keyboard hint to a tooltip label, e.g. "New terminal (Ctrl+T)". */
+/** Warm both chat views before the Chat toggle is pressed. */
+function preloadChatViews(): void {
+  void import('../Chat/ChatView').catch(() => undefined);
+  void import('../ChatV2/ChatV2View').catch(() => undefined);
+}
+
 function withShortcut(label: string, keys: string): string {
   return `${label} (${keys})`;
 }
@@ -207,12 +298,13 @@ function statusDotColor(status: AgentStatus): string {
 }
 
 /** B8 blink dot for a BACKGROUND tab, extracted so each tab subscribes to its
- *  OWN `surfaceAgentStatus[ptyId]` entry (a primitive). The parent used to
- *  subscribe to the whole map, so any pane's status change re-rendered every
- *  tab strip in the app. */
+ *  OWN status (a primitive). The parent used to subscribe to the whole map, so
+ *  any pane's status change re-rendered every tab strip in the app.
+ *  #1509 — the same per-surface attention the Fleet row reads, so a tab whose
+ *  dialog is still open keeps its dot after it has been looked at. */
 function SurfaceTabStatusDot({ ptyId, active }: { ptyId?: string; active: boolean }) {
   const t = useT();
-  const status = useStore((s) => (ptyId ? s.surfaceAgentStatus[ptyId] : undefined));
+  const status = useStore((s) => (ptyId ? surfaceAttentionStatus(s, ptyId) : undefined));
   if (!status || active) return null;
   return (
     <span
@@ -266,6 +358,9 @@ interface SurfaceTabsProps {
    * back to the setting alone, at full width.
    */
   actionsMode?: PaneActionsMode;
+  /** Draw the usage-limit chip compact (glyph + countdown). Pane.tsx decides it
+   *  from the width it already measures. */
+  usageLimitCompact?: boolean;
 }
 
 export default function SurfaceTabs({
@@ -284,6 +379,7 @@ export default function SurfaceTabs({
   onSplitHorizontalRemote,
   onSplitVerticalRemote,
   actionsMode,
+  usageLimitCompact = false,
 }: SurfaceTabsProps) {
   const t = useT();
   // Same 200ms threshold pattern WorkspaceItem uses so a fast click never
@@ -302,7 +398,52 @@ export default function SurfaceTabs({
   // setups, AND by the pane being wide enough to afford it — Pane.tsx combines
   // the two and passes the answer down.
   const paneActionsSetting = useStore((s) => s.paneActionsVisible);
+  const chatViewEnabled = useStore((s) => s.chatViewEnabled);
+  // D2 — this pane's role→model binding, subscribed here (same pattern as the
+  // zoom state below) rather than prop-threaded: the badge it feeds is part of
+  // this strip's layout, so the strip is what has to reserve its width.
+  const paneRoleName = useStore((s) => s.paneRole[paneId]);
+  const paneRoleBinding = useStore((s) =>
+    paneRoleName ? s.orchestratorRoleBindings[paneRoleName] : undefined,
+  );
   const mode: PaneActionsMode = actionsMode ?? (paneActionsSetting ? 'full' : 'none');
+  // Browser mirror (wmux web /app): tabs switch, nothing else — no close,
+  // rename, drag, pane move or action menu.
+  const readOnly = useStore((s) => s.readOnly);
+  // X8 — this pane's supervision state. The ⟳ badge it draws is laid out in
+  // this strip (it used to be absolutely positioned over the corner, where it
+  // covered whatever flow chrome happened to be underneath — the same defect
+  // the model badge had).
+  const supervision = useStore((s) => {
+    const ptyId = surfaces.find((sf) => sf.id === activeSurfaceId)?.ptyId;
+    return ptyId ? s.supervisionByPtyId[ptyId] : undefined;
+  });
+  const enforcedLaunch = useMemo(() => {
+    const surfaceType = surfaces.find((s) => s.id === activeSurfaceId)?.surfaceType;
+    if (!showsEnforcedModelBadge({ binding: paneRoleBinding, surfaceType })) return undefined;
+    return {
+      model: bindingEnforcesModel(paneRoleBinding) ? paneRoleBinding?.model : undefined,
+      skipFlag: bindingSkipPermissionsFlag(paneRoleBinding),
+    };
+  }, [paneRoleBinding, surfaces, activeSurfaceId]);
+  // Both badges are labels, so each carries the SAME string as tooltip and as
+  // accessible name — a screen reader gets what the pointer gets. (The old
+  // absolute spans set `pointer-events: none`, which silently suppressed the
+  // title tooltip they went to the trouble of setting.)
+  const enforcedLaunchLabel = enforcedLaunch
+    ? t('pane.enforcedLaunch', {
+        binding: [
+          paneRoleBinding?.agent,
+          enforcedLaunch.model,
+          enforcedLaunch.skipFlag ? t('pane.enforcedSkipPermissions', { flag: enforcedLaunch.skipFlag }) : undefined,
+        ].filter(Boolean).join(' · '),
+      })
+    : '';
+  const supervisionLabel = !supervision
+    ? ''
+    : supervision.status === 'stopped'
+      ? t('supervision.stoppedTooltip')
+      : t('supervision.armedTooltip', { count: supervision.restartCount });
   // Zoom/maximize state for this pane — the cluster's fifth button toggles it
   // and reflects the current state (pressed when zoomed). Subscribing here (same
   // pattern as Pane.tsx) keeps the button in sync without prop threading.
@@ -349,7 +490,7 @@ export default function SurfaceTabs({
   // at any width. Suppressed when the operator turned pane actions OFF in
   // Settings: that is a deliberate no-pane-chrome choice.
   const handleHeaderContextMenu = useCallback((e: React.MouseEvent) => {
-    if (mode === 'none' && !paneActionsSetting) return;
+    if (readOnly || (mode === 'none' && !paneActionsSetting)) return;
     // A rename field keeps its NATIVE context menu: claiming right-click on an
     // <input> would trade cut/copy/paste for verbs that cannot apply to text.
     if ((e.target as HTMLElement).closest('input, textarea')) return;
@@ -363,13 +504,16 @@ export default function SurfaceTabs({
       right: e.clientX + PANE_ACTIONS_MENU_WIDTH,
       bottom: e.clientY,
     });
-  }, [mode, paneActionsSetting, openMenuAt]);
+  }, [readOnly, mode, paneActionsSetting, openMenuAt]);
   // P2: pane-level identity + rename (distinct from the per-surface tab rename
   // below). The pane's display name is its user label (paneLabel mirror) or the
   // stable auto coordinate `w<ws>-<pane>(<agent>)`. Narrowed to THIS pane's
   // label / THIS pane's active-surface slug (primitives) so unrelated panes'
   // label or agent changes don't re-render this strip.
   const paneLabel = useStore((s) => s.paneLabel[paneId]);
+  // #1237 — snap-to-layout menu entries. Subscribed as the array reference:
+  // template edits are rare (palette save/delete), so identity-equal renders.
+  const layoutTemplates = useStore((s) => s.layoutTemplates);
   const activeSurface = surfaces.find((s) => s.id === activeSurfaceId) ?? surfaces[0];
   const activeSurfacePtyId = activeSurface?.ptyId;
   const activeSlug = useStore((s) =>
@@ -516,10 +660,24 @@ export default function SurfaceTabs({
       separatorBefore: true,
       onSelect: toggleZoom,
     },
+    // #1237 — snap the RUNNING panes into a saved arrangement. Menu-only on
+    // purpose: a sixth cluster button would break the five-button width
+    // contract (PANE_ACTIONS_CLUSTER_WIDTH, two DESIGN.md rulings), and the
+    // verb is workspace-level, not pane-level — the ⋮/right-click menu is the
+    // chrome-free home for it. Non-destructive twin of the palette's
+    // "Layout: X" (applyLayoutTemplate), which replaces panes with empty leaves.
+    ...layoutTemplates.map((tmpl, i) => ({
+      key: `snap-${tmpl.id}`,
+      label: `${t('pane.snapMenuPrefix')}${tmpl.name}`,
+      icon: <IconGrid size={14} />,
+      separatorBefore: i === 0,
+      onSelect: () => { useStore.getState().snapToLayoutTemplate(tmpl.id); },
+    })),
   ], [
     t, onSplitHorizontal, onSplitVertical, onAddBrowser, onAddRemote,
     onSplitHorizontalRemote, onSplitVerticalRemote, startPaneRename,
     stashChord, stashDisabled, stashTooltip, stashThisPane, isZoomed, toggleZoom,
+    layoutTemplates,
   ]);
 
   const commitPaneRename = () => {
@@ -556,7 +714,8 @@ export default function SurfaceTabs({
     // an in-memory File cannot cross the process boundary, so the drop
     // silently failed. text/plain alone behaves like a paste and is
     // accepted by every chat client we have tested.
-    const md = buildPaneMarkdown(workspace, paneId);
+    const state = useStore.getState();
+    const md = buildPaneMarkdown(workspace, paneId, state.surfaceAgent, state);
     e.dataTransfer.setData('text/plain', md);
     e.dataTransfer.effectAllowed = 'copy';
     setTerminalTextDropDragActive(true);
@@ -571,18 +730,23 @@ export default function SurfaceTabs({
 
   return (
     <div
-      // Bridge P1.6 — h-9 (36px chrome module): matches sidebar header/footer,
+      // Bridge P1.6 — h-10 (40px chrome module): matches sidebar header/footer,
       // deck tabs, and the agent toolbar so all top/bottom hairlines align.
-      className="flex items-center bg-[var(--bg-mantle)] border-b border-[var(--bg-surface)] h-9"
-      // borderColor → --border-soft so this strip's bottom hairline matches the
-      // deck tabs / sidebar / titlebar seams (they all override to border-soft;
-      // this one was left on the opaque --bg-surface, so the top-chrome line
-      // changed color at the pane↔deck seam). Focused pane adds the steel
-      // underline on top (inset so it never shifts layout) — the single focus
-      // signal in the design system.
+      // Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/app/shell/TitleBar.tsx), MIT License, Copyright (c) 2026 Nick
+      data-pane-focused={paneActive ? 'true' : undefined}
+      className="wmux-pane-header flex items-center h-10"
+      // The strip's bottom hairline lines up with the deck header and the
+      // titlebar seam. Focus is a tone change on that hairline (and an accent
+      // bar under the focused pane's active tab, ui.css) — never a second
+      // full-width accent line.
       style={{
-        borderColor: 'var(--border-soft)',
-        ...(paneActive ? { boxShadow: 'inset 0 -2px 0 var(--accent-blue)' } : {}),
+        boxShadow: `inset 0 -1px 0 ${paneActive ? 'var(--line-strong)' : 'var(--stroke)'}`,
+        // With no action cluster the corner zoom/maximize button is drawn
+        // absolutely over this strip's right end, so the strip's flow content
+        // stops short of it. With a cluster there is nothing to clear — the
+        // zoom verb is one of its buttons.
+        paddingRight: paneHeaderTailGap({ clusterShown: paneClusterWidth({ mode }) > 0 }),
+
       }}
       data-pane-tabs-active={paneActive ? 'true' : undefined}
       // Right-click the header for the same actions at any width. This is what
@@ -594,7 +758,7 @@ export default function SurfaceTabs({
       {/* #645 — pane move grip. First in the strip, OUTSIDE the scroll region,
           so it stays reachable however many tabs there are. Never on a tab
           itself: tabs own an HTML5 drag that exports terminal text. */}
-      <PaneDragGrip paneId={paneId} workspaceId={workspace.id} />
+      {!readOnly && <PaneDragGrip paneId={paneId} workspaceId={workspace.id} />}
 
       {/* Workspace tag dot — outside the scroll region so it stays visible
           however many tabs there are (it identifies the workspace, not a tab). */}
@@ -609,7 +773,7 @@ export default function SurfaceTabs({
 
       {/* Scroll region: pane label + tabs share the horizontal overflow so the
           action cluster below stays pinned to the right on narrow panes. */}
-      <div className="flex items-center flex-1 min-w-0 overflow-x-auto h-full">
+      <div className="wmux-surface-tablist flex items-center gap-1 px-1 flex-1 min-w-0 overflow-x-auto h-full">
       {/* P2 — pane identity + double-click rename. A distinct element/handler
           from the surface tabs (different store: pane label via MetadataStore vs
           surface.title), so the two renames never collide. */}
@@ -647,8 +811,8 @@ export default function SurfaceTabs({
       ) : (
         <span
           data-pane-label
-          className="shrink-0 px-2 h-full flex items-center text-[10px] font-mono text-[var(--text-muted)] hover:text-[var(--text-sub)] border-r border-[var(--bg-surface)] cursor-pointer select-none truncate max-w-[170px]"
-          onDoubleClick={startPaneRename}
+          className="shrink-0 px-2 h-full flex items-center text-[10px] font-mono text-[var(--text-muted)] hover:text-[var(--text-sub)] border-r border-transparent cursor-pointer select-none truncate max-w-[170px]"
+          onDoubleClick={readOnly ? undefined : startPaneRename}
           title={paneDisplay}
           {...tokenAttrs('textMuted', 'text')}
         >
@@ -658,18 +822,21 @@ export default function SurfaceTabs({
       {surfaces.map((s) => (
         <div
           key={s.id}
-          draggable={editingId !== s.id}
+          draggable={!readOnly && editingId !== s.id}
           onDragStart={handleDragStart}
           onDragEnd={() => setTerminalTextDropDragActive(false)}
-          className={`group flex items-center gap-1 px-3 h-full cursor-pointer text-xs border-r border-[var(--bg-surface)] transition-colors ${
+          // Tab pill: 30px, 6px radius, centered in the 40px strip. Active =
+          // --selection fill + full text; inactive = 50% text, hover fill.
+          // pr-3 keeps the 12px right padding the close button's refund uses.
+          data-active={s.id === activeSurfaceId ? 'true' : undefined}
+          className={`wmux-surface-tab group flex items-center gap-2 pl-3 pr-3 cursor-pointer text-[13px] transition-colors ${
             s.id === activeSurfaceId
-              ? 'bg-[var(--bg-base)] text-[var(--text-main)]'
-              : 'text-[var(--text-subtle)] hover:text-[var(--text-sub)] hover:bg-[rgba(var(--bg-base-rgb),0.5)]'
+              ? 'text-[var(--text-main)]'
+              : 'text-[color-mix(in_srgb,var(--text-main)_50%,transparent)] hover:text-[var(--text-main)] hover:bg-[var(--hover-fill)]'
           }`}
-          {...tokenAttrs('bgBase', 'bg')}
           {...tokenAttrs('textMain', 'text')}
           onClick={() => handleTabClick(s.id)}
-          onDoubleClick={() => startRename(s)}
+          onDoubleClick={readOnly ? undefined : () => startRename(s)}
           // Hover shows the terminal's working directory (cwd is always present
           // once the shell renders its first prompt; before that, the name).
           // A remote tab leads with WHERE it runs: its title is an OSC title
@@ -710,11 +877,11 @@ export default function SurfaceTabs({
               into the tab cell's own 12px right padding: a LEFT refund would put
               the box over the last 2px of the tab title — and over the rename
               input when the tab is being renamed — so a click meant for the end
-              of the name would close the tab instead. The 36px strip absorbs
+              of the name would close the tab instead. The 30px pill absorbs
               the height, so no vertical refund is needed either. */}
-          <button
+          {!readOnly && <button
             data-surface-tab-close
-            className={`${HIT_TARGET_24} -mr-1.5 text-[var(--text-subtle)] hover:text-[var(--accent-red)] transition-colors leading-none`}
+            className={`${HIT_TARGET_24} ${FOCUS_RING} ui-icon-btn ui-icon-btn-danger -mr-1.5 leading-none`}
             onClick={(e) => { e.stopPropagation(); onClose(s.id); }}
             // A strip of four buttons all saying "Close tab" says nothing about
             // WHICH tab closes, so both the tooltip and the accessible name
@@ -725,7 +892,7 @@ export default function SurfaceTabs({
             {...tokenAttrs('danger', 'accent')}
           >
             ✕
-          </button>
+          </button>}
         </div>
       ))}
       {/* OFF by default, and deliberately so. #451 removed the discoverable
@@ -737,7 +904,7 @@ export default function SurfaceTabs({
           This opt-in exists for the people who asked for it and is labelled
           experimental in Settings for exactly that reason: turning it on is
           choosing to break the rule for your own layout. */}
-      {newTerminalButtonVisible && (
+      {newTerminalButtonVisible && !readOnly && (
         <button
           className={`ui-icon-btn ${FOCUS_RING} w-6 h-6 shrink-0`}
           onClick={(e) => { e.stopPropagation(); onAddTerminal(); }}
@@ -750,6 +917,94 @@ export default function SurfaceTabs({
       )}
       </div>
 
+      {(() => {
+        const surface = surfaces.find((s) => s.id === activeSurfaceId);
+        if (!chatViewEnabled || readOnly || !surface || (surface.surfaceType && surface.surfaceType !== 'terminal')) return null;
+        return <div className="wmux-chat-toggle" role="group" aria-label={t('chat.viewMode')}>
+          {(['terminal', 'chat'] as const).map((view) => <button key={view} type="button"
+            className={FOCUS_RING} data-surface-view={view}
+            aria-pressed={(surface.viewMode ?? 'terminal') === view}
+            onPointerEnter={() => { if (view === 'chat') preloadChatViews(); }}
+            onFocus={() => { if (view === 'chat') preloadChatViews(); }}
+            onClick={(e) => { e.stopPropagation(); useStore.getState().setSurfaceViewMode(surface.id, view); }}>
+            {t(`chat.${view}`)}
+          </button>)}
+        </div>;
+      })()}
+
+      {/* D2 — muted enforced-model badge on a role-bound TERMINAL pane. Amber
+          stays reserved for alive+focus (DESIGN.md), so this rides the sub
+          tones. A browser/diff/editor surface never launches an agent, so the
+          badge would be a lie there — hence the surface-type gate, and the
+          enforceability gate beside it (see showsEnforcedModelBadge).
+
+          IN THE FLOW, not absolutely positioned over the strip. It used to be
+          an `position: absolute; right: <arithmetic past the action cluster>`
+          badge owned by Pane.tsx, and that arithmetic knew only about the
+          cluster, the zoom/maximize corner and the supervision badge — never
+          about this toggle, which is a flow child sitting exactly where the
+          offset landed. On a fan-out pane in Chat view the model pill covered
+          the second toggle button outright, so the switch read "Terminal
+          <model>" and the Chat label was only visible peeking out behind it.
+          A wider constant would not have fixed it: the toggle's width is its
+          two translated labels, so every locale moves the target. Laying the
+          badge out as a sibling is what makes overlap unrepresentable.
+
+          The supervision ⟳ badge above it moved here for the same reason and
+          in the same change: it was the other absolute span parked over this
+          corner, and with no role binding in play it covered the Chat button
+          by itself. Both are labels, not controls, so neither takes pointer
+          events away from anything — and being in the flow, both now keep
+          their own hover tooltip, which `pointer-events: none` used to eat. */}
+      <UsageLimitChip
+        ptyId={surfaces.find((sf) => sf.id === activeSurfaceId)?.ptyId}
+        compact={usageLimitCompact}
+      />
+      {supervision && (
+        <span
+          data-pane-supervision={supervision.status}
+          className={`shrink-0 px-[6px] rounded-[3px] font-mono text-[10px] leading-4 font-bold tracking-[0.04em] select-none ${
+            supervision.status === 'stopped'
+              ? 'text-[var(--bg-main)] bg-[var(--accent-red)]'
+              : 'text-[var(--text-muted)] bg-[var(--bg-overlay)]'
+          }`}
+          title={supervisionLabel}
+          aria-label={supervisionLabel}
+        >
+          {supervision.status === 'stopped' ? '⟳!' : '⟳'}
+        </span>
+      )}
+      {enforcedLaunch && (
+        <span
+          data-pane-enforced-model
+          // Shrinkable and capped, NOT shrink-0. A shrink-0 badge of unbounded
+          // width is a second way to break this header: a long model id (a
+          // dated full model name, say) takes its width out of the flow, and
+          // since the action cluster is shrink-0 too, what gives way is the
+          // right-hand end of the strip — the ⋮ that is the only way out of a
+          // narrow pane. Capped at 96px so a long id truncates instead of
+          // growing, and shrinkable so the badge, not the ⋮, is what yields
+          // when the pane runs out of room.
+          className="shrink min-w-0 max-w-[96px] truncate px-[5px] rounded-[3px] font-mono text-[10px] leading-4 tracking-[0.02em] text-[var(--text-muted)] bg-[var(--bg-surface)] border border-[var(--border-soft)] select-none"
+          title={enforcedLaunchLabel}
+          aria-label={enforcedLaunchLabel}
+          {...tokenAttrs('textMuted', 'text')}
+          {...tokenAttrs('bgSurface', 'bg')}
+        >
+          {/* The skip leads, so truncation eats the model id first: of the
+              two, "this pane runs without permission prompts" is the fact the
+              operator must not lose. Red text only, no fill — the destructive
+              tint DESIGN.md allows at rest, as on the Deck mode chip's Danger. */}
+          {enforcedLaunch.skipFlag && (
+            <span data-pane-enforced-skip className="text-[var(--accent-red)]" {...tokenAttrs('danger', 'text')}>
+              {t('pane.enforcedSkipBadge')}
+            </span>
+          )}
+          {enforcedLaunch.skipFlag && enforcedLaunch.model ? ' · ' : ''}
+          {enforcedLaunch.model}
+        </span>
+      )}
+
       {/* Right-aligned pane action cluster. Native next to the per-tab close
           button (same quiet chrome): boxless at rest, a subtle surface lift on
           hover, a keyboard-focus ring, and monochrome line icons from the
@@ -757,7 +1012,7 @@ export default function SurfaceTabs({
           tooltip carries the same shortcut the keyboard already binds. */}
       {mode === 'full' && (
         <div
-          className="flex items-center shrink-0 h-full pl-1 pr-0.5 gap-0.5 border-l border-[var(--border-soft)]"
+          className="flex items-center shrink-0 h-full pl-1 pr-0.5 gap-0.5 border-l border-transparent"
           data-pane-actions
         >
           {/* The "new terminal (tab in this pane)" button is not here: it lives
@@ -824,7 +1079,7 @@ export default function SurfaceTabs({
               tabs. Consolidates the old absolute-positioned corner maximize/
               restore controls (Pane.tsx) that overlapped this cluster. Pressed
               (accent) styling + aria-pressed convey the zoomed state. */}
-          <div className="flex items-center border-l border-[var(--border-soft)] ml-0.5 pl-1">
+          <div className="flex items-center border-l border-transparent ml-0.5 pl-1">
             <button
               className={`ui-icon-btn ${FOCUS_RING} w-6 h-6 ${isZoomed ? 'ui-icon-btn-active' : ''}`}
               onClick={(e) => { e.stopPropagation(); toggleZoom(); }}
@@ -849,7 +1104,7 @@ export default function SurfaceTabs({
           cluster, so it stays pinned to the right edge. */}
       {mode === 'overflow' && (
         <div
-          className="flex items-center shrink-0 h-full pl-1 pr-0.5 border-l border-[var(--border-soft)]"
+          className="flex items-center shrink-0 h-full pl-1 pr-0.5 border-l border-transparent"
           data-pane-actions="overflow"
         >
           <button

@@ -144,6 +144,12 @@ export interface AgentSignal {
    * in practice — the renderer mints a surface only AFTER pty.create returns.)
    */
   ptyId?: string;
+  /**
+   * #1727 — set only by the WSL hook: the boot id and the hook's Linux
+   * ancestors (pid, starttime, cmdline), RS-separated. Unvalidated text; see
+   * parseWslAgentReport (src/daemon/wslAgentProcess.ts).
+   */
+  wslAgentProcess?: string;
   cwd: string;
   payload: Record<string, unknown>;
   ts: number;
@@ -166,6 +172,14 @@ export interface HookSignalResponse {
    *  `reason` is shown to the model verbatim (the bridge writes it to stderr,
    *  which Claude Code feeds back on exit 2). */
   block?: { reason: string };
+  /**
+   * Present only for a bridge run with `--context` (the HQ brain's
+   * UserPromptSubmit hook): one line the bridge hands Claude Code as
+   * `hookSpecificOutput.additionalContext`, so the model sees which workspace
+   * the human was viewing when they typed. Absent = nothing to add, and the
+   * bridge then writes nothing at all.
+   */
+  additionalContext?: string;
   /**
    * #783 — PreToolUse permission gate verdict. Present ONLY when a real
    * decision was reached: `allow` = proceed without prompting, `deny` = block.
@@ -195,6 +209,16 @@ export interface HookSignalResponse {
  * wmux build); HookSignalRouter validates with this function before
  * forwarding to AgentDetector dedup + sendNotification.
  */
+/**
+ * #1463 — a SessionStart `payload.source` that begins a session with no turn
+ * in it: a new process (`startup`), a resumed one (`resume`) or `/clear`
+ * (which Claude Code queues behind a running turn). `compact` fires mid-turn
+ * on auto-compaction, and an unknown or missing source proves nothing.
+ */
+export function isFreshSessionSource(source: unknown): boolean {
+  return source === 'startup' || source === 'resume' || source === 'clear';
+}
+
 /** Closed set of allowed agent slugs. Used by isAgentSignal to reject
  *  unknown agent values rather than accepting any string (codex round-2
  *  review P2 #9). Derived from the identity table, so it cannot drift from
@@ -231,5 +255,7 @@ export function isAgentSignal(value: unknown): value is AgentSignal {
   if (v['workspaceId'] !== undefined && (typeof v['workspaceId'] !== 'string' || v['workspaceId'].length === 0)) return false;
   if (v['surfaceId'] !== undefined && (typeof v['surfaceId'] !== 'string' || v['surfaceId'].length === 0)) return false;
   if (v['ptyId'] !== undefined && (typeof v['ptyId'] !== 'string' || v['ptyId'].length === 0)) return false;
+  if (v['wslAgentProcess'] !== undefined && (typeof v['wslAgentProcess'] !== 'string' ||
+    v['wslAgentProcess'].length === 0 || v['wslAgentProcess'].length > 8192)) return false;
   return true;
 }

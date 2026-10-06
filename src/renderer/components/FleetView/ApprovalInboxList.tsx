@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+// Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/app/shell/Sidebar.tsx), MIT License, Copyright (c) 2026 Nick
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../../stores';
 import { selectWorkspaceIdName } from '../../stores/selectors/workspaceProjections';
@@ -7,14 +8,28 @@ import { groupCapabilities } from '../Approval/PermissionApprovalDialog';
 import type { RiskClassCopy } from '../../../main/mcp/methodCapabilityMap';
 import type { InboxItem } from '../../stores/selectors/approvalInbox';
 import { deadlineForItem, remainingSeconds } from './approvalCountdown';
+import { focusNotificationTarget } from '../../hooks/useNotificationListener';
+import { beginApprovalCountdown, pauseApprovalCountdown } from '../../utils/executeApprovalGate';
+import { IconWarning } from '../icons';
 
-// gpui button recipes (theme-safe). Approve = primary warm CTA; deny = danger
+// Button recipes (theme-safe). Approve = the solid primary; deny = danger
 // tinted. The row still carries the critical/attention border + countdown, so
-// warm-approve does not drop the "this is a sensitive grant" signal.
+// the primary approve does not drop the "this is a sensitive grant" signal.
 const BTN_PRIMARY_WARM =
-  'rounded-[5px] font-semibold bg-[var(--accent)] text-[var(--bg-base)] shadow-[inset_0_1px_0_color-mix(in_srgb,var(--surface-highlight)_22%,transparent),0_1px_2px_rgba(0,0,0,0.3)] hover:bg-[color-mix(in_srgb,var(--accent)_88%,var(--text-main))] transition-colors';
+  'rounded-md font-semibold bg-[var(--primary-fill)] text-[var(--primary-ink)] hover:bg-[color-mix(in_srgb,var(--primary-fill)_90%,transparent)] transition-colors';
 const BTN_DANGER_TINTED =
-  'rounded-[5px] border transition-colors bg-[color-mix(in_srgb,var(--accent-red)_15%,transparent)] border-[color-mix(in_srgb,var(--accent-red)_32%,transparent)] text-[color-mix(in_srgb,var(--accent-red)_70%,var(--text-main))] hover:bg-[color-mix(in_srgb,var(--accent-red)_22%,transparent)]';
+  'rounded-md border transition-colors bg-[color-mix(in_srgb,var(--accent-red)_15%,transparent)] border-[color-mix(in_srgb,var(--accent-red)_32%,transparent)] text-[color-mix(in_srgb,var(--accent-red)_70%,var(--text-main))] hover:bg-[color-mix(in_srgb,var(--accent-red)_22%,transparent)]';
+// Hairline neutral secondary (DESIGN.md Component Rules). Cancelling a help request
+// abandons one step, not the flow, so it is NOT the destructive treatment the
+// approval rows' Deny wears.
+const BTN_SECONDARY_RAISED =
+  'rounded-md border transition-colors bg-transparent border-[var(--line)] text-[color-mix(in_srgb,var(--text-main)_70%,transparent)] hover:bg-[var(--line)] hover:text-[var(--text-main)]';
+
+// Approval card (DESIGN.md Colour grammar): a request that waits on you is a content-20%
+// card with a dashed content-30% border; keyboard focus swaps in the accent
+// ring. Red stays for critical grants and errors.
+const APPROVAL_FILL = 'color-mix(in srgb, var(--text-main) 20%, transparent)';
+const APPROVAL_BORDER = '1px dashed color-mix(in srgb, var(--text-main) 30%, transparent)';
 
 // ─── S-C2 Approval Inbox list ─────────────────────────────────────────────────
 //
@@ -29,6 +44,7 @@ const BTN_DANGER_TINTED =
 // this renders nothing.
 
 interface ApprovalInboxListProps {
+  onNavigate?: () => void;
   items: InboxItem[];
   focusedIdx: number;
   onResolve: (item: InboxItem, approved: boolean) => void;
@@ -45,7 +61,7 @@ function severityAccent(severity: RiskClassCopy['severity']): string {
   }
 }
 
-export default function ApprovalInboxList({ items, focusedIdx, onResolve }: ApprovalInboxListProps) {
+export default function ApprovalInboxList({ items, focusedIdx, onResolve, onNavigate }: ApprovalInboxListProps) {
   const t = useT();
 
   // Resolve A2A sender/receiver workspace IDs to display names (mirrors
@@ -67,16 +83,58 @@ export default function ApprovalInboxList({ items, focusedIdx, onResolve }: Appr
     [mcpPrompts],
   );
 
+  // While this tab is open AppLayout unmounts the execute dialog, which is the
+  // only other thing that starts an A2A prompt's auto-deny clock — so without
+  // this the row sat at "0s" and never expired. Every row is on screen at once
+  // here, so each one's 30 s is time a person can actually use. Idempotent, so
+  // a row that is already counting keeps its deadline when another one lands.
+  const a2aRows = items.filter((it): it is Extract<InboxItem, { source: 'a2a' }> => it.source === 'a2a');
+  const a2aApprovalIds = a2aRows.map((it) => it.approvalId).join(',');
+  // Rows on screen whose clock is not running: new ones, and any another
+  // surface paused. Keyed on those alone, so a row that is already counting
+  // keeps its deadline when another one lands or settles.
+  const stoppedA2aIds = a2aRows.filter((it) => it.expiresAt <= 0).map((it) => it.approvalId).join(',');
+  useEffect(() => {
+    if (!stoppedA2aIds) return;
+    for (const id of stoppedA2aIds.split(',')) beginApprovalCountdown(id);
+  }, [stoppedA2aIds]);
+  // When the inbox goes away, the dialog takes over and shows ONE prompt at a
+  // time; the rest must not keep counting down unseen. Pause every row this
+  // list was showing — the dialog restarts the one it shows. Unmount only: a
+  // row that leaves the list while it stays open has settled.
+  const shownA2aIds = useRef<string[]>([]);
+  useEffect(() => {
+    shownA2aIds.current = a2aApprovalIds ? a2aApprovalIds.split(',') : [];
+  }, [a2aApprovalIds]);
+  useEffect(() => () => {
+    for (const id of shownA2aIds.current) pauseApprovalCountdown(id);
+  }, []);
+
   // Live countdown tick for any row that HAS a deadline (A2A always, an MCP
   // prompt once stamped), mirroring ExecuteApprovalDialog's now-tick. Gated so
   // an inbox of deadline-less prompts never spins a 250ms interval.
   const hasDeadline = items.some((it) => deadlineForItem(it, mcpDeadlineAt) !== undefined);
   const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
+  // Layout effect, and `now` refreshed on start: while no row had a deadline
+  // the tick was off and `now` kept its mount time, so the first countdown
+  // would paint against a stale clock ("auto-deny in 330s").
+  useLayoutEffect(() => {
     if (!hasDeadline) return;
+    setNow(Date.now());
     const tick = setInterval(() => setNow(Date.now()), 250);
     return () => clearInterval(tick);
   }, [hasDeadline]);
+
+  // Jump to the browser pane a help request is about, then step out of the way.
+  // Reuses focusNotificationTarget — the existing, race-tested jump (workspace
+  // switch, pane + surface activation, zoom coherence) FleetView's own rows go
+  // through — rather than a second focus path. Closing the cockpit matches what
+  // FleetView's card jump does: the operator asked to be taken to the pane.
+  const jumpToHelpSurface = (surfaceId: string) => {
+    onNavigate?.();
+    focusNotificationTarget(() => useStore.getState(), { surfaceId });
+    useStore.getState().setFleetViewVisible(false);
+  };
 
   // C-3 (review fix): the log is the STORE's, written at the removal point.
   // Inferring it here from "row vanished, deadline past" mislabelled rows a
@@ -91,7 +149,7 @@ export default function ApprovalInboxList({ items, focusedIdx, onResolve }: Appr
       {/* An empty listbox is a control with nothing to choose — announced, and
           unusable. When there are no rows the log below stands alone. */}
       {items.length > 0 && (
-      <div role="listbox" aria-label={t('fleet.tab.approvals')} className="flex flex-col gap-2">
+      <div role="listbox" aria-label={t('fleet.tab.approvals')} className="flex flex-col gap-0.5">
       {items.map((item, idx) => {
         const focused = idx === focusedIdx;
         const optionProps = {
@@ -117,28 +175,30 @@ export default function ApprovalInboxList({ items, focusedIdx, onResolve }: Appr
         );
 
         if (item.source === 'a2a') {
-          const remainingSec = Math.ceil(Math.max(0, item.expiresAt - now) / 1000);
+          const deadline = deadlineForItem(item);
           const sameWs = !!item.senderWorkspaceId && item.senderWorkspaceId === item.receiverWorkspaceId;
           return (
             <div
               key={item.key}
               {...optionProps}
-              className="flex flex-col gap-2 p-3 rounded-[7px] outline-none"
+              className="flex flex-col gap-2 px-2.5 py-2 rounded-md outline-none"
               style={{
-                backgroundColor: 'var(--bg-surface)',
-                border: `1px solid ${focused ? 'var(--accent-blue)' : 'var(--accent-red)'}`,
-                boxShadow: focused ? '0 0 0 1px var(--accent-blue)' : undefined,
+                backgroundColor: APPROVAL_FILL,
+                border: focused ? '1px solid var(--accent)' : APPROVAL_BORDER,
+                boxShadow: focused ? '0 0 0 1px var(--accent)' : undefined,
               }}
             >
               <div className="flex items-center gap-2">
-                <span style={{ color: 'var(--accent-red)', fontSize: 14 }}>⚠</span>
+                <span aria-hidden="true" className="inline-flex" style={{ color: 'var(--accent-yellow)' }}><IconWarning size={14} /></span>
                 <span className="text-sm font-semibold font-mono" style={{ color: 'var(--text-main)' }}>
                   {t('fleet.approvals.a2aTitle')}
                 </span>
                 <div className="flex-1" />
-                <span className="text-[10px] font-mono" style={{ color: 'var(--text-subtle)' }}>
-                  {t('fleet.approvals.autoDenyIn', { seconds: remainingSec })}
-                </span>
+                {deadline !== undefined && (
+                  <span className="text-[10px] font-mono" style={{ color: 'var(--text-subtle)' }}>
+                    {t('fleet.approvals.autoDenyIn', { seconds: remainingSeconds(deadline, now) })}
+                  </span>
+                )}
               </div>
               {/* Who is asking + what they want — security context (subordinate,
                   muted, mono). Uses the from/to/a2aDescRemote/a2aDescSameWorkspace keys. */}
@@ -188,6 +248,83 @@ export default function ApprovalInboxList({ items, focusedIdx, onResolve }: Appr
           );
         }
 
+        if (item.source === 'browserHelp') {
+          // Second rendition of ONE event (DESIGN.md attention grammar, max
+          // two): the in-pane bar is the first, this row is the second, and
+          // there is deliberately no titlebar chip and no modal. Amber dot =
+          // needs input, the one vocabulary the dots share.
+          const deadline = deadlineForItem(item);
+          return (
+            <div
+              key={item.key}
+              {...optionProps}
+              className="flex flex-col gap-2 px-2.5 py-2 rounded-md outline-none"
+              style={{
+                backgroundColor: APPROVAL_FILL,
+                border: focused ? '1px solid var(--accent)' : APPROVAL_BORDER,
+                boxShadow: focused ? '0 0 0 1px var(--accent)' : undefined,
+              }}
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <span
+                  aria-hidden="true"
+                  className="shrink-0 rounded-full"
+                  style={{ width: 6, height: 6, backgroundColor: 'var(--accent-yellow)' }}
+                />
+                <span className="text-sm font-semibold truncate" style={{ color: 'var(--text-main)' }}>
+                  {t('fleet.help.title')}
+                </span>
+                <div className="flex-1" />
+                {deadline !== undefined && (
+                  <span className="text-[10px] font-mono" style={{ color: 'var(--text-subtle)' }}>
+                    {t('fleet.help.timesOutIn', { seconds: remainingSeconds(deadline, now) })}
+                  </span>
+                )}
+              </div>
+              {/* Sans, not mono: this is the agent talking to the operator, not
+                  machine evidence (DESIGN.md typography rule). Rendered as a
+                  text child, so an agent-authored prompt can never be markup. */}
+              <p
+                className="text-xs whitespace-pre-wrap break-words"
+                style={{ color: 'var(--text-sub)' }}
+                data-browser-help-prompt
+              >
+                {item.prompt}
+              </p>
+              <div className="flex items-center justify-end gap-2">
+                {/* Every claim one click from its evidence: the page the human
+                    has to act on is one jump away. */}
+                {item.surfaceId !== undefined && (
+                  <button
+                    type="button"
+                    onClick={(e) => { stop(e); jumpToHelpSurface(item.surfaceId as string); }}
+                    title={t('fleet.help.jump')}
+                    aria-label={t('fleet.help.jump')}
+                    className="px-2 py-1.5 text-xs rounded-md transition-colors hover:bg-[var(--selection)]"
+                    style={{ color: 'var(--text-main)', minWidth: 24, minHeight: 24 }}
+                  >
+                    →
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={(e) => { stop(e); onResolve(item, false); }}
+                  className={`px-4 py-1.5 text-xs font-medium ${BTN_SECONDARY_RAISED}`}
+                >
+                  {t('browser.help.cancel')}
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => { stop(e); onResolve(item, true); }}
+                  className={`px-4 py-1.5 text-xs ${BTN_PRIMARY_WARM}`}
+                >
+                  {t('browser.help.done')}
+                </button>
+              </div>
+            </div>
+          );
+        }
+
         // MCP row. Highest-severity group is groups[0] — groupCapabilities
         // returns them in critical-first GROUP_RENDER_ORDER.
         const groups = groupCapabilities(item.declaredCapabilities);
@@ -197,18 +334,24 @@ export default function ApprovalInboxList({ items, focusedIdx, onResolve }: Appr
           <div
             key={item.key}
             {...optionProps}
-            className="flex flex-col gap-2 p-3 rounded-[7px] outline-none"
+            className="flex flex-col gap-2 px-2.5 py-2 rounded-md outline-none"
             style={{
-              backgroundColor: 'var(--bg-surface)',
-              border: `1px solid ${
-                focused ? 'var(--accent-blue)' : item.isCritical ? 'var(--accent-red)' : 'var(--bg-overlay)'
-              }`,
-              boxShadow: focused ? '0 0 0 1px var(--accent-blue)' : undefined,
+              backgroundColor: APPROVAL_FILL,
+              border: focused ? '1px solid var(--accent)' : item.isCritical ? '1px solid var(--accent-red)' : APPROVAL_BORDER,
+              boxShadow: focused ? '0 0 0 1px var(--accent)' : undefined,
             }}
           >
             <div className="flex items-center gap-2 min-w-0">
               <span className="text-xs font-mono truncate" style={{ color: 'var(--text-main)' }}>
-                <span style={{ color: 'var(--text-subtle)' }}>{t('fleet.approvals.plugin')}: </span>
+                {/* A tab-borrow prompt comes from a workspace's agent, not from a
+                    plugin; labelling it one would misattribute the request. */}
+                <span style={{ color: 'var(--text-subtle)' }}>
+                  {t(item.kind === 'browser-borrow'
+                    ? 'fleet.approvals.workspace'
+                    : item.kind === 'computer-app'
+                      ? 'fleet.approvals.agent'
+                      : 'fleet.approvals.plugin')}:{' '}
+                </span>
                 {item.clientName}
               </span>
               <div className="flex-1" />
@@ -229,7 +372,7 @@ export default function ApprovalInboxList({ items, focusedIdx, onResolve }: Appr
               })()}
               {item.isCritical && (
                 <span
-                  className="text-[10px] font-semibold px-1.5 py-0.5 rounded"
+                  className="text-[10px] font-semibold px-1.5 py-0.5 rounded-md"
                   style={{
                     backgroundColor: 'color-mix(in srgb, var(--accent-red) 22%, transparent)',
                     color: 'var(--accent-red)',
@@ -239,6 +382,15 @@ export default function ApprovalInboxList({ items, focusedIdx, onResolve }: Appr
                 </span>
               )}
             </div>
+
+            {/* The question itself, for a prompt that carries one. A borrow
+                declares no capabilities, so without this the row would say who
+                is asking and never what for. */}
+            {item.title && (
+              <div className="text-xs font-medium" style={{ color: 'var(--text-main)' }}>
+                {item.title}
+              </div>
+            )}
 
             {top && (
               <div className="text-xs font-medium" style={{ color: accent }}>

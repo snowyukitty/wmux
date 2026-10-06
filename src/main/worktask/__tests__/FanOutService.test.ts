@@ -15,7 +15,14 @@ import {
   firstRunStuckSummary,
   WORKER_DELIVERY_PREAMBLE,
 } from '../FanOutService';
-import { MODEL_ENV_MARKER, reattachModelEnvMarker, splitModelEnvMarker } from '../../../shared/workerLaunch';
+import {
+  MODEL_ENV_MARKER,
+  applyWorkerPermissionFlags,
+  reattachModelEnvMarker,
+  splitModelEnvMarker,
+  workerLaunchFlags,
+} from '../../../shared/workerLaunch';
+import { commandChoosesModel } from '../../../shared/orchestratorRole';
 import { FIRST_RUN_CLEAN_READS } from '../agentFirstRun';
 import type { FanOutDaemonPort, FanOutRendererPort } from '../FanOutService';
 import type { TaskWorktreePlan } from '../TaskWorktreeManager';
@@ -23,12 +30,19 @@ import type { ProjectConfigState } from '../../../shared/wmuxProjectConfig';
 import { clearFanoutPortReservationsForTest } from '../fanoutEnvironment';
 import { TaskLedger } from '../../../daemon/ledger/TaskLedger';
 import { setTaskLedgerForTests } from '../../deck/taskLedgerHost';
+import { FanOutGuards, setFanOutGuardsForTests } from '../fanoutGuards';
 
 let metaRoot: string;
+let lineage: FanOutGuards;
 beforeEach(() => {
   metaRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-fanout-'));
+  // The service stamps each task workspace's lineage; keep that out of the
+  // real wmux dir.
+  lineage = new FanOutGuards({ dir: metaRoot, countLiveTasks: () => 0, ledgerTaskOwner: () => null });
+  setFanOutGuardsForTests(lineage);
 });
 afterEach(() => {
+  setFanOutGuardsForTests(null);
   fs.rmSync(metaRoot, { recursive: true, force: true });
 });
 
@@ -43,6 +57,9 @@ function makePlan(slug: string): TaskWorktreePlan {
     metaDir: path.join(metaRoot, 'meta', slug),
   };
 }
+
+/** T3 — the commit the worktrees fake reports as origin's default branch. */
+const BASE_OID = 'c'.repeat(40);
 
 /** worktrees fake — preflight/createWorktree/removeWorktree 제어. */
 function makeWorktreesFake(opts?: {
@@ -64,6 +81,7 @@ function makeWorktreesFake(opts?: {
       return { ok: true as const, worktreePath: plan.worktreePath, branch: plan.branch };
     }),
     removeWorktree: vi.fn(async () => ({ ok: true as const })),
+    resolveBase: vi.fn(async () => ({ oid: BASE_OID, ref: 'refs/remotes/origin/main' })),
   } as any;
 }
 
@@ -149,10 +167,30 @@ function baseReq(overrides?: Partial<Parameters<FanOutService['start']>[0]>) {
   };
 }
 
-describe('buildInitialCommand (§4 D4)', () => {
+// #1274: the two suites below are the only ones here that exec a real shell
+// (`bash -c` / `sh -c`) to prove the launch string survives an alias-expanding
+// shell. Locally those tests are 8-25 ms, but the work is real-process, so it
+// scales with runner load: "uses a same-shell form" took 7.4 s on windows-latest
+// and blew vitest's 5 s default on a PR that never touched this code. Explicit
+// generous budget for the shell-spawning suites only.
+const SHELL_SPAWN_TIMEOUT_MS = 30_000;
+
+describe('buildInitialCommand (§4 D4)', { timeout: SHELL_SPAWN_TIMEOUT_MS }, () => {
   it('§7: promptPath 없으면 agentCmd만 그대로(빈 인자로 발사하지 않는다)', () => {
     expect(buildInitialCommand('claude', undefined)).toBe('claude');
     expect(buildInitialCommand('claude')).toBe('claude');
+  });
+
+  it('puts agy\'s -i right before the prompt argument (agy refuses a positional prompt)', () => {
+    expect(buildInitialCommand('agy', '/m/p.md', 'linux')).toBe("agy -i \"$(cat '/m/p.md')\"");
+    expect(buildInitialCommand('agy --model gemini-3.8-flash-high', '/m/p.md', 'linux')).toBe(
+      "agy --model gemini-3.8-flash-high -i \"$(cat '/m/p.md')\"",
+    );
+    expect(buildInitialCommand('agy', 'C:\\m\\p.md', 'win32').startsWith('agy -i "$(Get-Content -Raw')).toBe(true);
+    // Already flagged, promptless, or another CLI: unchanged.
+    expect(buildInitialCommand('agy --print', '/m/p.md', 'linux')).toBe("agy --print \"$(cat '/m/p.md')\"");
+    expect(buildInitialCommand('agy', undefined, 'linux')).toBe('agy');
+    expect(buildInitialCommand('codex', '/m/p.md', 'linux')).toBe("codex \"$(cat '/m/p.md')\"");
   });
 
   it('POSIX 경로 치환 명령을 만든다(경로 단일따옴표 쿼팅)', () => {
@@ -160,7 +198,7 @@ describe('buildInitialCommand (§4 D4)', () => {
     if (process.platform !== 'win32') {
       expect(buildInitialCommand('claude', '/m/prompt.md')).toBe("claude \"$(cat '/m/prompt.md')\"");
     } else {
-      expect(buildInitialCommand('claude', 'C:\\m\\prompt.md')).toContain('Get-Content -Raw -LiteralPath');
+      expect(buildInitialCommand('claude', 'C:\\m\\prompt.md')).toContain('Get-Content -Raw -Encoding UTF8 -LiteralPath');
     }
   });
 
@@ -168,13 +206,27 @@ describe('buildInitialCommand (§4 D4)', () => {
     if (process.platform === 'win32') {
       // PowerShell: 단일따옴표 리터럴, 내부 `'`는 `''`.
       const cmd = buildInitialCommand('claude', "C:\\a b\\it's $x`.md");
-      expect(cmd).toBe("claude \"$(Get-Content -Raw -LiteralPath 'C:\\a b\\it''s $x`.md')\"");
+      expect(cmd.startsWith("claude \"$(Get-Content -Raw -Encoding UTF8 -LiteralPath 'C:\\a b\\it''s $x`.md' | ")).toBe(
+        true,
+      );
       return;
     }
     // POSIX: 각 위험 경로가 단일따옴표 리터럴 안에 담기고 `'`만 닫고-이스케이프-열기.
     expect(buildInitialCommand('claude', '/a b/prompt.md')).toBe("claude \"$(cat '/a b/prompt.md')\"");
     expect(buildInitialCommand('claude', "/a/it's.md")).toBe("claude \"$(cat '/a/it'\\''s.md')\"");
     expect(buildInitialCommand('claude', '/a/$x`y.md')).toBe("claude \"$(cat '/a/$x`y.md')\"");
+  });
+
+  it('win32 (#1490): the prompt argument stays one quoted word the flag appender leaves intact', () => {
+    // The quote character inside the PowerShell stage is spelled [char]34 / \x22:
+    // a literal `"` would end the `"$(…)"` word early for the launch-line
+    // tokenizers. The real-shell behaviour is FanOutService.powershell.runtime.test.ts.
+    const cmd = buildInitialCommand('claude', "C:\\a b\\it's.md", 'win32');
+    expect(cmd.startsWith('claude "$(')).toBe(true);
+    expect(cmd.endsWith(')"')).toBe(true);
+    expect(cmd.slice('claude "'.length, -1)).not.toContain('"');
+    expect(applyWorkerPermissionFlags(cmd, 'auto')).toBe(`${cmd} ${workerLaunchFlags('auto')}`);
+    expect(commandChoosesModel(cmd)).toBe(false);
   });
 
   it('POSIX: 실제 sh -c 왕복에서 파일 내용이 argv로 실린다(재해석 없음)', () => {
@@ -199,7 +251,7 @@ describe('buildInitialCommand (§4 D4)', () => {
 
 // ── F15: the worker's model is wmux's decision, not the login shell's ─────────
 
-describe('workerLaunchCommand (F15)', () => {
+describe('workerLaunchCommand (F15)', { timeout: SHELL_SPAWN_TIMEOUT_MS }, () => {
   const POSIX = { platform: 'darwin' as NodeJS.Platform };
 
   it('neutralises a shell-exported ANTHROPIC_MODEL for a plain claude worker', () => {
@@ -218,8 +270,15 @@ describe('workerLaunchCommand (F15)', () => {
     const cmd = workerLaunchCommand('claude', undefined, POSIX).command;
     expect(cmd.startsWith('env ')).toBe(false);
     expect(cmd).toContain('unset ANTHROPIC_MODEL; ');
+  });
+
+  // POSIX-only: this is the POSIX launch form, which a Windows pane never runs,
+  // and spawning `bash` on windows-latest blew even a 30 s budget without saying
+  // anything about the command. The string assertions above run everywhere.
+  it.skipIf(process.platform === 'win32')('an alias-expanding bash runs the aliased claude', () => {
     // The alias-carrying shell really does expand the word after the `;` — an
     // `env -u` form would have looked for a BINARY that is not on PATH at all.
+    const cmd = workerLaunchCommand('claude', undefined, POSIX).command;
     const script = ['shopt -s expand_aliases', "alias claude='printf ALIASED'", cmd].join('\n');
     expect(execFileSync('bash', ['-c', script], { encoding: 'utf8' })).toBe('ALIASED');
   });
@@ -339,6 +398,172 @@ describe('firstRunStuckSummary (F15)', () => {
   });
 });
 
+describe('T3 worktree base — one fetch per fan-out, OID pinned, warning surfaced', () => {
+  it('resolves the base once for N tasks, hands every createWorktree the same OID, and stamps it', async () => {
+    const worktrees = makeWorktreesFake();
+    const daemon = makeDaemonFake();
+    const svc = new FanOutService({ daemon: daemon.port, renderer: makeRendererFake().port, worktrees });
+    const res = await svc.start(baseReq({ titles: ['a', 'b', 'c'] }));
+    expect(res.ok).toBe(true);
+    expect(worktrees.resolveBase).toHaveBeenCalledTimes(1);
+    expect(worktrees.resolveBase).toHaveBeenCalledWith('/repo');
+    expect(worktrees.createWorktree).toHaveBeenCalledTimes(3);
+    for (const call of worktrees.createWorktree.mock.calls) {
+      expect(call[1]).toBe(BASE_OID);
+    }
+    // The stamp is what task-mode diffs read the base from.
+    for (const t of res.tasks) {
+      const stamp = JSON.parse(fs.readFileSync(path.join(metaRoot, 'meta', t.taskId!.slice(-8), 'task.json'), 'utf8'));
+      expect(stamp.baseOid).toBe(BASE_OID);
+    }
+    expect(res.warnings).toBeUndefined();
+    expect(daemon.calls.some((c) => c.method === 'a2a.channel.post')).toBe(false);
+  });
+
+  it('a base warning rides a still-successful result and is posted to every mission channel', async () => {
+    const worktrees = makeWorktreesFake();
+    const warning = 'git fetch origin main failed (offline); tasks branched from the local HEAD';
+    worktrees.resolveBase = vi.fn(async () => ({ warning }));
+    const daemon = makeDaemonFake();
+    const svc = new FanOutService({ daemon: daemon.port, renderer: makeRendererFake().port, worktrees });
+    const res = await svc.start(baseReq());
+    expect(res.ok).toBe(true);
+    expect(res.warnings).toEqual([warning]);
+    for (const call of worktrees.createWorktree.mock.calls) {
+      expect(call[1]).toBeUndefined();
+    }
+    for (const t of res.tasks) {
+      const stamp = JSON.parse(fs.readFileSync(path.join(metaRoot, 'meta', t.taskId!.slice(-8), 'task.json'), 'utf8'));
+      expect(stamp.baseOid).toBeUndefined();
+    }
+    const posts = daemon.calls.filter((c) => c.method === 'a2a.channel.post');
+    expect(posts.map((p) => p.params['channelId'])).toEqual(['ch-1', 'ch-2']);
+    for (const p of posts) {
+      expect(p.params['text']).toContain(warning);
+      expect(p.params['verifiedWorkspaceId']).toBe('ws-ceo');
+    }
+  });
+
+  it('a base refused for submodules/LFS refuses the whole fan-out before any task exists', async () => {
+    const worktrees = makeWorktreesFake();
+    worktrees.resolveBase = vi.fn(async () => ({ error: 'the base refs/remotes/origin/main contains submodules' }));
+    const daemon = makeDaemonFake();
+    const svc = new FanOutService({ daemon: daemon.port, renderer: makeRendererFake().port, worktrees });
+    const res = await svc.start(baseReq());
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/submodules/);
+    expect(res.tasks).toEqual([]);
+    expect(daemon.calls).toHaveLength(0);
+  });
+
+  it('a refused preflight never fetches', async () => {
+    const worktrees = makeWorktreesFake({ preflightFail: 'not a git repository' });
+    const svc = new FanOutService({ daemon: makeDaemonFake().port, renderer: makeRendererFake().port, worktrees });
+    const res = await svc.start(baseReq());
+    expect(res.ok).toBe(false);
+    expect(worktrees.resolveBase).not.toHaveBeenCalled();
+  });
+});
+
+describe('depth-1 lineage stamp', () => {
+  it('asks the renderer to stamp each task workspace with its owner before launch, and confirms it main-side', async () => {
+    const daemon = makeDaemonFake();
+    const renderer = makeRendererFake();
+    const svc = new FanOutService({ daemon: daemon.port, renderer: renderer.port, worktrees: makeWorktreesFake() });
+    const res = await svc.start(baseReq());
+    expect(res.ok).toBe(true);
+    for (const p of renderer.spawned) expect((p as { fanoutTaskOf?: string }).fanoutTaskOf).toBe('ws-ceo');
+    for (const t of res.tasks) expect(lineage.fanoutOwnerOf(t.workspaceId!)).toBe('ws-ceo');
+  });
+
+  it('hands every task the one origin resolved at request time — even when the first spawn fails', async () => {
+    // The requester was resolved once, before the fan-out ran. Every spawn
+    // carries exactly that origin: the service never asks the renderer to
+    // re-resolve a ptyId, so a pane that closes mid-fan-out cannot move its
+    // tasks to whichever pane holds that ptyId next.
+    const origin = { kind: 'pane' as const, paneId: 'p74', surfaceId: 's74', label: 'w115-74' };
+    const renderer = makeRendererFake({ spawnFailOn: (name) => name.endsWith('A') });
+    const res = await new FanOutService({ daemon: makeDaemonFake().port, renderer: renderer.port, worktrees: makeWorktreesFake() })
+      .start({ ...baseReq(), titles: ['A', 'B', 'C'], idempotencyKey: 'k-pane', caller: origin });
+    expect(renderer.spawned).toHaveLength(3);
+    for (const p of renderer.spawned) {
+      expect((p as { fanoutOrigin?: unknown }).fanoutOrigin).toEqual(origin);
+      expect(p).not.toHaveProperty('fanoutCaller');
+    }
+    // …and main's confirming re-mark stamps that same origin.
+    for (const t of res.tasks.filter((x) => x.workspaceId)) {
+      expect(lineage.lineageFor([t.workspaceId!])[t.workspaceId!].origin).toEqual(origin);
+    }
+
+    // No resolvable requester: no task carries one.
+    const none = makeRendererFake();
+    await new FanOutService({ daemon: makeDaemonFake().port, renderer: none.port, worktrees: makeWorktreesFake() })
+      .start({ ...baseReq(), idempotencyKey: 'k-none' });
+    for (const p of none.spawned) expect(p).not.toHaveProperty('fanoutOrigin');
+  });
+
+  it('stamps a GUI or orchestrator origin main-side without replacing a recorded one', async () => {
+
+    const gui = makeRendererFake();
+    const res = await new FanOutService({ daemon: makeDaemonFake().port, renderer: gui.port, worktrees: makeWorktreesFake() })
+      .start({ ...baseReq(), idempotencyKey: 'k-gui', caller: { kind: 'gui' } });
+    const ids = res.tasks.map((t) => t.workspaceId!);
+    for (const id of ids) expect(lineage.lineageFor([id])[id].origin).toEqual({ kind: 'gui' });
+
+    // A pane origin the renderer stamped first survives the service's re-mark.
+    lineage.markTask('ws-pre', 'ws-ceo', { kind: 'pane', paneId: 'p74', label: 'w115-74' });
+    lineage.markTask('ws-pre', 'ws-ceo', { kind: 'orchestrator' });
+    expect(lineage.lineageFor(['ws-pre'])['ws-pre'].origin).toEqual({ kind: 'pane', paneId: 'p74', label: 'w115-74' });
+  });
+
+  it('hands the renderer the operator\'s worker permission mode for every task', async () => {
+    const renderer = makeRendererFake();
+    const svc = new FanOutService({
+      daemon: makeDaemonFake().port,
+      renderer: renderer.port,
+      worktrees: makeWorktreesFake(),
+      workerPermissionMode: () => 'acceptEdits',
+    });
+    await svc.start(baseReq());
+    expect(renderer.spawned.map((p) => (p as { workerPermissionMode?: string }).workerPermissionMode)).toEqual([
+      'acceptEdits',
+      'acceptEdits',
+    ]);
+  });
+
+  it('uses the mode the caller read (the one it audited), reading the store at most once per run', async () => {
+    const renderer = makeRendererFake();
+    const read = vi.fn(() => 'acceptEdits' as const);
+    const svc = new FanOutService({
+      daemon: makeDaemonFake().port,
+      renderer: renderer.port,
+      worktrees: makeWorktreesFake(),
+      workerPermissionMode: read,
+    });
+    await svc.start(baseReq({ workerPermissionMode: 'bypassPermissions' }));
+    expect(read).not.toHaveBeenCalled();
+    expect(renderer.spawned.map((p) => (p as { workerPermissionMode?: string }).workerPermissionMode)).toEqual([
+      'bypassPermissions',
+      'bypassPermissions',
+    ]);
+    await svc.start(baseReq({ idempotencyKey: 'fo-key-2' }));
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases its in-flight live-cap booking one task at a time', async () => {
+    const settled = vi.spyOn(lineage, 'taskSettled');
+    const svc = new FanOutService({
+      daemon: makeDaemonFake().port,
+      renderer: makeRendererFake({ spawnFailOn: (name) => name.includes('Task B') }).port,
+      worktrees: makeWorktreesFake(),
+    });
+    await svc.start(baseReq());
+    // Once per task, the failed one included.
+    expect(settled).toHaveBeenCalledTimes(2);
+    expect(settled).toHaveBeenCalledWith('fo-key-1');
+  });
+});
+
 describe('§0 E2E 정상 — N=2 전부 성공', () => {
   it('①~⑤ 시퀀스가 태스크당 한 번씩 돌고 물질화·invite가 성립한다', async () => {
     const daemon = makeDaemonFake();
@@ -439,7 +664,10 @@ describe('§0 E2E 정상 — N=2 전부 성공', () => {
     const promptFile = renderer.spawned[0].initialCommand.match(/'([^']*prompt\.md)'/)?.[1];
     const body = fs.readFileSync(promptFile!, 'utf8');
     expect(body.startsWith('BUILD IT')).toBe(true);
-    expect(body).toContain('a2a_task_send');
+    expect(body).toContain('send_message');
+    // The preamble is LLM-facing: it must teach the LISTED delivery tool,
+    // never the unlisted a2a_task_send alias (#1302).
+    expect(body).not.toContain('a2a_task_send');
     expect(body).toContain('channel_unread');
     // 계약문의 핵심: 워크스페이스 단위 채널 포스트는 프롬프트에 붙지 않는다.
     expect(body).toMatch(/not.*pasted/i);
@@ -1134,5 +1362,39 @@ describe('fan-out worker first run (A-1)', () => {
       setTaskLedgerForTests(null);
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('per-worker private temp dir', () => {
+  it('points TMPDIR/TMP/TEMP at a dir of its own and hands every spawned or failed-spawn dir to the sweep', async () => {
+    const created: string[] = [];
+    const registered: Array<[string, string]> = [];
+    const removed: string[] = [];
+    const renderer = makeRendererFake({ spawnFailOn: (name) => name.endsWith('Task A') });
+    const svc = new FanOutService({
+      daemon: makeDaemonFake().port,
+      renderer: renderer.port,
+      worktrees: makeWorktreesFake(),
+      workerTempDirs: {
+        create: () => {
+          const dir = `/tmp/wmux-task-${created.length + 1}`;
+          created.push(dir);
+          return dir;
+        },
+        register: (ws, dir) => registered.push([ws, dir]),
+        remove: (dir) => removed.push(dir),
+      },
+    });
+    const res = await svc.start({ ...baseReq(), idempotencyKey: 'k-tmp' });
+    expect(res.tasks.find((t) => t.title === 'Task B')?.workspaceId).toBe('ws-task-1');
+    expect(created).toHaveLength(2);
+    const [dirA, dirB] = created;
+    // Task A's spawn failed, but a failed spawn can still leave a live
+    // session behind: the sweep (which checks live sessions) owns the dir.
+    const taskA = res.tasks.find((t) => t.title === 'Task A')!;
+    expect(removed).toEqual([]);
+    expect(registered).toEqual([[`task:${taskA.taskId}`, dirA], ['ws-task-1', dirB]]);
+    const spawnB = renderer.spawned.find((p) => p.name.endsWith('Task B'))!;
+    expect(spawnB.env).toMatchObject({ TMPDIR: dirB, TMP: dirB, TEMP: dirB });
   });
 });

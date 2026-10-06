@@ -1959,3 +1959,79 @@ describe('pane.rpc — hosted plugin binding on metadata verbs', () => {
     }
   });
 });
+
+describe('pane.rpc — fleet.triage', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sendToRendererMock.mockResolvedValue({ generatedAt: 1, scope: 'fleet', needsYou: [], running: [], idle: { count: 0 } });
+  });
+
+  it('forwards a valid request to the renderer', async () => {
+    const response = await register().dispatch({ id: 't1', method: 'fleet.triage', params: { workspaceId: 'ws-1', includeIdle: true } });
+    expect(response.ok).toBe(true);
+    expect(sendToRendererMock).toHaveBeenCalledWith(expect.any(Function), 'fleet.triage', { workspaceId: 'ws-1', includeIdle: true });
+  });
+
+  it('refuses a non-string workspaceId instead of widening to the whole fleet', async () => {
+    const response = await register().dispatch({ id: 't2', method: 'fleet.triage', params: { workspaceId: 42 } });
+    expect(response.ok).toBe(false);
+    expect(sendToRendererMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses a non-boolean includeIdle', async () => {
+    const response = await register().dispatch({ id: 't3', method: 'fleet.triage', params: { includeIdle: 'yes' } });
+    expect(response.ok).toBe(false);
+    expect(sendToRendererMock).not.toHaveBeenCalled();
+  });
+
+  it('turns a booting renderer answer into an error', async () => {
+    sendToRendererMock.mockResolvedValue({ error: 'wmux is still starting (paneGate=pending)', retryable: true });
+    const response = await register().dispatch({ id: 't4', method: 'fleet.triage', params: {} });
+    expect(response.ok).toBe(false);
+  });
+});
+
+describe('pane.list — the HQ also sees agents in other workspaces', () => {
+  const panesByWs: Record<string, unknown[]> = {
+    'ws-hq': [{ id: 'p-hq', agents: [] }],
+    'ws-wmux': [
+      {
+        id: 'p-1',
+        agents: [{ ptyId: 'pty-1', surfaceId: 's-1', agentName: 'claude', agentStatus: 'running', pendingQuestion: 'secret text' }],
+      },
+      { id: 'p-shell', agents: [] },
+      { id: 'p-stashed', stashed: true, agents: [{ ptyId: 'pty-x', agentName: 'codex', agentStatus: 'idle' }] },
+    ],
+  };
+  function setup(hqId: string | null): RpcRouter {
+    sendToRendererMock.mockReset();
+    sendToRendererMock.mockImplementation(async (_w: unknown, method: string, params: { workspaceId?: string }) => {
+      if (method === 'workspace.list') return [{ id: 'ws-hq', name: 'Moa' }, { id: 'ws-wmux', name: 'wmux' }];
+      if (method === 'pane.list') return panesByWs[params.workspaceId ?? ''] ?? [];
+      return null;
+    });
+    const router = new RpcRouter();
+    registerPaneRpc(router, () => ({}) as BrowserWindow, {
+      store: new MetadataStore({ eventBus: new EventBus() }),
+      getHqWorkspaceId: () => hqId,
+    });
+    return router;
+  }
+
+  it('lists each live agent pane elsewhere with metadata only', async () => {
+    const res = await setup('ws-hq').dispatch({ id: 'h1', method: 'pane.list', params: { workspaceId: 'ws-hq' } });
+    expect(res.ok).toBe(true);
+    const result = (res as { result: { panes: unknown[]; otherWorkspaceAgents?: unknown[] } }).result;
+    expect(result.panes).toHaveLength(1);
+    expect(result.otherWorkspaceAgents).toEqual([
+      { workspaceId: 'ws-wmux', workspaceName: 'wmux', paneId: 'p-1', ptyId: 'pty-1', agentName: 'claude', agentStatus: 'running' },
+    ]);
+  });
+
+  it('a non-HQ workspace gets no such field', async () => {
+    const res = await setup('ws-hq').dispatch({ id: 'h2', method: 'pane.list', params: { workspaceId: 'ws-wmux' } });
+    expect((res as { result: Record<string, unknown> }).result).not.toHaveProperty('otherWorkspaceAgents');
+    const none = await setup(null).dispatch({ id: 'h3', method: 'pane.list', params: { workspaceId: 'ws-hq' } });
+    expect((none as { result: Record<string, unknown> }).result).not.toHaveProperty('otherWorkspaceAgents');
+  });
+});

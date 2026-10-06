@@ -24,8 +24,9 @@
 // Internal-only surfaces (daemon control, company subsystem, surface
 // arrangement) map to the reserved `wmux.internal` capability. The
 // permissionGrammar reserves the `wmux.` prefix, so no plugin can ever
-// declare it; legacy callers (no `clientName` envelope) fall through the
-// grandfather path in RpcRouter and stay allowed during the v3.0 transition.
+// declare it. Only wmux's own curated lanes reach these methods: legacy
+// callers (no `clientName` envelope) used to grandfather through, and are
+// refused since #1111 closed that lane.
 
 import type { RpcMethod } from '../../shared/rpc';
 
@@ -34,9 +35,10 @@ import type { RpcMethod } from '../../shared/rpc';
  * permissionGrammar.ts at parse time) or one of two sentinels:
  *   - `null`             — method is bootstrap-exempt; no capability needed
  *   - `'wmux.internal'`  — substrate-internal method; reserved prefix, no
- *                          plugin can ever satisfy this. Legacy (no envelope)
- *                          callers grandfather through RpcRouter's existing
- *                          legacy path.
+ *                          plugin can ever satisfy this. Reached only through
+ *                          wmux's curated lanes (renderer operator, commander,
+ *                          first-party / CLI / hook-bridge / statusline); a
+ *                          legacy (no envelope) caller is refused since #1111.
  */
 export type RequiredCapabilityName = string | null;
 export type CapabilityResolver = (params: Record<string, unknown>) => RequiredCapabilityName;
@@ -66,6 +68,7 @@ export type RiskClass =
   | 'terminal-content' // reads what's on the user's screen
   | 'terminal-input'   // types into the user's panes
   | 'browser'          // controls a Playwright browser
+  | 'computer'         // sees and drives other desktop apps
   | 'metadata'         // labels / status / custom map writes
   | 'events'           // event subscription
   | 'pane-lifecycle'   // create/focus/list panes
@@ -102,6 +105,21 @@ export function resolveRequiredCapability(
   params: Record<string, unknown>,
 ): RequiredCapabilityName {
   return typeof entry.capability === 'function' ? entry.capability(params) : entry.capability;
+}
+
+/**
+ * Risk classes the enforcer's verdict is binding for in EVERY mode. In shadow
+ * mode a non-allow outcome is normally only logged; for these it is refused,
+ * like the commander gate in RpcRouter. `computer` reads other apps' windows
+ * and injects input into them, so an unapproved named client must never reach
+ * it just because a build (or `mcp.mode: "shadow"`) runs the enforcer advisory.
+ */
+const ALWAYS_ENFORCED_RISK_CLASSES: ReadonlySet<RiskClass> = new Set<RiskClass>(['computer']);
+
+/** Whether a non-allow verdict on `method` is refused even in shadow mode. */
+export function isAlwaysEnforcedMethod(method: string): boolean {
+  const entry = (METHOD_CAPABILITY as Record<string, RequiredCapability | undefined>)[method];
+  return entry?.riskClass !== undefined && ALWAYS_ENFORCED_RISK_CLASSES.has(entry.riskClass);
 }
 
 // === Path extractors ===
@@ -183,6 +201,10 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
 
   // --- Pane lifecycle ---
   'pane.list':   { capability: 'pane.read', riskClass: 'pane-lifecycle' },
+  // The answer carries agent-authored output (last message, tool activity)
+  // for every pane, so it is terminal content, not a pane listing: a
+  // third-party plugin needs the same grant input.readScreen does.
+  'fleet.triage': { capability: 'terminal.read', riskClass: 'terminal-content' },
   'pane.focus':  { capability: 'pane.read', riskClass: 'pane-lifecycle' },
   'pane.split':  { capability: 'pane.create', riskClass: 'pane-lifecycle' },
   'pane.close':  { capability: 'pane.create', riskClass: 'pane-lifecycle' },
@@ -259,6 +281,16 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   //     (`wmux doctor`) is unaffected — it rides the WMUX_CLI_METHODS tier.
   'perf.status':         { capability: 'pane.read' },
 
+  // --- Desktop computer use. Observation and input are separate grants: a
+  // screenshot of another app is sensitive, but injecting input into it is a
+  // different order of risk. Per-app consent is enforced in ComputerService on
+  // top of these.
+  'computer.capabilities':  { capability: 'computer.observe', riskClass: 'computer' },
+  'computer.listApps':      { capability: 'computer.observe', riskClass: 'computer' },
+  'computer.listWindows':   { capability: 'computer.observe', riskClass: 'computer' },
+  'computer.getAppState':   { capability: 'computer.observe', riskClass: 'computer' },
+  'computer.act':           { capability: 'computer.control', riskClass: 'computer' },
+
   // --- Command Deck. Route resolution for the commander brain's MCP; the
   //     method carries its OWN auth (a per-spawn token minted by main and
   //     injected only into the brain subprocess's env — commanderTrust.ts).
@@ -275,6 +307,13 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   // Brain self-resolve of a stale decision (WP3). Same commander-token auth +
   // server-side auto/staleness/substance gate, so no capability gate either.
   'deck.resolveDecision': { capability: null },
+  // Moa hand-off proposal. Own commander-token auth (HQ brain only) in
+  // deck.rpc.ts, and it only raises an operator card, so no capability gate.
+  'deck.proposeHandoff': { capability: null },
+  // Orphan Deck state prune (`wmux deck state --prune --yes`). Runs inside the
+  // app so its writes share the stores' in-process locks and caches; it
+  // deletes state, so it carries the same internal gate as workspace.close.
+  'deck.state.prune': { capability: 'wmux.internal' },
 
   // --- Browser (Playwright). Plugin-declarable methods get the browser
   //     risk-class prompt and are gated against KNOWN_CAPABILITIES entries.
@@ -282,6 +321,7 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   // MCP server. Keep it reserved until the pipe can bind ordinary plugin
   // requests to a verified workspace instead of trusting a supplied id.
   'browser.tabs':              { capability: 'wmux.internal' },
+  'browser.surface.adopt':     { capability: 'wmux.internal' },
   'browser.open':              { capability: 'browser.navigate', riskClass: 'browser' },
   'browser.navigate':          { capability: 'browser.navigate', riskClass: 'browser' },
   'browser.goBack':            { capability: 'browser.navigate', riskClass: 'browser' },
@@ -334,6 +374,16 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'browser.actionCache.promote':{ capability: 'browser.click', riskClass: 'browser' },
   'browser.actionCache.demote': { capability: 'browser.click', riskClass: 'browser' },
   'browser.actionCache.promoted':{ capability: 'browser.read', riskClass: 'browser' },
+  // Per-site memory. Same split as the cache: reading what a site did to a
+  // previous run is `browser.read`; writing or deleting it reuses
+  // `browser.click`, because a caller that can already drive the page can
+  // produce every failure this store records.
+  'browser.siteMemory.list':   { capability: 'browser.read',  riskClass: 'browser' },
+  'browser.siteMemory.record': { capability: 'browser.click', riskClass: 'browser' },
+  'browser.siteMemory.forget': { capability: 'browser.click', riskClass: 'browser' },
+  // Site guide pointers: read-only, answers with titles and paths of local
+  // notes that match a page.
+  'browser.siteGuides.match':  { capability: 'browser.read',  riskClass: 'browser' },
 
   // Lease methods pin a guest at full speed (or strip that exemption from a
   // real automation op), i.e. they mutate the app's resource policy — a
@@ -344,6 +394,15 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'browser.lease.renew':       { capability: 'browser.evaluate', riskClass: 'browser' },
   'browser.lease.release':     { capability: 'browser.evaluate', riskClass: 'browser' },
 
+  // browser_request_help. Opening a request puts a row on the operator's screen
+  // and outlines an element in the page, so it is gated on `browser.click` —
+  // the tier for clients that already act on a page — rather than minting a
+  // capability for one tool. Reading a request the caller itself opened is
+  // `browser.read`; cancelling it is the same act as opening, so it matches.
+  'browser.help.request':      { capability: 'browser.click', riskClass: 'browser' },
+  'browser.help.status':       { capability: 'browser.read',  riskClass: 'browser' },
+  'browser.help.cancel':       { capability: 'browser.click', riskClass: 'browser' },
+
   // --- Daemon control. Internal-only; reserved capability.
   'daemon.createSession':    { capability: 'wmux.internal' },
   'daemon.destroySession':   { capability: 'wmux.internal' },
@@ -352,6 +411,8 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'daemon.resizeSession':    { capability: 'wmux.internal' },
   'daemon.listSessions':     { capability: 'wmux.internal' },
   'daemon.readPromptEvents': { capability: 'wmux.internal' },
+  'daemon.phone.register': { capability: 'wmux.internal' },
+  'daemon.phone.complete': { capability: 'wmux.internal' },
   'daemon.ping':             { capability: 'wmux.internal' },
   'daemon.shutdown':         { capability: 'wmux.internal' },
   'daemon.compact':          { capability: 'wmux.internal' },
@@ -367,6 +428,9 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   // Main → daemon only. A plugin that could write this table would choose
   // which panes an automated approval may be pressed into.
   'daemon.workspaceFacts.set': { capability: 'wmux.internal' },
+  // Main → daemon only. A client that could write this would choose which
+  // brain pane a paired phone may read and type into.
+  'daemon.moa.set':          { capability: 'wmux.internal' },
   // LanLink PR-2 — cursor-pull of the durable remote inbox. main↔daemon only
   // (DaemonClient → daemon control pipe); never an external MCP surface.
   'daemon.inbox.poll':       { capability: 'wmux.internal' },
@@ -496,6 +560,13 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   // else; the bytes written are the approval record's own, never the caller's.
   'approval.press':   { capability: 'task.write', riskClass: 'a2a' },
 
+  // --- Scheduled runs (pipe/handlers/automation.rpc.ts) ---
+  // propose stores a DISABLED, approval-mode draft and queues it for the
+  // human; list/runs return a redacted view (no prompt, folder or account).
+  'automation.propose': { capability: 'automation.write', riskClass: 'a2a' },
+  'automation.list':    { capability: 'automation.read',  riskClass: 'a2a' },
+  'automation.runs':    { capability: 'automation.read',  riskClass: 'a2a' },
+
   // --- Company subsystem (substrate-internal team/orchestration). All
   //     internal for v3.0; can be re-classified once spec covers a2a teams.
   'company.create':         { capability: 'wmux.internal' },
@@ -528,6 +599,12 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   // Internal channel from the wmux-bundled hook plugin. No external plugin
   // should fire these — `wmux.internal` keeps the gate closed.
   'hooks.signal': { capability: 'wmux.internal' },
+  // Live Claude Code rate limits from the bundled statusline script — the same
+  // internal caller class as hooks.signal.
+  'usage.rateLimits': { capability: 'wmux.internal' },
+  // Moa's read gate asks which repositories it may read without a prompt.
+  // Read-only, answered from main's memory; the same internal caller class.
+  'deck.moaReadRoots': { capability: 'wmux.internal' },
 };
 
 /**
@@ -570,6 +647,9 @@ export const CAPABILITY_RISK_CLASS: Record<string, RiskClass> = {
   'browser.read':      'browser',
   'browser.cookies':   'browser',
   'browser.emulate':   'browser',
+  // Desktop computer use
+  'computer.observe':  'computer',
+  'computer.control':  'computer',
   // A2A
   'a2a.send':    'a2a',
   'a2a.execute': 'a2a',
@@ -587,6 +667,9 @@ export const CAPABILITY_RISK_CLASS: Record<string, RiskClass> = {
   // a2a one; the capability ids stay distinct from ledger.*.
   'task.read':  'a2a',
   'task.write': 'a2a',
+  // Scheduled runs — agent-drafted work the human later enables.
+  'automation.read':  'a2a',
+  'automation.write': 'a2a',
   // Plugin host UI contribution points (B-1) — enforced at mount time by
   // the renderer host, not per-RPC; classed here so the approval dialog
   // renders real copy instead of fallback text.
@@ -657,6 +740,9 @@ export const CAPABILITY_EFFECT: Record<string, 'read' | 'write'> = {
   'browser.evaluate':  'write',
   'browser.read':      'read',
   'browser.cookies':   'write',
+  // Desktop computer use
+  'computer.observe':  'read',
+  'computer.control':  'write',
   'browser.emulate':   'write',
   // A2A
   'a2a.send':    'write',
@@ -671,6 +757,9 @@ export const CAPABILITY_EFFECT: Record<string, 'read' | 'write'> = {
   // patches a repository, pushes a branch or removes a worktree.
   'task.read':  'read',
   'task.write': 'write',
+  // Scheduled runs: list/runs observe, propose stores a draft.
+  'automation.read':  'read',
+  'automation.write': 'write',
   // Plugin host UI contribution points — enforced at mount time, never a
   // per-RPC gate, so the classification is nominal. Listed so the
   // completeness test covers the whole vocabulary.
@@ -723,6 +812,12 @@ export const RISK_CLASS_COPY: Record<RiskClass, RiskClassCopy> = {
     summary: 'Can control a Playwright browser session',
     detail:
       'The plugin can open pages, click elements, type text, run JavaScript, and capture screenshots. Sites you log into in this browser are reachable by the plugin.',
+  },
+  'computer': {
+    severity: 'critical',
+    summary: 'Can see and control other apps on your desktop',
+    detail:
+      'The plugin can read other apps\' windows (accessibility text and screenshots, which are sent to its model provider) and click, type, and press keys in them. wmux asks again for each app and never allows password managers, terminals, or wmux itself.',
   },
   'a2a': {
     severity: 'caution',

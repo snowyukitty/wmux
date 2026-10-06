@@ -43,7 +43,7 @@ function render(ui: React.ReactElement) {
 
 /** Open the context menu on the row and return the Detach button. */
 function openMenu(container: HTMLElement): HTMLButtonElement {
-  const row = container.querySelector('[role="button"]') as HTMLElement;
+  const row = container.querySelector('[role="treeitem"]') as HTMLElement;
   act(() => {
     row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
   });
@@ -63,6 +63,19 @@ afterEach(() => {
 });
 
 describe('RemoteWorkspaceItem', () => {
+  it.each([
+    ['Shift+F10', { key: 'F10', shiftKey: true }],
+    ['the Menu key', { key: 'ContextMenu' }],
+  ])('opens its menu from the keyboard with %s, like a local row', (_label, init) => {
+    const { container, unmount } = render(
+      <RemoteWorkspaceItem workspace={WS} isActive={false} onSelect={vi.fn()} onDetach={vi.fn()} />,
+    );
+    const row = container.querySelector('[role="treeitem"]') as HTMLElement;
+    act(() => { row.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init })); });
+    expect(Array.from(container.querySelectorAll('button')).some((b) => /Detach/.test(b.textContent ?? ''))).toBe(true);
+    unmount();
+  });
+
   it('opens its menu on right-click', () => {
     const { container, unmount } = render(
       <RemoteWorkspaceItem workspace={WS} isActive={false} onSelect={vi.fn()} onDetach={vi.fn()} />,
@@ -129,5 +142,56 @@ describe('RemoteWorkspaceItem', () => {
     expect(onDetach).not.toHaveBeenCalled();
 
     unmount();
+  });
+
+  it('names a rejected credential in the accessible name and on a visible line', () => {
+    const { container } = render(
+      <RemoteWorkspaceItem workspace={{ ...WS, hostLabel: '', authRejected: true, stale: true }} isActive={false} onSelect={vi.fn()} onDetach={vi.fn()} />,
+    );
+    const row = container.querySelector('[role="treeitem"]') as HTMLElement;
+    expect(row.getAttribute('aria-label')).toContain('the remote host no longer accepts this computer');
+    expect(container.textContent).toContain('Pair again needed');
+  });
+
+  it('says a host needs HTTPS in the accessible name and on the visible host line', () => {
+    const { container } = render(
+      <RemoteWorkspaceItem workspace={{ ...WS, insecureTransport: true, stale: true }} isActive={false} onSelect={vi.fn()} onDetach={vi.fn()} />,
+    );
+    const row = container.querySelector('[role="treeitem"]') as HTMLElement;
+    expect(row.getAttribute('aria-label')).toContain('needs HTTPS — re-pair over HTTPS');
+    expect(container.textContent).toContain('needs HTTPS');
+    expect(container.textContent).not.toContain('Pair again needed');
+  });
+
+  // Remote rows share the local list, so each one says "another machine" by
+  // a server glyph on the host line, and a stale mirror is dimmed.
+  it('marks the host line with a server glyph and dims only a stale row', () => {
+    const live = render(<RemoteWorkspaceItem workspace={WS} isActive={false} onSelect={vi.fn()} onDetach={vi.fn()} />);
+    expect(live.container.querySelector('[data-remote-host-glyph] svg')).not.toBeNull();
+    expect(live.container.textContent).toContain('mac-mini');
+    expect(live.container.querySelector('[data-remote-stale]')).toBeNull();
+    const stale = render(<RemoteWorkspaceItem workspace={{ ...WS, stale: true }} isActive={false} onSelect={vi.fn()} onDetach={vi.fn()} />);
+    expect(stale.container.querySelector('[data-remote-stale]')?.className).toContain('opacity-60');
+  });
+});
+
+// Remote rows sort by their most urgent agent pane (Sidebar), so a row lifted
+// for needing you must say so — dogfood showed one on top with a grey dot.
+describe('RemoteWorkspaceItem — needs-you', () => {
+  const pane = { sessionId: 's1', agentName: 'claude', agentStatus: 'awaiting_input' } as unknown as AttachedRemoteWorkspace['panes'][number];
+
+  it('labels a live mirror whose agent is waiting on the user', () => {
+    const { container } = render(
+      <RemoteWorkspaceItem workspace={{ ...WS, panes: [pane] }} isActive={false} onSelect={vi.fn()} onDetach={vi.fn()} />,
+    );
+    expect(container.querySelector('[data-remote-needs-you]')).not.toBeNull();
+    expect(container.querySelector('.sidebar-row-needs')).not.toBeNull();
+  });
+
+  it('says nothing for a stale mirror, whose status is frozen', () => {
+    const { container } = render(
+      <RemoteWorkspaceItem workspace={{ ...WS, panes: [pane], stale: true }} isActive={false} onSelect={vi.fn()} onDetach={vi.fn()} />,
+    );
+    expect(container.querySelector('[data-remote-needs-you]')).toBeNull();
   });
 });

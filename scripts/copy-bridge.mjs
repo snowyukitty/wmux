@@ -11,15 +11,18 @@
 import { mkdirSync, copyFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildSync } from 'esbuild';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const destDir = join(repoRoot, 'dist', 'cli-bundle');
 
 // Self-contained agent bridges shipped in the CLI bundle (extraResource):
 //   - Claude Code hook/statusline bridges
-//   - Codex lifecycle notify bridge
+//   - Codex lifecycle notify + hooks bridges
 //   - OpenCode lifecycle plugin (renamed in the bundle to avoid generic wmux.js)
 const bridges = [
+  { src: join(repoRoot, 'integrations', 'codex', 'bin', 'wmux-codex-thread.mjs'), dest: 'wmux-codex-thread.mjs' },
+  { src: join(repoRoot, 'integrations', 'opencode', 'plugins', 'wmux-chat-tui.mjs'), dest: 'wmux-chat-tui.mjs' },
   {
     src: join(repoRoot, 'integrations', 'claude', 'bin', 'wmux-bridge.mjs'),
     dest: 'wmux-bridge.mjs',
@@ -33,8 +36,16 @@ const bridges = [
     dest: 'wmux-codex-notify.mjs',
   },
   {
+    src: join(repoRoot, 'integrations', 'codex', 'bin', 'wmux-codex-hooks-bridge.mjs'),
+    dest: 'wmux-codex-hooks-bridge.mjs',
+  },
+  {
     src: join(repoRoot, 'integrations', 'opencode', 'plugins', 'wmux.js'),
     dest: 'wmux-opencode-plugin.js',
+  },
+  {
+    src: join(repoRoot, 'integrations', 'agy', 'bin', 'quota-sink.js'),
+    dest: 'quota-sink.js',
   },
 ];
 
@@ -48,3 +59,11 @@ for (const { src, dest: destBasename } of bridges) {
   copyFileSync(src, dest);
   console.log(`copy-bridge: ${src} -> ${dest}`);
 }
+
+// The WSL config guard uses the same TOML parser as wmux. Bundle it so the
+// packaged Windows runtime needs neither Linux Node nor a node_modules tree.
+buildSync({
+  entryPoints: [join(repoRoot, 'integrations/codex/bin/wmux-wsl-codex-config.mjs')],
+  outfile: join(destDir, 'wmux-wsl-codex-config.mjs'),
+  bundle: true, platform: 'node', format: 'esm',
+});

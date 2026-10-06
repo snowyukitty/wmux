@@ -7,7 +7,7 @@
 
 # wmux API Reference (generated)
 
-> **Generated from wmux v3.51.0 sources.** This file is produced by
+> **Generated from wmux v4.0.0 sources.** This file is produced by
 > `scripts/gen-api-reference.mjs` directly from the code — it lists every
 > RPC method, event type, required capability, and the key event-bus
 > constants exactly as the running daemon sees them. For the hand-curated
@@ -26,15 +26,15 @@ returns `EPERM`. Wire framing: newline-delimited JSON, one object per line.
 
 ## RPC methods
 
-Total: **174** methods (`ALL_RPC_METHODS` in
+Total: **198** methods (`ALL_RPC_METHODS` in
 `src/shared/rpc.ts`). Capability and risk class are read from
 `src/main/mcp/methodCapabilityMap.ts`:
 
 - `capability` is the `wmuxPermissions` capability the method requires.
   `null` = bootstrap/introspection (any caller, no declaration needed).
   `wmux.internal` = reserved prefix no plugin can declare (internal-only;
-  legacy envelope-less callers grandfather through until #1111 closes
-  the lane — first release on or after 2026-09-30).
+  reached only through wmux's own curated lanes; an envelope-less caller
+  is refused since #1111 closed the legacy grandfather lane).
 - `riskClass` drives the approval-dialog wording; blank for `null` and
   `wmux.internal` methods.
 
@@ -127,6 +127,7 @@ Total: **174** methods (`ALL_RPC_METHODS` in
 |---|---|---|
 | `browser.tabs` | `wmux.internal` |  |
 | `browser.open` | `browser.navigate` | `browser` |
+| `browser.surface.adopt` | `wmux.internal` |  |
 | `browser.navigate` | `browser.navigate` | `browser` |
 | `browser.goBack` | `browser.navigate` | `browser` |
 | `browser.close` | `browser.navigate` | `browser` |
@@ -159,9 +160,26 @@ Total: **174** methods (`ALL_RPC_METHODS` in
 | `browser.actionCache.promote` | `browser.click` | `browser` |
 | `browser.actionCache.demote` | `browser.click` | `browser` |
 | `browser.actionCache.promoted` | `browser.read` | `browser` |
+| `browser.siteMemory.list` | `browser.read` | `browser` |
+| `browser.siteMemory.record` | `browser.click` | `browser` |
+| `browser.siteMemory.forget` | `browser.click` | `browser` |
+| `browser.siteGuides.match` | `browser.read` | `browser` |
 | `browser.lease.acquire` | `browser.evaluate` | `browser` |
 | `browser.lease.renew` | `browser.evaluate` | `browser` |
 | `browser.lease.release` | `browser.evaluate` | `browser` |
+| `browser.help.request` | `browser.click` | `browser` |
+| `browser.help.status` | `browser.read` | `browser` |
+| `browser.help.cancel` | `browser.click` | `browser` |
+
+### `computer`
+
+| Method | Capability | Risk class |
+|---|---|---|
+| `computer.capabilities` | `computer.observe` | `computer` |
+| `computer.listApps` | `computer.observe` | `computer` |
+| `computer.listWindows` | `computer.observe` | `computer` |
+| `computer.getAppState` | `computer.observe` | `computer` |
+| `computer.act` | `computer.control` | `computer` |
 
 ### `a2a`
 
@@ -265,7 +283,10 @@ Total: **174** methods (`ALL_RPC_METHODS` in
 | `daemon.superviseRearm` | `wmux.internal` |  |
 | `daemon.superviseStop` | `wmux.internal` |  |
 | `daemon.setResumeBinding` | `wmux.internal` |  |
+| `daemon.phone.register` | `wmux.internal` |  |
+| `daemon.phone.complete` | `wmux.internal` |  |
 | `daemon.workspaceFacts.set` | `wmux.internal` |  |
+| `daemon.moa.set` | `wmux.internal` |  |
 | `daemon.inbox.poll` | `wmux.internal` |  |
 
 ### `hooks`
@@ -278,6 +299,7 @@ Total: **174** methods (`ALL_RPC_METHODS` in
 
 | Method | Capability | Risk class |
 |---|---|---|
+| `fleet.triage` | `terminal.read` | `terminal-content` |
 | `ui.decoratePane` | `ui.pane-decoration` | `ui` |
 | `perf.status` | `pane.read` |  |
 | `deck.resolvePaneRoute` | `null` |  |
@@ -285,6 +307,10 @@ Total: **174** methods (`ALL_RPC_METHODS` in
 | `deck.completeWork` | `null` |  |
 | `deck.requestDecision` | `null` |  |
 | `deck.resolveDecision` | `null` |  |
+| `deck.proposeHandoff` | `null` |  |
+| `deck.state.prune` | `wmux.internal` |  |
+| `usage.rateLimits` | `wmux.internal` |  |
+| `deck.moaReadRoots` | `wmux.internal` |  |
 | `task.mission.start` | `a2a.channel.send` | `a2a` |
 | `task.mission.close` | `a2a.channel.send` | `a2a` |
 | `task.mission.list` | `a2a.channel.read` | `a2a` |
@@ -301,6 +327,9 @@ Total: **174** methods (`ALL_RPC_METHODS` in
 | `task.git.log` | `task.read` | `a2a` |
 | `task.gh.prView` | `task.read` | `a2a` |
 | `approval.press` | `task.write` | `a2a` |
+| `automation.propose` | `automation.write` | `a2a` |
+| `automation.list` | `automation.read` | `a2a` |
+| `automation.runs` | `automation.read` | `a2a` |
 
 ---
 

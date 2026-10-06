@@ -28,6 +28,7 @@ import * as fs from 'fs';
 import { getMcpBrokerPipeName, getAuthTokenPath } from '../shared/constants';
 import { COMMANDER_MODE_ARG } from '../shared/commanderSurface';
 import { CORE_MODE_ARG } from '../shared/coreSurface';
+import { roleArgValue } from '../shared/roleSurfaces';
 
 const CONNECT_RETRIES = 10;
 const CONNECT_RETRY_DELAY_MS = 300;
@@ -107,6 +108,8 @@ async function main(): Promise<void> {
       // so a version skew that drops the field loses token savings, not a
       // guarantee. `commanderMode` must never be treated this way.
       coreMode: process.argv.includes(CORE_MODE_ARG),
+      // Additive like coreMode: an older broker ignores it and hosts full.
+      roleSurface: roleArgValue(process.argv),
     }) + '\n',
   );
 

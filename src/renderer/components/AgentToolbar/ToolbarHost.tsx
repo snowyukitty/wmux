@@ -3,6 +3,7 @@ import { useStore } from '../../stores';
 import AgentToolbar, { AGENT_TOOLBAR_HEIGHT } from './AgentToolbar';
 import { useComposeShortcut } from './useComposeShortcut';
 import { useHoverReveal, HOVER_TRIGGER_ZONE_PX } from './useHoverReveal';
+import { isRemoteMirrorVisible } from '../../stores/slices/remoteWorkspacesSlice';
 
 /**
  * Owns the reveal state for AgentToolbar and the element the trigger band is
@@ -25,7 +26,9 @@ export default function ToolbarHost() {
   // them), but every toolbar verb targets the LOCAL active workspace's pty. A
   // bar floating over a remote screen would inject into a terminal that is not
   // on screen and spawn worktrees in the wrong repo.
-  const remoteActive = useStore((s) => s.activeRemoteKey != null);
+  // #1086 — the same predicate WorkspaceCenter's render gate reads, so chrome
+  // and centre can never disagree about which surface is on screen.
+  const remoteActive = useStore(isRemoteMirrorVisible);
 
   if (!enabled || remoteActive) return null;
   return <RevealHost />;
@@ -38,7 +41,9 @@ export default function ToolbarHost() {
  * pointermove in the app.
  */
 function RevealHost() {
-  const pinned = useStore((s) => s.agentToolbarPinned);
+  // A tour step pointing at the bar holds it up like a pin, without touching
+  // the persisted pin preference.
+  const pinned = useStore((s) => s.agentToolbarPinned || s.agentToolbarTourHold);
   const [hold, setHold] = useState(false);
   const hostRef = useRef<HTMLDivElement>(null);
   // Keep-alive band = the bar plus a small margin, derived from the bar's own

@@ -177,12 +177,44 @@ describe('X6 ② reboot-survival durability', () => {
     const src = fs.readFileSync(daemonIndexPath, 'utf-8');
     const idx = src.indexOf('const applyResumeBinding =');
     expect(idx).toBeGreaterThan(-1);
-    const body = src.slice(idx, idx + 5700);
+    const end = src.indexOf("pipeServer.onRpc('daemon.setResumeBinding'", idx);
+    expect(end).toBeGreaterThan(idx);
+    const body = src.slice(idx, end);
     expect(body).toMatch(/lastDetectedAgent\s*=\s*next\.agent/);
     expect(body).toMatch(/KNOWN_AGENT_SLUGS/);
     // ...and the RPC must still route through it, or the wire path silently
     // stops persisting bindings for older (main-relaying) bridges.
     expect(src).toMatch(/onRpc\('daemon\.setResumeBinding'[\s\S]{0,220}applyResumeBinding\(/);
+  });
+
+  it('every stored-binding folder comparison is guarded by isUsableResumeBinding', () => {
+    // A stored binding without its folder once stopped the daemon at startup:
+    // normalizeResumeCwd(undefined) threw inside recovery. Recovery and the
+    // promote path compare the stored binding's folder; each must check the
+    // binding first, on the same condition.
+    const src = fs.readFileSync(daemonIndexPath, 'utf-8');
+    const lines = src.split('\n').filter((line) => /normalizeResumeCwd\([\w.]*resumeBinding\.cwd\)/.test(line));
+    expect(lines).toHaveLength(2);
+    for (const line of lines) {
+      const guard = line.indexOf('isUsableResumeBinding(');
+      expect(guard).toBeGreaterThan(-1);
+      expect(guard).toBeLessThan(line.indexOf('normalizeResumeCwd('));
+    }
+  });
+
+  it('the applier refuses a binding that fails isUsableResumeBinding before reading it', () => {
+    // applyResumeBinding is a closure inside main(); its contract is locked at
+    // the source, and isUsableResumeBinding itself is unit-tested in
+    // agentResume.test.ts with the folder-less shape this refuses.
+    const src = fs.readFileSync(daemonIndexPath, 'utf-8');
+    const idx = src.indexOf('const applyResumeBinding =');
+    expect(idx).toBeGreaterThan(-1);
+    const end = src.indexOf("pipeServer.onRpc('daemon.setResumeBinding'", idx);
+    const body = src.slice(idx, end);
+    const guard = body.search(/if \(!managed \|\| !isUsableResumeBinding\(resumeBinding\)\) return false;/);
+    expect(guard).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(body.indexOf('resumeBinding.'));
+    expect(guard).toBeLessThan(body.indexOf('let vetted'));
   });
 
   it('the applier VETS transcriptPath, so the RPC route cannot persist an unchecked one', () => {
@@ -194,8 +226,26 @@ describe('X6 ② reboot-survival durability', () => {
     const src = fs.readFileSync(daemonIndexPath, 'utf-8');
     const idx = src.indexOf('const applyResumeBinding =');
     expect(idx).toBeGreaterThan(-1);
-    const body = src.slice(idx, idx + 5700);
-    expect(body).toMatch(/checkTranscriptPath\(/);
+    const end = src.indexOf("pipeServer.onRpc('daemon.setResumeBinding'", idx);
+    expect(end).toBeGreaterThan(idx);
+    const body = src.slice(idx, end);
+    expect(body).toMatch(/checkNativeTranscriptPath\(vetted\.agent,/);
+  });
+
+  it('#1624: Codex is admitted before any search; Claude still searches BEFORE the provisional guard', () => {
+    const src = fs.readFileSync(daemonIndexPath, 'utf-8');
+    const idx = src.indexOf('const applyResumeBinding =');
+    const body = src.slice(idx, src.indexOf("pipeServer.onRpc('daemon.setResumeBinding'", idx));
+    const admit = body.indexOf('admitCodexCapture(');
+    const claudeStart = body.indexOf("p.resumeBinding.agent === 'claude'");
+    const search = body.indexOf('transcriptDiscovery?.start(', claudeStart);
+    const guard = body.indexOf('isProvisionalCapture(prev, p.resumeBinding)');
+    expect(admit).toBeGreaterThan(-1);
+    expect(admit).toBeLessThan(claudeStart);
+    expect(claudeStart).toBeLessThan(search);
+    expect(search).toBeLessThan(guard);
+    // The only unconditional search start is the Claude branch.
+    expect(body.split('transcriptDiscovery?.start(').length).toBe(2);
   });
 
   it('Rung 0: the daemon stamps WMUX_PTY_ID into each pane env (per-pane routing key)', () => {

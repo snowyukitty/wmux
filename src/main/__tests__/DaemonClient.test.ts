@@ -260,6 +260,7 @@ describe('DaemonClient', () => {
       mockServer = createMockDaemonServer(pipeName, AUTH_TOKEN, {
         'daemon.getAgentState': (params) => ({
           agentName: params['id'] === 'sess-1' ? 'Codex CLI' : null,
+          agentVerified: true,
           agentStatus: 'waiting',
           inputQuiet: true,
           inputRevision: 12,
@@ -272,11 +273,96 @@ describe('DaemonClient', () => {
       await client.connect();
       await expect(client.getAgentState('sess-1')).resolves.toEqual({
         agentName: 'Codex CLI',
+        agentVerified: true,
         agentStatus: 'waiting',
         inputQuiet: true,
         inputRevision: 12,
         incarnationId: 'incarnation-1',
       });
+
+      await client.disconnect();
+      await mockServer.stop();
+    });
+
+    it('passes the key-input and hook fields through, and omits malformed ones (#1680)', async () => {
+      const pipeName = testPipeName('agent-state-key-input');
+      let extra: Record<string, unknown> = { keyInputRevision: 7, keyInputQuiet: false, hookReports: true };
+      mockServer = createMockDaemonServer(pipeName, AUTH_TOKEN, {
+        'daemon.getAgentState': () => ({
+          agentName: 'Claude Code',
+          agentVerified: true,
+          agentStatus: 'idle',
+          inputQuiet: true,
+          inputRevision: 12,
+          incarnationId: 'incarnation-1',
+          ...extra,
+        }),
+      });
+      await mockServer.start();
+
+      client = new DaemonClient(pipeName, AUTH_TOKEN);
+      await client.connect();
+      await expect(client.getAgentState('sess-1')).resolves.toMatchObject({
+        inputRevision: 12,
+        keyInputRevision: 7,
+        keyInputQuiet: false,
+        hookReports: true,
+      });
+      extra = { keyInputRevision: -1, keyInputQuiet: 'no', hookReports: 1 };
+      const malformed = await client.getAgentState('sess-1');
+      expect(malformed).not.toBeNull();
+      expect(malformed).not.toHaveProperty('keyInputRevision');
+      expect(malformed).not.toHaveProperty('keyInputQuiet');
+      expect(malformed).not.toHaveProperty('hookReports');
+
+      await client.disconnect();
+      await mockServer.stop();
+    });
+
+    it('parses agentVerified as false, never null, when an older daemon omits it (#1307)', async () => {
+      const pipeName = testPipeName('agent-state-unverified-field');
+      mockServer = createMockDaemonServer(pipeName, AUTH_TOKEN, {
+        'daemon.getAgentState': () => ({
+          agentName: 'Codex CLI',
+          agentStatus: 'waiting',
+          inputQuiet: true,
+          inputRevision: 12,
+          incarnationId: 'incarnation-1',
+        }),
+      });
+      await mockServer.start();
+
+      client = new DaemonClient(pipeName, AUTH_TOKEN);
+      await client.connect();
+      const result = await client.getAgentState('sess-1');
+      // Missing on an old daemon must parse to false, not null — a null
+      // snapshot would abort the resume path's slug/incarnation comparison
+      // entirely instead of letting it run against an unverified pane.
+      expect(result).not.toBeNull();
+      expect(result?.agentVerified).toBe(false);
+
+      await client.disconnect();
+      await mockServer.stop();
+    });
+
+    it('parses a non-boolean agentVerified as false (#1307)', async () => {
+      const pipeName = testPipeName('agent-state-nonbool-field');
+      mockServer = createMockDaemonServer(pipeName, AUTH_TOKEN, {
+        'daemon.getAgentState': () => ({
+          agentName: 'Codex CLI',
+          agentVerified: 'yes',
+          agentStatus: 'waiting',
+          inputQuiet: true,
+          inputRevision: 12,
+          incarnationId: 'incarnation-1',
+        }),
+      });
+      await mockServer.start();
+
+      client = new DaemonClient(pipeName, AUTH_TOKEN);
+      await client.connect();
+      const result = await client.getAgentState('sess-1');
+      expect(result?.agentVerified).toBe(false);
 
       await client.disconnect();
       await mockServer.stop();
@@ -706,6 +792,32 @@ describe('DaemonClient', () => {
       expect(cwdEvents).toHaveLength(1);
       expect(cwdEvents[0]).toEqual({ sessionId: 'sess-cwd-1', cwd: 'D:\\proj\\api' });
 
+      await client.disconnect();
+      sockets.forEach(s => s.destroy());
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    });
+
+    it('should emit session:input from an input.typed daemon broadcast', async () => {
+      const pipeName = testPipeName('evtyped');
+      const sockets = new Set<net.Socket>();
+      const server = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.on('close', () => sockets.delete(socket));
+        socket.setEncoding('utf8');
+        socket.on('data', () => { /* accept all; no RPC handling needed */ });
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.on('error', reject);
+        server.listen(pipeName, () => resolve());
+      });
+      client = new DaemonClient(pipeName, AUTH_TOKEN);
+      await client.connect();
+      const seen: Array<{ sessionId: string }> = [];
+      client.on('session:input', (payload: { sessionId: string }) => seen.push(payload));
+      await new Promise(r => setTimeout(r, 100));
+      for (const socket of sockets) socket.write(JSON.stringify({ type: 'input.typed', sessionId: 'sess-typed', data: null }) + '\n');
+      await new Promise(r => setTimeout(r, 200));
+      expect(seen).toEqual([{ sessionId: 'sess-typed' }]);
       await client.disconnect();
       sockets.forEach(s => s.destroy());
       await new Promise<void>(resolve => server.close(() => resolve()));

@@ -16,6 +16,7 @@ import {
   BODY_PREVIEW_MAX_LEN,
   bodyPreview,
   mayCarryBody,
+  wakeAgentSlug,
   type WakeUnreadEntry,
   type WakeSessionView,
   type WakeNudgeOutcome,
@@ -68,6 +69,10 @@ interface Harness {
 
 function makeHarness(
   principalPtyIdOf?: (principalId: string) => string | undefined,
+  approvals: {
+    approvalBlocked?: (sessionId: string) => boolean;
+    screenShowsApproval?: (sessionId: string) => Promise<boolean | null>;
+  } = {},
 ): Harness {
   let entries: WakeUnreadEntry[] = [];
   let sessions: WakeSessionView[] = [];
@@ -91,6 +96,7 @@ function makeHarness(
     log: (_level, message) => logs.push(message),
     now: () => nowMs,
     enterDelayMs: 1,
+    ...approvals,
   });
   return {
     worker,
@@ -457,6 +463,26 @@ describe('pickTarget — never guess', () => {
     expect(target?.id).toBe('b');
   });
 
+  it('a recovered pane whose output is active but whose agent is unconfirmed gets no input', () => {
+    // A viewer activated the recovered pane's output; it still holds a fresh
+    // shell while lastDetectedAgent names the agent from before the restart.
+    const recovered = session({ id: 'pty-r', lastDetectedAgent: 'codex', deferred: false, recoveredAgentUnconfirmed: true });
+    const h = makeHarness(() => 'pty-r');
+    h.setEntries([entry({ unread: 2, mentionUnread: 1 })]);
+    h.setSessions([recovered]);
+    h.worker.tickOnce();
+    flushEnter();
+    expect(h.writes).toEqual([]);
+    expect(pickTarget([recovered], 'ws-b', 'codex')).toBeNull();
+    expect(pickTargetWithPrincipal([recovered], 'ws-b', 'codex', 'pane:ws-b/p1', () => 'pty-r')).toBeNull();
+
+    // Once the agent is seen running again the pane is a target as before.
+    h.setSessions([{ ...recovered, recoveredAgentUnconfirmed: false }]);
+    h.worker.tickOnce();
+    flushEnter();
+    expect(h.writes.map((w) => w.sessionId)).toEqual(['pty-r', 'pty-r']);
+  });
+
   it('never nudges an agent-less shell — the single-pane fallback requires a detected agent (dogfood 2026-07-05)', () => {
     // Live -dev proof: the member's real claude pane was ATTACHED (deferred to
     // the renderer Stop-hook path), leaving a bare zsh (lastDetectedAgent none)
@@ -487,6 +513,33 @@ describe('pickTarget — never guess', () => {
     // A different agent slug than the member id still gets the fallback: it is
     // a real agent pane, just not slug-matched.
     expect(pickTarget([session({ id: 'a', lastDetectedAgent: 'opencode' })], 'ws-b', 'reviewer')?.id).toBe('a');
+  });
+});
+
+describe('wakeAgentSlug — a pane back at its prompt is a shell', () => {
+  it('drops the sticky slug once OSC 133 says the foreground command returned, so no picker targets the shell', () => {
+    // The slug outlives the agent: Claude exits, zsh stays, and the nudge
+    // (hint + body preview + Enter) was typed into the shell.
+    const agent = wakeAgentSlug('claude', false);
+    expect(agent).toBeUndefined();
+    const shell = session({ id: 'pty-x', lastDetectedAgent: agent });
+    expect(pickTarget([shell], 'ws-b', 'claude')).toBeNull();
+    expect(pickTargetWithPrincipal([shell], 'ws-b', 'w1', 'pane:ws-b/p1', () => 'pty-x')).toBeNull();
+  });
+
+  it('keeps the slug while a command runs or when the shell has no OSC 133 integration', () => {
+    expect(wakeAgentSlug('claude', true)).toBe('claude');
+    expect(wakeAgentSlug('codex', undefined)).toBe('codex');
+    expect(wakeAgentSlug(undefined, true)).toBeUndefined();
+  });
+
+  it('lets process truth outrank the marker both ways', () => {
+    // A wrapper/nested shell drew a prompt while the agent it launched runs.
+    expect(wakeAgentSlug('claude', false, { slug: 'claude', alive: true })).toBe('claude');
+    // The agent died and something else (vim, ssh) now owns the foreground.
+    expect(wakeAgentSlug('claude', true, { slug: 'claude', alive: false })).toBeUndefined();
+    // A live process of another slug proves nothing about the sticky one.
+    expect(wakeAgentSlug('claude', false, { slug: 'codex', alive: true })).toBeUndefined();
   });
 });
 
@@ -829,7 +882,7 @@ describe('ChannelWakeWorker — body preview + inject outcome', () => {
   });
 
   it('bodyPreview strips control characters and caps the length', () => {
-    expect(bodyPreview('abc')).toBe('a b c');
+    expect(bodyPreview('a\x07b\x1bc')).toBe('a b c');
     expect(bodyPreview(undefined)).toBe('');
     expect(bodyPreview('   ')).toBe('');
     // Only the first line — the rest would submit as separate lines.
@@ -838,5 +891,59 @@ describe('ChannelWakeWorker — body preview + inject outcome', () => {
     const out = bodyPreview(long);
     expect(out.length).toBe(BODY_PREVIEW_MAX_LEN);
     expect(out.endsWith('…')).toBe(true);
+  });
+});
+
+// A nudge is committed with an Enter. An approval dialog waiting on a human is
+// quiet, so the quiet gate alone would press it; the worker holds instead.
+describe('ChannelWakeWorker — approval in front of the pane', () => {
+  const mention = () => entry({ mentionUnread: 1 });
+
+  it('holds while an approval record / human-blocked pane is reported, without spending budget', () => {
+    let blocked = true;
+    const h = makeHarness(undefined, { approvalBlocked: () => blocked });
+    h.setEntries([mention()]);
+    h.setSessions([session({})]);
+    for (let i = 0; i < MENTION_NUDGE_CAP + 2; i++) h.worker.tickOnce();
+    flushEnter();
+    expect(h.writes).toEqual([]);
+    expect(h.broadcasts).toEqual([]); // budget never exhausted by held nudges
+    blocked = false;
+    h.worker.tickOnce();
+    flushEnter();
+    expect(h.writes.map((w) => w.data).at(-1)).toBe('\r');
+  });
+
+  it('holds while the screen shows a dialog, and while it cannot be read', async () => {
+    let screen: boolean | null = true;
+    const h = makeHarness(undefined, { screenShowsApproval: async () => screen });
+    h.setEntries([mention()]);
+    h.setSessions([session({})]);
+    h.worker.tickOnce();
+    await vi.advanceTimersByTimeAsync(5);
+    expect(h.writes).toEqual([]);
+    screen = null;
+    h.worker.tickOnce();
+    await vi.advanceTimersByTimeAsync(5);
+    expect(h.writes).toEqual([]);
+    screen = false;
+    h.worker.tickOnce();
+    await vi.advanceTimersByTimeAsync(5);
+    expect(h.writes.map((w) => w.data)).toHaveLength(2);
+    expect(h.writes.at(-1)?.data).toBe('\r');
+  });
+
+  it('withholds the Enter when a dialog appears between the text and the Enter', async () => {
+    let screen = false;
+    const h = makeHarness(undefined, { screenShowsApproval: async () => screen });
+    h.setEntries([mention()]);
+    h.setSessions([session({})]);
+    h.worker.tickOnce();
+    await vi.advanceTimersByTimeAsync(0); // screen check, then the text write
+    expect(h.writes).toHaveLength(1);
+    screen = true; // a dialog is drawn before the Enter
+    await vi.advanceTimersByTimeAsync(5);
+    expect(h.writes.map((w) => w.data)).not.toContain('\r');
+    expect(h.outcomes.at(-1)?.ok).toBe(false);
   });
 });

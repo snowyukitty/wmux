@@ -4,6 +4,7 @@ import type { Pane, PaneLeaf, Surface, Workspace } from '../../../shared/types';
 import { createRemoteSurface, createSurface, generateId } from '../../../shared/types';
 import { isPlausibleCwd } from '../../../shared/cwdShape';
 import { getWorkspaceLeafPanes } from '../../../shared/paneUtils';
+import { dropStalePaneFoldKeys } from '../../utils/sidebarLayout';
 import { isSafeBrowserUrl } from '../../utils/browserPane';
 import { clearNudgesFor } from '../../hooks/channelMentionRateLimit';
 import { saveSessionNow } from '../../utils/sessionSaveBridge';
@@ -13,6 +14,7 @@ import { computePaneAutoName } from '../../utils/paneNaming';
 import { recomputeWorkspacePorts } from './workspacePorts';
 
 export interface SurfaceSlice {
+  setSurfaceViewMode: (surfaceId: string, mode: 'terminal' | 'chat') => void;
   /** Add a terminal surface to a pane. `workspaceId` lets RPC / eager-spawn
    * callers (e.g. the pane.split background-workspace path, #236) target a
    * non-active workspace — defaults to the active one, so existing positional
@@ -26,7 +28,10 @@ export interface SurfaceSlice {
    * splitPane, then calls this to populate it. ptyId stays '' (see
    * createRemoteSurface), so every ptyId-gated check already treats this
    * surface as non-local without further changes. */
-  addRemoteSurface: (paneId: string, hostId: string, sessionId: string, shell?: string, cwd?: string, workspaceId?: string, owned?: boolean) => void;
+  /** `workspaceId` is the LOCAL workspace the pane lives in; the trailing
+   *  `remoteWorkspaceId` (#1329) is the workspace on the REMOTE host that
+   *  `sessionId` belongs to, which is what the liveness poll asks about. */
+  addRemoteSurface: (paneId: string, hostId: string, sessionId: string, shell?: string, cwd?: string, workspaceId?: string, owned?: boolean, remoteWorkspaceId?: string) => void;
   addEditorSurface: (paneId: string, filePath: string) => void;
   /** J2 — diff 리뷰 서피스 추가. taskId만 영속(diff 내용은 파생 데이터).
    * 같은 taskId가 이미 열려 있으면 그 탭으로 전환. editor/browser처럼 ptyId 없음. */
@@ -62,6 +67,12 @@ export interface SurfaceSlice {
    * the tab tooltip rely on. No-op for an empty ptyId or an unknown pty.
    */
   updateSurfaceCwd: (ptyId: string, cwd: string) => void;
+  /** The git branch each terminal last reported, keyed by ptyId. The
+   *  workspace's `metadata.gitBranch` is overwritten by whichever surface
+   *  reported last, so the Moa view pointer reads this one instead. Not
+   *  persisted; rebuilt as panes report. */
+  surfaceGitBranch: Record<string, string>;
+  setSurfaceGitBranch: (ptyId: string, branch: string) => void;
   /**
    * Persist the browser surface's current URL. Driven by BrowserPanel's
    * did-navigate events (user clicks, toolbar, MCP/CDP navigations alike), so
@@ -126,6 +137,12 @@ function persistBindingNow(get: () => StoreState): void {
 }
 
 export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', never]], [], SurfaceSlice> = (set, get) => ({
+  surfaceGitBranch: {},
+  setSurfaceGitBranch: (ptyId, branch) => set((state: StoreState) => {
+    if (!ptyId || state.surfaceGitBranch[ptyId] === branch) return;
+    if (branch) state.surfaceGitBranch[ptyId] = branch;
+    else delete state.surfaceGitBranch[ptyId];
+  }),
   addSurface: (paneId, ptyId, shell, cwd, workspaceId) => {
     set((state: StoreState) => {
       const targetWsId = workspaceId || state.activeWorkspaceId;
@@ -160,13 +177,13 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
     pane.activeSurfaceId = surface.id;
   }),
 
-  addRemoteSurface: (paneId, hostId, sessionId, shell, cwd, workspaceId, owned) => set((state: StoreState) => {
+  addRemoteSurface: (paneId, hostId, sessionId, shell, cwd, workspaceId, owned, remoteWorkspaceId) => set((state: StoreState) => {
     const targetWsId = workspaceId || state.activeWorkspaceId;
     const ws = state.workspaces.find((w: Workspace) => w.id === targetWsId);
     if (!ws) return;
     const pane = findLeafPane(ws.rootPane, paneId);
     if (!pane) return;
-    const surface = createRemoteSurface(hostId, sessionId, shell || '', cwd || '', owned === true);
+    const surface = createRemoteSurface(hostId, sessionId, shell || '', cwd || '', owned === true, remoteWorkspaceId);
     pane.surfaces.push(surface);
     pane.activeSurfaceId = surface.id;
   }),
@@ -300,9 +317,12 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
     }
     if (closedPtyId && state.surfaceAgent) delete state.surfaceAgent[closedPtyId];
     if (closedPtyId && state.surfaceActivity) delete state.surfaceActivity[closedPtyId];
+    if (closedPtyId && state.surfaceLastActivity) delete state.surfaceLastActivity[closedPtyId];
     // Drop the pending question too: a leaked entry would let a REUSED ptyId
     // inherit a dead pane's question and read as blocked from birth.
     if (closedPtyId && state.surfacePendingQuestion) delete state.surfacePendingQuestion[closedPtyId];
+    if (closedPtyId && state.surfaceLastMessage) delete state.surfaceLastMessage[closedPtyId];
+    if (closedPtyId && state.surfaceQuestionSeen) delete state.surfaceQuestionSeen[closedPtyId];
     // Drop per-surface ports and agent status too (fleet-activity adversarial
     // review): without this, every closed surface leaves a dead ptyId entry
     // behind, and a REUSED ptyId inherits the previous surface's status.
@@ -316,6 +336,7 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
     // Same rule for the turn latch: it outranks the byte heuristic, so a leaked
     // entry would pin a REUSED ptyId at 'running' with no live agent to end it.
     if (closedPtyId && state.surfaceTurnOpenAt) delete state.surfaceTurnOpenAt[closedPtyId];
+    if (closedPtyId && state.surfaceTurnEndAt) delete state.surfaceTurnEndAt[closedPtyId];
     if (closedPtyId) clearNudgesFor(closedPtyId); // A5: free the rate-cap entry for a reusable ptyId
     // J3 F4: onExhausted 매핑도 이 ptyId 소멸과 함께 evict(무한 성장·재사용 ptyId 오염 방지).
     if (closedPtyId && state.taskPtyRegistry) delete state.taskPtyRegistry[closedPtyId];
@@ -355,6 +376,13 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
       }
     }
     });
+    // Closing a pane's last tab removes the pane: its task-group fold state goes too.
+    if (Object.keys(get().sidebarTaskGroupExpanded ?? {}).some((k) => k.startsWith('pane:'))) {
+      set((state: StoreState) => {
+        const ws = state.workspaces.find((w: Workspace) => w.id === (workspaceId || state.activeWorkspaceId));
+        if (ws) dropStalePaneFoldKeys(state.sidebarTaskGroupExpanded, ws.id, getWorkspaceLeafPanes(ws).map((leaf) => leaf.id));
+      });
+    }
     if (stashDropped) {
       const d = stashDropped as {
         wsId: string;
@@ -419,6 +447,18 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
     });
     persistBindingNow(get);
   },
+
+  setSurfaceViewMode: (surfaceId, mode) => set((state: StoreState) => {
+    for (const ws of state.workspaces) {
+      for (const pane of getWorkspaceLeafPanes(ws)) {
+        const surface = pane.surfaces.find((s) => s.id === surfaceId);
+        if (surface && (!surface.surfaceType || surface.surfaceType === 'terminal')) {
+          surface.viewMode = mode;
+          return;
+        }
+      }
+    }
+  }),
 
   updateSurfaceTitle: (surfaceId, title) => set((state: StoreState) => {
     for (const ws of state.workspaces) {

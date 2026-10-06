@@ -16,6 +16,9 @@ import { HUMAN_WORKSPACE_ID, CHANNEL_MENTIONS_MAX } from '../../../shared/channe
 import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
 import { buildDiffAskContext } from '../../../shared/diffAskContext';
+import { moaOwnsPanel, moaQuestionBlock } from '../Moa/panel/moaPanelMode';
+import { unwrapRpc } from '../../utils/unwrapRpc';
+import { HunkLines } from './HunkLines';
 
 // gpui button recipes (theme-safe color-mix on tokens; primary/danger keep the
 // rgba sheen the DESIGN spec calls for). Reused across this panel's header.
@@ -53,6 +56,8 @@ interface TaskMeta {
   channelArchived: boolean;
   /** F11 — closed면 close/PR 버튼을 감춘다(worktree 제거됨·닫을 것 없음). */
   status: 'open' | 'closed';
+  /** A detached task is closed but keeps its worktree — its diff is still live. */
+  detached: boolean;
 }
 
 // F10 — diff 코멘트 역조회(미션 채널의 diff-comment 앵커 메시지).
@@ -177,7 +182,8 @@ async function resolveTaskMeta(taskId: string, verifiedWorkspaceId: string): Pro
   }).electronAPI;
   if (!api?.rpc) return null;
   try {
-    const res = (await api.rpc.invoke('task.mission.list', { verifiedWorkspaceId })) as {
+    // rpc.invoke returns the `{ id, ok, result }` envelope; the task list is in `result`.
+    const res = unwrapRpc(await api.rpc.invoke('task.mission.list', { verifiedWorkspaceId })) as {
       ok?: boolean;
       tasks?: Array<{
         id: string;
@@ -185,6 +191,7 @@ async function resolveTaskMeta(taskId: string, verifiedWorkspaceId: string): Pro
         worktreePath?: string;
         branch?: string;
         missionChannelId?: string;
+        detachedAt?: number;
       }>;
     };
     const task = res?.tasks?.find((t) => t.id === taskId);
@@ -196,7 +203,7 @@ async function resolveTaskMeta(taskId: string, verifiedWorkspaceId: string): Pro
     const channelId = task.missionChannelId ?? '';
     if (channelId) {
       try {
-        const chRes = (await api.rpc.invoke('a2a.channel.get', {
+        const chRes = unwrapRpc(await api.rpc.invoke('a2a.channel.get', {
           verifiedWorkspaceId,
           channelId,
         })) as { ok?: boolean; channel?: { status?: string }; error?: unknown };
@@ -214,6 +221,7 @@ async function resolveTaskMeta(taskId: string, verifiedWorkspaceId: string): Pro
       missionChannelId: channelId,
       channelArchived,
       status: task.status === 'closed' ? 'closed' : 'open',
+      detached: typeof task.detachedAt === 'number',
     };
   } catch {
     return null;
@@ -232,7 +240,7 @@ async function loadDiffComments(
   }).electronAPI;
   if (!api?.rpc) return [];
   try {
-    const res = (await api.rpc.invoke('a2a.channel.getMessages', {
+    const res = unwrapRpc(await api.rpc.invoke('a2a.channel.getMessages', {
       verifiedWorkspaceId,
       channelId,
     })) as { ok?: boolean; messages?: Array<{ text?: string; memberName?: string; postedAt?: number; data?: unknown }> };
@@ -265,7 +273,7 @@ async function loadMissionRoster(
   }).electronAPI;
   if (!api?.rpc) return [];
   try {
-    const res = (await api.rpc.invoke('a2a.channel.getMembers', {
+    const res = unwrapRpc(await api.rpc.invoke('a2a.channel.getMembers', {
       verifiedWorkspaceId,
       channelId,
     })) as {
@@ -302,28 +310,6 @@ function CommentList({ comments }: { comments: DiffComment[] }) {
           <div className="text-[var(--text-sub)] whitespace-pre-wrap">{c.text}</div>
         </div>
       ))}
-    </div>
-  );
-}
-
-// hunk 라인에 +/- 색만 입힌다(신택스 하이라이팅 금지 — 비목표).
-function HunkBody({ bodyLines }: { bodyLines: readonly string[] }) {
-  return (
-    <div className="font-mono text-[11px] leading-[1.5] whitespace-pre overflow-x-auto">
-      {bodyLines.map((line, i) => {
-        const c = line.charAt(0);
-        const color =
-          c === '+'
-            ? 'text-[var(--accent-green)]'
-            : c === '-'
-              ? 'text-[var(--accent-red)]'
-              : 'text-[var(--text-sub)]';
-        return (
-          <div key={i} className={color}>
-            {line || ' '}
-          </div>
-        );
-      })}
     </div>
   );
 }
@@ -374,47 +360,85 @@ export default function DiffPanel({ source, isActive, surfaceId, verifiedWorkspa
   // J3 §1·§2: close·PR 진행 상태(중복 클릭 방지).
   const [lifecycleBusy, setLifecycleBusy] = useState<'close' | 'pr' | null>(null);
   const pushToast = useStore((s) => s.pushToast);
+  // When Moa runs, the question goes to Moa (the panel is pinned to its HQ).
+  const askMoa = useStore((s) => moaOwnsPanel(s.moa));
+  // Moa off or its HQ down: the panel is only a card, so a question would sit
+  // queued until Moa came back. Ask is disabled instead, saying why.
+  const askBlock = useStore((s) => moaQuestionBlock(s.moa));
   const t = useT();
 
+  // Bumped by every load() and by a successful Close. A load whose generation
+  // is no longer current drops its results, so a read that was in flight when
+  // Close succeeded cannot put back the 'open' meta or the removed hunks.
+  const loadGenRef = useRef(0);
+
   const load = useCallback(async () => {
+    const gen = ++loadGenRef.current;
+    const superseded = () => gen !== loadGenRef.current;
     setLoading(true);
     setError(null);
     setApplyMsg(null);
     setFailedProbes(new Set());
-    let readPath: string;
-    if (isTask) {
-      const m = await resolveTaskMeta(taskId, verifiedWorkspaceId);
-      if (!m) {
-        setError(t('diff.taskNotFound'));
+    try {
+      let readPath: string;
+      if (isTask) {
+        const m = await resolveTaskMeta(taskId, verifiedWorkspaceId);
+        if (superseded()) return;
+        if (!m) {
+          setError(t('diff.taskNotFound'));
+          setLoading(false);
+          return;
+        }
+        setMeta(m);
+        // A closed task's worktree has been removed: say so instead of reading a
+        // path that no longer exists (and offering its stale hunks for adoption).
+        if (m.status === 'closed' && !m.detached) {
+          setData(null);
+          setError(t('diff.taskClosed'));
+          setLoading(false);
+          return;
+        }
+        // F10: 코멘트 역조회(실패는 빈 목록 — diff 렌더는 막지 않음).
+        const loadedComments = await loadDiffComments(m.missionChannelId, taskId, verifiedWorkspaceId);
+        if (superseded()) return;
+        setComments(loadedComments);
+        readPath = m.worktreePath;
+      } else {
+        // 워크스페이스 모드 — 태스크 역참조·코멘트 없음. repoPath는 diff:resolveRepo가
+        // 정규화한 worktree toplevel이다.
+        readPath = repoPath;
+      }
+      const bridge = getDiffBridge();
+      if (!bridge) {
+        setError(t('diff.bridgeUnavailable'));
         setLoading(false);
         return;
       }
-      setMeta(m);
-      // F10: 코멘트 역조회(실패는 빈 목록 — diff 렌더는 막지 않음).
-      setComments(await loadDiffComments(m.missionChannelId, taskId, verifiedWorkspaceId));
-      readPath = m.worktreePath;
-    } else {
-      // 워크스페이스 모드 — 태스크 역참조·코멘트 없음. repoPath는 diff:resolveRepo가
-      // 정규화한 worktree toplevel이다.
-      readPath = repoPath;
-    }
-    const bridge = getDiffBridge();
-    if (!bridge) {
-      setError(t('diff.bridgeUnavailable'));
+      // workspace 모드는 명시 전달 — 자기 HEAD 대비 미커밋만(본 repo 매핑 없음).
+      // linked worktree에서 브랜치 커밋이 diff로 새는 것을 막는다(Codex P2).
+      const res = await bridge.read(readPath, undefined, isTask ? 'task' : 'workspace');
+      if (superseded()) return;
+      if (!res.ok) {
+        setError(res.error);
+        setData(null);
+      } else {
+        setData(res);
+        // Stay on the file being reviewed when it is still in the diff.
+        if (res.files.length > 0) {
+          setSelectedFile((prev) =>
+            prev && res.files.some((f) => f.path === prev) ? prev : res.files[0].path,
+          );
+        }
+      }
       setLoading(false);
-      return;
-    }
-    // workspace 모드는 명시 전달 — 자기 HEAD 대비 미커밋만(본 repo 매핑 없음).
-    // linked worktree에서 브랜치 커밋이 diff로 새는 것을 막는다(Codex P2).
-    const res = await bridge.read(readPath, undefined, isTask ? 'task' : 'workspace');
-    if (!res.ok) {
-      setError(res.error);
+    } catch (e) {
+      // A rejected IPC call must not leave the panel on "Loading" or surface as
+      // an unhandled rejection from the `void load()` callers.
+      if (superseded()) return;
+      setError(e instanceof Error ? e.message : String(e));
       setData(null);
-    } else {
-      setData(res);
-      if (res.files.length > 0) setSelectedFile(res.files[0].path);
+      setLoading(false);
     }
-    setLoading(false);
   }, [isTask, taskId, repoPath, verifiedWorkspaceId, t]);
 
   useEffect(() => {
@@ -504,12 +528,28 @@ export default function DiffPanel({ source, isActive, surfaceId, verifiedWorkspa
     setFailedProbes(new Set());
     const snapshot: DiffTargetSnapshot = data.snapshot;
     const req: DiffApplyRequest = { taskId, snapshot, selections };
-    const res = await bridge.applyHunks(req, meta.worktreePath);
+    let res: DiffApplyResult;
+    try {
+      res = await bridge.applyHunks(req, meta.worktreePath);
+    } catch (e) {
+      setApplying(false);
+      setApplyMsg(e instanceof Error ? e.message : String(e));
+      return;
+    }
     setApplying(false);
     if (res.ok) {
-      setApplyMsg(t('diff.adopted', { count: res.appliedFiles.length }));
-      // 재열람: 채택분은 여전히 태스크 worktree diff에 보이며 "적용됨" 뱃지로 표시됨.
-      void load();
+      const adoptedMsg = t('diff.adopted', { count: res.appliedFiles.length });
+      // Adopting writes the target, not the task worktree, so the adopted hunks
+      // are still in the reloaded diff with unchanged digests and the stale-
+      // selection sweep would keep their ticks. Clear them so a second click
+      // cannot re-apply the same hunks.
+      setSelection({});
+      setSelectionDigest({});
+      // load() clears the message bar, so the confirmation goes up after it.
+      // The adopt did land in the target even if this reload fails; load()
+      // shows its own error in the panel body and never throws.
+      await load();
+      setApplyMsg(adoptedMsg);
     } else {
       if (res.code === 'probe' && res.failedProbes) {
         setFailedProbes(new Set(res.failedProbes.map((p) => `${p.path}#${p.hunkIndex}`)));
@@ -608,7 +648,22 @@ export default function DiffPanel({ source, isActive, surfaceId, verifiedWorkspa
       if (res.ok) {
         // F11과 정합: close가 커밋됐으니 로컬 meta도 closed로 — PR/닫기 버튼이
         // 제거된 worktree를 상대로 다시 눌리지 않게 즉시 숨긴다.
-        setMeta((m) => (m ? { ...m, status: 'closed' } : m));
+        setMeta((m) => (m ? { ...m, status: 'closed', detached: false } : m));
+        // The worktree is gone: drop its hunks and ticks so nothing can be
+        // adopted from it, and discard any load still in flight.
+        loadGenRef.current += 1;
+        setLoading(false);
+        setData(null);
+        setSelection({});
+        setSelectionDigest({});
+        setApplyMsg(null);
+        setError(t('diff.taskClosed'));
+        // The daemon commits the close before task:close returns, so re-list the
+        // owner's tasks now: otherwise the sidebar and Fleet keep showing this
+        // task as open until the next 15 s mission poll. verifiedWorkspaceId is
+        // the owner (see Pane.tsx); on a legacy surface without one it is the
+        // task's own workspace, which owns no tasks, so the re-list is a no-op.
+        void useStore.getState().refreshMissions(verifiedWorkspaceId);
         pushToast({
           level: res.archivePending ? 'warn' : 'info',
           message: res.unmaterialized
@@ -622,6 +677,11 @@ export default function DiffPanel({ source, isActive, surfaceId, verifiedWorkspa
           level: 'warn',
           message: t('diff.closePreserved'),
         });
+        // Right after an adopt the agent's edits are still uncommitted in the
+        // worktree, so Close refuses. Keep the way out on screen (the toast
+        // times out): discard them there, or commit and open a PR.
+        const preserved = res.preservedWorktree ?? meta?.worktreePath;
+        if (preserved) setApplyMsg(t('diff.closePreservedAt', { path: preserved }));
       } else if (res.reason === 'unpushed') {
         pushToast({
           level: 'warn',
@@ -635,7 +695,7 @@ export default function DiffPanel({ source, isActive, surfaceId, verifiedWorkspa
     } finally {
       setLifecycleBusy(null);
     }
-  }, [lifecycleBusy, taskId, verifiedWorkspaceId, pushToast, t]);
+  }, [lifecycleBusy, taskId, verifiedWorkspaceId, meta, pushToast, t]);
 
   // diff→오케스트레이터 질문: hunk 컨텍스트 블록 + 질문을 단일 메시지로
   // 조립해 pendingBrainPrompt 릴레이에 싣고 Orchestrator 탭으로 전환한다
@@ -648,9 +708,11 @@ export default function DiffPanel({ source, isActive, surfaceId, verifiedWorkspa
     (file: string, hunkHeader: string, hunkBody: string) => {
       const question = askText.trim();
       if (!question) return;
+      const st = useStore.getState();
+      // The form can be open when Moa switches off; never queue into a card.
+      if (moaQuestionBlock(st.moa)) return;
       setAskTarget(null);
       setAskText('');
-      const st = useStore.getState();
       const prompt = buildDiffAskContext({
         repoLabel: isTask ? meta?.worktreePath || taskId : repoPath,
         branch: meta?.branch || data?.snapshot.targetBranch || '',
@@ -767,10 +829,11 @@ export default function DiffPanel({ source, isActive, surfaceId, verifiedWorkspa
           {t('diff.reload')}
         </button>
         {/* 채택은 태스크 모드 전용 — 워크스페이스 모드는 repo 자신 대상이라 무의미(읽기 전용). */}
-        {isTask && (
+        {isTask && !(meta?.status === 'closed' && !meta.detached) && (
           <button
             className={`px-2 py-0.5 text-[10px] ${BTN_PRIMARY_WARM} disabled:opacity-40`}
             onClick={() => void handleAdopt()}
+            data-testid="diff-adopt"
             disabled={applying || selectedCount === 0}
             title={t('diff.adoptTitle')}
           >
@@ -899,12 +962,19 @@ export default function DiffPanel({ source, isActive, surfaceId, verifiedWorkspa
                         <div className="flex-1" />
                         {/* diff→오케스트레이터 질문 — 양 모드 공통(hunk 컨텍스트 동봉). */}
                         <button
-                          className="text-[10px] text-[var(--text-muted)] hover:text-[var(--text-main)]"
+                          className="text-[10px] text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-40 disabled:hover:text-[var(--text-muted)]"
+                          disabled={askBlock !== null}
                           onClick={() => {
                             setAskText('');
                             setAskTarget((prev) => (prev === key ? null : key));
                           }}
-                          title={t('diff.askOrchestrator') || 'Ask the orchestrator about this hunk'}
+                          title={
+                            askBlock === 'off'
+                              ? t('moa.panel.diffAskOff')
+                              : askBlock === 'hq-problem'
+                                ? t('moa.panel.diffAskHqProblem')
+                                : askMoa ? t('moa.panel.diffAskTitle') : t('diff.askOrchestrator') || 'Ask the orchestrator about this hunk'
+                          }
                           data-diff-ask
                         >
                           {t('diff.ask') || 'Ask'}
@@ -929,7 +999,7 @@ export default function DiffPanel({ source, isActive, surfaceId, verifiedWorkspa
                         )}
                       </div>
                       {/* 인라인 질문 폼 — Enter 발사, Esc 닫기. */}
-                      {askTarget === key && (
+                      {askTarget === key && askBlock === null && (
                         <div
                           className="flex items-center gap-1.5 px-2 py-1 bg-[var(--bg-base)] border-t border-[var(--bg-mantle)]"
                           data-diff-ask-form
@@ -949,7 +1019,7 @@ export default function DiffPanel({ source, isActive, surfaceId, verifiedWorkspa
                                 setAskText('');
                               }
                             }}
-                            placeholder={t('diff.askPrompt') || 'Ask the orchestrator — hunk context attaches automatically'}
+                            placeholder={askMoa ? t('moa.panel.diffAskPrompt') : t('diff.askPrompt') || 'Ask the orchestrator — hunk context attaches automatically'}
                             spellCheck={false}
                             className="flex-1 min-w-0 bg-transparent text-[11px] text-[var(--text-main)] placeholder-[var(--text-muted)] outline-none px-1"
                           />
@@ -1001,7 +1071,7 @@ export default function DiffPanel({ source, isActive, surfaceId, verifiedWorkspa
                         </div>
                       )}
                       <div className="px-2 py-1">
-                        <HunkBody bodyLines={hunk.bodyLines} />
+                        <HunkLines bodyLines={hunk.bodyLines} />
                       </div>
                       {/* F10: 이 hunk 헤더에 매칭된 코멘트 인라인 표시. */}
                       <CommentList comments={fileComments.byHunk.get(hunk.header) ?? []} />

@@ -161,7 +161,15 @@ async function loadForPlatform(
     probeVolume: vi.fn(() => ({ volume: 'C:\\', freeBytes: 9e12 })),
     readDaemonPid: vi.fn((): number | null => null),
     readAbortMarker: vi.fn((): string | null => null),
+    // #1341 — the structured read the boot notice now uses. Defaults to
+    // whatever readAbortMarker says, with no target version, so every test
+    // written before the stamp existed keeps exercising the same path.
+    readAbortRecord: vi.fn((): { reason: string; targetVersion: string | null } | null => {
+      const reason = teardown.readAbortMarker();
+      return reason === null ? null : { reason, targetVersion: null };
+    }),
     clearAbortMarker: vi.fn(),
+    sweepStaleWaiterTasks: vi.fn(() => 0),
     // #1056 — resolves true by default so existing tests exercise the same
     // happy path as before this check existed; the dedicated test below
     // overrides it to prove the refusal branch.
@@ -178,6 +186,20 @@ async function loadForPlatform(
   };
   vi.doMock('../installIntegrity', () => integrity);
 
+  // #1525 — the pre-quit Smart App Control check spawns reg.exe and
+  // PowerShell for real, and the machine running this suite may itself have
+  // SAC enforcing (the maintainer's does). Default: not enforcing, so every
+  // install test written before the check existed walks the same path; the
+  // dedicated tests below override it.
+  const sac = {
+    assessSmartAppControlBlock: vi.fn(async (_installerPath: string) => ({
+      likelyBlocked: false,
+      sacState: 0 as number | null,
+      signatureStatus: null as string | null,
+    })),
+  };
+  vi.doMock('../smartAppControl', () => sac);
+
   vi.doMock('electron', () => ({
     autoUpdater: nativeUpdater,
     app: { getVersion: () => FAKE_VERSION, getPath: () => tempPathDir, quit: appQuit, isPackaged },
@@ -192,7 +214,7 @@ async function loadForPlatform(
   }));
 
   const mod = await import('../AutoUpdater');
-  return { AutoUpdater: mod.AutoUpdater, requestUrls, ipcHandlers, ipcListeners, request, appQuit, shellOpenPath, nativeUpdater, teardown, integrity, tempPathDir };
+  return { AutoUpdater: mod.AutoUpdater, requestUrls, ipcHandlers, ipcListeners, request, appQuit, shellOpenPath, nativeUpdater, teardown, integrity, sac, tempPathDir };
 }
 
 describe('AutoUpdater platform gating', () => {
@@ -208,6 +230,24 @@ describe('AutoUpdater platform gating', () => {
 
     expect(requestUrls).toContain(EXPECTED_WIN32_FEED);
     updater.stop();
+  });
+
+  it('win32: start() sweeps leftover waiter task registrations; other platforms do not', async () => {
+    // #1283 review — the two leak paths (a /Create that timed out after the
+    // server committed, a /Delete that failed) can only be cleaned up later,
+    // and startup is the one place blocking costs the user nothing.
+    vi.useFakeTimers();
+    const win = await loadForPlatform('win32');
+    const winUpdater = new win.AutoUpdater(() => null, quitHooks());
+    winUpdater.start();
+    expect(win.teardown.sweepStaleWaiterTasks).toHaveBeenCalledTimes(1);
+    winUpdater.stop();
+
+    const mac = await loadForPlatform('darwin');
+    const macUpdater = new mac.AutoUpdater(() => null, quitHooks());
+    macUpdater.start();
+    expect(mac.teardown.sweepStaleWaiterTasks).not.toHaveBeenCalled();
+    macUpdater.stop();
   });
 
   it('win32: periodic timer keeps polling the win32 feed', async () => {
@@ -407,6 +447,105 @@ describe('AutoUpdater #502 — quit after launching the installer', () => {
     expect(plan.setupExePath).toContain('.Setup.exe');
     // #502 + #866: quit so Squirrel never runs against a live instance, and ask
     // for the full shutdown so the daemon goes down with us.
+    expect(loaded.appQuit).toHaveBeenCalledTimes(1);
+  });
+
+  it('win32 (#1525): Smart App Control enforcing + an untrusted installer holds the install BEFORE anything is torn down', async () => {
+    const loaded = await loadForPlatform('win32', downloadRoutes);
+    const hooks = quitHooks();
+    const { updater, installHandler, sent } = await downloadUpdateFor(loaded, hooks);
+    loaded.sac.assessSmartAppControlBlock.mockResolvedValueOnce({
+      likelyBlocked: true, sacState: 1, signatureStatus: 'UnknownError',
+    });
+
+    await installHandler();
+
+    // Asked about the verified installer itself.
+    const probed = loaded.sac.assessSmartAppControlBlock.mock.calls[0]![0];
+    expect(probed).toContain(`wmux-update-${UPDATE_VERSION}-`);
+    // Reported as the hold, tagged so the always-mounted toast surface shows
+    // it and offers "Install anyway".
+    const err = sent.find((m) => m.channel === IPC.UPDATE_ERROR);
+    expect(err).toBeDefined();
+    expect(err!.data.source).toBe('install');
+    expect(err!.data.code).toBe('smart-app-control');
+    expect(String(err!.data.message)).toContain('Smart App Control');
+    // wmux stays open and NOTHING irreversible ran: no waiter, no daemon
+    // shutdown latch, no force-kill, no quit.
+    expect(loaded.appQuit).not.toHaveBeenCalled();
+    expect(loaded.teardown.spawnInstallWaiter).not.toHaveBeenCalled();
+    expect(loaded.teardown.collectInstallRootProcesses).not.toHaveBeenCalled();
+    expect(loaded.teardown.terminatePids).not.toHaveBeenCalled();
+    expect(hooks.onInstallRequiresFullShutdown).not.toHaveBeenCalled();
+    expect(loaded.shellOpenPath).not.toHaveBeenCalled();
+    // Unlatched, so "Install anyway" (or a later retry) is not answered with
+    // "an update install is already in progress".
+    expect((updater as unknown as { isInstalling: boolean }).isInstalling).toBe(false);
+  });
+
+  it('win32 (#1525): "Install anyway" skips only the Smart App Control check, for that one call', async () => {
+    const loaded = await loadForPlatform('win32', downloadRoutes);
+    const { installHandler, sent } = await downloadUpdateFor(loaded);
+    loaded.sac.assessSmartAppControlBlock.mockResolvedValue({
+      likelyBlocked: true, sacState: 1, signatureStatus: 'UnknownError',
+    });
+
+    // A plain press is held...
+    await installHandler();
+    expect(sent.filter((m) => m.data.code === 'smart-app-control')).toHaveLength(1);
+    expect(loaded.appQuit).not.toHaveBeenCalled();
+
+    // ...the notice's action goes ahead with the normal flow, unprobed.
+    await installHandler(undefined, { installAnyway: true });
+    expect(loaded.sac.assessSmartAppControlBlock).toHaveBeenCalledTimes(1);
+    expect(loaded.teardown.spawnInstallWaiter).toHaveBeenCalledTimes(1);
+    expect(loaded.appQuit).toHaveBeenCalledTimes(1);
+  });
+
+  it('win32 (#1525): the bypass is only honoured as an explicit installAnyway:true', async () => {
+    const loaded = await loadForPlatform('win32', downloadRoutes);
+    const { installHandler, sent } = await downloadUpdateFor(loaded);
+    loaded.sac.assessSmartAppControlBlock.mockResolvedValue({
+      likelyBlocked: true, sacState: 1, signatureStatus: 'NotSigned',
+    });
+
+    await installHandler(undefined, { installAnyway: 'yes' });
+    await installHandler(undefined, 'installAnyway');
+
+    expect(sent.filter((m) => m.data.code === 'smart-app-control')).toHaveLength(2);
+    expect(loaded.appQuit).not.toHaveBeenCalled();
+  });
+
+  it('win32 (#1525): a clear verdict (evaluation mode, off, or a Valid signature) installs as before', async () => {
+    const loaded = await loadForPlatform('win32', downloadRoutes);
+    const { installHandler, sent } = await downloadUpdateFor(loaded);
+    loaded.sac.assessSmartAppControlBlock.mockResolvedValueOnce({
+      likelyBlocked: false, sacState: 2, signatureStatus: null,
+    });
+
+    await installHandler();
+
+    expect(loaded.sac.assessSmartAppControlBlock).toHaveBeenCalledTimes(1);
+    expect(sent.some((m) => m.channel === IPC.UPDATE_ERROR)).toBe(false);
+    expect(loaded.teardown.spawnInstallWaiter).toHaveBeenCalledTimes(1);
+    expect(loaded.appQuit).toHaveBeenCalledTimes(1);
+  });
+
+  it('win32 (#1525): a Smart App Control probe that fails or times out fails OPEN', async () => {
+    const loaded = await loadForPlatform('win32', downloadRoutes);
+    const { installHandler, sent } = await downloadUpdateFor(loaded);
+    loaded.sac.assessSmartAppControlBlock.mockRejectedValueOnce(new Error('powershell timed out'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      await installHandler();
+      // One log line says why the check was skipped.
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('Smart App Control check failed'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(sent.some((m) => m.channel === IPC.UPDATE_ERROR)).toBe(false);
+    expect(loaded.teardown.spawnInstallWaiter).toHaveBeenCalledTimes(1);
     expect(loaded.appQuit).toHaveBeenCalledTimes(1);
   });
 
@@ -939,6 +1078,68 @@ describe('AutoUpdater — the auto-update toggle gates background polls only', (
 
     updater.stop();
   });
+
+  it('#1250: the toggle listener exists at CONSTRUCTION, before start() — the renderer sends during loadSession', async () => {
+    // The renderer pushes the persisted auto-update toggle ~1s into boot,
+    // while start() (end of the ready sequence, waiting on the daemon
+    // bootstrap) may not run for tens of seconds. The send is
+    // ipcRenderer.send — fire-and-forget — so a listener registered in
+    // start() misses it silently and `enabled` stays true for the whole
+    // session. This is the exact shape of the live bug: toggle off, yet
+    // background checks, downloads, and the update toast kept coming.
+    vi.useFakeTimers();
+    const { AutoUpdater, requestUrls, ipcListeners } = await loadForPlatform('win32');
+
+    const updater = new AutoUpdater(() => null, quitHooks());
+    // The renderer's boot-time send happens BEFORE start(). No start() yet.
+    ipcListeners.get(IPC.AUTO_UPDATE_ENABLED)!(null, false);
+
+    updater.start();
+    await vi.advanceTimersByTimeAsync(15_000 + 30 * 60 * 1000);
+    expect(requestUrls).toHaveLength(0);
+
+    updater.stop();
+  });
+
+  it('#1250: start() seeds the toggle from session.json when the renderer never sends it', async () => {
+    // Covers the boots where the IPC never arrives at all: window still
+    // loading, or the renderer's session load failed on a locked file and
+    // fell back without dispatching loadSession. The disk read is the only
+    // voice left, and it must be honoured.
+    vi.useFakeTimers();
+    const { AutoUpdater, requestUrls } = await loadForPlatform('win32');
+
+    const updater = new AutoUpdater(() => null, {
+      ...quitHooks(),
+      readAutoUpdateEnabled: () => false,
+    });
+    // No AUTO_UPDATE_ENABLED send — the renderer never spoke.
+    updater.start();
+    await vi.advanceTimersByTimeAsync(15_000 + 30 * 60 * 1000);
+    expect(requestUrls).toHaveLength(0);
+
+    updater.stop();
+  });
+
+  it('#1250: the renderer-delivered toggle wins over a stale session.json value', async () => {
+    // The disk read in start() fills the silence, never overwrites: if the
+    // renderer already delivered the toggle, its value is fresher (the user
+    // may have flipped the setting after the last session save).
+    vi.useFakeTimers();
+    const { AutoUpdater, requestUrls, ipcListeners } = await loadForPlatform('win32');
+
+    const updater = new AutoUpdater(() => null, {
+      ...quitHooks(),
+      readAutoUpdateEnabled: () => true, // stale disk value
+    });
+    ipcListeners.get(IPC.AUTO_UPDATE_ENABLED)!(null, false); // fresh renderer value
+
+    updater.start();
+    await vi.advanceTimersByTimeAsync(15_000 + 30 * 60 * 1000);
+    expect(requestUrls).toHaveLength(0);
+
+    updater.stop();
+  });
 });
 
 describe('AutoUpdater #866 — a refused install is reported on the next boot', () => {
@@ -1026,6 +1227,67 @@ describe('AutoUpdater #866 — a refused install is reported on the next boot', 
     const updater = new loaded.AutoUpdater(() => null, quitHooks());
     expect(await takeHandler(loaded)()).toBeNull();
     expect(loaded.teardown.clearAbortMarker).toHaveBeenCalledTimes(1);
+    updater.stop();
+  });
+
+  it('#1341 win32: a marker stamped with the version we are running is a COMPLETED install', async () => {
+    // Squirrel starts the new app before Setup.exe exits, so the marker the
+    // waiter wrote pessimistically is still on disk when we boot. Running the
+    // version it targeted proves the install finished; reporting a refusal
+    // here is what three consecutive real updates did.
+    const loaded = await loadForPlatform('win32');
+    loaded.teardown.readAbortRecord.mockReturnValueOnce({
+      reason: 'install-aborted: wmux quit to install the update and the install waiter did start, but it was stopped before it could run the installer',
+      targetVersion: FAKE_VERSION,
+    });
+
+    const updater = new loaded.AutoUpdater(() => null, quitHooks());
+    expect(await takeHandler(loaded)()).toBeNull();
+    // Cleared by US, not by the waiter: the waiter may be dead (#1264), and a
+    // marker left behind would repeat the false refusal on every later boot.
+    expect(loaded.teardown.clearAbortMarker).toHaveBeenCalledTimes(1);
+    updater.stop();
+  });
+
+  it('#1341 win32: a marker stamped with an OLDER version is still a real refusal', async () => {
+    // The install did not land — we are running what we ran before. This is
+    // the #1264/#1056 case, and it must keep reaching the user.
+    const loaded = await loadForPlatform('win32');
+    loaded.teardown.readAbortRecord.mockReturnValueOnce({
+      reason: 'install-aborted: install root still locked',
+      targetVersion: '9.9.8',
+    });
+
+    const updater = new loaded.AutoUpdater(() => null, quitHooks());
+    expect(await takeHandler(loaded)()).toBe('install-aborted: install root still locked');
+    expect(loaded.teardown.clearAbortMarker).toHaveBeenCalledTimes(1);
+    updater.stop();
+  });
+
+  it('#1341 win32: an unstamped (pre-fix) marker keeps the old behaviour', async () => {
+    const loaded = await loadForPlatform('win32');
+    loaded.teardown.readAbortRecord.mockReturnValueOnce({
+      reason: 'install-aborted: install root still locked',
+      targetVersion: null,
+    });
+
+    const updater = new loaded.AutoUpdater(() => null, quitHooks());
+    expect(await takeHandler(loaded)()).toBe('install-aborted: install root still locked');
+    updater.stop();
+  });
+
+  it('#1341 win32: a marker the waiter clears LATE never becomes a refusal', async () => {
+    // Same boot, two asks: the first lands inside the Squirrel window (marker
+    // present, stamped with our own version), the second after the waiter
+    // finally removed it. Neither may report a refusal.
+    const loaded = await loadForPlatform('win32');
+    loaded.teardown.readAbortRecord
+      .mockReturnValueOnce({ reason: 'install-aborted: interrupted', targetVersion: FAKE_VERSION })
+      .mockReturnValueOnce(null);
+
+    const updater = new loaded.AutoUpdater(() => null, quitHooks());
+    expect(await takeHandler(loaded)()).toBeNull();
+    expect(await takeHandler(loaded)()).toBeNull();
     updater.stop();
   });
 

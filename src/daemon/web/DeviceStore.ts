@@ -2,7 +2,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { scheduleTokenFileReHarden, secureWriteTokenFile } from '../../shared/security';
-import { DeviceAuditLog } from './deviceAudit';
+import { DeviceAuditLog, type DeviceActor } from './deviceAudit';
+import { normalizeDeviceKind, type DeviceKind } from '../../shared/web';
 
 /**
  * M3 — the per-device credential roster for `wmux web` (`devices.json`).
@@ -72,6 +73,26 @@ export type DeviceBatchRevocationCause =
 interface PendingRevocationAudit {
   name?: string;
   reason?: DeviceBatchRevocationCause;
+  /** Who asked, for a single-device revoke. A batch cause names itself. */
+  actor?: DeviceActor;
+  /**
+   * The audit line was already written when the first write failed, so the
+   * flush after a later successful write must not add a second one.
+   */
+  audited?: boolean;
+}
+
+/** Outcome of `setInput`. Fail-closed like revoke: `ok` means the grant is ON DISK. */
+export interface DeviceSetInputResult {
+  ok: boolean;
+  reason?: 'not-found' | 'revoked' | 'persist-failed';
+  /** True only when this call changed the grant the device holds in memory. */
+  changed: boolean;
+  /**
+   * True when the grant already held this value in memory but an earlier
+   * write of it failed, so this call re-attempted that write.
+   */
+  retried?: boolean;
 }
 
 /**
@@ -90,6 +111,8 @@ export interface DeviceSummary {
   allowInput: boolean;
   /** Set once, never cleared — revocation is permanent; a device re-pairs to return. */
   revokedAt?: number;
+  /** What the device said it was at pairing. Display only; `unknown` for legacy records. */
+  kind: DeviceKind;
 }
 
 /**
@@ -190,6 +213,8 @@ const DEVICE_NAME_MAX = 64;
  * be one the relay refuses.
  */
 const APNS_TOKEN_PATTERN = /^[0-9a-f]{64,200}$/;
+/** ActivityKit tokens: longer than a device token, no documented fixed length. */
+const LIVE_ACTIVITY_TOKEN_PATTERN = /^[0-9a-f]{64,512}$/;
 
 /** X25519 public key size. Mirrors PUSH_X25519_KEY_BYTES in pushEnvelope. */
 const PUSH_PUBLIC_KEY_BYTES = 32;
@@ -238,6 +263,38 @@ export interface DevicePushRegistration {
   apnsEnvironment?: 'development' | 'production';
 }
 
+/**
+ * What a device registers so the daemon can drive its Live Activity.
+ *
+ * TWO TOKENS, ARRIVING AT DIFFERENT TIMES, which is the whole reason this is a
+ * record of its own and not more fields on `DevicePushRegistration`. iOS hands
+ * the app a push-to-start token at launch and an activity token only once an
+ * activity actually exists — so the route that writes this MERGES (see
+ * `registerLiveActivity`), while `registerPush` replaces wholesale.
+ *
+ * Neither is a secret, for the same reason the push registration's fields are
+ * not: they are APNs routing handles Apple mints and rotates.
+ */
+export interface DeviceLiveActivityRegistration {
+  hostID?: string;
+  /** Starts an activity the app has not created yet. Lowercase hex. */
+  pushToStartToken?: string;
+  /** Updates the activity that is running now. Lowercase hex. Dies with it. */
+  activityToken?: string;
+  /**
+   * Which APNs stage minted these, read from the app's own provisioning
+   * profile.
+   *
+   * REGISTERED HERE, not borrowed from the push registration. A phone that
+   * refused notification permission has no push registration at all — Live
+   * Activities are a separate permission — and a push registration replaces
+   * wholesale, so a stage learned there can vanish under this one's feet.
+   */
+  apnsEnvironment?: 'development' | 'production';
+  /** When the device last told us any of these. */
+  registeredAt: number;
+}
+
 interface DeviceRecord {
   deviceId: string;
   name: string;
@@ -264,6 +321,14 @@ interface DeviceRecord {
    */
   allowInput?: boolean;
   push?: DevicePushRegistration;
+  liveActivity?: DeviceLiveActivityRegistration;
+  /**
+   * What the device said it was when it paired (`phone` | `computer`).
+   * Additive and optional: absent on every record written before it existed,
+   * which lists as `unknown`, and an older daemon reading a newer file simply
+   * ignores it. Display only — never consulted by `resolve`.
+   */
+  kind?: Exclude<DeviceKind, 'unknown'>;
 }
 
 /** Resolve a record's grant, applying the grandfather rule in one place. */
@@ -328,6 +393,24 @@ export class DeviceStore {
    * losing the original batch cause from the audit trail.
    */
   private readonly pendingRevocationAudits = new Map<string, PendingRevocationAudit>();
+  /**
+   * Devices whose grant changed in memory but has not reached disk yet. A
+   * same-value retry must re-attempt the write rather than answer `ok` for a
+   * grant a restart would revive. Cleared by any successful write, since the
+   * roster is always written whole.
+   */
+  private readonly unpersistedGrants = new Set<string>();
+  /**
+   * Grant changes whose `input-grant` audit line already says `persist-failed`.
+   * When a later write lands, `persist()` appends a `grant-persisted` line for
+   * each, so the trail does not record a change that is now on disk as failed
+   * forever. A newer change to the same device supersedes its entry, since that
+   * change writes its own `input-grant` line with its own outcome.
+   */
+  private readonly failedGrantAudits = new Map<
+    string,
+    { actor: DeviceActor; allowInput: boolean }
+  >();
 
   // Observability for the tests: proof that the cache elides derivations, and
   // that a wrong secret is never short-circuited before one.
@@ -359,6 +442,7 @@ export class DeviceStore {
         // can actually do, and a legacy record's absent field means granted.
         allowInput: recordAllowsInput(d),
         ...(d.revokedAt !== undefined ? { revokedAt: d.revokedAt } : {}),
+        kind: d.kind ?? 'unknown',
       }));
   }
 
@@ -377,7 +461,7 @@ export class DeviceStore {
    * HTTP handler awaits this, and a promise-returning signature leaves room to
    * move the write off the event loop later without touching that call site.
    */
-  async mint(params: { name?: string; allowInput?: boolean } = {}): Promise<MintedDevice> {
+  async mint(params: { name?: string; allowInput?: boolean; kind?: DeviceKind } = {}): Promise<MintedDevice> {
     const name = params.name ?? '';
     // Written EXPLICITLY on every new record, never left absent. That is what
     // keeps an absent field meaning "roster predates this field" rather than
@@ -408,6 +492,8 @@ export class DeviceStore {
       lastSeenAt: at,
       allowInput,
     };
+    const kind = normalizeDeviceKind(params.kind);
+    if (kind !== 'unknown') record.kind = kind;
     this.derivations += 1;
 
     this.devices.set(deviceId, record);
@@ -433,6 +519,46 @@ export class DeviceStore {
   }
 
   /**
+   * One phone worktree creation (contract item 5): the device (empty for the
+   * operator token) and the outcome tag. Never a path or a branch name.
+   */
+  recordGitWorktree(deviceId: string, reason: string): void {
+    this.audit.append({ event: 'git-worktree', deviceId, reason });
+  }
+
+  /**
+   * One file served to a phone because the pane's agent sent it with
+   * `SendUserFile`: the device (empty for the operator token), the pane, the
+   * basename and the size. Never the full path or the content. Repeats of the
+   * same device, pane and file within `SENT_FILE_COALESCE_MS` write one line.
+   */
+  recordSentFile(entry: { deviceId: string; sessionId: string; file: string; bytes: number }): void {
+    this.audit.append(
+      {
+        event: 'sent-file',
+        deviceId: entry.deviceId,
+        sessionId: entry.sessionId,
+        file: entry.file,
+        bytes: entry.bytes,
+      },
+      { coalesceKey: JSON.stringify([entry.deviceId, entry.sessionId, entry.file]) },
+    );
+  }
+
+  /**
+   * A paired device sent something to the Moa (HQ brain) pane: the device, the
+   * pane, and which route (`chat` or `input`) in `reason`. Never what was sent.
+   * Repeats of the same device, pane and route within `MOA_SEND_COALESCE_MS`
+   * write one line.
+   */
+  recordMoaSend(entry: { deviceId: string; sessionId: string; route: 'chat' | 'input' }): void {
+    this.audit.append(
+      { event: 'moa-send', deviceId: entry.deviceId, sessionId: entry.sessionId, reason: entry.route },
+      { coalesceKey: JSON.stringify([entry.deviceId, entry.sessionId, entry.route]) },
+    );
+  }
+
+  /**
    * Revoke a device. FAIL-CLOSED: `ok` is true only once the revocation is on
    * disk, because an operator who is told "revoked" will stop worrying about
    * that phone.
@@ -441,8 +567,12 @@ export class DeviceStore {
    * working NOW, and the honest report is that the change may not survive a
    * restart. Reverting it would leave a device the operator just tried to kill
    * still serving traffic in the process that is running.
+   *
+   * `actor` lands in the audit line. It defaults to `desktop` because that was
+   * the only caller before the phone could manage devices; every web path
+   * passes its own.
    */
-  revoke(deviceId: string): DeviceRevokeResult {
+  revoke(deviceId: string, actor: DeviceActor = 'desktop'): DeviceRevokeResult {
     const record = this.devices.get(deviceId);
     if (!record) return { ok: false, reason: 'not-found' };
     if (record.revokedAt !== undefined) {
@@ -460,11 +590,18 @@ export class DeviceStore {
     // Drop the cached verification FIRST: nothing may be able to authenticate
     // as this device between here and the notification, whatever the disk does.
     this.forgetVerified(deviceId);
-    this.pendingRevocationAudits.set(deviceId, { name: record.name });
+    this.pendingRevocationAudits.set(deviceId, { name: record.name, actor });
     this.pruneRevoked();
 
     if (!this.persist()) {
       this.log('error', `[web] revoke of ${deviceId} could not be persisted; it is blocked in memory only`);
+      // Audit NOW, as setInput does: the device is blocked in memory, and a
+      // daemon that dies before the next successful write would otherwise lose
+      // who revoked it. The pending entry is marked so that write does not add
+      // a second line.
+      this.audit.append({ event: 'revoke', deviceId, name: record.name, actor, reason: 'persist-failed' });
+      const pending = this.pendingRevocationAudits.get(deviceId);
+      if (pending) pending.audited = true;
       return { ok: false, reason: 'persist-failed' };
     }
     this.log('info', `[web] revoked device "${record.name}" (${deviceId})`);
@@ -489,34 +626,66 @@ export class DeviceStore {
    *
    * No cache invalidation: `verified` caches the SECRET derivation, which this
    * does not touch, and the grant is read from the record on every request.
+   *
+   * Audited only when the grant actually changes, and written even when the
+   * persist fails: the change took effect in memory either way, and that is
+   * the moment someone asking "who took this phone's keyboard away?" cares
+   * about. `actor` defaults to `desktop` for the same reason as on `revoke`.
    */
-  setInput(deviceId: string, allowInput: boolean): { ok: boolean; reason?: 'not-found' | 'revoked' | 'persist-failed' } {
+  setInput(
+    deviceId: string,
+    allowInput: boolean,
+    actor: DeviceActor = 'desktop',
+  ): DeviceSetInputResult {
     const record = this.devices.get(deviceId);
-    if (!record) return { ok: false, reason: 'not-found' };
+    if (!record) return { ok: false, reason: 'not-found', changed: false };
     // A tombstone has no capabilities to adjust. Silently "granting" input to a
     // revoked device would put a row on screen claiming a power it cannot use.
-    if (record.revokedAt !== undefined) return { ok: false, reason: 'revoked' };
+    if (record.revokedAt !== undefined) return { ok: false, reason: 'revoked', changed: false };
 
     if (recordAllowsInput(record) === allowInput) {
-      // Already there. Still force the field to exist, so a legacy record stops
-      // depending on the grandfather rule the moment the operator touches it.
-      if (record.allowInput === undefined) {
-        record.allowInput = allowInput;
-        if (!this.persist()) return { ok: false, reason: 'persist-failed' };
+      // Already there in memory — but only `ok` once it is also on disk. An
+      // earlier change that failed to persist is retried here; answering `ok`
+      // from memory alone would let a restart revive the old grant.
+      const retried = this.unpersistedGrants.has(deviceId);
+      // Still force the field to exist, so a legacy record stops depending on
+      // the grandfather rule the moment the operator touches it.
+      const legacy = record.allowInput === undefined;
+      if (legacy) record.allowInput = allowInput;
+      if ((retried || legacy) && !this.persist()) {
+        // Remember the failure, or the next same-value PATCH (no longer legacy,
+        // not marked retried) would answer `ok` without ever writing.
+        this.unpersistedGrants.add(deviceId);
+        return { ok: false, reason: 'persist-failed', changed: false, ...(retried ? { retried } : {}) };
       }
-      return { ok: true };
+      return { ok: true, changed: false, ...(retried ? { retried } : {}) };
     }
 
     record.allowInput = allowInput;
-    if (!this.persist()) {
+    // This change writes its own audit line below, whatever the disk does, so
+    // an older failed change to the same device must not be flushed as the
+    // outcome of this write.
+    this.failedGrantAudits.delete(deviceId);
+    const persisted = this.persist();
+    this.audit.append({
+      event: 'input-grant',
+      deviceId,
+      name: record.name,
+      actor,
+      allowInput,
+      ...(persisted ? {} : { reason: 'persist-failed' }),
+    });
+    if (!persisted) {
+      this.unpersistedGrants.add(deviceId);
+      this.failedGrantAudits.set(deviceId, { actor, allowInput });
       this.log(
         'error',
         `[web] input grant for ${deviceId} could not be persisted; it is ${allowInput ? 'granted' : 'blocked'} in memory only`,
       );
-      return { ok: false, reason: 'persist-failed' };
+      return { ok: false, reason: 'persist-failed', changed: true };
     }
     this.log('info', `[web] device "${record.name}" (${deviceId}) input ${allowInput ? 'ALLOWED' : 'set read-only'}`);
-    return { ok: true };
+    return { ok: true, changed: true };
   }
 
   /**
@@ -668,6 +837,167 @@ export class DeviceStore {
       return false;
     }
     this.log('info', `[web] dropped a dead push registration for ${deviceId}`);
+    return true;
+  }
+
+  // --- live activity --------------------------------------------------------
+
+  /**
+   * Record where to reach this device's Live Activity. MERGES.
+   *
+   * The two tokens do not arrive together: iOS issues the push-to-start token at
+   * launch, and the activity token only after an activity exists — which, when
+   * the daemon is the one starting it, is a round trip later. A wholesale
+   * replace (what `registerPush` does) would mean each call erased whichever
+   * token was not in hand, so the daemon would never hold both at once.
+   *
+   * So: an OMITTED field is left alone, and an explicit `null` REMOVES one.
+   * `activityToken: null` is how the app says the activity is over — it ended
+   * it, or the person swiped it away — and the alternative to hearing that is
+   * pushing at a token until Apple answers 410.
+   *
+   * Refuses on an unknown or revoked device, for the same reason `registerPush`
+   * does: a revoked phone must not be able to keep itself reachable.
+   */
+  registerLiveActivity(
+    deviceId: string,
+    input: {
+      hostID?: unknown;
+      pushToStartToken?: unknown;
+      activityToken?: unknown;
+      apnsEnvironment?: unknown;
+    },
+  ): {
+    ok: boolean;
+    reason?: 'not-found' | 'revoked' | 'bad-token' | 'bad-apns-environment' | 'persist-failed';
+  } {
+    const record = this.devices.get(deviceId);
+    if (!record) return { ok: false, reason: 'not-found' };
+    if (record.revokedAt !== undefined) return { ok: false, reason: 'revoked' };
+
+    // `undefined` = leave it, `null` = drop it, a string = set it. Anything
+    // else is a client bug and is said out loud rather than dropped, the same
+    // way a bad stage is: a silently ignored token is a lock screen that never
+    // updates and nothing to trace it to.
+    const readToken = (raw: unknown): string | null | undefined | 'bad' => {
+      if (raw === undefined) return undefined;
+      if (raw === null) return null;
+      if (typeof raw !== 'string') return 'bad';
+      const token = raw.trim().toLowerCase();
+      return LIVE_ACTIVITY_TOKEN_PATTERN.test(token) ? token : 'bad';
+    };
+
+    const pushToStart = readToken(input?.pushToStartToken);
+    const activity = readToken(input?.activityToken);
+    if (pushToStart === 'bad' || activity === 'bad') return { ok: false, reason: 'bad-token' };
+
+    // Same allowlist as `registerPush`, handed over raw by the route so a
+    // present-but-unreadable value cannot be coerced into absence.
+    const rawEnv = input?.apnsEnvironment;
+    if (rawEnv !== undefined && rawEnv !== 'development' && rawEnv !== 'production') {
+      return { ok: false, reason: 'bad-apns-environment' };
+    }
+
+    // `null` drops the host binding, exactly as it drops a token: after a host
+    // change the phone has to be able to say "the old host is not mine any
+    // more" instead of leaving a stale hostID to be pushed against.
+    if (input.hostID !== undefined && input.hostID !== null &&
+        (typeof input.hostID !== 'string' || !/^[a-f0-9]{64}$/.test(input.hostID))) {
+      return { ok: false, reason: 'bad-token' };
+    }
+    const previous = record.liveActivity;
+    const merged: DeviceLiveActivityRegistration = {
+      ...(previous ?? {}),
+      registeredAt: this.now(),
+    };
+    if (pushToStart === null) delete merged.pushToStartToken;
+    else if (pushToStart !== undefined) merged.pushToStartToken = pushToStart;
+    if (activity === null) delete merged.activityToken;
+    else if (activity !== undefined) merged.activityToken = activity;
+    if (rawEnv !== undefined) merged.apnsEnvironment = rawEnv;
+    if (input.hostID === null) delete merged.hostID;
+    else if (typeof input.hostID === "string") merged.hostID = input.hostID;
+    record.liveActivity = merged;
+
+    if (!this.persist()) {
+      // Roll back rather than report a registration a restart forgets — the
+      // app would believe the daemon is driving its activity and watch the lock
+      // screen go stale instead.
+      if (previous) record.liveActivity = previous;
+      else delete record.liveActivity;
+      return { ok: false, reason: 'persist-failed' };
+    }
+    return { ok: true };
+  }
+
+  /** Every device whose Live Activity the daemon can currently reach. */
+  liveActivityTargets(): Array<{
+    deviceId: string;
+    name: string;
+    liveActivity: DeviceLiveActivityRegistration;
+  }> {
+    const out: Array<{
+      deviceId: string;
+      name: string;
+      liveActivity: DeviceLiveActivityRegistration;
+    }> = [];
+    for (const record of this.devices.values()) {
+      if (record.revokedAt !== undefined || !record.liveActivity) continue;
+      out.push({
+        deviceId: record.deviceId,
+        name: record.name,
+        liveActivity: { ...record.liveActivity },
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Drop the ACTIVITY token only — what a 410 on an update means.
+   *
+   * Deliberately not `forgetPush`. An activity token dies every time an
+   * activity ends, which is routine and frequent; treating that as "this device
+   * is gone" would switch the device's approval notifications off several times
+   * a day. The push-to-start token survives too, so the next pending approval
+   * can start a fresh activity.
+   */
+  forgetLiveActivityToken(deviceId: string, token: string): boolean {
+    const record = this.devices.get(deviceId);
+    if (!record?.liveActivity?.activityToken) return false;
+    // COMPARE-AND-DELETE. The 410 names the token the request was sent WITH,
+    // and a registration can land while that request is in flight — the app
+    // rotates its activity constantly. Deleting whatever is stored now would
+    // throw away a token that was never refused, and the daemon would sit there
+    // unable to update an activity that is alive.
+    if (record.liveActivity.activityToken !== token.trim().toLowerCase()) return false;
+    const previous = record.liveActivity;
+    record.liveActivity = { ...previous };
+    delete record.liveActivity.activityToken;
+    if (!this.persist()) {
+      record.liveActivity = previous;
+      this.log('error', `[web] could not persist the dead activity-token removal for ${deviceId}`);
+      return false;
+    }
+    return true;
+  }
+
+  /** Drop the PUSH-TO-START token only — what a 410 on a start means. */
+  forgetPushToStartToken(deviceId: string, token: string): boolean {
+    const record = this.devices.get(deviceId);
+    if (!record?.liveActivity?.pushToStartToken) return false;
+    // Compare-and-delete, for the reason spelled out above.
+    if (record.liveActivity.pushToStartToken !== token.trim().toLowerCase()) return false;
+    const previous = record.liveActivity;
+    record.liveActivity = { ...previous };
+    delete record.liveActivity.pushToStartToken;
+    if (!this.persist()) {
+      record.liveActivity = previous;
+      this.log(
+        'error',
+        `[web] could not persist the dead push-to-start-token removal for ${deviceId}`,
+      );
+      return false;
+    }
     return true;
   }
 
@@ -849,10 +1179,21 @@ export class DeviceStore {
   }
 
   private flushPendingRevocationAudits(): void {
-    for (const [deviceId, entry] of this.pendingRevocationAudits) {
-      this.audit.append({ event: 'revoke', deviceId, ...entry });
+    for (const [deviceId, { audited, ...entry }] of this.pendingRevocationAudits) {
+      if (!audited) this.audit.append({ event: 'revoke', deviceId, ...entry });
     }
     this.pendingRevocationAudits.clear();
+  }
+
+  private flushFailedGrantAudits(): void {
+    for (const [deviceId, { actor, allowInput }] of this.failedGrantAudits) {
+      const record = this.devices.get(deviceId);
+      // A device revoked (or pruned) since has no grant left on disk to report.
+      if (!record || record.revokedAt !== undefined) continue;
+      // The name as written now: a rename may have landed with this very write.
+      this.audit.append({ event: 'grant-persisted', deviceId, name: record.name, actor, allowInput });
+    }
+    this.failedGrantAudits.clear();
   }
 
   private persist(): boolean {
@@ -864,11 +1205,16 @@ export class DeviceStore {
         fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
         secureWriteTokenFile(this.filePath, payload);
         this.flushPendingRevocationAudits();
+        this.flushFailedGrantAudits();
+        this.unpersistedGrants.clear();
         return true;
       }
       fs.writeFileSync(tmp, payload, { encoding: 'utf-8', mode: 0o600 });
       fs.renameSync(tmp, this.filePath);
       this.flushPendingRevocationAudits();
+      this.flushFailedGrantAudits();
+      // The roster is written whole, so every in-memory grant is on disk now.
+      this.unpersistedGrants.clear();
       this.scheduleHarden();
       return true;
     } catch (err) {
@@ -1025,6 +1371,10 @@ function coerceDevice(raw: unknown): DeviceRecord | null {
   // phone may not hold and deliver a notification it cannot open.
   const push = coercePush(o['push']);
   if (push) record.push = push;
+  // Absent on every record written before Live Activity push existed, which is
+  // simply "this device has not registered one" — the app registers on launch.
+  const liveActivity = coerceLiveActivity(o['liveActivity']);
+  if (liveActivity) record.liveActivity = liveActivity;
   // ABSENT and MALFORMED are different, and only the first grandfathers.
   //
   // Absent marks a record written before per-device grants existed, whose
@@ -1039,6 +1389,10 @@ function coerceDevice(raw: unknown): DeviceRecord | null {
   if ('allowInput' in o && o['allowInput'] !== undefined) {
     record.allowInput = o['allowInput'] === true;
   }
+  // Allowlisted or dropped: an unrecognised value lists as `unknown`, which is
+  // all this display-only field can safely say about it.
+  const kind = normalizeDeviceKind(o['kind']);
+  if (kind !== 'unknown') record.kind = kind;
   // Any truthy finite revokedAt keeps the device refused. A malformed one is
   // treated as REVOKED rather than active: fail-closed is the only safe read of
   // "this record may have been revoked".
@@ -1077,6 +1431,50 @@ function coercePush(raw: unknown): DevicePushRegistration | null {
   const rawEnv = o['apnsEnvironment'];
   const apnsEnvironment = rawEnv === 'development' || rawEnv === 'production' ? rawEnv : undefined;
   return { apnsToken, publicKey, registeredAt, ...(apnsEnvironment ? { apnsEnvironment } : {}) };
+}
+
+/**
+ * Restore a Live Activity registration.
+ *
+ * PER TOKEN, not all-or-nothing. The two tokens are independent handles with
+ * independent lifetimes, so a half-written or hand-edited record keeps the half
+ * that still parses instead of losing both — the same reasoning that made the
+ * write path a merge. A record with nothing left in it at all — no token, no
+ * stage — is nothing to hold.
+ *
+ * A malformed stage is IGNORED rather than fatal, matching `coercePush`: "stage
+ * unknown" is a state the relay already handles, and `registerLiveActivity` is
+ * where a live client hears that its value was wrong.
+ */
+function coerceLiveActivity(raw: unknown): DeviceLiveActivityRegistration | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const o = raw as Record<string, unknown>;
+  const readToken = (value: unknown): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const token = value.toLowerCase();
+    return LIVE_ACTIVITY_TOKEN_PATTERN.test(token) ? token : undefined;
+  };
+  const pushToStartToken = readToken(o['pushToStartToken']);
+  const activityToken = readToken(o['activityToken']);
+  const registeredAt =
+    typeof o['registeredAt'] === 'number' && Number.isFinite(o['registeredAt'])
+      ? o['registeredAt']
+      : 0;
+  const rawEnv = o['apnsEnvironment'];
+  const apnsEnvironment = rawEnv === 'development' || rawEnv === 'production' ? rawEnv : undefined;
+  // A stage with no tokens is still worth keeping. `registerLiveActivity`
+  // MERGES, and the stage arrives on its own call — a phone that reports its
+  // APNs environment before iOS has issued either token would have that answer
+  // dropped on the next daemon restart and then never send it again, because
+  // from the app's side it already told us. Nothing at all, though, is nothing.
+  if (!pushToStartToken && !activityToken && !apnsEnvironment) return null;
+  return {
+    ...(typeof o["hostID"] === "string" && /^[a-f0-9]{64}$/.test(o["hostID"]) ? { hostID: o["hostID"] } : {}),
+    ...(pushToStartToken ? { pushToStartToken } : {}),
+    ...(activityToken ? { activityToken } : {}),
+    ...(apnsEnvironment ? { apnsEnvironment } : {}),
+    registeredAt,
+  };
 }
 
 function coerceKdf(raw: unknown): DeviceKdfParams | null {

@@ -86,17 +86,24 @@ import { DaemonSessionManager } from '../DaemonSessionManager';
 import { restoreSeam } from '../../shared/restoreSeam';
 import { createDefaultConfig } from '../config';
 import { PWSH_EXIT_TAIL } from '../execWrapper';
+import { FACTORY_DEFAULT_SCOPES, __setPolicyProbeForTests } from '../../shared/pwshExecutionPolicy';
+
+// #1620: never let the host's real registry decide PowerShell argv here. Pin a
+// machine with an explicit policy (no extra args) unless a test opts in.
+const EXPLICIT_POLICY = { scopes: { ...FACTORY_DEFAULT_SCOPES, currentUser: 'set' as const }, platform: 'win32' as const };
 
 describe('DaemonSessionManager', () => {
   let manager: DaemonSessionManager;
 
   beforeEach(() => {
+    __setPolicyProbeForTests(EXPLICIT_POLICY);
     manager = new DaemonSessionManager();
     lastMockPty = null;
   });
 
   afterEach(() => {
     manager.disposeAll();
+    __setPolicyProbeForTests(null);
   });
 
   // 1. createSession → session created with state = detached
@@ -249,10 +256,37 @@ describe('DaemonSessionManager', () => {
     expect(lastMockPty?.spawnEnv?.WMUX_AUTH_TOKEN).toBeUndefined();
   });
 
+  it('drops agent-nesting markers and WMUX_SOCKET_PATH from a supplied env (fresh and recovered panes)', () => {
+    manager.createSession({
+      id: 'nesting-env',
+      cmd: 'cmd.exe',
+      cwd: '.',
+      env: {
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDECODE: '1',
+        CLAUDE_CODE_SESSION_X: 'abc',
+        claude_code_entrypoint: 'cli', // case-insensitive
+        WMUX_SOCKET_PATH: '/tmp/parent.sock',
+        WMUX_WORKSPACE_ID: 'real-ws',
+        CLAUDE_CONFIG_DIR: '/Users/me/.claude-work',
+        ANTHROPIC_BASE_URL: 'https://example.invalid',
+        CLAUDE_CODE_SANDBOXED: '1', // set on purpose for fan-out/automation panes
+      },
+    });
+    const env = lastMockPty?.spawnEnv ?? {};
+    for (const key of ['CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_X', 'claude_code_entrypoint', 'WMUX_SOCKET_PATH']) {
+      expect(env[key]).toBeUndefined();
+    }
+    expect(env.WMUX_WORKSPACE_ID).toBe('real-ws');
+    expect(env.CLAUDE_CONFIG_DIR).toBe('/Users/me/.claude-work');
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://example.invalid');
+    expect(env.CLAUDE_CODE_SANDBOXED).toBe('1');
+  });
+
   // Instance-isolation suffix (WMUX_DATA_SUFFIX) must always reflect THIS
   // daemon's own instance, never a value carried in a replayed/persisted env
   // blob — otherwise a recovered pane could be pointed at a DIFFERENT instance's
-  // control pipe. stripReservedAuth keeps non-auth WMUX_* from a supplied env, so
+  // control pipe. stripReservedSuppliedEnv keeps WMUX_DATA_SUFFIX in a supplied env, so
   // the daemon forces its own inherited suffix over the blob (and scrubs it when
   // the daemon itself has none).
   it("forces the daemon's own WMUX_DATA_SUFFIX over a replayed env blob", () => {
@@ -297,7 +331,7 @@ describe('DaemonSessionManager', () => {
         id: 'suffix-case',
         cmd: 'cmd.exe',
         cwd: '.',
-        env: { wmux_data_suffix: '-stale', FOO: 'bar' }, // lowercase variant survives stripReservedAuth
+        env: { wmux_data_suffix: '-stale', FOO: 'bar' }, // lowercase variant survives stripReservedSuppliedEnv
       });
       const spawned = lastMockPty?.spawnEnv ?? {};
       const anyVariant = Object.keys(spawned).some((k) => k.toUpperCase() === 'WMUX_DATA_SUFFIX');
@@ -622,31 +656,35 @@ describe('DaemonSessionManager', () => {
     expect(managed[0].ptyProcess).toBeDefined();
   });
 
-  // v2.8.1 hotfix: actionable error at MAX_SESSIONS (Bug 1)
-  it('throws an actionable error when the session cap is reached', () => {
-    for (let i = 0; i < 200; i++) {
-      manager.createSession({ id: `cap-${i}`, cmd: 'cmd.exe', cwd: '.' });
-    }
-    // The 201st must fail with a message the UI can show verbatim. The
-    // pre-v2.8.1 message was "Maximum session limit (50) reached" which
-    // surfaced as a generic "unknown error" toast in the renderer.
-    expect(() =>
-      manager.createSession({ id: 'cap-201', cmd: 'cmd.exe', cwd: '.' }),
-    ).toThrow(/Cannot create new terminal: 200 active sessions already running/);
-  });
-
-  // substrate 3.0: the session cap is configurable (was a 200 literal)
-  it('honours a custom session.maxSessions from setConfig', () => {
+  // v2.8.1 hotfix (Bug 1) + substrate 3.0: the cap is configurable and the
+  // error is actionable. One test, because the two are the same branch.
+  //
+  // #1274: this used to be two tests, the first spawning 200 mock sessions to
+  // reach the *default* cap. Those 200 sessions' garbage was collected during
+  // the next one — which is why "honours a custom session.maxSessions", a
+  // three-session test that takes 4 ms in isolation, was measured at 5.4-7.3 s
+  // against the 5 s per-test limit on macos-14. The ceiling is read from
+  // config (and the no-config path falls back to createDefaultConfig), so a
+  // small configured cap exercises the identical branch with 1/50th of the
+  // allocation, and the default 200 is pinned by an assertion instead of by
+  // 200 PTY spawns.
+  it('honours session.maxSessions and refuses past it with an actionable error', () => {
     const cfg = createDefaultConfig();
+    expect(cfg.session.maxSessions).toBe(200);
     cfg.session.maxSessions = 3;
     manager.setConfig(cfg);
     for (let i = 0; i < 3; i++) {
       manager.createSession({ id: `cm-${i}`, cmd: 'cmd.exe', cwd: '.' });
     }
-    // The cap is now 3, not the default 200 — and the message echoes it.
+    // The cap is now 3, not the default 200 — and the message echoes it. It
+    // must be showable verbatim in the UI: the pre-v2.8.1 text was "Maximum
+    // session limit (50) reached", which surfaced as a generic "unknown error"
+    // toast in the renderer.
     expect(() =>
       manager.createSession({ id: 'cm-overflow', cmd: 'cmd.exe', cwd: '.' }),
-    ).toThrow(/Cannot create new terminal: 3 active sessions already running/);
+    ).toThrow(
+      /Cannot create new terminal: 3 active sessions already running\. Close some panes/,
+    );
   });
 
   // codex P2: DEAD tombstones must not occupy a cap slot
@@ -781,6 +819,20 @@ describe('DaemonSessionManager', () => {
       expect(modes?.preamble(total - 4)).toBe('');
     });
 
+    // #1464: the replay decision reads process.platform when the unmute timer
+    // FIRES, so a platform override has to span the resize AND the timers.
+    // Sessions are created on the host platform first — createSession has its
+    // own win32 paths (shell resolution) this suite is not about.
+    const withPlatform = (platform: NodeJS.Platform, body: () => void): void => {
+      const orig = Object.getOwnPropertyDescriptor(process, 'platform');
+      Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+      try {
+        body();
+      } finally {
+        if (orig) Object.defineProperty(process, 'platform', orig);
+      }
+    };
+
     it('unmutes after first resize plus the drain delay', () => {
       vi.useFakeTimers();
       try {
@@ -795,16 +847,19 @@ describe('DaemonSessionManager', () => {
 
         // Resize flips deferred → false synchronously but schedules
         // the actual unmute so any output ConPTY emits at the prior
-        // geometry can drain first.
-        manager.resizeSession('rec-3', 120, 30);
-        expect(managed?.deferred).toBe(false);
-        expect(managed?.bridge.isMuted).toBe(true);
+        // geometry can drain first. That flush is a ConPTY behavior, so the
+        // drop below is the Windows contract (#1464 replays it elsewhere).
+        withPlatform('win32', () => {
+          manager.resizeSession('rec-3', 120, 30);
+          expect(managed?.deferred).toBe(false);
+          expect(managed?.bridge.isMuted).toBe(true);
 
-        // Output that fires DURING the drain window is still muted.
-        lastMockPty?.simulateData('stale-geometry-bytes');
-        expect(managed?.ringBuffer.readAll().toString()).toBe('');
+          // Output that fires DURING the drain window is still muted.
+          lastMockPty?.simulateData('stale-geometry-bytes');
+          expect(managed?.ringBuffer.readAll().toString()).toBe('');
 
-        vi.advanceTimersByTime(100);
+          vi.advanceTimersByTime(100);
+        });
         expect(managed?.bridge.isMuted).toBe(false);
 
         // Output produced AFTER the drain reaches the ring buffer.
@@ -812,6 +867,305 @@ describe('DaemonSessionManager', () => {
         expect(managed?.ringBuffer.readAll().toString()).toBe(
           'post-resize prompt $ ',
         );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('#1464: replays output held while muted when the first resize keeps the saved geometry', () => {
+      vi.useFakeTimers();
+      try {
+        manager.createSession({
+          id: 'rec-same',
+          cmd: '/bin/zsh',
+          cwd: '.',
+          cols: 62,
+          rows: 44,
+          scrollbackData: Buffer.from('history-before-crash'),
+          deferOutput: true,
+        });
+        const managed = manager.getSession('rec-same');
+        const prefill = 'history-before-crash' + restoreSeam(44);
+
+        // The fresh shell prints its first prompt before the renderer attaches,
+        // together with a DA1 and a cursor-position query it has long stopped
+        // waiting for by the time the replay reaches xterm.
+        lastMockPty?.simulateData('fresh-\x1b[c');
+        lastMockPty?.simulateData('prompt % \x1b[6n');
+        expect(managed?.ringBuffer.readAll().toString()).toBe(prefill);
+
+        // Same geometry: no SIGWINCH reaches the shell, so it will never
+        // repaint that prompt on its own. Holds on Windows too — there is no
+        // stale geometry to drain.
+        withPlatform('win32', () => {
+          manager.resizeSession('rec-same', 62, 44);
+          vi.advanceTimersByTime(100);
+        });
+        expect(managed?.bridge.isMuted).toBe(false);
+        // Replayed, with the queries stripped (they would otherwise draw a
+        // late reply into the program's input).
+        expect(managed?.ringBuffer.readAll().toString()).toBe(prefill + 'fresh-prompt % ');
+
+        // Live output after the unmute follows the replayed prompt in order.
+        lastMockPty?.simulateData('ls');
+        expect(managed?.ringBuffer.readAll().toString()).toBe(prefill + 'fresh-prompt % ls');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('#1464: a geometry change drops the old-size output but replays the repaint at the new size', () => {
+      vi.useFakeTimers();
+      try {
+        manager.createSession({ id: 'rec-diff', cmd: '/bin/zsh', cwd: '.', cols: 62, rows: 44, deferOutput: true });
+        const managed = manager.getSession('rec-diff');
+        withPlatform('linux', () => {
+          lastMockPty?.simulateData('prompt-at-saved-geometry % ');
+          // The relaunched renderer's first fit is often transient (27 → 25 → 27
+          // cols in the #1464 repro), so a second resize can land inside the
+          // drain window too. Each one makes the shell repaint at the new size.
+          manager.resizeSession('rec-diff', 100, 30);
+          lastMockPty?.simulateData('repaint-at-100x30 % ');
+          manager.resizeSession('rec-diff', 98, 30);
+          lastMockPty?.simulateData('repaint-at-98x30 % ');
+          expect(managed?.ringBuffer.readAll().toString()).toBe('');
+
+          vi.advanceTimersByTime(100);
+        });
+        expect(managed?.bridge.isMuted).toBe(false);
+        expect(managed?.ringBuffer.readAll().toString()).toBe('repaint-at-98x30 % ');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('#1464: on Windows a size change at a LATER resize inside the window discards, then asks ConPTY to repaint', () => {
+      // The first resize keeps the saved size, the second (the Resume row
+      // shrinking the pane) changes it: the held bytes may mix ConPTY frames
+      // from both sizes, so none are replayed. The prompt comes back from a
+      // same-size resize after the unmute, which ConPTY answers with a full
+      // repaint at the current geometry.
+      vi.useFakeTimers();
+      try {
+        manager.createSession({ id: 'rec-win', cmd: 'cmd.exe', cwd: '.', cols: 62, rows: 44, deferOutput: true });
+        const managed = manager.getSession('rec-win');
+        const pty = lastMockPty!;
+        const sizes: Array<[number, number]> = [];
+        const resize = pty.resize.bind(pty);
+        pty.resize = (cols: number, rows: number) => {
+          sizes.push([cols, rows]);
+          resize(cols, rows);
+        };
+        withPlatform('win32', () => {
+          pty.simulateData('prompt-at-saved-geometry > ');
+          manager.resizeSession('rec-win', 62, 44);
+          vi.advanceTimersByTime(50);
+          manager.resizeSession('rec-win', 62, 42);
+          pty.simulateData('conpty-frame-at-62x42 > ');
+          vi.advanceTimersByTime(50);
+        });
+        expect(managed?.bridge.isMuted).toBe(false);
+        expect(managed?.ringBuffer.readAll().toString()).toBe('');
+        // One real change, then the repaint request at the current geometry.
+        expect(sizes).toEqual([[62, 42], [62, 42]]);
+        // The repaint ConPTY sends in answer goes out live.
+        pty.simulateData('conpty-repaint > ');
+        expect(managed?.ringBuffer.readAll().toString()).toBe('conpty-repaint > ');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('#1464: no repaint request when nothing changed size, or off Windows', () => {
+      vi.useFakeTimers();
+      try {
+        for (const [platform, id, to] of [
+          ['win32', 'rec-win-same', [62, 44]],
+          ['linux', 'rec-linux-diff', [62, 42]],
+        ] as const) {
+          manager.createSession({ id, cmd: 'sh', cwd: '.', cols: 62, rows: 44, deferOutput: true });
+          const pty = lastMockPty!;
+          withPlatform(platform, () => {
+            manager.resizeSession(id, to[0], to[1]);
+            const before = pty.resizeCalls;
+            vi.advanceTimersByTime(100);
+            expect(pty.resizeCalls).toBe(before);
+          });
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('#1464: past the hold cap the head is kept, so the first prompt survives', () => {
+      vi.useFakeTimers();
+      try {
+        manager.createSession({ id: 'rec-big', cmd: '/bin/zsh', cwd: '.', cols: 62, rows: 44, deferOutput: true });
+        const managed = manager.getSession('rec-big');
+        lastMockPty?.simulateData('first-prompt % ');
+        // A burst past the 256 KiB cap (a busy recovered pane) is not held…
+        lastMockPty?.simulateData('x'.repeat(300 * 1024));
+        // …and nothing after it either, or the replay would have a hole in it.
+        lastMockPty?.simulateData('tail');
+        manager.resizeSession('rec-big', 62, 44);
+        vi.advanceTimersByTime(100);
+        expect(managed?.bridge.isMuted).toBe(false);
+        expect(managed?.ringBuffer.readAll().toString()).toBe('first-prompt % ');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('activateDeferred releases held output at the saved size, on every platform', () => {
+      // A pane no desktop renderer mounts (headless daemon, phone-only) is
+      // activated by a web viewer, which never resizes: nothing may change
+      // size, and the prompt held while muted must reach the ring.
+      vi.useFakeTimers();
+      try {
+        for (const platform of ['win32', 'linux'] as const) {
+          const id = `rec-activate-${platform}`;
+          manager.createSession({ id, cmd: 'sh', cwd: '.', cols: 62, rows: 44, deferOutput: true });
+          const managed = manager.getSession(id);
+          const pty = lastMockPty;
+          if (!pty) throw new Error('no pty spawned');
+          pty.simulateData('held-prompt $ ');
+          expect(managed?.ringBuffer.readAll().toString()).toBe('');
+
+          withPlatform(platform, () => {
+            manager.activateDeferred(id);
+            expect(managed?.deferred).toBe(false);
+            vi.advanceTimersByTime(100);
+          });
+          expect(managed?.bridge.isMuted).toBe(false);
+          expect(managed?.ringBuffer.readAll().toString()).toBe('held-prompt $ ');
+          expect(pty.resizeCalls).toBe(0);
+          expect(managed?.meta.cols).toBe(62);
+
+          pty.simulateData('after');
+          expect(managed?.ringBuffer.readAll().toString()).toBe('held-prompt $ after');
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('activateDeferred is a no-op on an active or unknown session', () => {
+      vi.useFakeTimers();
+      try {
+        manager.createSession({ id: 'rec-twice', cmd: 'sh', cwd: '.', deferOutput: true });
+        const managed = manager.getSession('rec-twice');
+        manager.activateDeferred('rec-twice');
+        vi.advanceTimersByTime(100);
+        lastMockPty?.simulateData('live');
+        // A second activation must not mute again or replay anything twice.
+        manager.activateDeferred('rec-twice');
+        vi.advanceTimersByTime(100);
+        expect(managed?.bridge.isMuted).toBe(false);
+        expect(managed?.ringBuffer.readAll().toString()).toBe('live');
+        expect(() => manager.activateDeferred('no-such-session')).not.toThrow();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('activating the output does not confirm the recovered agent; only confirmAgent does', () => {
+      vi.useFakeTimers();
+      try {
+        manager.createSession({ id: 'rec-agent', cmd: 'sh', cwd: '.', deferOutput: true });
+        manager.createSession({ id: 'fresh', cmd: 'sh', cwd: '.' });
+        const managed = manager.getSession('rec-agent');
+        expect(managed?.recoveredAgentUnconfirmed).toBe(true);
+        expect(manager.getSession('fresh')?.recoveredAgentUnconfirmed).toBe(false);
+
+        manager.activateDeferred('rec-agent');
+        vi.advanceTimersByTime(100);
+        manager.resizeSession('rec-agent', 100, 30);
+        expect(managed?.bridge.isMuted).toBe(false);
+        expect(managed?.recoveredAgentUnconfirmed).toBe(true);
+
+        manager.confirmAgent('rec-agent');
+        expect(managed?.recoveredAgentUnconfirmed).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('a pending unmute does not touch a new session created under the same id', () => {
+      vi.useFakeTimers();
+      try {
+        manager.createSession({ id: 'rec-reuse', cmd: 'sh', cwd: '.', deferOutput: true });
+        manager.activateDeferred('rec-reuse');
+        manager.destroySession('rec-reuse');
+        manager.createSession({ id: 'rec-reuse', cmd: 'sh', cwd: '.', deferOutput: true });
+        vi.advanceTimersByTime(100);
+        const fresh = manager.getSession('rec-reuse');
+        expect(fresh?.deferred).toBe(true);
+        expect(fresh?.bridge.isMuted).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // Records every PTY resize, so the Windows repaint request can be counted.
+    const recordSizes = (): Array<[number, number]> => {
+      const pty = lastMockPty;
+      if (!pty) throw new Error('no pty spawned');
+      const sizes: Array<[number, number]> = [];
+      const resize = pty.resize.bind(pty);
+      pty.resize = (cols: number, rows: number) => {
+        sizes.push([cols, rows]);
+        resize(cols, rows);
+      };
+      return sizes;
+    };
+
+    it('on Windows the first desk resize after a web activation still gets a ConPTY repaint', () => {
+      vi.useFakeTimers();
+      try {
+        for (const [platform, repaints] of [['win32', 1], ['linux', 0]] as const) {
+          const id = `rec-first-${platform}`;
+          manager.createSession({ id, cmd: 'sh', cwd: '.', cols: 62, rows: 44, deferOutput: true });
+          const managed = manager.getSession(id);
+          const sizes = recordSizes();
+          withPlatform(platform, () => {
+            manager.activateDeferred(id);
+            vi.advanceTimersByTime(100);
+            expect(managed?.bridge.isMuted).toBe(false);
+            manager.resizeSession(id, 100, 30);
+            vi.advanceTimersByTime(100);
+            // Only the first resize is the desk's first geometry.
+            manager.resizeSession(id, 90, 30);
+            vi.advanceTimersByTime(100);
+          });
+          const repaint: Array<[number, number]> = repaints ? [[100, 30]] : [];
+          expect(sizes).toEqual([[100, 30], ...repaint, [90, 30]]);
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('on Windows a size change inside the drain window after a web activation discards, then repaints', () => {
+      vi.useFakeTimers();
+      try {
+        manager.createSession({ id: 'rec-web-win', cmd: 'cmd.exe', cwd: '.', cols: 62, rows: 44, deferOutput: true });
+        const managed = manager.getSession('rec-web-win');
+        const pty = lastMockPty;
+        if (!pty) throw new Error('no pty spawned');
+        const sizes = recordSizes();
+        withPlatform('win32', () => {
+          pty.simulateData('prompt-at-saved-geometry > ');
+          manager.activateDeferred('rec-web-win');
+          vi.advanceTimersByTime(50);
+          manager.resizeSession('rec-web-win', 62, 42);
+          pty.simulateData('conpty-frame-at-62x42 > ');
+          vi.advanceTimersByTime(50);
+          // The first-geometry repaint is not requested twice.
+          vi.advanceTimersByTime(200);
+        });
+        expect(managed?.bridge.isMuted).toBe(false);
+        expect(managed?.ringBuffer.readAll().toString()).toBe('');
+        expect(sizes).toEqual([[62, 42], [62, 42]]);
       } finally {
         vi.useRealTimers();
       }
@@ -998,6 +1352,32 @@ describe('DaemonSessionManager', () => {
       expect(session.exec).toEqual({ command: 'claude /loop' });
     });
 
+    // #1620: on a factory-default Windows client powershell.exe resolves an npm
+    // agent (`codex`) to its .ps1 shim, and Restricted blocks it.
+    it('gives a Windows PowerShell 5.1 exec unit RemoteSigned on a factory-default machine', () => {
+      __setPolicyProbeForTests({ scopes: FACTORY_DEFAULT_SCOPES, platform: 'win32' });
+      manager.createSession({ id: 'exec-ps51', cmd: 'powershell.exe', cwd: '.', exec: { command: 'codex' } });
+      expect(lastMockPty?.spawnArgs).toEqual([
+        '-NoLogo',
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'RemoteSigned',
+        '-Command',
+        `codex${PWSH_EXIT_TAIL}`,
+      ]);
+    });
+
+    it('leaves a 5.1 exec unit alone when the machine has an explicit policy', () => {
+      manager.createSession({ id: 'exec-ps51-explicit', cmd: 'powershell.exe', cwd: '.', exec: { command: 'codex' } });
+      expect(lastMockPty?.spawnArgs).not.toContain('-ExecutionPolicy');
+    });
+
+    it('never gives a pwsh 7 exec unit the flag', () => {
+      __setPolicyProbeForTests({ scopes: FACTORY_DEFAULT_SCOPES, platform: 'win32' });
+      manager.createSession({ id: 'exec-pwsh7', cmd: 'pwsh.exe', cwd: '.', exec: { command: 'codex' } });
+      expect(lastMockPty?.spawnArgs).not.toContain('-ExecutionPolicy');
+    });
+
     // X6: a non-persisted execLaunchCommand spawns the resume-rewritten command
     // (used by recovery/restart replays) while meta.exec.command stays original.
     it('spawns execLaunchCommand but persists the ORIGINAL exec.command (X6 resume replay)', () => {
@@ -1018,6 +1398,40 @@ describe('DaemonSessionManager', () => {
       // ...but the persisted unit command is the ORIGINAL (badge / future
       // first-launch semantics / no drift across repeated replays).
       expect(session.exec).toEqual({ command: 'claude' });
+    });
+
+    // Phone contract v-next item 4: a phone workspace pane's agent runs on the
+    // account the pane was created on even when the login profile exports
+    // another one, lineage is on the meta from creation, and a gone account
+    // directory is dropped rather than handed to the CLI.
+    it.skipIf(process.platform === 'win32')('pins a phone pane account after the login profile and records lineage at creation', () => {
+      const lineage = { sessionId: 'web-src', verified: true, at: 7 };
+      const gone = path.join(os.tmpdir(), `wmux-gone-${process.pid}-${Date.now()}`);
+      const session = manager.createSession({
+        id: 'web-3f1c2e4a-0b6d-4c1e-9a7f-2d8e5b6c7a90',
+        cmd: '/bin/sh',
+        cwd: '.',
+        env: { WMUX_WORKSPACE_ID: 'ws-1', CLAUDE_CONFIG_DIR: os.tmpdir(), CODEX_HOME: gone },
+        exec: { command: 'claude' },
+        handoffFrom: lineage,
+        paneAccount: { vendor: 'claude' },
+      });
+      expect(lastMockPty?.spawnArgs).toEqual(['-lc', `export CLAUDE_CONFIG_DIR='${os.tmpdir()}'; claude`]);
+      expect(session.exec).toEqual({ command: 'claude' });
+      expect(session.handoffFrom).toEqual(lineage);
+      expect(session.paneAccount).toEqual({ vendor: 'claude' });
+      expect(session.env.CODEX_HOME).toBeUndefined();
+    });
+
+    it('keeps a temporary Codex relay out of persisted recovery commands', () => {
+      const session = manager.createSession({
+        id:'codex-relay',cmd:'pwsh.exe',cwd:'.',
+        exec:{command:'codex --model model-a'},
+        execLaunchCommand:'codex --model model-a --remote unix:///tmp/wmux-tui-owned/tui.sock',
+      });
+      expect(lastMockPty?.spawnArgs.join(' ')).toContain('--remote unix:///tmp/wmux-tui-owned/tui.sock');
+      expect(session.exec).toEqual({command:'codex --model model-a'});
+      expect(JSON.stringify(manager.listSessions())).not.toContain('wmux-tui-owned');
     });
 
     it('without execLaunchCommand, spawns the original exec.command (first launch unchanged)', () => {

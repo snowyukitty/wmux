@@ -3,7 +3,8 @@ import type {
   RegisteredTool,
 } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import type { z } from 'zod';
+import { z } from 'zod';
+import { inputSchemaDeclaresMaxBytes, wrapHandlerWithResultCap } from './resultCap';
 
 /**
  * Launch-time tool surfaces. A server instance selects exactly one profile and
@@ -40,6 +41,13 @@ export interface WmuxToolSpec<Name extends string = string> {
   readonly name: Name;
   readonly description: string;
   readonly inputSchema: z.ZodRawShape;
+  /**
+   * Reject unknown input keys instead of silently dropping them. Off by
+   * default: every strict tool pays `"additionalProperties":false` in its
+   * tools/list schema (29 bytes), and the full profile's byte budget cannot
+   * absorb that for all of them at once.
+   */
+  readonly strictInput?: boolean;
   readonly profiles: readonly WmuxToolProfile[];
   readonly invoke: (
     input: Record<string, unknown>,
@@ -125,6 +133,37 @@ export function defineWmuxTool<
 }
 
 /**
+ * Build the schema the SDK validates one call against.
+ *
+ * A raw shape becomes a stripping object: an agent that passes a misspelled or
+ * unsupported option gets it silently dropped, reads a result produced without
+ * it, and concludes the option did nothing. `strictInput` tools reject that
+ * call instead, and the message names both the offending key and the keys that
+ * would have worked, so the next attempt does not need another round trip.
+ */
+export function toolInputSchema(
+  spec: Pick<WmuxToolSpec, 'inputSchema' | 'strictInput'>,
+): z.ZodRawShape | z.ZodObject<z.ZodRawShape> {
+  if (!spec.strictInput) {
+    return spec.inputSchema;
+  }
+  const valid = Object.keys(spec.inputSchema);
+  const tail = valid.length > 0
+    ? `valid: ${valid.join(', ')}`
+    : 'this tool takes no options';
+  return z.strictObject(spec.inputSchema, {
+    error: (issue) =>
+      issue.code === 'unrecognized_keys'
+        // JSON.stringify, not bare quotes: a key containing a quote or a
+        // newline has to read back as one key, not as broken punctuation.
+        ? `unknown option ${issue.keys.map((key) => JSON.stringify(key)).join(', ')}; ${tail}`
+        // Every other issue keeps Zod's own wording; only the unknown-key
+        // case has a message worth replacing.
+        : undefined,
+  });
+}
+
+/**
  * Select a deterministic profile without mutating the catalog or its order.
  * Duplicate names fail before filtering so a hidden collision cannot surface
  * later when a different immutable profile is selected.
@@ -168,9 +207,20 @@ export function registerWmuxTools(
         spec.name,
         {
           description: spec.description,
-          inputSchema: spec.inputSchema,
+          inputSchema: toolInputSchema(spec),
         },
-        (input) => spec.invoke(input, context),
+        // Result-size guard (src/mcp/resultCap.ts): every catalog tool's TEXT
+        // result is capped at 64 KiB head+tail unless the tool's input schema
+        // declares a `maxBytes` the caller set. The wrapped callback is passed
+        // through UNADAPTED on purpose: it carries the guard's idempotency
+        // mark, so the legacy-lane wrapper in createWmuxServer (which also
+        // patches server.registerTool) recognizes it and skips a second wrap
+        // instead of truncating twice. The marker names the raise path only
+        // when this spec's schema actually declares maxBytes.
+        wrapHandlerWithResultCap(
+          (parsed: Record<string, unknown>) => spec.invoke(parsed, context),
+          { declaresMaxBytes: inputSchemaDeclaresMaxBytes(spec.inputSchema) },
+        ),
       ),
     ),
   );

@@ -21,6 +21,11 @@
 import path from 'node:path';
 import { getWmuxDir } from '../../daemon/config';
 import { atomicReadJSONSync, atomicWriteJSON } from '../../daemon/util/atomicWrite';
+import { createSerialChain } from './serialChain';
+
+/** Save and clear (incl. the workspace teardown) share one read-modify-write
+ *  chain, so a teardown clear cannot drop a concurrent save of another key. */
+const serialize = createSerialChain();
 
 export interface PersistedCommanderSession {
   /** The SDK session id to pass as `resume` on the next first turn. */
@@ -84,10 +89,12 @@ export async function saveCommanderSession(
   dir?: string,
 ): Promise<void> {
   if (!workspaceId) return;
-  const sessions = readSessionsFile(dir);
-  sessions[workspaceId] = { sessionId, updatedAt: new Date().toISOString() };
-  const record: CommanderSessionsFile = { sessions };
-  await atomicWriteJSON(getCommanderSessionPath(dir), record);
+  await serialize(async () => {
+    const sessions = readSessionsFile(dir);
+    sessions[workspaceId] = { sessionId, updatedAt: new Date().toISOString() };
+    const record: CommanderSessionsFile = { sessions };
+    await atomicWriteJSON(getCommanderSessionPath(dir), record);
+  });
 }
 
 /** Drop one workspace orchestrator's persisted session (the `/clear` reset).
@@ -98,9 +105,11 @@ export async function clearCommanderSession(
   dir?: string,
 ): Promise<void> {
   if (!workspaceId) return;
-  const sessions = readSessionsFile(dir);
-  if (!(workspaceId in sessions)) return;
-  delete sessions[workspaceId];
-  const record: CommanderSessionsFile = { sessions };
-  await atomicWriteJSON(getCommanderSessionPath(dir), record);
+  await serialize(async () => {
+    const sessions = readSessionsFile(dir);
+    if (!(workspaceId in sessions)) return;
+    delete sessions[workspaceId];
+    const record: CommanderSessionsFile = { sessions };
+    await atomicWriteJSON(getCommanderSessionPath(dir), record);
+  });
 }

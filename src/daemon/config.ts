@@ -10,7 +10,7 @@ import {
   CHANNEL_TRASH_TTL_HOURS_DEFAULT,
 } from '../shared/channels';
 import { getWindowsDefaultShell } from '../shared/shellResolution';
-import { dataSuffix, getDaemonSocketPath, getLegacyDaemonSocketPath } from '../shared/constants';
+import { assertNotLiveWmuxDataDir, dataSuffix, getDaemonSocketPath, getLegacyDaemonSocketPath } from '../shared/constants';
 import { coerceLanLinkConfig, defaultLanLinkConfig } from '../shared/lanlink';
 import {
   DESKTOP_PRESENCE_STALE_AFTER_MS,
@@ -21,7 +21,9 @@ import {
 
 /** ~/.wmux directory (인스턴스 격리 suffix 반영 — main에서 상속된 WMUX_DATA_SUFFIX) */
 export function getWmuxDir(): string {
-  return path.join(os.homedir(), `.wmux${dataSuffix()}`);
+  const home = os.homedir();
+  assertNotLiveWmuxDataDir(home);
+  return path.join(home, `.wmux${dataSuffix()}`);
 }
 
 /** Path to daemon config file */

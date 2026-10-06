@@ -1,13 +1,18 @@
 import type { SpawnKind } from '../../shared/spawnKind';
 import type { DeadPaneRecovery } from '../../shared/ptyRecovery';
-import { applyRoleBinding, type RoleBinding } from '../../shared/orchestratorRole';
+import type { FanoutOrigin } from '../../shared/fanoutOrigin';
+import { applyRoleBinding, type RoleBinding, type WmuxTools } from '../../shared/orchestratorRole';
+import { commandLauncherStem } from '../../shared/fanoutPreset';
 
 export interface PtyCreateOptions {
+  /** A role binding's wmux MCP tool level; main splices the flags into
+   *  initialCommand (it knows where the bundle lives) and drops the hint. */
+  wmuxTools?: { tools: WmuxTools; role?: string };
   shell?: string;
   cwd?: string;
   /** Known-dead session cwd candidates. Main validates them in order and
    * falls back to home; ordinary blank-surface creates leave this absent. */
-  recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd'>;
+  recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd' | 'wslTarget' | 'args' | 'sourceSessionId'>;
   cols?: number;
   rows?: number;
   workspaceId?: string;
@@ -18,6 +23,11 @@ export interface PtyCreateOptions {
    * provisioner·project seed)은 스탬프를 생략 → main이 fail-closed로 gated 처리.
    */
   spawnKind?: SpawnKind;
+  /** Fan-out task pane: main stamps the workspace's depth-1 lineage with this
+   *  owner inside the create, before the PTY exists. */
+  fanoutTaskOf?: string;
+  /** Fan-out task pane: who asked, stamped on the lineage with the owner. */
+  fanoutOrigin?: FanoutOrigin;
   /**
    * Workspace profile env overlay. Merged into the new PTY's environment AFTER
    * the safe-inherited baseline and BEFORE wmux identity vars are forced, so a
@@ -53,7 +63,7 @@ export interface PtyCreateOptions {
 export interface SurfaceCwdHealInput {
   spawnedCwd?: string;
   requestedCwd?: string;
-  recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd'>;
+  recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd' | 'wslTarget' | 'args' | 'sourceSessionId'>;
 }
 
 import type { WorkspaceProfile } from '../../shared/types';
@@ -126,10 +136,14 @@ export function withRoleBinding<T extends PtyCreateOptions>(
   options: T,
   binding: RoleBinding | undefined,
   role?: string,
+  /** Fan-out only: extra launcher stems to treat as agents (applyRoleBinding). */
+  extraAgents?: ReadonlySet<string>,
 ): T {
   if (!binding) return options;
   const next = { ...options };
   let touched = false;
+  // The tool level only means something for the agent the binding names, so it
+  // rides along only when the launch line (after the rewrite below) runs it.
   for (const field of ['initialCommand', 'exec'] as const) {
     const before = options[field];
     if (before === undefined) continue;
@@ -138,6 +152,7 @@ export function withRoleBinding<T extends PtyCreateOptions>(
     // is a launch, and the submitted-line prose gate would wrongly reject it.
     const { command, changed } = applyRoleBinding(before, binding, {
       spawnedProcess: field === 'exec',
+      ...(extraAgents ? { extraAgents } : {}),
     });
     if (!changed) continue;
     next[field] = command;
@@ -146,6 +161,11 @@ export function withRoleBinding<T extends PtyCreateOptions>(
     // to carry a note (unlike input.send, which reports `enforcedModel` back to
     // the caller), so the rewrite would otherwise be invisible.
     console.log('[wmux:role-binding] seed command rewritten', { role, field, before, after: command });
+  }
+  const launch = next.initialCommand;
+  if (binding.tools && binding.agent && launch && commandLauncherStem(launch) === binding.agent) {
+    next.wmuxTools = { tools: binding.tools, ...(role ? { role } : {}) };
+    touched = true;
   }
   return touched ? next : options;
 }

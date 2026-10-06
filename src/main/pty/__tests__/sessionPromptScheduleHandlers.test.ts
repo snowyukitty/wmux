@@ -34,10 +34,14 @@ function schedule(id: string, ptyId = 'pty-1'): SessionPromptSchedule {
   };
 }
 
-function handlers(available = true, slug: 'codex' | 'claude' | null = 'codex') {
+function handlers(
+  available = true,
+  slug: 'codex' | 'claude' | null = 'codex',
+  agentVerified = true,
+) {
   return createSessionPromptScheduleHandlers({
     available,
-    getAgentState: async () => slug ? { slug, incarnationId: 'incarnation-1' } : null,
+    getAgentState: async () => slug ? { slug, incarnationId: 'incarnation-1', agentVerified } : null,
     dir,
   });
 }
@@ -169,7 +173,7 @@ describe('session prompt schedule IPC handlers', () => {
     await saveSessionPromptSchedules([paused], dir);
     const ipc = createSessionPromptScheduleHandlers({
       available: true,
-      getAgentState: async () => state,
+      getAgentState: async () => ({ ...state, agentVerified: true }),
       dir,
     });
 
@@ -198,14 +202,43 @@ describe('session prompt schedule IPC handlers', () => {
     ]);
   });
 
+  it('refuses to schedule a live-but-unverified pane (#1307)', async () => {
+    const request = {
+      ptyId: 'pty-1',
+      agentSlug: 'codex',
+      prompt: 'continue',
+      nextRunAt: Date.now() + 60_000,
+    };
+    await expect(handlers(true, 'codex', false).create(request)).resolves.toEqual({
+      ok: false,
+      code: 'agent_unavailable',
+    });
+    expect(loadSessionPromptSchedules(dir)).toEqual([]);
+  });
+
+  it('resumes a live-but-unverified pane whose slug and incarnation still match — the #1307 regression guard', async () => {
+    const paused = schedule('paused');
+    paused.enabled = false;
+    await saveSessionPromptSchedules([paused], dir);
+
+    await expect(handlers(true, 'codex', false).update({
+      ptyId: 'pty-1',
+      id: 'paused',
+      enabled: true,
+    })).resolves.toEqual({ ok: true });
+    expect(loadSessionPromptSchedules(dir)).toEqual([
+      expect.objectContaining({ id: 'paused', enabled: true }),
+    ]);
+  });
+
   it.each(['missing', 'rejected'] as const)(
     'preserves a paused schedule through a %s lookup and revalidates on retry',
     async (failure) => {
       const paused = { ...schedule('paused'), enabled: false, lastResult: 'busy' as const };
       await saveSessionPromptSchedules([paused], dir);
       const getAgentState = vi.fn(async () => ({
-        slug: 'codex' as const, incarnationId: 'incarnation-1',
-      }) as { slug: 'codex'; incarnationId: string } | null);
+        slug: 'codex' as const, incarnationId: 'incarnation-1', agentVerified: true,
+      }) as { slug: 'codex'; incarnationId: string; agentVerified: boolean } | null);
       if (failure === 'missing') getAgentState.mockResolvedValueOnce(null);
       else getAgentState.mockRejectedValueOnce(new Error('daemon disconnected'));
       const ipc = createSessionPromptScheduleHandlers({ available: true, getAgentState, dir });
@@ -225,30 +258,33 @@ describe('session prompt schedule IPC handlers', () => {
   it('still refuses a replacement session after an unavailable lookup', async () => {
     await saveSessionPromptSchedules([{ ...schedule('paused'), enabled: false }], dir);
     const getAgentState = vi.fn(async () => ({
-      slug: 'codex' as const, incarnationId: 'incarnation-2',
-    }) as { slug: 'codex'; incarnationId: string } | null).mockResolvedValueOnce(null);
+      slug: 'codex' as const, incarnationId: 'incarnation-2', agentVerified: true,
+    }) as { slug: 'codex'; incarnationId: string; agentVerified: boolean } | null)
+      .mockResolvedValueOnce(null);
     const ipc = createSessionPromptScheduleHandlers({ available: true, getAgentState, dir });
     const request = { ptyId: 'pty-1', id: 'paused', enabled: true };
 
     await expect(ipc.update(request)).resolves.toEqual({ ok: false, code: 'agent_unavailable' });
     await expect(ipc.update(request)).resolves.toEqual({ ok: false, code: 'session_changed' });
-    expect(loadSessionPromptSchedules(dir)).toEqual([
+    const persisted = JSON.parse(fs.readFileSync(getSessionPromptSchedulesPath(dir), 'utf8'));
+    expect(persisted).toEqual([
       expect.objectContaining({ enabled: false, lastResult: 'session_changed' }),
     ]);
+    expect(persisted[0]).not.toHaveProperty('deliveryClaim');
   });
 
   it('refuses resume in local mode without invalidating the binding or querying the daemon', async () => {
     const paused = { ...schedule('paused'), enabled: false };
     await saveSessionPromptSchedules([paused], dir);
     const getAgentState = vi.fn(async () => ({
-      slug: 'codex' as const, incarnationId: 'incarnation-1',
+      slug: 'codex' as const, incarnationId: 'incarnation-1', agentVerified: true,
     }));
     const ipc = createSessionPromptScheduleHandlers({ available: false, getAgentState, dir });
 
     await expect(ipc.update({ ptyId: 'pty-1', id: 'paused', enabled: true }))
       .resolves.toEqual({ ok: false, code: 'daemon_required' });
     expect(getAgentState).not.toHaveBeenCalled();
-    expect(loadSessionPromptSchedules(dir)).toEqual([paused]);
+    expect(JSON.parse(fs.readFileSync(getSessionPromptSchedulesPath(dir), 'utf8'))).toEqual([paused]);
   });
 
   it('pauses an already-enabled row on unavailable validation without discarding its delivery claim', async () => {
@@ -260,7 +296,8 @@ describe('session prompt schedule IPC handlers', () => {
 
     await expect(handlers(true, null).update({ ptyId: 'pty-1', id: 'active', enabled: true }))
       .resolves.toEqual({ ok: false, code: 'agent_unavailable' });
-    expect(loadSessionPromptSchedules(dir)).toEqual([{ ...active, enabled: false }]);
+    expect(JSON.parse(fs.readFileSync(getSessionPromptSchedulesPath(dir), 'utf8')))
+      .toEqual([{ ...active, enabled: false }]);
   });
 
   it('allows pause and delete without querying an unavailable daemon', async () => {

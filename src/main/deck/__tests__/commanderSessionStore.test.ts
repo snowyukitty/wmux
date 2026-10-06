@@ -107,4 +107,12 @@ describe('commanderSessionStore (per-workspace)', () => {
   it('missing file → null (fresh install)', () => {
     expect(loadCommanderSession('ws-1', join(tmpdir(), 'wmux-deck-store-nonexistent'))).toBeNull();
   });
+
+  it('a save and a clear for different workspaces both survive', () =>
+    withTempDir(async (dir) => {
+      await saveCommanderSession('ws-a', 'sess-a', dir);
+      await Promise.all([saveCommanderSession('ws-b', 'sess-b', dir), clearCommanderSession('ws-a', dir)]);
+      expect(loadCommanderSession('ws-a', dir)).toBeNull();
+      expect(loadCommanderSession('ws-b', dir)?.sessionId).toBe('sess-b');
+    }));
 });

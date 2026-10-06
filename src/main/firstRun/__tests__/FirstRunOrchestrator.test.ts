@@ -162,8 +162,12 @@ const MARKER_PATH = path.join(
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+let origSuffix: string | undefined;
+
 describe('FirstRunOrchestrator', () => {
   beforeEach(() => {
+    origSuffix = process.env.WMUX_DATA_SUFFIX;
+    delete process.env.WMUX_DATA_SUFFIX;
     vi.mocked(fs.stat).mockReset();
     vi.mocked(fs.readFile).mockReset();
     vi.mocked(fs.writeFile).mockReset();
@@ -175,6 +179,8 @@ describe('FirstRunOrchestrator', () => {
   });
 
   afterEach(() => {
+    if (origSuffix === undefined) delete process.env.WMUX_DATA_SUFFIX;
+    else process.env.WMUX_DATA_SUFFIX = origSuffix;
     vi.useRealTimers();
   });
 

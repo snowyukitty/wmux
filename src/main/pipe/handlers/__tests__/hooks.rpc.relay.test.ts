@@ -29,6 +29,8 @@ vi.mock('../../../ipc/handlers/metadata.handler', () => ({
 }));
 
 import { registerHooksRpc, relayHookSignalToDaemon } from '../hooks.rpc';
+import { registerBrainPty } from '../../../deck/brainPtyHookBus';
+import { __resetMoaPaneFeedForTest, buildMoaPanePayload, setMoaPaneSource } from '../../../deck/moaPaneFeed';
 import { DaemonNotificationRouter } from '../../../notification/DaemonNotificationRouter';
 
 function fakeWindow(): BrowserWindow {
@@ -168,6 +170,25 @@ describe('hooks.signal — daemon relay', () => {
     // the hook has taken this pane's lifecycle over from the detector.
     expect(touchAuthority).toHaveBeenCalledWith('pty-1', 'claude', expect.any(Number), true, 'agent.stop');
     expect(dispatchNotificationMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('local fallback persists a resume binding only for a pane-exact route (#1523)', async () => {
+    const { router: hookRouter } = stubHookRouter();
+    const daemon = fakeDaemon({ connected: false });
+    const bindingCalls = () => daemon.rpc.mock.calls.filter(([method]) => method === 'daemon.setResumeBinding');
+
+    // Exact: the signal names pty-1 and pty-1 is live → the binding is written.
+    await dispatchSignal(daemon.client, hookRouter, { ptyId: 'pty-1', agentSessionId: 'conv-exact' });
+    expect(bindingCalls()).toHaveLength(1);
+    expect(bindingCalls()[0][1]).toMatchObject({ id: 'pty-1', resumeBinding: { sessionId: 'conv-exact' } });
+
+    // Guessed: no ptyId, routed to pty-1 by workspace/cwd → routed, but no
+    // binding RPC (and so no spool fallback either).
+    const res = await dispatchSignal(daemon.client, hookRouter, {
+      agent: 'codex', workspaceId: 'ws-1', agentSessionId: 'conv-guess',
+    });
+    expect(res.result).toEqual({ ok: true });
+    expect(bindingCalls()).toHaveLength(1);
   });
 
   it('falls back to local processing when there is no daemon client at all', async () => {
@@ -375,5 +396,53 @@ describe('relayHookSignalToDaemon', () => {
     await relayHookSignalToDaemon(client, signal());
     const opts = (rpc.mock.calls[0] as unknown as unknown[])[2] as { timeoutMs: number };
     expect(opts.timeoutMs).toBeLessThan(2000);
+  });
+});
+
+describe('hooks.signal — brain-pty lane', () => {
+  it('returns a brain listener\'s context line on the response, with no relay', async () => {
+    const { router: hookRouter } = stubHookRouter();
+    const daemon = fakeDaemon({ connected: true });
+    const line = '[wmux context] viewing workspace "A" (ws-a), pane p, branch main, cwd /a';
+    const off = registerBrainPty('pty-brain', () => ({ additionalContext: line }));
+    try {
+      const res = await dispatchSignal(daemon.client, hookRouter, { kind: 'agent.user_prompt_submit', ptyId: 'pty-brain' });
+      expect(res).toEqual(expect.objectContaining({ ok: true, result: { ok: true, additionalContext: line } }));
+      expect(daemon.rpc).not.toHaveBeenCalled();
+    } finally {
+      off();
+    }
+  });
+
+  it('a human prompt both gets its context line and closes the Moa dialog flag (phone Moa pane)', async () => {
+    __resetMoaPaneFeedForTest();
+    setMoaPaneSource(() => ({ sessionId: 'pty-brain', workspaceId: 'ws-hq', brainCwd: '/repo' }));
+    const { router: hookRouter } = stubHookRouter();
+    const line = '[wmux context] viewing workspace "A" (ws-a)';
+    const off = registerBrainPty('pty-brain', (s) => (s.kind === 'agent.user_prompt_submit' ? { additionalContext: line } : undefined));
+    try {
+      // The brain's own permission dialog opens: the Moa pane carries the flag.
+      const asked = await dispatchSignal(null, hookRouter, { kind: 'agent.awaiting_input', ptyId: 'pty-brain', payload: { tool_name: 'Bash' } });
+      expect(asked.result).toEqual({ ok: true });
+      expect(buildMoaPanePayload()).toMatchObject({ dialog: expect.any(Object) });
+      // The human types a prompt: #1766's context line rides the response, and the flag clears.
+      const res = await dispatchSignal(null, hookRouter, { kind: 'agent.user_prompt_submit', ptyId: 'pty-brain' });
+      expect(res.result).toEqual({ ok: true, additionalContext: line });
+      expect(buildMoaPanePayload()).not.toHaveProperty('dialog');
+    } finally {
+      off();
+      __resetMoaPaneFeedForTest();
+    }
+  });
+
+  it('answers a plain ok when the listener adds nothing', async () => {
+    const { router: hookRouter } = stubHookRouter();
+    const off = registerBrainPty('pty-brain', () => undefined);
+    try {
+      const res = await dispatchSignal(null, hookRouter, { kind: 'agent.user_prompt_submit', ptyId: 'pty-brain' });
+      expect(res.result).toEqual({ ok: true });
+    } finally {
+      off();
+    }
   });
 });

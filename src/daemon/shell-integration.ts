@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { getWmuxDir } from './config';
 import { isMac } from '../shared/platform';
+import { windowsPowerShellPolicyArgs } from '../shared/pwshExecutionPolicy';
 
 /**
  * Shell integration installer: materializes OSC 133 init scripts into
@@ -39,7 +40,228 @@ import { isMac } from '../shared/platform';
 // a directory whose real name contains a literal percent sequence
 // ("build%20cache") was silently corrupted, and a raw ESC/BEL byte in a
 // directory name could terminate the OSC 7 early and inject terminal escapes.
-const INTEGRATION_VERSION = 9;
+// v10: hand the $? snapshot to the wrapped prompt (issue #1267). The wrapper
+// snapshots $? and $LASTEXITCODE as its first two statements, but never gave
+// that snapshot to the prompt it wraps — and every statement in between resets
+// $? to true. So oh-my-posh, Starship, and anything else that reads $? to
+// colour an exit-code segment saw "success" after every failed command, while
+// the same config in Windows Terminal was correct.
+// v11: decide the exit code from whether $LASTEXITCODE MOVED (issue #1270). It
+// is set only by native commands and never cleared, so preferring it whenever
+// it was non-null meant that from a session's first native command onward every
+// failing cmdlet reported D;0 — the value agent.lifecycle.exitCode is built
+// from. Preferring $? instead trades the bug for its mirror image, marking a
+// successful cmdlet failed with the previous native command's code. Movement
+// since the last prompt is what separates "this number describes the command
+// that just ran" from "this number is left over".
+// v12: a `codex` shell function in the bash and zsh integrations. Codex CLI
+// 0.157+ starts one shared per-account background server the first time a
+// TUI runs, and that server outlives the pane that started it and parents
+// the shell commands and MCP servers of every later Codex thread on the
+// account. Typed in a pane, it inherited that pane's WMUX_* keys, so other
+// panes' Codex commands acted as the first pane. See CODEX_SEED_GUARD.
+const INTEGRATION_VERSION = 12;
+
+// -----------------------------------------------------------------------
+// Codex shared-server seed guard (v12) — shared by the bash and zsh scripts.
+//
+// Measured against codex-cli 0.157.1 with a fresh CODEX_HOME and no server
+// running:
+//   - `codex`, `codex resume --last`, `codex agents` → start a managed server
+//     (ppid 1) that carries every WMUX_* key of the shell that typed it.
+//   - `--no-daemon` (before or after `resume`) → no server, no control socket.
+//   - `-c features.daemon_auto_start=false` → interactive forms and `exec`
+//     run in-process instead, with no error; `agents` still starts a server,
+//     and an explicit `app-server daemon start` still works.
+//   - `exec`/`e`/`review` → run in-process; no server started, and none
+//     connected to when one was already running.
+//
+// Classifying the command line is best effort, so no classification is
+// trusted to keep the pane identity on its own:
+//   - every wrapped call gets `-c features.daemon_auto_start=false` when the
+//     installed codex knows that feature — a misread line still cannot start
+//     the server from this shell;
+//   - any word naming a server (`app-server`, `exec-server`, `remote-control`,
+//     `daemon`), anywhere on the line, runs the call with every WMUX_* key
+//     removed. A false positive only drops the pane identity for that run;
+//   - interactive forms (no subcommand, a prompt, `resume`, `fork`, any
+//     `-i/--image`, which only the interactive CLI takes) also get
+//     `--no-daemon` and keep the pane env — the thread runs in this process,
+//     so its commands act as this pane and nothing outlives it. Without the
+//     feature guard or `--no-daemon` they run with WMUX_* removed;
+//   - `exec`/`e`/`review` keep the pane env: the hooks bridge needs
+//     WMUX_PTY_ID to attribute their events to this pane;
+//   - an option this function does not know, before the first word, means the
+//     subcommand cannot be told apart from an option value: identity is kept
+//     only when the feature guard is available (plus `--no-daemon`), otherwise
+//     WMUX_* is removed;
+//   - every other subcommand (`agents`, `queue`, `app`, `login`, …) runs with
+//     WMUX_* removed.
+// It steps aside entirely when the command already chooses a server
+// (`--remote`, `--no-daemon` — wmux's own Codex launches pass `--remote`),
+// when WMUX_CODEX_WRAP=0, or when no codex executable is on PATH.
+//
+// What the installed codex supports is probed once per binary (keyed by its
+// path, inode and mtime) with `--help` and `features list`, both run with
+// WMUX_* removed. The binary is always called by absolute path: zsh
+// alias-expands the word after `command`, and the user's rc is sourced before
+// this function is defined. On WSL the pane PATH starts with wmux's own codex
+// shim, which finds the real codex by skipping WMUX_WSL_BIN; calls that remove
+// WMUX_* therefore go to the real codex directly (through the shim they would
+// find the shim again and re-exec forever).
+//
+// Not covered (the codex CLI is reached without this function): scripts and
+// `bash -c`/`zsh -c` lines, `env codex`, `exec codex`, a full path to the
+// binary, a user alias for codex that expands to anything but `codex …`
+// (aliases win over functions), a shell started inside the pane (nested
+// zsh/bash, tmux, screen — they read the user's rc, not this one), a
+// user-defined `codex` function (left alone on purpose), Git Bash, shells with
+// the integration turned off, fish/pwsh, and shells opened before v12 was
+// installed.
+// -----------------------------------------------------------------------
+function codexSeedGuardHelpers(unsetAll: string): string {
+  return `__wmux_codex_classify() {
+  local __wmux_a __wmux_skip=0 __wmux_sub='' __wmux_end=0 __wmux_pass=0 __wmux_srv=0 __wmux_img=0 __wmux_unk=0
+  __wmux_codex_kind=''
+  for __wmux_a in "$@"; do
+    case "$__wmux_a" in
+      app-server|exec-server|remote-control|daemon) __wmux_srv=1 ;;
+    esac
+    [ "$__wmux_end" = 1 ] && continue
+    if [ "$__wmux_skip" = 1 ]; then __wmux_skip=0; continue; fi
+    case "$__wmux_a" in
+      --) __wmux_end=1; continue ;;
+      --remote|--remote=*|--no-daemon) __wmux_pass=1; continue ;;
+    esac
+    { [ -n "$__wmux_sub" ] || [ "$__wmux_img" = 1 ]; } && continue
+    case "$__wmux_a" in
+      -c|--config|-m|--model|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-C|--cd|--enable|--disable|--add-dir|--local-provider|--remote-auth-token-env) __wmux_skip=1 ;;
+      -i|--image|-i?*|--image=*) __wmux_img=1 ;;
+      --oss|--strict-config|--approve-for-me|--dangerously-bypass-approvals-and-sandbox|--dangerously-bypass-hook-trust|--worktree|--search|--no-alt-screen|-h|--help|-V|--version) ;;
+      -[cmpsaC]?*) ;;
+      --*=*)
+        case "\${__wmux_a%%=*}" in
+          --config|--model|--profile|--sandbox|--ask-for-approval|--cd|--enable|--disable|--add-dir|--local-provider|--remote-auth-token-env) ;;
+          *) __wmux_unk=1 ;;
+        esac ;;
+      -*) __wmux_unk=1 ;;
+      *) __wmux_sub="$__wmux_a" ;;
+    esac
+  done
+  if [ "$__wmux_srv" = 1 ]; then __wmux_codex_kind=scrub
+  elif [ "$__wmux_pass" = 1 ]; then __wmux_codex_kind=pass
+  elif [ "$__wmux_img" = 1 ]; then __wmux_codex_kind=tui
+  elif [ "$__wmux_unk" = 1 ]; then __wmux_codex_kind=unknown
+  else
+    case "$__wmux_sub" in
+      ''|resume|fork) __wmux_codex_kind=tui ;;
+      exec|e|review) __wmux_codex_kind=env ;;
+      agents|login|logout|mcp|plugin|app|completion|update|doctor|sandbox|debug|apply|a|queue|archive|delete|migrate-rollouts|unarchive|cloud|features|help) __wmux_codex_kind=scrub ;;
+      *) __wmux_codex_kind=tui ;;
+    esac
+  fi
+}
+
+# PATH without wmux's WSL codex shim directory (a no-op off WSL).
+__wmux_codex_strip_path() {
+  local __wmux_rest="$PATH:" __wmux_d __wmux_clean=''
+  while [ -n "$__wmux_rest" ]; do
+    __wmux_d=\${__wmux_rest%%:*}
+    __wmux_rest=\${__wmux_rest#*:}
+    [ "$__wmux_d" = "\${WMUX_WSL_BIN:-}" ] && continue
+    __wmux_clean="\${__wmux_clean:+$__wmux_clean:}$__wmux_d"
+  done
+  printf '%s' "$__wmux_clean"
+}
+
+# What does this codex support? Asked once per binary (path + inode + mtime).
+__wmux_codex_probe() {
+  local __wmux_key __wmux_out
+  __wmux_key="$1|$(command \\ls -lLi -- "$1" 2>/dev/null)"
+  [ "\${__wmux_codex_probe_key-}" = "$__wmux_key" ] && return 0
+  __wmux_out=$(${unsetAll}; "$1" --help 2>/dev/null </dev/null)
+  case "$__wmux_out" in
+    *--no-daemon*) __wmux_codex_nodaemon=1 ;;
+    *) __wmux_codex_nodaemon=0 ;;
+  esac
+  __wmux_out=$(${unsetAll}; "$1" features list 2>/dev/null </dev/null)
+  case "$__wmux_out" in
+    *daemon_auto_start*) __wmux_codex_guard=1 ;;
+    *) __wmux_codex_guard=0 ;;
+  esac
+  __wmux_codex_probe_key="$__wmux_key"
+}`;
+}
+
+/** The dispatching body shared by both shells. `unsetAll` is the
+ *  shell-specific statement that removes every WMUX_* variable; `lookup` is
+ *  the shell's PATH search for codex. */
+function codexSeedGuardBody(unsetAll: string, lookup: string): string {
+  return `  local __wmux_bin __wmux_real __wmux_keep=0
+  __wmux_bin=$(${lookup})
+  if [ -z "$__wmux_bin" ]; then
+    command codex "$@"
+    return
+  fi
+  if [ "\${WMUX_CODEX_WRAP:-1}" = "0" ]; then
+    "$__wmux_bin" "$@"
+    return
+  fi
+  __wmux_codex_classify "$@"
+  if [ "$__wmux_codex_kind" = pass ]; then
+    "$__wmux_bin" "$@"
+    return
+  fi
+  __wmux_real=$__wmux_bin
+  if [ -n "\${WMUX_WSL_BIN:-}" ]; then
+    __wmux_real=$(PATH=$(__wmux_codex_strip_path); ${lookup})
+    if [ -z "$__wmux_real" ]; then
+      "$__wmux_bin" "$@"
+      return
+    fi
+  fi
+  __wmux_codex_probe "$__wmux_real"
+  case "$__wmux_codex_kind" in
+    env) __wmux_keep=1 ;;
+    tui)
+      [ "$__wmux_codex_nodaemon" = 1 ] && set -- --no-daemon "$@"
+      { [ "$__wmux_codex_guard" = 1 ] || [ "$__wmux_codex_nodaemon" = 1 ]; } && __wmux_keep=1
+      ;;
+    unknown)
+      if [ "$__wmux_codex_guard" = 1 ]; then
+        [ "$__wmux_codex_nodaemon" = 1 ] && set -- --no-daemon "$@"
+        __wmux_keep=1
+      fi
+      ;;
+  esac
+  [ "$__wmux_codex_guard" = 1 ] && set -- -c features.daemon_auto_start=false "$@"
+  if [ "$__wmux_keep" = 1 ]; then
+    "$__wmux_bin" "$@"
+  else
+    ( ${unsetAll}; exec "$__wmux_real" "$@" )
+  fi`;
+}
+
+const BASH_CODEX_SEED_GUARD = `# Codex shared-server seed guard (v12). Off with WMUX_CODEX_WRAP=0. Skipped on
+# Git Bash and when the user already defines a codex function.
+if [ -z "\${MSYSTEM:-}" ] && ! declare -F codex >/dev/null 2>&1; then
+${codexSeedGuardHelpers('unset "${!WMUX_@}" 2>/dev/null')}
+
+function codex {
+${codexSeedGuardBody('unset "${!WMUX_@}" 2>/dev/null', 'type -P codex 2>/dev/null')}
+}
+fi`;
+
+const ZSH_CODEX_SEED_GUARD = `# Codex shared-server seed guard (v12). Off with WMUX_CODEX_WRAP=0. Skipped when
+# the user already defines a codex function.
+if (( ! \${+functions[codex]} )); then
+${codexSeedGuardHelpers("unset -m 'WMUX_*'")}
+
+function codex {
+  emulate -L zsh
+${codexSeedGuardBody("unset -m 'WMUX_*'", 'whence -p codex 2>/dev/null')}
+}
+fi`;
 const VERSION_FILE = '.version';
 
 // -----------------------------------------------------------------------
@@ -64,6 +286,11 @@ if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { return }
 
 $global:__wmux_last_exit = 0
 
+# The $LASTEXITCODE the LAST prompt render saw (#1270). It is the only way to
+# tell "a native command just ran and set this" from "this is left over from
+# some native command earlier in the session" — see the prompt function.
+$global:__wmux_prev_le = $LASTEXITCODE
+
 # Stash the user's existing prompt function so we can wrap it instead of
 # clobbering any customization (oh-my-posh, Starship, etc.).
 if (-not (Get-Variable -Name '__wmux_prev_prompt' -Scope Global -ErrorAction SilentlyContinue)) {
@@ -79,7 +306,34 @@ function global:prompt {
     # is to snapshot both variables before doing anything else.
     $__wmux_ok = $?
     $__wmux_le = $LASTEXITCODE
-    $ec = if ($null -ne $__wmux_le) { $__wmux_le } elseif ($__wmux_ok) { 0 } else { 1 }
+
+    # Which of the two snapshots actually describes the command that just ran
+    # (#1270).
+    #
+    # $LASTEXITCODE is set ONLY by native commands, and it is never cleared. So
+    # from the first native command onward it is non-null for the rest of the
+    # session, and preferring it unconditionally — which is what this line used
+    # to do — meant every cmdlet afterwards reported a stale number.
+    # 'Get-Item Q:\\nope-xyz' after any earlier native command emitted D;0, and
+    # that value feeds agent.lifecycle.exitCode.
+    #
+    # The other direction is just as wrong and is why '$? first, always' is not
+    # the answer either: after 'cmd /c exit 7', a SUCCEEDING cmdlet leaves
+    # $LASTEXITCODE at 7, so reporting it would mark a successful command failed.
+    #
+    # What separates the two cases is whether $LASTEXITCODE MOVED since the last
+    # prompt. It did → a native command ran and that number is its exit code.
+    # It did not → the last command was a cmdlet, the number is stale, and $?
+    # is the only thing that knows how it went.
+    #
+    # The residual case: two native commands in a row exiting with the SAME
+    # code. The second one's number has not moved, so its failure is reported as
+    # 1 rather than its own code. Both are non-zero, the consumer is a
+    # failed/succeeded signal, and exit 1 — far and away the most common failure
+    # code — reports as exactly itself.
+    $__wmux_le_moved = $__wmux_le -ne $global:__wmux_prev_le
+    $ec = if ($__wmux_le_moved) { $__wmux_le } elseif ($__wmux_ok) { 0 } else { 1 }
+    $global:__wmux_prev_le = $__wmux_le
 
     $esc = [char]27
     $bel = [char]7
@@ -107,6 +361,23 @@ function global:prompt {
         $osc7Path = ($loc.ProviderPath -split '\\\\' | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/'
         $pre += "$esc]7;file://$env:COMPUTERNAME/$osc7Path$bel"
     }
+
+    # Re-assert the snapshot before delegating (#1267). Every statement above
+    # reset $? to true, so the prompt we wrap would otherwise always see
+    # "success" and an exit-code segment (oh-my-posh status, Starship) would
+    # stay green after a failed command. $? is not assignable and the snapshot
+    # cannot be deferred — any statement is enough to reset it — so the value
+    # is re-created here instead.
+    #
+    # -ErrorAction Ignore is the variant with no side effects: unlike
+    # SilentlyContinue it records nothing in $Error, which matters because
+    # oh-my-posh reads the newest error record as exit code 1 and would mask
+    # the real code. Ignore also never throws under $ErrorActionPreference =
+    # 'Stop', on 5.1 and 7+ alike.
+    #
+    # This must stay the LAST statement before the delegation: any cmdlet call
+    # in between (a Test-Path, say) resets $? straight back to true.
+    if (-not $__wmux_ok) { Write-Error -Message 'wmux: last command failed' -ErrorAction Ignore }
 
     $body = if ($global:__wmux_prev_prompt) {
         try { & $global:__wmux_prev_prompt } catch { "PS $($executionContext.SessionState.Path.CurrentLocation)> " }
@@ -168,6 +439,10 @@ if [ -r "\$HOME/.bashrc" ] && [ -z "\${__WMUX_BASHRC_SOURCED:-}" ]; then
   # shellcheck disable=SC1091
   . "\$HOME/.bashrc"
 fi
+
+# After the user's rc (so an existing codex function is seen) and after the
+# opt-out above (WMUX_SHELL_INTEGRATION=0 turns this off too).
+${BASH_CODEX_SEED_GUARD}
 
 __wmux_last_exit=0
 
@@ -289,6 +564,10 @@ fi
 if [ "\${WMUX_SHELL_INTEGRATION:-1}" = "0" ]; then
   return 0 2>/dev/null
 fi
+
+# After the user's .zshrc (so an existing codex function is seen) and after the
+# opt-out above (WMUX_SHELL_INTEGRATION=0 turns this off too).
+${ZSH_CODEX_SEED_GUARD}
 
 # preexec: 명령 실행 직전 → C (command start)
 __wmux_preexec() { printf '\\033]133;C\\a'; }
@@ -451,8 +730,13 @@ export function buildSpawnInjection(shellPath: string): SpawnInjection | null {
   if (kind === 'pwsh') {
     // -NoExit keeps the interactive session alive after the init script runs.
     // Dot-source the script so its function definitions persist in the shell.
+    // On a factory-default Windows client the effective policy is Restricted
+    // and the dot-source fails (#1620); the policy args must precede -Command.
     return {
-      args: ['-NoLogo', '-NoExit', '-Command', `. '${paths.pwsh.replace(/'/g, "''")}'`],
+      args: [
+        '-NoLogo', '-NoExit', ...windowsPowerShellPolicyArgs(shellPath),
+        '-Command', `. '${paths.pwsh.replace(/'/g, "''")}'`,
+      ],
       env: { WMUX_SHELL_INTEGRATION: '1' },
     };
   }

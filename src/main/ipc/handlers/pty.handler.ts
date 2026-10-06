@@ -1,5 +1,9 @@
-import { ipcMain, BrowserWindow } from 'electron';
+import { applyWmuxToolsToCommand, isWmuxToolsHint, locateWmuxMcpEntry } from '../../agents/toolSurfaceLaunch';
+import { codexConfigPath, codexHasWmuxServer } from '../../../shared/mcpRegistration';
+import { WSL_RPC_TIMEOUT_MS } from '../../../shared/wsl';
+import { app, ipcMain, BrowserWindow } from 'electron';
 import path from 'node:path';
+import { homedir } from 'node:os';
 import { StringDecoder } from 'node:string_decoder';
 import { PTYManager } from '../../pty/PTYManager';
 import { PTYBridge } from '../../pty/PTYBridge';
@@ -13,6 +17,7 @@ import { sanitizePtyText } from '../../../shared/types';
 import { resolveSpawnEnv } from '../../pty/resolveSpawnEnv';
 import { withFreshWindowsPath } from '../../../shared/windowsPathEnv';
 import { getAccountStore } from '../../account/accountStore';
+import { withAccountQuota } from '../../account/accountQuotaGate';
 import { resolveEnvPolicy, type SpawnKind } from '../../../shared/spawnKind';
 import { withheldCredentialNames } from '../../../shared/envFilter';
 import { getShellUtf8Locale } from '../../pty/shellLocale';
@@ -40,11 +45,17 @@ import {
 } from '../../../shared/wmuxProjectConfig';
 import type { DaemonSupervisionPolicy } from '../../../shared/rpc';
 import type { ResumeBinding } from '../../../shared/agentResume';
+import type { AgentSlug } from '../../../shared/events';
 import { createDeadPaneRecovery, type DeadPaneRecovery } from '../../../shared/ptyRecovery';
-import { resolvePtyCreateCwd, type PtyCwdSource } from '../../pty/resolvePtyCwd';
+import { isWslShell, type WslTarget } from '../../../shared/wsl';
+import { resolvePtyCreateCwdForShell, type PtyCwdSource } from '../../pty/resolvePtyCwd';
 import { FANOUT_TASK_PORT_ENV } from '../../worktask/fanoutEnvironment';
 import { agentDisplayToSlug } from '../../../shared/agentIdentity';
+import { wslDistroArgs, isWslDistroSpawnArgs } from '../../../shared/wslDistro';
+import { getDefaultWslDistro } from '../../pty/defaultWslDistro';
 import { SessionPromptScheduler } from '../../pty/SessionPromptScheduler';
+import { stampFanoutTaskPane } from '../../worktask/fanoutGuards';
+import type { FanoutOrigin } from '../../../shared/fanoutOrigin';
 import {
   removeSessionPromptSchedulesForPty,
 } from '../../pty/sessionPromptScheduleStore';
@@ -98,9 +109,9 @@ interface PtyCreateSupervisionInput {
 type PtyCreateOptions = {
   shell?: string;
   cwd?: string;
-  /** Dead-session replacement candidates. Main validates spawnCwd, then cwd;
+  /** Dead-session replacement candidates. WSL validates inside its distro;
    * neither value is trusted merely because it came from the renderer. */
-  recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd'>;
+  recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd' | 'wslTarget' | 'args' | 'sourceSessionId'>;
   cols?: number;
   rows?: number;
   workspaceId?: string;
@@ -112,7 +123,42 @@ type PtyCreateOptions = {
   /** 스폰 출처 (실행 컨텍스트 정책). 'user-shell'만 env 투과; exec/supervision이
    * 있으면 스탬프와 무관하게 gated. 미지정은 fail-closed gated. */
   spawnKind?: SpawnKind;
+  /** Fan-out task pane: the owner workspace this one's lineage stamp names. */
+  fanoutTaskOf?: string;
+  /** Fan-out task pane: who asked, stamped with the owner (sanitized there). */
+  fanoutOrigin?: FanoutOrigin;
+  /** Role binding's wmux MCP tool level (main/agents/toolSurfaceLaunch). */
+  wmuxTools?: unknown;
 };
+
+
+/** The MCP bundle this app would register (packaged stable copy or dev dist). */
+function currentMcpEntry(): string | null {
+  try {
+    return locateWmuxMcpEntry({
+      home: app.getPath('home'),
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      appPath: app.getAppPath(),
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** Splice a role binding's wmux tool level into the typed launch line, then
+ *  drop the hint so it never reaches a spawn API. Invalid hints are ignored. */
+function withWmuxTools(options: PtyCreateOptions | undefined): PtyCreateOptions | undefined {
+  if (!options || options.wmuxTools === undefined) return options;
+  const { wmuxTools, ...rest } = options;
+  if (!rest.initialCommand || !isWmuxToolsHint(wmuxTools)) return rest;
+  const initialCommand = applyWmuxToolsToCommand(rest.initialCommand, wmuxTools, {
+    entry: currentMcpEntry(),
+    codexHasWmuxServer: () => codexHasWmuxServer(codexConfigPath(rest.env)),
+  });
+  if (initialCommand !== rest.initialCommand) console.log('[pty:create] wmux tool level applied', { tools: wmuxTools.tools, role: wmuxTools.role });
+  return { ...rest, initialCommand };
+}
 
 /** Clamp one runaway-guard bound to its cap; falls back to `def` when absent.
  * Defense-in-depth — the schema already clamps wmux.json values, but the funnel
@@ -355,6 +401,11 @@ export function registerPTYHandlers(
       if (options?.shell !== undefined && !isAllowedShell(options.shell)) {
         throw new Error(`PTY_CREATE: shell not allowed: ${options.shell}`);
       }
+      // Depth-1 lineage for a fan-out task pane: stamped here, inside the
+      // create and before the PTY (and the agent) exists. A failed stamp fails
+      // the create; the renderer rolls the workspace back.
+      stampFanoutTaskPane(options);
+      options = withWmuxTools(await withAccountQuota(options));
 
       // X8 exec-style unit: a supervised wmux.json leaf runs its command as the
       // pane's root process under a daemon-chosen wrapper shell (the daemon
@@ -367,13 +418,28 @@ export function registerPTYHandlers(
           ? resolveSupervisionPolicy(options.supervision)
           : undefined;
 
-      const cwdResolution = resolvePtyCreateCwd(options?.cwd, options?.recoveryCwds);
-      const safeCwd = cwdResolution.safeCwd;
-      const effectiveCwd = safeCwd ?? require('os').homedir();
       // Daemon-mode default shell. On Windows prefer PowerShell 7 over 5.1 via
       // ShellDetector (issue #176) — mirrors PTYManager.getDefaultShell() so
       // both modes pick the same default.
       const shell = options?.shell || (process.platform === 'win32' ? new ShellDetector().getDefault() : (process.env.SHELL || '/bin/bash'));
+      const cwdResolution = resolvePtyCreateCwdForShell(options?.cwd, options?.recoveryCwds, shell);
+      const safeCwd = cwdResolution.safeCwd;
+      let effectiveCwd = safeCwd ?? (isWslShell(shell) ? '~' : homedir());
+      // #1103 — the renderer's WSL distro choice, applied at the one place
+      // the effective shell is known. Non-wsl shells and no-choice both yield
+      // undefined (today's behaviour).
+      // A renderer may name a dead session, but cannot supply its distro/user.
+      // Ordinary new panes always use the settings picker.
+      const recoveryId = options?.recoveryCwds?.sourceSessionId;
+      // WSL-only: non-WSL replacements never read distro/user from the dead
+      // session, so they must not pay for (or fail on) this lookup.
+      const recoverySessions = recoveryId && isWslShell(shell)
+        ? await daemonClient.rpc('daemon.listSessions', {}) as Array<{ id: string; state: string; cmd: string; args?: string[]; wslTarget?: WslTarget }>
+        : [];
+      const trustedRecovery = recoverySessions.find(s => s.id === recoveryId && s.state === 'dead' && isWslShell(s.cmd));
+      const wslArgs = isWslDistroSpawnArgs(shell, trustedRecovery?.args)
+        ? [...trustedRecovery.args]
+        : wslDistroArgs(shell, getDefaultWslDistro());
 
       // Generate a unique session ID
       const crypto = require('crypto');
@@ -489,13 +555,18 @@ export function registerPTYHandlers(
       const result = await daemonClient.rpc('daemon.createSession', {
         id: sessionId,
         cmd: shell,
+        ...(wslArgs ? { args: wslArgs } : {}),
         cwd: effectiveCwd,
+        wslTarget: trustedRecovery?.wslTarget,
         cols: options?.cols || 80,
         rows: options?.rows || 24,
         env: resolvedEnv,
         ...(execCommand !== undefined ? { exec: { command: execCommand } } : {}),
         ...(supervisionPolicy !== undefined ? { supervision: supervisionPolicy } : {}),
-      });
+      }, isWslShell(shell) ? { timeoutMs: WSL_RPC_TIMEOUT_MS } : undefined);
+
+      const createdCwd = (result as { cwd?: string })?.cwd;
+      if (isWslShell(shell) && createdCwd) effectiveCwd = createdCwd;
 
       // Attach to the session (makes daemon start the SessionPipe server)
       await daemonClient.rpc('daemon.attachSession', { id: sessionId });
@@ -561,10 +632,15 @@ export function registerPTYHandlers(
       return { id: sessionId, shell, cwd: effectiveCwd };
     }));
   } else {
-    ipcMain.handle(IPC.PTY_CREATE, wrapHandler(IPC.PTY_CREATE, (_event: Electron.IpcMainInvokeEvent, options?: PtyCreateOptions) => {
+    ipcMain.handle(IPC.PTY_CREATE, wrapHandler(IPC.PTY_CREATE, async (_event: Electron.IpcMainInvokeEvent, options?: PtyCreateOptions) => {
       if (options?.shell !== undefined && !isAllowedShell(options.shell)) {
         throw new Error(`PTY_CREATE: shell not allowed: ${options.shell}`);
       }
+      // Depth-1 lineage for a fan-out task pane: stamped here, inside the
+      // create and before the PTY (and the agent) exists. A failed stamp fails
+      // the create; the renderer rolls the workspace back.
+      stampFanoutTaskPane(options);
+      options = withWmuxTools(await withAccountQuota(options));
 
       // X8 — supervision lives inside the daemon (decision ②). In local mode it
       // can't be honored, but a silent drop would be a trust violation: the user
@@ -588,18 +664,26 @@ export function registerPTYHandlers(
         }
       }
 
-      const cwdResolution = resolvePtyCreateCwd(options?.cwd, options?.recoveryCwds);
+      // Same default-shell resolution as the daemon branch (issue #176), so
+      // the distro injection below sees the shell PTYManager will actually
+      // spawn even when the caller omitted one.
+      const shell = options?.shell
+        || (process.platform === 'win32' ? new ShellDetector().getDefault() : (process.env.SHELL || '/bin/bash'));
+      const cwdResolution = resolvePtyCreateCwdForShell(options?.cwd, options?.recoveryCwds, shell);
       const safeCwd = cwdResolution.safeCwd;
       const effectiveCwd = safeCwd ?? undefined;
       // Split off initialCommand — it's written into the shell post-create, not
       // a spawn option. exec/supervision are daemon-only (handled above) and
       // must not reach ptyManager.create, so build a clean spawn-options object
       // from only the local-relevant fields instead of spreading the payload.
-      const { initialCommand, shell, cols, rows, workspaceId, surfaceId, env, spawnKind } = options ?? {};
-      const instance = ptyManager.create({ shell, cols, rows, workspaceId, surfaceId, env, cwd: effectiveCwd, spawnKind });
+      const { initialCommand, cols, rows, workspaceId, surfaceId, env, spawnKind } = options ?? {};
+      // #1103 — same distro injection as the daemon branch, so both modes
+      // boot the same WSL distro for the same setting.
+      const wslArgs = wslDistroArgs(shell, getDefaultWslDistro());
+      const instance = await ptyManager.createAsync({ shell, ...(wslArgs ? { shellArgs: wslArgs } : {}), cols, rows, workspaceId, surfaceId, env, cwd: effectiveCwd, spawnKind });
       logCwdResolution(instance.id, cwdResolution.incomingCwd, safeCwd, cwdResolution.source);
       ptyBridge.setupDataForwarding(instance.id);
-      const actualCwd = effectiveCwd || require('os').homedir();
+      const actualCwd = instance.cwd || effectiveCwd || homedir();
       updateCwd(instance.id, actualCwd);
       // Startup command: gate on the shell's first output (one-shot onData)
       // so it lands at a ready prompt, mirroring the daemon path. ptyManager
@@ -722,7 +806,9 @@ export function registerPTYHandlers(
     if (!useDaemon || !daemonClient) return null;
     const agent = await daemonClient.getAgentState(ptyId);
     const slug = agent?.agentName ? agentDisplayToSlug(agent.agentName) : undefined;
-    return agent && slug ? { slug, incarnationId: agent.incarnationId } : null;
+    return agent && slug
+      ? { slug, incarnationId: agent.incarnationId, agentVerified: agent.agentVerified }
+      : null;
   };
 
   const sessionPromptScheduler = new SessionPromptScheduler({
@@ -903,6 +989,14 @@ export function registerPTYHandlers(
     }));
   }
 
+  // pty:cancel-create (#1305) — registered in BOTH modes, because the renderer
+  // closing a surface does not know which one it is in. In daemon mode nothing
+  // local was ever reserved, so the manager simply answers false and the
+  // daemon's own `pendingCreates` guard keeps covering that path.
+  ipcMain.removeHandler(IPC.PTY_CANCEL_CREATE);
+  ipcMain.handle(IPC.PTY_CANCEL_CREATE, wrapHandler(IPC.PTY_CANCEL_CREATE, async (_event: Electron.IpcMainInvokeEvent, surfaceId: string) =>
+    typeof surfaceId === 'string' && surfaceId.length > 0 && ptyManager.cancelPendingCreate(surfaceId)));
+
   // pty:list
   ipcMain.removeHandler(IPC.PTY_LIST);
   if (useDaemon && daemonClient) {
@@ -926,10 +1020,17 @@ export function registerPTYHandlers(
         // additive volatile runtime joined by the daemon's listSessions handler.
         supervision?: { restart: string; limit: unknown; status: 'armed' | 'stopped' };
         supervisionRuntime?: { status: 'armed' | 'stopped'; restartCount: number };
+        // #1101 — origin identity for the orphaned-session list: the workspace
+        // the session was spawned in (env-stamped by main force-stamps) and
+        // the agent identity the daemon already derives for /api/sessions.
+        agent?: { displayName?: string };
+        lastDetectedAgent?: string;
         // X6 ② — present only for an interactive agent pane recovered this boot.
         resumeAgent?: string;
         // X6 ③ — the captured resume binding (origin id + cwd + permission mode),
         // surfaced alongside resumeAgent (recovery-only, cwd-matched) for the pill.
+        args?: string[];
+        wslTarget?: WslTarget;
         resumeBinding?: ResumeBinding;
         // OSC 133 — true = a foreground command owns the PTY, false = at a shell
         // prompt, undefined = no shell integration. The resume chip's authoritative
@@ -940,6 +1041,9 @@ export function registerPTYHandlers(
         // chip waits for), undefined = never attributed. Only present alongside
         // resumeBinding.
         agentProcessAlive?: boolean;
+        // The slug of the pane's live, process-attributed agent. Absent when
+        // none is attributed or it died.
+        liveAgent?: AgentSlug;
       }>;
       // Map to same shape as local PTYManager.getActiveInstances(), plus an
       // additive `supervision` summary for the renderer's supervision slice
@@ -990,12 +1094,25 @@ export function registerPTYHandlers(
           ...(s.resumeAgent ? { resumeAgent: s.resumeAgent } : {}),
           // X6 ③ — carry the binding so the pill can build `--resume <id>`.
           ...(s.resumeBinding ? { resumeBinding: s.resumeBinding } : {}),
+          ...(s.args ? { args: s.args } : {}),
+          ...(s.wslTarget ? { wslTarget: s.wslTarget } : {}),
           // OSC 133 shell state — the resume chip's authoritative gate. Only
           // present when shell integration emits markers (else undefined → the
           // renderer falls back to its activity heuristic).
           ...(s.commandRunning !== undefined ? { commandRunning: s.commandRunning } : {}),
           // Process-truth agent liveness — the resume chip's edge-trigger gate.
           ...(s.agentProcessAlive !== undefined ? { agentProcessAlive: s.agentProcessAlive } : {}),
+          // Process-truth identity — seeds the pane's agent row when no hook
+          // or banner named it.
+          ...(s.liveAgent ? { liveAgent: s.liveAgent } : {}),
+          // #1101 — origin identity for the orphaned-session list. workspaceId
+          // is the spawn-time env stamp (present for every pane-origin session;
+          // absent for phone-created ones, which then adopt into the active
+          // workspace). agentName mirrors /api/sessions' precedence.
+          ...(s.env?.[ENV_KEYS.WORKSPACE_ID] ? { workspaceId: s.env[ENV_KEYS.WORKSPACE_ID] } : {}),
+          ...(s.agent?.displayName ?? s.lastDetectedAgent
+            ? { agentName: (s.agent?.displayName ?? s.lastDetectedAgent) as string }
+            : {}),
         }));
       // RCA A8 — log the count the renderer's reconcile will act on. An empty
       // or short list here, correlated with a renderer ptyId-clear, is the
@@ -1015,11 +1132,17 @@ export function registerPTYHandlers(
   if (useDaemon && daemonClient) {
     // Fix B — pty:promote: on-demand recovery of a cap-skipped suspended session.
     ipcMain.removeHandler(IPC.PTY_PROMOTE);
-    ipcMain.handle(IPC.PTY_PROMOTE, wrapHandler(IPC.PTY_PROMOTE, async (_event: Electron.IpcMainInvokeEvent, id: string) => {
+    ipcMain.handle(IPC.PTY_PROMOTE, wrapHandler(IPC.PTY_PROMOTE, async (_event: Electron.IpcMainInvokeEvent, id: string, opts?: { fresh?: boolean }) => {
       if (!id) return { success: false, error: 'id is required' };
-      const res = await daemonClient.rpc('daemon.promoteSession', { id }) as { ok: boolean; error?: { message: string } };
+      // #1305 — `fresh` is the explicit way out of a pane whose WSL directory
+      // is gone: home instead of the missing directory, the original command
+      // instead of a resume. Only ever set by the user pressing that action.
+      const fresh = opts?.fresh === true;
+      const res = await daemonClient.rpc('daemon.promoteSession', { id, ...(fresh ? { fresh: true } : {}) }, { timeoutMs: WSL_RPC_TIMEOUT_MS }) as { ok: boolean; error?: { code?: string; message: string } };
       if (res.ok) return { success: true };
-      return { success: false, error: res.error?.message ?? 'promote failed' };
+      // The renderer branches on this: CWD_MISSING is the one failure Retry
+      // cannot clear, so it is the one that offers starting fresh.
+      return { success: false, error: res.error?.message ?? 'promote failed', cwdMissing: res.error?.code === 'CWD_MISSING' };
     }));
 
     ipcMain.handle(IPC.PTY_RECONNECT, wrapHandler(IPC.PTY_RECONNECT, async (_event: Electron.IpcMainInvokeEvent, id: string) => {
@@ -1032,9 +1155,11 @@ export function registerPTYHandlers(
           cwd?: string;
           spawnCwd?: string;
           resumeAgent?: string;
+          args?: string[];
+          wslTarget?: WslTarget;
           resumeBinding?: ResumeBinding;
         }>;
-        const session = sessions.find(s => s.id === id);
+        let session = sessions.find(s => s.id === id);
         if (!session || session.state === 'dead') {
           // RCA A1 — permanent failure: the daemon authoritatively reports the
           // session as absent or dead. Safe for the renderer to clear the
@@ -1047,6 +1172,20 @@ export function registerPTYHandlers(
             transient: false,
             ...(session ? { recovery: createDeadPaneRecovery(session) } : {}),
           };
+        }
+
+        if (session.state === 'suspended') {
+          try {
+            const result = await daemonClient.rpc('daemon.promoteSession', { id }, { timeoutMs: WSL_RPC_TIMEOUT_MS }) as { ok: boolean; error?: { code?: string; message: string } };
+            // #1305 — carry WHY it stayed pending, not just that it did. The
+            // banner's Retry is the right and only offer for every other
+            // failure; a missing directory additionally gets "start fresh".
+            if (!result.ok) return { success: false, recoveryPending: true, error: result.error?.message || 'WSL recovery failed. Check the target and retry.', cwdMissing: result.error?.code === 'CWD_MISSING' };
+            const refreshed = await daemonClient.rpc('daemon.listSessions', {}) as typeof sessions;
+            session = refreshed.find(s => s.id === id) ?? session;
+          } catch (err) {
+            return { success: false, recoveryPending: true, error: err instanceof Error ? err.message : String(err) };
+          }
         }
 
         // 재접속 시 cwd를 즉시 복원한다(owner-reported: 앱 재시작 후 워크스페이스
@@ -1255,11 +1394,13 @@ export function registerPTYHandlers(
       const res = await daemonClient.rpc('daemon.readSessionText', { id, scrollback }, { timeoutMs: DAEMON_RESYNC_RPC_TIMEOUT_MS }) as {
         mode: 'rows' | 'unavailable';
         rows?: Array<{ text: string; wrapped: boolean }>;
+        bufferType?: 'normal' | 'alternate';
+        rowsBelowCursor?: number;
         truncated?: boolean;
         reason?: string;
       };
       if (res.mode === 'rows') {
-        return { success: true, rows: res.rows ?? [], truncated: res.truncated === true };
+        return { success: true, rows: res.rows ?? [], bufferType: res.bufferType, rowsBelowCursor: res.rowsBelowCursor, truncated: res.truncated === true };
       }
       return { success: false, code: 'unavailable', reason: res.reason };
     } catch (err) {
@@ -1402,6 +1543,7 @@ export function registerPTYHandlers(
     ipcMain.removeHandler(IPC.PTY_RESIZE);
     ipcMain.removeAllListeners(IPC.PTY_SET_VIEWER_VISIBILITY);
     ipcMain.removeHandler(IPC.PTY_DISPOSE);
+    ipcMain.removeHandler(IPC.PTY_CANCEL_CREATE);
     ipcMain.removeHandler(IPC.PTY_LIST);
     ipcMain.removeHandler(IPC.PTY_PROMOTE);
     ipcMain.removeHandler(IPC.PTY_RECONNECT);

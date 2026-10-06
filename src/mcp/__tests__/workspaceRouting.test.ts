@@ -120,8 +120,9 @@ describe('MCP workspace routing (source-level invariants)', () => {
     expect(block).toContain('resolveTerminalRoute(');
     expect(block).toContain('lookupPidMapWorkspace');
     expect(block).toContain('claimPinnedRoute');
-    // The verified-cache getter is gated on workspaceResolved (R1).
-    expect(block).toMatch(/workspaceResolved\s*\?\s*MY_WORKSPACE_ID\s*:\s*''/);
+    // The verified-cache getter is gated on workspaceResolved (R1), and never
+    // serves a shared Codex app-server caller, whose identity is per call (#1778).
+    expect(block).toMatch(/workspaceResolved\s*&&\s*!threadOnlyScope\(\)\s*\?\s*MY_WORKSPACE_ID\s*:\s*''/);
   });
 
   it('stale RPC outcomes invalidate identity and only the route generation they used', () => {
@@ -268,7 +269,11 @@ describe('MCP workspace routing (source-level invariants)', () => {
     // via the fail-soft resolveScopedReadWorkspaceId ('' on an unresolvable
     // identity → the builtin path never throws), never requireWorkspaceId nor the
     // raw weak resolver.
-    const block = toolBlock('browser_session_status');
+    // The logic lives in the shared `browserSessionStatus` const (both the
+    // pre-merge browser_session_status tool and the merged browser_session
+    // {action:'status'} call it), so the invariant locks the const.
+    const block = src.match(/const browserSessionStatus = async \(\) => \{[\s\S]*?callRpc\('browser\.session\.status'/)?.[0];
+    if (!block) throw new Error('browserSessionStatus handler not found in mcp/index.ts');
     expect(block).toMatch(/resolveScopedReadWorkspaceId\(\)/);
     expect(block).not.toMatch(/requireWorkspaceId\(\)/);
     expect(block).not.toMatch(/resolveWorkspaceId\(\)/);

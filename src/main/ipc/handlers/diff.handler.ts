@@ -10,6 +10,7 @@
 //   (plans/apply-hunks-toctou-design.md).
 import { ipcMain } from 'electron';
 import { readFile, lstat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -18,6 +19,8 @@ import { IPC } from '../../../shared/constants';
 import { wrapHandler } from '../wrapHandler';
 import { git } from '../../git/git';
 import { resolveAccessiblePath } from './fs.handler';
+import { metaDirForWorktree } from '../../worktask/TaskWorktreeManager';
+import { WORKTASK_META_FILENAME } from '../../../shared/workTask';
 import {
   parseUnifiedDiff,
   reassemblePatch,
@@ -29,6 +32,7 @@ import {
   type DiffReadFile,
   type DiffReadResult,
   type DiffReadError,
+  type DiffSummaryResult,
   type DiffNumstat,
   type DiffTargetSnapshot,
   type DiffApplyRequest,
@@ -172,6 +176,128 @@ const EMPTY_TREE_OID = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 // counts describe the same diff the panel renders.
 const DIFF_ALGORITHM = '--histogram';
 
+// T3 — the commit a fan-out task branched from, from its task.json stamp (the
+// meta dir sits beside the worktree). Undefined for tasks that fell back to
+// the owner's HEAD, for stamps written before T3, and for non-task worktrees.
+async function readTaskBaseOid(worktreePath: string): Promise<string | undefined> {
+  try {
+    const raw = await readFile(join(metaDirForWorktree(worktreePath), WORKTASK_META_FILENAME), 'utf8');
+    const oid = (JSON.parse(raw) as { baseOid?: unknown }).baseOid;
+    return typeof oid === 'string' && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(oid) ? oid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// The base a task's diff is measured against (diff:read task mode and
+// diff:summary share it, so the row's counts describe the panel's diff).
+async function taskMergeBase(worktreePath: string, targetRepoPath: string, targetHeadOid: string): Promise<string> {
+  // targetHeadOid 미지정 시 타겟 repo의 현 HEAD를 사용(렌더러가 미리 알 필요 없음).
+  let headOid = targetHeadOid;
+  if (!headOid) {
+    const h = await git(['rev-parse', 'HEAD'], targetRepoPath);
+    headOid = h.code === 0 ? h.stdout.trim() : '';
+  }
+  // T3: a task that branched from origin's default branch is compared against
+  // that commit, not the owner's HEAD — a local main behind origin (or a
+  // feature-branch checkout) would otherwise show every upstream commit in
+  // between as the worker's change, and as an adoptable hunk.
+  const baseOid = await readTaskBaseOid(worktreePath);
+  // mergeBase = merge-base HEAD {targetHeadOid} — 단일 출처(§2 G8).
+  const mb = await git(['merge-base', 'HEAD', baseOid ?? headOid], worktreePath);
+  return mb.code === 0 && mb.stdout.trim() ? mb.stdout.trim() : (baseOid ?? headOid);
+}
+
+/** Lines in a file (a final line without a newline counts) and whether it is
+ *  binary (a NUL byte anywhere). Streamed, so a large file costs no memory. */
+function countFileLines(path: string): Promise<{ lines: number; binary: boolean }> {
+  return new Promise((resolve, reject) => {
+    let lines = 0;
+    let size = 0;
+    let last = -1;
+    let binary = false;
+    const stream = createReadStream(path);
+    stream.on('data', (chunk: Buffer | string) => {
+      const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+      if (buf.length === 0) return;
+      size += buf.length;
+      if (buf.includes(0)) { binary = true; stream.destroy(); resolve({ lines: 0, binary: true }); return; }
+      for (let i = 0; i < buf.length; i++) if (buf[i] === 10) lines += 1;
+      last = buf[buf.length - 1];
+    });
+    stream.on('error', reject);
+    stream.on('close', () => {
+      if (binary) return;
+      resolve({ lines: size > 0 && last !== 10 ? lines + 1 : lines, binary: false });
+    });
+  });
+}
+
+/**
+ * diff:summary — the counts for Fleet's Ready to review row. No patch text
+ * and no size cap: `git diff --numstat` against the task merge base for
+ * committed + tracked changes, plus each untracked file counted by streaming
+ * it. When `knownStateKey` equals the worktree's current state key the counts
+ * are skipped — a redraw or a re-render asks again for free.
+ */
+export async function readDiffSummary(worktreePath: string, knownStateKey: string): Promise<DiffSummaryResult | DiffReadError> {
+  const targetRepoPath = await resolveTargetRepo(worktreePath);
+  if (!targetRepoPath) {
+    return { ok: false, error: 'Could not find the target repository — the task worktree may be damaged or removed.', code: 'no-repo' };
+  }
+  const [head, status] = await Promise.all([
+    git(['rev-parse', 'HEAD'], worktreePath),
+    git(['-c', 'core.quotepath=false', 'status', '--porcelain', '-uall', '-z'], worktreePath),
+  ]);
+  if (status.code !== 0) {
+    return { ok: false, error: `git status failed: ${status.stderr.slice(0, 200)}`, code: 'status-fail' };
+  }
+  const entries = parsePorcelainZ(status.stdout);
+  // State key: HEAD + status + each changed path's size/mtime (a second edit
+  // to an already-modified file leaves the status line as it was).
+  const hash = createHash('sha256').update(head.stdout.trim()).update('\0').update(status.stdout);
+  const stats = await Promise.all(entries.map((e) => lstat(join(worktreePath, e.path)).catch(() => null)));
+  entries.forEach((e, i) => {
+    const st = stats[i];
+    hash.update(`\0${e.path}\0${st ? `${st.size}:${st.mtimeMs}` : 'x'}`);
+  });
+  const stateKey = hash.digest('hex');
+  if (knownStateKey && knownStateKey === stateKey) return { ok: true, stateKey, unchanged: true };
+
+  const mergeBase = await taskMergeBase(worktreePath, targetRepoPath, '');
+  const num = await git(['diff', DIFF_ALGORITHM, '--numstat', mergeBase], worktreePath);
+  if (num.code !== 0) {
+    return { ok: false, error: `git diff --numstat failed: ${num.stderr.slice(0, 200)}`, code: 'numstat-fail' };
+  }
+  let files = 0;
+  let additions = 0;
+  let deletions = 0;
+  let binary = 0;
+  for (const n of parseNumstat(num.stdout)) {
+    files += 1;
+    if (n.additions === null || n.deletions === null) binary += 1;
+    additions += n.additions ?? 0;
+    deletions += n.deletions ?? 0;
+  }
+  let untracked = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.xy !== '??') continue;
+    untracked += 1;
+    files += 1;
+    const st = stats[i];
+    if (!st || !st.isFile()) { binary += 1; continue; }
+    try {
+      const counted = await countFileLines(join(worktreePath, e.path));
+      if (counted.binary) binary += 1;
+      else additions += counted.lines;
+    } catch {
+      binary += 1;
+    }
+  }
+  return { ok: true, stateKey, files, additions, deletions, untracked, binary };
+}
+
 // diff:read 구현.
 //
 // mode:
@@ -197,14 +323,14 @@ async function readDiff(
         })()
       : await resolveTargetRepo(worktreePath);
   if (!targetRepoPath) {
-    return { ok: false, error: '타겟 repo를 찾을 수 없음(worktree 손상?)', code: 'no-repo' };
+    return { ok: false, error: 'Could not find the target repository — the task worktree may be damaged or removed.', code: 'no-repo' };
   }
 
   // F8: targetHeadOid 인자 가드 — 지정 시 SHA-1 hex(7~40자)만 허용.
   //   빈 문자열(미지정)은 아래에서 타겟 HEAD로 도출하므로 통과. 인자 주입을
   //   merge-base·git 명령에 그대로 넘기기 전에 형식을 명시 검증한다.
   if (targetHeadOid && !/^[0-9a-fA-F]{7,40}$/.test(targetHeadOid)) {
-    return { ok: false, error: 'targetHeadOid 형식 오류(SHA hex 7~40자 아님)', code: 'bad-oid' };
+    return { ok: false, error: 'Invalid targetHeadOid — expected a 7 to 40 character hex commit id.', code: 'bad-oid' };
   }
 
   let mergeBase: string;
@@ -213,15 +339,7 @@ async function readDiff(
     const h = await git(['rev-parse', 'HEAD'], targetRepoPath);
     mergeBase = h.code === 0 && h.stdout.trim() ? h.stdout.trim() : EMPTY_TREE_OID;
   } else {
-    // targetHeadOid 미지정 시 타겟 repo의 현 HEAD를 사용(렌더러가 미리 알 필요 없음).
-    let headOid = targetHeadOid;
-    if (!headOid) {
-      const h = await git(['rev-parse', 'HEAD'], targetRepoPath);
-      headOid = h.code === 0 ? h.stdout.trim() : '';
-    }
-    // mergeBase = merge-base HEAD {targetHeadOid} — 단일 출처(§2 G8).
-    const mb = await git(['merge-base', 'HEAD', headOid], worktreePath);
-    mergeBase = mb.code === 0 && mb.stdout.trim() ? mb.stdout.trim() : headOid;
+    mergeBase = await taskMergeBase(worktreePath, targetRepoPath, targetHeadOid);
   }
 
   // 1-arg 워킹트리 대조(미커밋 포함). untracked 제외 — 별도 합성.
@@ -240,7 +358,7 @@ async function readDiff(
     worktreePath,
   );
   if (diffRes.code !== 0) {
-    return { ok: false, error: `git diff 실패: ${diffRes.stderr.slice(0, 200)}`, code: 'diff-fail' };
+    return { ok: false, error: `git diff failed: ${diffRes.stderr.slice(0, 200)}`, code: 'diff-fail' };
   }
   const numRes = await git(['diff', DIFF_ALGORITHM, '--numstat', mergeBase], worktreePath);
 
@@ -296,7 +414,7 @@ async function readDiff(
   if (Buffer.byteLength(diffText, 'utf8') > DIFF_TOTAL_CAP_BYTES) {
     return {
       ok: false,
-      error: 'diff 총량이 2MB를 초과 — 표시 전용(채택 불가). 커밋 단위를 좁혀 재열람.',
+      error: 'The diff is larger than 2 MB, so it cannot be shown or adopted here. Split the work into smaller commits and reopen the diff.',
       code: 'too-large',
     };
   }
@@ -351,7 +469,7 @@ function patchPathsSafe(patch: string): boolean {
 async function applyHunks(req: DiffApplyRequest, worktreePath: string): Promise<DiffApplyResult> {
   const targetRepoPath = await resolveTargetRepo(worktreePath);
   if (!targetRepoPath) {
-    return { ok: false, error: '타겟 repo를 찾을 수 없음', code: 'apply' };
+    return { ok: false, error: 'Could not find the target repository.', code: 'apply' };
   }
 
   return withRepoLock(targetRepoPath, async (): Promise<DiffApplyResult> => {
@@ -361,7 +479,7 @@ async function applyHunks(req: DiffApplyRequest, worktreePath: string): Promise<
       cur.targetHeadOid !== req.snapshot.targetHeadOid ||
       cur.targetBranch !== req.snapshot.targetBranch
     ) {
-      return { ok: false, error: '타겟이 이동됨 — diff 재열람 필요', code: 'drift' };
+      return { ok: false, error: 'The target moved since this diff was read — reload the diff.', code: 'drift' };
     }
 
     // 선택 파일의 diff를 재계산(태스크 worktree 기준). read와 동일 소스.
@@ -465,21 +583,21 @@ async function applyHunks(req: DiffApplyRequest, worktreePath: string): Promise<
       if (truncatedSet.has(f.path)) {
         return {
           ok: false,
-          error: `${f.path}: 캡 초과로 표시 전용 — 채택 불가`,
+          error: `${f.path}: too large to adopt — shown for reading only.`,
           code: 'unsupported',
         };
       }
       if (!f.hunkSelectable) {
         return {
           ok: false,
-          error: `${f.path}: rename·binary·mode 변경은 채택 불가`,
+          error: `${f.path}: renames, binary files and mode changes cannot be adopted.`,
           code: 'unsupported',
         };
       }
       selectedFiles.push({ file: f, hunkIndices: idxs });
     }
     if (selectedFiles.length === 0) {
-      return { ok: false, error: '선택된 hunk 없음', code: 'apply' };
+      return { ok: false, error: 'No hunks selected.', code: 'apply' };
     }
 
     // ② dirty 거부(§3): 대상 파일이 현재 dirty면 거부.
@@ -488,7 +606,7 @@ async function applyHunks(req: DiffApplyRequest, worktreePath: string): Promise<
       if (dirtySet.has(sf.file.path)) {
         return {
           ok: false,
-          error: `${sf.file.path}: 타겟에 미커밋 변경 있음 — 충돌 방지로 거부`,
+          error: `${sf.file.path}: has uncommitted changes in the target — commit or discard them there, then adopt again.`,
           code: 'dirty',
         };
       }
@@ -496,7 +614,7 @@ async function applyHunks(req: DiffApplyRequest, worktreePath: string): Promise<
 
     const patch = reassemblePatch(selectedFiles);
     if (!patchPathsSafe(patch)) {
-      return { ok: false, error: '패치 내부 경로 검증 실패(.. 또는 절대경로)', code: 'path' };
+      return { ok: false, error: 'Patch rejected — it contains a path outside the repository (.. or an absolute path).', code: 'path' };
     }
 
     // ③ 프로브(§3, F2 재정의): per-hunk 개별 프로브는 UI 힌트 전용이고,
@@ -530,7 +648,7 @@ async function applyHunks(req: DiffApplyRequest, worktreePath: string): Promise<
       if (already.length > 0) {
         return {
           ok: false,
-          error: '일부 hunk가 타겟에 이미 적용됨 — 해당 hunk를 선택 해제 후 재시도',
+          error: 'Some hunks are already applied in the target — deselect them and retry.',
           code: 'probe',
           failedProbes: already,
         };
@@ -547,7 +665,7 @@ async function applyHunks(req: DiffApplyRequest, worktreePath: string): Promise<
         const notApplicable = probes.filter((p) => !p.applicable);
         return {
           ok: false,
-          error: `선택 hunk 결합 적용 불가(타겟 미변경): ${gate.stderr.slice(0, 200)}`,
+          error: `The selected hunks do not apply together (target unchanged): ${gate.stderr.slice(0, 200)}`,
           code: 'probe',
           failedProbes: notApplicable.length > 0 ? notApplicable : probes,
         };
@@ -558,7 +676,7 @@ async function applyHunks(req: DiffApplyRequest, worktreePath: string): Promise<
       if (applied.code !== 0) {
         return {
           ok: false,
-          error: `git apply 실패(타겟 미변경): ${applied.stderr.slice(0, 200)}`,
+          error: `git apply failed (target unchanged): ${applied.stderr.slice(0, 200)}`,
           code: 'apply',
         };
       }
@@ -582,15 +700,36 @@ export function registerDiffHandlers(): () => void {
         mode: unknown,
       ): Promise<DiffReadResult | DiffReadError> => {
         if (typeof worktreePath !== 'string' || !worktreePath) {
-          return { ok: false, error: 'worktreePath 필요', code: 'bad-args' };
+          return { ok: false, error: 'worktreePath is required.', code: 'bad-args' };
         }
         // F2 (#615): confine the renderer path before it reaches `git -C`.
         const safeWt = await resolveAccessiblePath(worktreePath);
-        if (!safeWt) return { ok: false, error: 'worktreePath 필요', code: 'bad-args' };
+        if (!safeWt) return { ok: false, error: 'worktreePath is required.', code: 'bad-args' };
         // targetHeadOid는 선택 — 미지정 시 타겟 repo HEAD로 도출.
         const head = typeof targetHeadOid === 'string' ? targetHeadOid : '';
         // mode 미지정/오값은 'task'(기존 계약). 'workspace'만 명시 분기.
         return readDiff(safeWt, head, mode === 'workspace' ? 'workspace' : 'task');
+      },
+    ),
+  );
+
+  ipcMain.removeHandler(IPC.DIFF_SUMMARY);
+  ipcMain.handle(
+    IPC.DIFF_SUMMARY,
+    wrapHandler(
+      IPC.DIFF_SUMMARY,
+      async (
+        _event: Electron.IpcMainInvokeEvent,
+        worktreePath: unknown,
+        knownStateKey: unknown,
+      ): Promise<DiffSummaryResult | DiffReadError> => {
+        if (typeof worktreePath !== 'string' || !worktreePath) {
+          return { ok: false, error: 'worktreePath is required.', code: 'bad-args' };
+        }
+        // F2 (#615): confine the renderer path before it reaches `git -C`.
+        const safeWt = await resolveAccessiblePath(worktreePath);
+        if (!safeWt) return { ok: false, error: 'worktreePath is required.', code: 'bad-args' };
+        return readDiffSummary(safeWt, typeof knownStateKey === 'string' ? knownStateKey : '');
       },
     ),
   );
@@ -631,14 +770,14 @@ export function registerDiffHandlers(): () => void {
         worktreePath: unknown,
       ): Promise<DiffApplyResult> => {
         if (typeof worktreePath !== 'string' || !worktreePath) {
-          return { ok: false, error: 'worktreePath 필요', code: 'apply' };
+          return { ok: false, error: 'worktreePath is required.', code: 'apply' };
         }
         // F2 (#615): confine the renderer path before git/file writes touch it.
         const safeWt = await resolveAccessiblePath(worktreePath);
-        if (!safeWt) return { ok: false, error: 'worktreePath 필요', code: 'apply' };
+        if (!safeWt) return { ok: false, error: 'worktreePath is required.', code: 'apply' };
         const r = req as DiffApplyRequest;
         if (!r || !r.snapshot || !Array.isArray(r.selections)) {
-          return { ok: false, error: 'applyHunks 요청 형식 오류', code: 'apply' };
+          return { ok: false, error: 'Malformed applyHunks request.', code: 'apply' };
         }
         return applyHunks(r, safeWt);
       },
@@ -647,6 +786,7 @@ export function registerDiffHandlers(): () => void {
 
   return () => {
     ipcMain.removeHandler(IPC.DIFF_READ);
+    ipcMain.removeHandler(IPC.DIFF_SUMMARY);
     ipcMain.removeHandler(IPC.DIFF_RESOLVE_REPO);
     ipcMain.removeHandler(IPC.DIFF_APPLY_HUNKS);
   };

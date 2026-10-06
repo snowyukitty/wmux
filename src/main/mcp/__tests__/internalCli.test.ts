@@ -114,6 +114,13 @@ describe('WMUX_CLI_METHODS source invariant', () => {
       'surface.focus',
       'surface.close',
       'notify',
+      // `wmux deck state --prune --yes`: deletes only Deck state of workspaces
+      // that no longer exist, behind an explicit --yes, and refuses unless the
+      // app's own workspace list is fresh and came from a restored session. It
+      // moved from a CLI-side file rewrite to this in-app RPC so its writes go
+      // through the stores' in-process locks (the CLI could already do this
+      // by writing the files directly, so the grant adds no new reach).
+      'deck.state.prune',
     ]);
     const leaked = reserved
       .filter((m) => WMUX_CLI_METHODS.has(m))

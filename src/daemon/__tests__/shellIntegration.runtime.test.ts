@@ -13,9 +13,11 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
 import type { ManagedSession } from '../DaemonSessionManager';
 import { DaemonSessionManager } from '../DaemonSessionManager';
 import type { PromptEvent } from '../PromptEventLog';
+import { FACTORY_DEFAULT_SCOPES, __setPolicyProbeForTests } from '../../shared/pwshExecutionPolicy';
 
 const SYS = process.env.SystemRoot || 'C:\\Windows';
 const PF = process.env.ProgramFiles || 'C:\\Program Files';
@@ -76,6 +78,44 @@ function waitForEventAfter(
       }
     };
     managed.bridge.on('prompt', onPrompt);
+  });
+}
+
+/**
+ * Poll the session's raw output until `pattern` matches something written
+ * after `baselineBytes`.
+ *
+ * The prompt body is rendered by the shell itself — it is not reported as a
+ * PromptEvent — so verifying what the WRAPPED prompt observed means reading
+ * the PTY stream rather than promptLog.
+ */
+function waitForOutputAfter(
+  managed: ManagedSession,
+  baselineBytes: number,
+  pattern: RegExp,
+  label: string,
+  timeoutMs = EVENT_TIMEOUT_MS,
+): Promise<RegExpMatchArray> {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const tick = () => {
+      const fresh = managed.ringBuffer.readAll().subarray(baselineBytes).toString('utf8');
+      const match = fresh.match(pattern);
+      if (match) {
+        resolve(match);
+        return;
+      }
+      if (Date.now() > deadline) {
+        reject(
+          new Error(
+            `timed out waiting for ${label} — tail after baseline: ${JSON.stringify(fresh.slice(-400))}`,
+          ),
+        );
+        return;
+      }
+      setTimeout(tick, 50);
+    };
+    tick();
   });
 }
 
@@ -162,6 +202,137 @@ describe.runIf(hasPowerShell)('OSC 133 runtime — powershell.exe', () => {
       'command_end with non-zero exitCode',
     );
     expect(cmdEnd.exitCode).toBe(7);
+  }, EVENT_TIMEOUT_MS + 2000);
+
+  // Issue #1267. The wrapper delegates to $global:__wmux_prev_prompt, so
+  // whatever $? that scriptblock observes is exactly what oh-my-posh or
+  // Starship would observe. Installing a probe there exercises the real
+  // contract through a real ConPTY — a substring assertion on PWSH_INIT can
+  // prove the restore is present but not that it actually survives to the
+  // delegation, which is the half that was broken.
+  it('hands the real $? to the wrapped prompt', async () => {
+    manager = new DaemonSessionManager();
+    const id = `rt-pwsh-status-${Date.now()}`;
+    manager.createSession({
+      id,
+      cmd: POWERSHELL,
+      cwd: path.resolve(process.cwd()),
+    });
+
+    const managed = manager.getSession(id)!;
+
+    // Stand in for the user's prompt engine. $q must be assigned as the
+    // scriptblock's first statement — reading $? later would measure this
+    // probe's own bookkeeping instead of the command that just ran.
+    managed.ptyProcess.write('$global:__wmux_prev_prompt = { $q = $?; "WMUXPROBE[$q]" }\r');
+    await waitForOutputAfter(managed, 0, /WMUXPROBE\[(?:True|False)\]/, 'the probe prompt to render');
+
+    // A failing native command: the wrapped prompt must see $? = False.
+    const beforeFailure = managed.ringBuffer.readAll().length;
+    managed.ptyProcess.write(`& "${CMD_EXE}" /c exit 7\r`);
+    const afterFailure = await waitForOutputAfter(
+      managed,
+      beforeFailure,
+      /WMUXPROBE\[(True|False)\]/,
+      'a prompt render after a failing command',
+    );
+    expect(afterFailure[1]).toBe('False');
+
+    // ...and True again after one that succeeds, so a fix that simply pins
+    // the status to False cannot pass.
+    const beforeSuccess = managed.ringBuffer.readAll().length;
+    managed.ptyProcess.write(`& "${CMD_EXE}" /c exit 0\r`);
+    const afterSuccess = await waitForOutputAfter(
+      managed,
+      beforeSuccess,
+      /WMUXPROBE\[(True|False)\]/,
+      'a prompt render after a successful command',
+    );
+    expect(afterSuccess[1]).toBe('True');
+  }, EVENT_TIMEOUT_MS + 2000);
+
+  // Issue #1270. $LASTEXITCODE is set only by NATIVE commands and is never
+  // cleared, so from the session's first native command onward it is non-null
+  // for good — and the exit code was taken from it whenever it was. Every
+  // failing cmdlet after that point reported 0, which is what
+  // agent.lifecycle.exitCode was fed.
+  it('reports a failing cmdlet after a native command as non-zero', async () => {
+    manager = new DaemonSessionManager();
+    const id = `rt-pwsh-cmdlet-fail-${Date.now()}`;
+    manager.createSession({ id, cmd: POWERSHELL, cwd: path.resolve(process.cwd()) });
+
+    const managed = manager.getSession(id)!;
+    const baseline = managed.promptLog.size;
+
+    // A native command first — this is what puts a number in $LASTEXITCODE
+    // and arms the bug. Anchored on its own command_start: the startup prompt
+    // render emits a D;0 of its own, and matching that instead would leave the
+    // assertion below reading the wrong command's exit code.
+    managed.ptyProcess.write(`& "${CMD_EXE}" /c exit 0\r`);
+    const nativeStart = await waitForEventAfter(
+      managed,
+      baseline,
+      (e) => e.type === 'command_start',
+      'command_start for the native command',
+    );
+    await waitForEventAfter(
+      managed,
+      baseline,
+      (e) => e.type === 'command_end' && e.byteOffset >= nativeStart.byteOffset,
+      'command_end for the native command',
+    );
+
+    const afterNative = managed.promptLog.size;
+    managed.ptyProcess.write('Get-Item Q:\\nope-xyz\r');
+    const cmdletStart = await waitForEventAfter(
+      managed,
+      afterNative,
+      (e) => e.type === 'command_start',
+      'command_start for the failing cmdlet',
+    );
+    const cmdEnd = await waitForEventAfter(
+      managed,
+      afterNative,
+      (e) => e.type === 'command_end' && e.byteOffset >= cmdletStart.byteOffset,
+      'command_end for the failing cmdlet',
+    );
+    expect(cmdEnd.exitCode).toBe(1);
+  }, EVENT_TIMEOUT_MS + 2000);
+
+  // The other direction, and the reason "$? first, always" is not the fix
+  // either: $LASTEXITCODE is still 7 after a cmdlet that succeeded, so
+  // reporting it would mark a successful command failed.
+  it('reports a succeeding cmdlet after a failing native command as zero', async () => {
+    manager = new DaemonSessionManager();
+    const id = `rt-pwsh-cmdlet-ok-${Date.now()}`;
+    manager.createSession({ id, cmd: POWERSHELL, cwd: path.resolve(process.cwd()) });
+
+    const managed = manager.getSession(id)!;
+    const baseline = managed.promptLog.size;
+
+    managed.ptyProcess.write(`& "${CMD_EXE}" /c exit 7\r`);
+    await waitForEventAfter(
+      managed,
+      baseline,
+      (e) => e.type === 'command_end' && e.exitCode === 7,
+      'command_end with exitCode 7',
+    );
+
+    const afterNative = managed.promptLog.size;
+    managed.ptyProcess.write('Get-Location | Out-Null\r');
+    const cmdletStart = await waitForEventAfter(
+      managed,
+      afterNative,
+      (e) => e.type === 'command_start',
+      'command_start for the succeeding cmdlet',
+    );
+    const cmdEnd = await waitForEventAfter(
+      managed,
+      afterNative,
+      (e) => e.type === 'command_end' && e.byteOffset >= cmdletStart.byteOffset,
+      'command_end for the succeeding cmdlet',
+    );
+    expect(cmdEnd.exitCode).toBe(0);
   }, EVENT_TIMEOUT_MS + 2000);
 });
 
@@ -263,5 +434,113 @@ describe.runIf(hasGitBash)('OSC 133 runtime — bash.exe (Git Bash)', () => {
       'command_end with non-zero exitCode',
     );
     expect(cmdEnd.exitCode).toBe(1);
+  }, EVENT_TIMEOUT_MS + 2000);
+});
+
+// #1620: a Windows client that never set an execution policy runs Restricted,
+// and a Restricted powershell.exe refuses to load ANY .ps1 — wmux's own init,
+// and the npm .ps1 shim an agent like `codex` resolves to. CI runners ship a
+// permissive machine policy, so the Restricted default is reproduced per pane
+// with the Process-scope env var PSExecutionPolicyPreference. The probe is
+// pinned so the host's real registry cannot decide the outcome.
+describe.runIf(hasPowerShell)('execution policy on a factory-default machine — powershell.exe (#1620)', () => {
+  // createSession's env REPLACES the child environment (powershell.exe cannot
+  // even load without SystemRoot), so overlay onto the real one. Windows env
+  // names are case-insensitive but a spread copy is not: an inherited
+  // PSEXECUTIONPOLICYPREFERENCE=Bypass (a parent started with -ExecutionPolicy
+  // Bypass, e.g. an AI coding agent's shell) would survive next to ours and
+  // win, so the controls time out and the fix cases pass vacuously. Drop every
+  // case variant before overlaying.
+  const RESTRICTED_ENV: Record<string, string> = {
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(
+        (e): e is [string, string] => e[1] !== undefined && e[0].toLowerCase() !== 'psexecutionpolicypreference',
+      ),
+    ),
+    PSExecutionPolicyPreference: 'Restricted',
+  };
+  const BLOCKED = /UnauthorizedAccess/;
+  let manager: DaemonSessionManager;
+  let tmp: string | undefined;
+
+  afterEach(() => {
+    if (manager) manager.disposeAll();
+    __setPolicyProbeForTests(null);
+    if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+    tmp = undefined;
+  });
+
+  // Native PowerShell/PSReadLine startup occasionally stalls before the policy error.
+  // Retry this live-OS control once in the runtime lane, keeping its assertions.
+  it('control: with no policy arg, Restricted blocks the init script and no markers arrive', { retry: 1, timeout: EVENT_TIMEOUT_MS * 2 + 2000 }, async () => {
+    __setPolicyProbeForTests({ scopes: { ...FACTORY_DEFAULT_SCOPES, currentUser: 'set' }, platform: 'win32' });
+    manager = new DaemonSessionManager();
+    const id = `rt-policy-control-${Date.now()}`;
+    manager.createSession({ id, cmd: POWERSHELL, cwd: path.resolve(process.cwd()), env: RESTRICTED_ENV });
+    const managed = manager.getSession(id)!;
+
+    // Proves the env var reached the pane AND that this setup reproduces the bug.
+    await waitForOutputAfter(managed, 0, BLOCKED, 'the Restricted policy error');
+
+    managed.ptyProcess.write('echo wmux-policy-control\r');
+    await waitForOutputAfter(managed, 0, /wmux-policy-control[\s\S]*wmux-policy-control/, 'echo output');
+    expect(managed.promptLog.size).toBe(0);
+  });
+
+  it('fix: RemoteSigned lets the init script load, so OSC 133 command markers arrive', async () => {
+    __setPolicyProbeForTests({ scopes: FACTORY_DEFAULT_SCOPES, platform: 'win32' });
+    manager = new DaemonSessionManager();
+    const id = `rt-policy-fix-${Date.now()}`;
+    manager.createSession({ id, cmd: POWERSHELL, cwd: path.resolve(process.cwd()), env: RESTRICTED_ENV });
+    const managed = manager.getSession(id)!;
+    const baseline = managed.promptLog.size;
+
+    managed.ptyProcess.write('echo wmux-policy-fix\r');
+    const cmdStart = await waitForEventAfter(managed, baseline, (e) => e.type === 'command_start', 'command_start');
+    const cmdEnd = await waitForEventAfter(
+      managed,
+      baseline,
+      (e) => e.type === 'command_end' && e.byteOffset >= cmdStart.byteOffset,
+      'command_end after command_start',
+    );
+    expect(cmdEnd.exitCode).toBe(0);
+    expect(managed.ringBuffer.readAll().toString('utf8')).not.toMatch(BLOCKED);
+  }, EVENT_TIMEOUT_MS * 2 + 2000);
+
+  // Stand-in for an npm agent shim (codex.ps1) that PowerShell prefers over
+  // the .cmd: any .ps1 run by an exec unit hits the same policy gate.
+  function writeProbeScript(): string {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-policy-'));
+    const script = path.join(tmp, 'wmuxprobe.ps1');
+    fs.writeFileSync(script, "Write-Output 'wmux-ps1-ran'\n");
+    return script;
+  }
+
+  it('exec unit control: Restricted blocks a .ps1 agent shim', async () => {
+    __setPolicyProbeForTests({ scopes: { ...FACTORY_DEFAULT_SCOPES, currentUser: 'set' }, platform: 'win32' });
+    const script = writeProbeScript();
+    manager = new DaemonSessionManager();
+    const id = `rt-policy-exec-control-${Date.now()}`;
+    manager.createSession({
+      id, cmd: POWERSHELL, cwd: path.resolve(process.cwd()), env: RESTRICTED_ENV,
+      exec: { command: `& '${script.replace(/'/g, "''")}'` },
+    });
+    const managed = manager.getSession(id)!;
+    await waitForOutputAfter(managed, 0, BLOCKED, 'the Restricted policy error');
+    expect(managed.ringBuffer.readAll().toString('utf8')).not.toContain('wmux-ps1-ran');
+  }, EVENT_TIMEOUT_MS + 2000);
+
+  it('exec unit fix: RemoteSigned lets the .ps1 agent shim run', async () => {
+    __setPolicyProbeForTests({ scopes: FACTORY_DEFAULT_SCOPES, platform: 'win32' });
+    const script = writeProbeScript();
+    manager = new DaemonSessionManager();
+    const id = `rt-policy-exec-fix-${Date.now()}`;
+    manager.createSession({
+      id, cmd: POWERSHELL, cwd: path.resolve(process.cwd()), env: RESTRICTED_ENV,
+      exec: { command: `& '${script.replace(/'/g, "''")}'` },
+    });
+    const managed = manager.getSession(id)!;
+    await waitForOutputAfter(managed, 0, /wmux-ps1-ran/, 'the script output');
+    expect(managed.ringBuffer.readAll().toString('utf8')).not.toMatch(BLOCKED);
   }, EVENT_TIMEOUT_MS + 2000);
 });

@@ -7,6 +7,7 @@ import { createUISlice, type UISlice } from './slices/uiSlice';
 import { createNotificationSlice, type NotificationSlice } from './slices/notificationSlice';
 import { createA2aSlice, type A2aSlice } from './slices/a2aSlice';
 import { createApprovalInboxSlice, type ApprovalInboxSlice } from './slices/approvalInboxSlice';
+import { createBrowserHelpSlice, type BrowserHelpSlice } from './slices/browserHelpSlice';
 import { createCompanySlice, type CompanySlice } from './slices/companySlice';
 import { createToastSlice, type ToastSlice } from './slices/toastSlice';
 import { createSearchSlice, type SearchSlice } from './slices/searchSlice';
@@ -20,8 +21,13 @@ import { createChannelsSlice, type ChannelsSlice } from './slices/channelsSlice'
 import { createWorkTaskSlice, type WorkTaskSlice } from './slices/workTaskSlice';
 import { createDeckSlice, type DeckSlice } from './slices/deckSlice';
 import { createRemoteWorkspacesSlice, type RemoteWorkspacesSlice } from './slices/remoteWorkspacesSlice';
+import { createOrphanSessionsSlice, type OrphanSessionsSlice } from './slices/orphanSessionsSlice';
+import { createSchedulesSlice, type SchedulesSlice } from './slices/schedulesSlice';
+import { createUsageLimitSlice, type UsageLimitSlice } from './slices/usageLimitSlice';
+import { createWorkspaceSettleSlice, type WorkspaceSettleSlice } from './slices/workspaceSettleSlice';
+import { createMoaSlice, type MoaSlice } from './slices/moaSlice';
 
-export type StoreState = WorkspaceSlice & PaneSlice & SurfaceSlice & UISlice & NotificationSlice & A2aSlice & ApprovalInboxSlice & CompanySlice & ToastSlice & SearchSlice & ProjectConfigSlice & SupervisionSlice & ResumeSlice & AgentToolbarSlice & ChromePresetSlice & RemoteInboxSlice & ChannelsSlice & WorkTaskSlice & DeckSlice & RemoteWorkspacesSlice;
+export type StoreState = WorkspaceSlice & PaneSlice & SurfaceSlice & UISlice & NotificationSlice & A2aSlice & ApprovalInboxSlice & BrowserHelpSlice & CompanySlice & ToastSlice & SearchSlice & ProjectConfigSlice & SupervisionSlice & ResumeSlice & AgentToolbarSlice & ChromePresetSlice & RemoteInboxSlice & ChannelsSlice & WorkTaskSlice & DeckSlice & RemoteWorkspacesSlice & OrphanSessionsSlice & SchedulesSlice & UsageLimitSlice & WorkspaceSettleSlice & MoaSlice;
 
 export const useStore = create<StoreState>()(
   immer((...args) => ({
@@ -32,6 +38,7 @@ export const useStore = create<StoreState>()(
     ...createNotificationSlice(...args),
     ...createA2aSlice(...args),
     ...createApprovalInboxSlice(...args),
+    ...createBrowserHelpSlice(...args),
     ...createCompanySlice(...args),
     ...createToastSlice(...args),
     ...createSearchSlice(...args),
@@ -45,5 +52,10 @@ export const useStore = create<StoreState>()(
     ...createWorkTaskSlice(...args),
     ...createDeckSlice(...args),
     ...createRemoteWorkspacesSlice(...args),
+    ...createOrphanSessionsSlice(...args),
+    ...createSchedulesSlice(...args),
+    ...createUsageLimitSlice(...args),
+    ...createWorkspaceSettleSlice(...args),
+    ...createMoaSlice(...args),
   }))
 );

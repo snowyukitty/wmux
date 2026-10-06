@@ -2,9 +2,11 @@
 // (worktree.handler.test style). Covers the conflict-detection parser
 // (diff-filter=U / NUL), precondition checks, base-resolution fallback, the verify
 // exit-code verdict, and the clean-merge→Land / conflict→Discard round-trips.
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync, lstatSync, readFileSync, realpathSync, appendFileSync } from 'node:fs';
+import { copyDirSync } from '../../../test-utils/copyDirSync';
+import { disableGitMaintenance } from '../../../test-utils/gitFixture';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -29,17 +31,36 @@ function g(cwd: string, args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' });
 }
 
-// Temp repo with a main branch and a single base commit.
-function makeRepo(): { base: string; repo: string; cleanup: () => void } {
-  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'wmux-ms-')));
+// Each git spawn costs 100 ms+ on the Windows runner, so a suite's fixture repo
+// is committed once (beforeAll) and every test gets a byte copy of it. The
+// copied index carries the template's stat data, so it is refreshed once —
+// otherwise git reads f.txt as modified and the precondition checks misfire.
+
+// Template repo with a main branch and a single base commit.
+function makeTemplate(): { base: string; repo: string; cleanup: () => void } {
+  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'wmux-ms-tpl-')));
   const repo = join(base, 'repo');
   mkdirSync(repo);
   g(repo, ['init', '-q', '-b', 'main']);
-  g(repo, ['config', 'user.email', 't@t']);
-  g(repo, ['config', 'user.name', 't']);
+  disableGitMaintenance(repo);
+  appendFileSync(join(repo, '.git', 'config'), '[user]\n\temail = t@t\n\tname = t\n');
   writeFileSync(join(repo, 'f.txt'), 'a\n');
   g(repo, ['add', '-A']);
   g(repo, ['commit', '-q', '-m', 'base']);
+  return { base, repo, cleanup: () => rmSync(base, { recursive: true, force: true }) };
+}
+
+// A test's own copy of a template repo.
+function makeRepo(templateRepo: string): { base: string; repo: string; cleanup: () => void } {
+  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'wmux-ms-')));
+  const repo = join(base, 'repo');
+  try {
+    copyDirSync(templateRepo, repo);
+    g(repo, ['update-index', '-q', '--refresh']);
+  } catch (error) {
+    rmSync(base, { recursive: true, force: true });
+    throw error;
+  }
   return { base, repo, cleanup: () => rmSync(base, { recursive: true, force: true }) };
 }
 
@@ -47,12 +68,18 @@ function makeRepo(): { base: string; repo: string; cleanup: () => void } {
 function addFeat(repo: string, content: string): string {
   g(repo, ['checkout', '-q', '-b', 'feat']);
   writeFileSync(join(repo, 'f.txt'), content);
-  g(repo, ['add', '-A']);
-  g(repo, ['commit', '-q', '-m', 'feat']);
+  g(repo, ['commit', '-q', '-a', '-m', 'feat']);
   const oid = g(repo, ['rev-parse', 'feat']).trim();
   g(repo, ['checkout', '-q', 'main']);
   return oid;
 }
+
+// #1274: the suites below drive the real `git` binary (init/commit/worktree/merge)
+// against a temp repo, so their runtime tracks process-spawn cost rather than code
+// speed. Locally the whole file is ~6.6 s with the slowest test ~1.2 s; on a loaded
+// windows-latest runner the same work measured 6.0 s against vitest's 5 s default
+// and flaked on PRs that never touch this code. Explicit generous budget instead.
+const GIT_PROCESS_TIMEOUT_MS = 30_000;
 
 describe('parseNulList — NUL(-z)-separated parser', () => {
   it('splits NUL-separated items and drops empty items / trailing NULs', () => {
@@ -70,19 +97,27 @@ describe('isIntegrationPath — prefix recognition', () => {
   });
 });
 
-describe('detectConflicts — conflict detection (not exit code)', () => {
+describe('detectConflicts — conflict detection (not exit code)', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
+  let tpl: ReturnType<typeof makeTemplate>;
+  let featOid: string;
+  let baseOid: string;
+  // Separate hooks so no single hook's 10 s budget has to cover every spawn.
+  beforeAll(() => (tpl = makeTemplate()));
+  // Set up a main2 vs feat conflict.
+  beforeAll(() => (featOid = addFeat(tpl.repo, 'FEAT\n')));
+  beforeAll(() => {
+    writeFileSync(join(tpl.repo, 'f.txt'), 'MAIN\n');
+    g(tpl.repo, ['commit', '-q', '-a', '-m', 'main2']);
+    baseOid = g(tpl.repo, ['rev-parse', 'HEAD']).trim();
+  });
+  afterAll(() => tpl?.cleanup());
+  // Template state every copy starts from: main = base → main2 (f.txt "MAIN"),
+  // and branch feat = base → feat (f.txt "FEAT"), so the two conflict on f.txt.
   let scn: ReturnType<typeof makeRepo>;
-  beforeEach(() => (scn = makeRepo()));
-  afterEach(() => scn.cleanup());
+  beforeEach(() => (scn = makeRepo(tpl.repo)));
+  afterEach(() => scn?.cleanup());
 
   it('a conflicting merge returns the unmerged file list, a clean merge returns an empty list', async () => {
-    // Set up a main2 vs feat conflict.
-    const featOid = addFeat(scn.repo, 'FEAT\n');
-    writeFileSync(join(scn.repo, 'f.txt'), 'MAIN\n');
-    g(scn.repo, ['add', '-A']);
-    g(scn.repo, ['commit', '-q', '-m', 'main2']);
-    const baseOid = g(scn.repo, ['rev-parse', 'HEAD']).trim();
-
     const created = await createIntegrationWorktree(scn.repo, baseOid, 'feat');
     expect(created.ok).toBe(true);
     if (!created.ok) return;
@@ -103,10 +138,13 @@ describe('detectConflicts — conflict detection (not exit code)', () => {
   });
 });
 
-describe('checkTargetPreconditions — target (base) preconditions', () => {
+describe('checkTargetPreconditions — target (base) preconditions', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
+  let tpl: ReturnType<typeof makeTemplate>;
+  beforeAll(() => (tpl = makeTemplate()));
+  afterAll(() => tpl?.cleanup());
   let scn: ReturnType<typeof makeRepo>;
-  beforeEach(() => (scn = makeRepo()));
-  afterEach(() => scn.cleanup());
+  beforeEach(() => (scn = makeRepo(tpl.repo)));
+  afterEach(() => scn?.cleanup());
 
   it('clean · HEAD==base · no MERGE_HEAD → ok', async () => {
     const r = await checkTargetPreconditions(scn.repo, 'main');
@@ -129,8 +167,7 @@ describe('checkTargetPreconditions — target (base) preconditions', () => {
   it('rejects when an in-progress merge (MERGE_HEAD) is present', async () => {
     const featOid = addFeat(scn.repo, 'FEAT\n');
     writeFileSync(join(scn.repo, 'f.txt'), 'MAIN\n');
-    g(scn.repo, ['add', '-A']);
-    g(scn.repo, ['commit', '-q', '-m', 'main2']);
+    g(scn.repo, ['commit', '-q', '-a', '-m', 'main2']);
     // Trigger a conflicting merge in the main worktree itself to leave a MERGE_HEAD.
     try {
       g(scn.repo, ['merge', '--no-commit', '--no-ff', featOid]);
@@ -143,10 +180,13 @@ describe('checkTargetPreconditions — target (base) preconditions', () => {
   });
 });
 
-describe('resolveBaseFromGit — fallback chain (no gh)', () => {
+describe('resolveBaseFromGit — fallback chain (no gh)', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
+  let tpl: ReturnType<typeof makeTemplate>;
+  beforeAll(() => (tpl = makeTemplate()));
+  afterAll(() => tpl?.cleanup());
   let scn: ReturnType<typeof makeRepo>;
-  beforeEach(() => (scn = makeRepo()));
-  afterEach(() => scn.cleanup());
+  beforeEach(() => (scn = makeRepo(tpl.repo)));
+  afterEach(() => scn?.cleanup());
 
   it('uses the branch name when origin/HEAD symbolic-ref exists', async () => {
     // Mimic an origin remote with a bare repo and set origin/HEAD.
@@ -226,10 +266,13 @@ describe('linkNodeModules — dep link into the integration worktree', () => {
   });
 });
 
-describe('runVerify — exit-code verdict (injected commands)', () => {
+describe('runVerify — exit-code verdict (injected commands)', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
+  let tpl: ReturnType<typeof makeTemplate>;
+  beforeAll(() => (tpl = makeTemplate()));
+  afterAll(() => tpl?.cleanup());
   let scn: ReturnType<typeof makeRepo>;
-  beforeEach(() => (scn = makeRepo()));
-  afterEach(() => scn.cleanup());
+  beforeEach(() => (scn = makeRepo(tpl.repo)));
+  afterEach(() => scn?.cleanup());
 
   it('all steps exit 0 → ok:true', async () => {
     const res = await runVerify(scn.repo, {
@@ -253,15 +296,22 @@ describe('runVerify — exit-code verdict (injected commands)', () => {
   });
 });
 
-describe('clean merge → Land round-trip', () => {
+describe('clean merge → Land round-trip', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
+  let tpl: ReturnType<typeof makeTemplate>;
+  let featOid: string;
+  let baseOid: string;
+  // Separate hooks so no single hook's 10 s budget has to cover every spawn.
+  beforeAll(() => (tpl = makeTemplate()));
+  beforeAll(() => {
+    featOid = addFeat(tpl.repo, 'a\nfeat\n'); // A change that does not conflict with main.
+    baseOid = g(tpl.repo, ['rev-parse', 'HEAD']).trim();
+  });
+  afterAll(() => tpl?.cleanup());
   let scn: ReturnType<typeof makeRepo>;
-  beforeEach(() => (scn = makeRepo()));
-  afterEach(() => scn.cleanup());
+  beforeEach(() => (scn = makeRepo(tpl.repo)));
+  afterEach(() => scn?.cleanup());
 
   it('fast-forwards base to the result after merging in the isolated worktree', async () => {
-    const featOid = addFeat(scn.repo, 'a\nfeat\n'); // A change that does not conflict with main.
-    const baseOid = g(scn.repo, ['rev-parse', 'HEAD']).trim();
-
     const created = await createIntegrationWorktree(scn.repo, baseOid, 'feat');
     expect(created.ok).toBe(true);
     if (!created.ok) return;
@@ -297,8 +347,6 @@ describe('clean merge → Land round-trip', () => {
   });
 
   it('rejects Land when base moved since the start', async () => {
-    const featOid = addFeat(scn.repo, 'a\nfeat\n');
-    const baseOid = g(scn.repo, ['rev-parse', 'HEAD']).trim();
     const created = await createIntegrationWorktree(scn.repo, baseOid, 'feat');
     if (!created.ok) return;
     await runMergeNoCommit(created.path, featOid);

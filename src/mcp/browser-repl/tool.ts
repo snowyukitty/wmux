@@ -20,7 +20,8 @@ import {
   type RegisterWmuxToolsOptions,
   type WmuxToolSpec,
 } from '../toolCatalog';
-import { BROWSER_REPL_TOOLS, createBrowserBridge } from './bridge';
+import { BROWSER_REPL_TOOLS, captureDispatchContext, createBrowserBridge } from './bridge';
+import { renderImageLegend, textWithImages } from './runCollect';
 import { BrowserReplSession, type BrowserReplRunOutcome } from './BrowserReplSession';
 
 /** Longer than repl_run's 30s: a script here waits on real pages. */
@@ -166,6 +167,7 @@ export function formatBrowserReplOutcome(outcome: BrowserReplRunOutcome): string
     lines.push('', '--- hints ---', ...outcome.hints);
     if (outcome.hintsElided) lines.push(`(${outcome.hintsElided} more hint line(s) not shown)`);
   }
+  lines.push(...renderImageLegend(outcome.images ?? [], outcome.imagesElided ?? 0));
   if (outcome.ok && outcome.result && outcome.result.text !== 'undefined') {
     lines.push('', '--- result ---', outcome.result.text);
     if (outcome.result.truncated) {
@@ -174,8 +176,46 @@ export function formatBrowserReplOutcome(outcome: BrowserReplRunOutcome): string
   }
   if (!outcome.ok && outcome.error) {
     lines.push('', '--- error ---', outcome.error);
+    // #1360: an error mid-script looked like it discarded everything. It never
+    // did — the ledger, console and hints above are the run's results so far —
+    // but nothing said so, and nothing said WHICH step broke. Both now do.
+    if (outcome.failedStep !== undefined) {
+      lines.push(
+        `failed at step ${outcome.failedStep} (browser.${outcome.failedCall}); ` +
+          `the ${outcome.failedStep - 1} step(s) before it did run and are listed above.`,
+      );
+    } else if (outcome.callCount > 0) {
+      lines.push(
+        `every one of the ${outcome.callCount} browser call(s) above succeeded — ` +
+          'the error came from the snippet itself, not from a step.',
+      );
+    }
   }
   return lines.join('\n');
+}
+
+/**
+ * How long a run may ask for before an MCP client stops waiting in the
+ * foreground and reports the call as backgrounded.
+ *
+ * Not a wmux limit — the client's. wmux has no handle to poll for such a run
+ * and cannot invent one: the result is delivered when it finishes, or not at
+ * all. What it CAN do is stop the caller from walking into it silently, and
+ * name the thing that does survive, which is the runtime's own state (#1360).
+ */
+export const CLIENT_BACKGROUND_MS = 120_000;
+
+/** The warning a long-timeout run carries, or '' when it stays in front. */
+export function backgroundWarning(timeoutMs: number): string {
+  if (timeoutMs <= CLIENT_BACKGROUND_MS) return '';
+  return (
+    `note: this run may take longer than the ~${CLIENT_BACKGROUND_MS / 1000}s after which an MCP ` +
+    'client moves a tool call to the background. There is no handle to poll for a backgrounded ' +
+    'run: its result arrives when it finishes, or not at all. What survives either way is this ' +
+    "runtime's state — assign progress to globalThis (e.g. globalThis.rows = rows) as the script " +
+    'goes, then read it back with a short browser_repl call. Splitting the script under ' +
+    `timeout:${CLIENT_BACKGROUND_MS} keeps every part in the foreground.`
+  );
 }
 
 // ── catalog ───────────────────────────────────────────────────────────────
@@ -188,11 +228,26 @@ const BROWSER_REPL_DESCRIPTION =
   'Each allowed browser_X tool is `await browser.X(args)` with the same args, resolving to ' +
   '{text, events} (+ refs:[{ref,param,role,name}] for snapshot/smart_snapshot, diff text, all refs; ' +
   'pass refs[i].ref as the arg named refs[i].param). A failed step throws (catchable). ' +
+  'screenshot adds image:"img-N" (attached below). ' +
   `Allowed: ${BROWSER_REPL_TOOLS.join(', ')}. ` +
+  'Args for the steps whose standalone tools are unlisted: navigate_back() hover(ref) drag(sourceRef,targetRef|path) ' +
+  'select(ref,values) scroll_into_view(ref) highlight(ref) dialog(accept,text). ' +
   'Other browser_* tools stay separate calls. Top-level await works; state persists between calls ' +
   'until a timeout kills the runtime, but let/const inside an awaiting snippet do not — assign to ' +
+  // No room for the #1360 notes here: this description sits ~2 bytes under the
+  // tools/list budget browserRepl.catalog.test.ts pins. The failing-step line
+  // and the backgrounding warning ride in the RESULT instead, which is where
+  // the caller is when either matters.
   'globalThis to keep a value. console.log is captured; sleep(ms) is available. ' +
-  'Every step still records to the action trace for browser_replay.';
+  'Steps record to the action trace for browser_replay, except path drags, point wheels and modifier gestures.';
+
+// Per-call text-result cap, honoured by the dispatch-layer guard
+// (src/mcp/resultCap.ts). Plain z.number(): the guard floors and clamps the
+// value itself (every zod numeric modifier costs bytes in tools/list).
+const maxBytesParam = z
+  .number()
+  .optional()
+  .describe('Cap the text result in bytes (default 65536, max 524288).');
 
 export function createBrowserReplCatalog(
   tools: ReadonlyMap<string, CollectedTool>,
@@ -210,17 +265,26 @@ export function createBrowserReplCatalog(
         .string()
         .optional()
         .describe('Default surfaceId for every browser.* call in this snippet.'),
+      maxBytes: maxBytesParam,
     },
+    strictInput: true,
     profiles: ['full'],
     invoke: async ({ code, timeout, surfaceId }) => {
       // Captured HERE, inside the MCP dispatch, and re-entered per call: the
       // worker's messages arrive outside this AsyncLocalStorage context.
       const scope = getConnectionScope();
-      const bridge = createBrowserBridge(tools, { surfaceId, scope });
+      const bridge = createBrowserBridge(tools, { surfaceId, scope, context: captureDispatchContext() });
       const session = getSession(() => new BrowserReplSession(BROWSER_REPL_TOOLS));
+      const resolvedTimeout = clampTimeout(timeout);
       try {
-        const outcome = await session.run(code, clampTimeout(timeout), bridge);
-        return text(formatBrowserReplOutcome(outcome), !outcome.ok);
+        const outcome = await session.run(code, resolvedTimeout, bridge);
+        const warning = backgroundWarning(resolvedTimeout);
+        const rendered = formatBrowserReplOutcome(outcome);
+        return textWithImages(
+          warning ? `${rendered}\n\n${warning}` : rendered,
+          outcome.images ?? [],
+          !outcome.ok,
+        );
       } catch (error) {
         return text(`browser_repl: ${error instanceof Error ? error.message : String(error)}`, true);
       }

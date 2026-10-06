@@ -1,4 +1,8 @@
 import { launcherStem, tokenize } from './agentResume';
+import {
+  EFFORT_TOKEN_RE, freshContextGrammarFor, hasPermissionChoice, isSkipPermissionsToken, launchGrammarFor,
+  permissionChoiceIndexes,
+} from './agentLaunchOptions';
 
 // Orchestrator pane role (soft, operator-assigned "preferred role").
 //
@@ -89,7 +93,28 @@ export interface RoleBinding {
   model?: string;
   /** Extra launch args appended verbatim (advanced). Normalized/capped. */
   args?: string;
+  /** Reasoning effort, spliced with the agent's own grammar
+   *  (agentLaunchOptions). Ignored for agy, whose effort is the model id suffix. */
+  effort?: string;
+  /** Launch with the agent's own skip-permission-prompts flag. */
+  skipPermissions?: boolean;
+  /**
+   * Start each dispatched task in a fresh conversation (#1680): when a caller
+   * marks a send as a NEW task (`input.send` `newTask`, or the new-task branch
+   * of an a2a send), wmux types the bound agent's fresh-context command
+   * (agentLaunchOptions) first. The operator's half of a two-key opt-in: it
+   * does nothing without the caller's signal, and the caller's signal does
+   * nothing without it. Not a launch option, so applyRoleBinding ignores it.
+   */
+  freshContext?: boolean;
+  /** wmux MCP tools the agent sees: 'full' (every tool), 'core' (no browser
+   *  tools), 'role' (only this role's tools, src/shared/roleSurfaces.ts).
+   *  Unset = whatever the CLI's own wmux registration gives it. */
+  tools?: WmuxTools;
 }
+
+export const WMUX_TOOLS = ['full', 'core', 'role'] as const;
+export type WmuxTools = (typeof WMUX_TOOLS)[number];
 
 /** Operator-level, cross-workspace. Keyed by role name (ORCH_ROLES ∪ custom). */
 export type OrchestratorRoleBindings = Record<string, RoleBinding>;
@@ -106,6 +131,15 @@ interface ModelFlagGrammar {
 const MODEL_FLAG_BY_LAUNCHER: Readonly<Record<string, ModelFlagGrammar>> = {
   claude: { flag: (m) => `--model ${m}` },
   codex: { flag: (m) => `--model ${m}` },
+  // grok (1.0.x) is a fan-out-only launcher (see shared/fanoutPreset.ts), not a
+  // KNOWN_AGENT_STEMS entry, so a role binding never reaches it. Verified
+  // 2026-09-26: `grok --model grok-4.7-build-fast` runs, an unknown id is refused.
+  grok: { flag: (m) => `--model ${m}` },
+  // agy (Antigravity CLI 1.2.13). Verified 2026-09-29: `agy --model
+  // gemini-3.8-flash-low` runs; an unknown id is refused with the model list.
+  // The id must be a full `agy models` id (the effort suffix included) — a bare
+  // family name such as `gemini-3.8-flash` also demands `--effort`.
+  agy: { flag: (m) => `--model ${m}` },
   // opencode/gemini/aider deliberately absent — their `--model` CLI grammar is
   // NOT verified anywhere in the repo (integrations/ + agentResume both cover
   // only claude/codex). Binding a role to them is a no-op + note (D-5), never a
@@ -145,17 +179,19 @@ export function launcherSupportsModelFlag(stem: string): boolean {
 export function applyRoleAgent(
   command: string,
   binding: RoleBinding | undefined,
+  options?: Pick<ApplyRoleBindingOptions, 'extraAgents'>,
 ): { command: string; changed: boolean; note?: string } {
   const unchanged = { command, changed: false };
   const agent = binding?.agent?.trim();
   if (!agent) return unchanged;
-  if (!KNOWN_AGENT_STEMS.has(agent)) {
+  const known = (stem: string): boolean => KNOWN_AGENT_STEMS.has(stem) || options?.extraAgents?.has(stem) === true;
+  if (!known(agent)) {
     return { ...unchanged, note: `Role is bound to "${agent}", which wmux does not recognise as an agent CLI; launched unchanged.` };
   }
   const tokens = tokenize(command);
   if (tokens.length === 0) return unchanged;
   const stem = launcherStem(tokens[0].value);
-  if (!KNOWN_AGENT_STEMS.has(stem)) return unchanged;
+  if (!known(stem)) return unchanged;
   if (stem === agent) return unchanged;
   const flagged = tokens.slice(1).some((t) => !t.quoted && t.value.startsWith('-'));
   if (flagged) {
@@ -167,8 +203,69 @@ export function applyRoleAgent(
     };
   }
   // Replace only the launcher token; everything after it (the prompt argument)
-  // is spliced back byte-identical.
-  return { command: agent + command.slice(tokens[0].end), changed: true };
+  // is spliced back byte-identical. A CLI that takes its first prompt only from
+  // a flag gets that flag right before the argument (agy: `-i "<prompt>"`);
+  // later rewrites insert their flags after the launcher, so `-i` stays adjacent.
+  const rest = command.slice(tokens[0].end);
+  const promptFlag = PROMPT_FLAG_BY_STEM[agent];
+  if (promptFlag && tokens.length > 1) return { command: `${agent} ${promptFlag}${rest}`, changed: true };
+  return { command: agent + rest, changed: true };
+}
+
+/** Agent CLIs that refuse a positional first prompt, with the flag that takes it
+ *  instead. The fan-out worker line is `<agent> "$(cat <prompt file>)"`; agy
+ *  answers a bare argument with "Prompts are read only from -p/--print,
+ *  -i/--prompt-interactive, or stdin", while `agy -i "<prompt>"` runs the prompt
+ *  and keeps the session open. Verified 2026-09-30 in a real PTY, agy 1.2.14. */
+const PROMPT_FLAG_BY_STEM: Readonly<Record<string, string>> = { agy: '-i' };
+
+/** Every flag such a CLI reads its first prompt from (agy: "-p/--print,
+ *  -i/--prompt-interactive"). A line already carrying one needs no other. */
+const PROMPT_TAKING_FLAGS_BY_STEM: Readonly<Record<string, readonly string[]>> = {
+  agy: ['-i', '--prompt-interactive', '-p', '--print'],
+};
+
+/** Stem of the raw first word: tokenize() treats `\` as an escape, which would
+ *  mangle a Windows launcher path (`C:\Tools\agy.exe`). */
+function rawLauncherStem(command: string): string {
+  return launcherStem(/^\s*(\S+)/.exec(command)?.[1] ?? '');
+}
+
+function hasPromptTakingFlag(stem: string, args: readonly { value: string; quoted: boolean }[]): boolean {
+  const flags = PROMPT_TAKING_FLAGS_BY_STEM[stem] ?? [];
+  return args.some((t) => !t.quoted && flags.some((f) => t.value === f || t.value.startsWith(`${f}=`)));
+}
+
+/**
+ * The flag a prompt argument appended to `agentCmd` must be preceded by, or
+ * undefined when none is needed: the CLI takes a positional prompt, or the
+ * command already carries a prompt-taking flag. Used where wmux assembles
+ * `<agentCmd> "<prompt>"` itself (fan-out worker lines), so a human-typed
+ * `agy` in the Fan-out dialog launches as `agy -i "<prompt>"` too.
+ */
+export function promptFlagForLauncher(agentCmd: string): string | undefined {
+  const tokens = tokenize(agentCmd);
+  if (tokens.length === 0) return undefined;
+  const stem = rawLauncherStem(agentCmd);
+  const flag = PROMPT_FLAG_BY_STEM[stem];
+  if (!flag) return undefined;
+  return hasPromptTakingFlag(stem, tokens.slice(1)) ? undefined : flag;
+}
+
+/**
+ * Will this fan-out worker line be refused for its prompt? For a line wmux
+ * assembled as `<agentCmd> "<prompt>"` (any argument means a prompt is
+ * there): true when the launcher rejects a positional first prompt and no
+ * prompt-taking flag is present (agy answers "Prompts are read only from
+ * -p/--print, -i/--prompt-interactive, or stdin" and exits). A bare launcher
+ * (no prompt) is never refused.
+ */
+export function launchRefusesPositionalPrompt(command: string): boolean {
+  const tokens = tokenize(command);
+  if (tokens.length < 2) return false;
+  const stem = rawLauncherStem(command);
+  if (!PROMPT_FLAG_BY_STEM[stem]) return false;
+  return !hasPromptTakingFlag(stem, tokens.slice(1));
 }
 
 /**
@@ -190,6 +287,55 @@ export function bindingEnforcesModel(binding: RoleBinding | undefined): boolean 
   );
 }
 
+/**
+ * The skip-permissions flag a launch in this role will carry, or undefined when
+ * it carries none. The sibling of {@link bindingEnforcesModel}, with the same
+ * contract: an affordance claiming "this pane skips permission prompts" gates
+ * on this, never on the setting merely being stored.
+ *
+ * Mirrors applyRoleBinding on a fresh launch of the bound agent. The binding
+ * must name the agent, and the agent must have a verified skip grammar
+ * (agentLaunchOptions). Then, in order:
+ *  1. a skip spelling in the role's `args` → that spelling. The args are
+ *     appended as written, and a skip flag next to a permission flag on one
+ *     line still runs bypass.
+ *  2. `skipPermissions` with a permission flag in the args → none. The args are
+ *     the role's own permission choice, so the rewrite adds no skip flag.
+ *  3. `skipPermissions` → the agent's skip flag.
+ *
+ * An agentless binding answers undefined even when its args carry a skip
+ * spelling: the args still apply to any agent launched, but no grammar says
+ * which spelling is the skip. A line that makes its own permission choice can
+ * still withhold the skip for that one launch (#1681); this answers for the
+ * role, not for a particular line.
+ */
+export function bindingSkipPermissionsFlag(binding: RoleBinding | undefined): string | undefined {
+  const agent = binding?.agent;
+  const launch = agent ? launchGrammarFor(agent) : undefined;
+  const flag = launch?.skipPermissionsFlag;
+  if (!binding || !launch || !flag) return undefined;
+  const argValues = tokenize(binding.args?.trim() ?? '').map((t) => t.value);
+  const inArgs = argValues.find((v) => isSkipPermissionsToken(launch, v));
+  if (inArgs) return inArgs;
+  if (!binding.skipPermissions || hasPermissionChoice(launch, argValues)) return undefined;
+  return flag;
+}
+
+/** Does a launch in this role skip permission prompts? See {@link bindingSkipPermissionsFlag}. */
+export function bindingEnforcesSkipPermissions(binding: RoleBinding | undefined): boolean {
+  return bindingSkipPermissionsFlag(binding) !== undefined;
+}
+
+/**
+ * Does a new task sent to a pane in this role start a fresh conversation?
+ * Same contract as {@link bindingEnforcesModel}: the setting alone is not
+ * enough, the bound agent must also have a verified fresh-context command
+ * (claude, codex). A stored `freshContext` on any other agent is inert.
+ */
+export function bindingEnforcesFreshContext(binding: RoleBinding | undefined): boolean {
+  return binding?.freshContext === true && freshContextGrammarFor(binding.agent) !== undefined;
+}
+
 /** Launcher stems wmux recognizes as agent CLIs. This is applyRoleBinding's
  *  OUTER gate: a command whose stem is absent here is never rewritten in any
  *  way, so `git commit -m "wip"` and `npm test` in a bound pane come back
@@ -206,6 +352,7 @@ export const KNOWN_AGENT_STEMS: ReadonlySet<string> = new Set([
   'copilot',
   'openclaude',
   'kiro-cli',
+  'agy',
 ]);
 
 /** Max lengths for the binding fields at the normalization boundary. `args` is
@@ -280,7 +427,10 @@ function normalizeArgsField(input: unknown): string | undefined {
  *  load), or undefined when the result carries no usable field. */
 export function normalizeRoleBinding(input: unknown): RoleBinding | undefined {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) return undefined;
-  const src = input as { agent?: unknown; model?: unknown; args?: unknown };
+  const src = input as {
+    agent?: unknown; model?: unknown; args?: unknown;
+    effort?: unknown; skipPermissions?: unknown; freshContext?: unknown; tools?: unknown;
+  };
   const binding: RoleBinding = {};
   // Agent normalizes to a launcher stem so it compares cleanly against a live
   // command's stem (drops a path/extension a hand-edited value might carry).
@@ -291,7 +441,15 @@ export function normalizeRoleBinding(input: unknown): RoleBinding | undefined {
   if (agent) binding.agent = agent;
   if (model) binding.model = model;
   if (args) binding.args = args;
-  if (binding.agent === undefined && binding.model === undefined && binding.args === undefined) {
+  if (typeof src.effort === 'string' && EFFORT_TOKEN_RE.test(src.effort)) binding.effort = src.effort;
+  // Strict booleans only: a hand-edited "true" string does not switch it on.
+  if (src.skipPermissions === true) binding.skipPermissions = true;
+  if (src.freshContext === true) binding.freshContext = true;
+  if ((WMUX_TOOLS as readonly unknown[]).includes(src.tools)) binding.tools = src.tools as WmuxTools;
+  if (
+    binding.agent === undefined && binding.model === undefined && binding.args === undefined &&
+    binding.effort === undefined && !binding.skipPermissions && !binding.freshContext && !binding.tools
+  ) {
     return undefined;
   }
   return binding;
@@ -403,6 +561,20 @@ function alreadyEndsWithArgs(command: string, args: string): boolean {
   return tail.every((v, i) => v === argTokens[i]);
 }
 
+/** `args` without the tokens `drop` matches (by value and index), the rest
+ *  kept as written (quotes included). `args` is normalized to single spaces, so
+ *  rejoining with one space loses nothing. */
+function dropArgTokens(args: string, drop: (value: string, index: number) => boolean): string {
+  const kept: string[] = [];
+  let start = 0;
+  tokenize(args).forEach((tkn, i) => {
+    const raw = args.slice(start, tkn.end).trim();
+    start = tkn.end;
+    if (!drop(tkn.value, i)) kept.push(raw);
+  });
+  return kept.join(' ');
+}
+
 /**
  * Pure transform: given a launch command + a role's binding, return the command
  * with the bound agent's model (and any extra args) enforced.
@@ -432,9 +604,20 @@ function alreadyEndsWithArgs(command: string, args: string): boolean {
  *    though `binding.args` may still be appended.
  *  - Otherwise: inject `--model <m>` right after the launcher token and append
  *    normalized `binding.args` at the end.
+ *  - `binding.effort` / `binding.skipPermissions` splice the agent's own flag
+ *    (agentLaunchOptions) next to the model, unless that flag is already on the
+ *    line or in the args. A permission flag in the args (`--permission-mode`)
+ *    also stops the skip injection: the role's own config wins.
+ *  - An explicit permission choice wins over the role's skip (#1681):
+ *    {@link ApplyRoleBindingOptions.suppressSkipPermissions} (a toggle the user
+ *    set OFF) or a permission flag typed on the line itself withholds the skip
+ *    flag and drops the skip spellings from `binding.args`. A typed permission
+ *    flag also drops the permission flags in `binding.args`, so the user's
+ *    mode is the one that runs. The other args stay.
  *
  * `modelInjected` reports whether the model flag was ACTUALLY spliced in, so a
- * caller never advertises an enforced model when only `args` changed.
+ * caller never advertises an enforced model when only `args` changed;
+ * `optionsInjected` does the same for effort and skip permissions.
  *
  * Idempotent: re-applying never double-adds the model flag (an explicit
  * `--model` short-circuits) nor the args (token-boundary trailing check).
@@ -459,25 +642,61 @@ export interface ApplyRoleBindingOptions {
    * was built for.
    */
   spawnedProcess?: boolean;
+  /**
+   * Launcher stems to treat as agents on top of KNOWN_AGENT_STEMS. Fan-out
+   * passes its own closed list (FANOUT_EXTRA_AGENT_STEMS) so a CLI it verified
+   * can be launched through this rewrite without becoming an agent identity
+   * everywhere else (detection, resume, the role-binding dropdown).
+   */
+  extraAgents?: ReadonlySet<string>;
+  /**
+   * Do not inject the binding's skip-permissions flag on this launch. Set by the
+   * resume chip and the recovery pill when the user explicitly turned their
+   * "skip permissions" toggle OFF: that per-launch choice wins over the role
+   * (owner decision, #1677). The skip spellings in the binding's args are
+   * dropped too (#1681); model, effort and the other args are still applied,
+   * and a skip flag already on the line is left alone.
+   */
+  suppressSkipPermissions?: boolean;
+}
+
+/** The launch options a rewrite ACTUALLY spliced in, each present only when it
+ *  was (a flag already on the line or in the args, or a withheld skip, is not
+ *  reported). The sibling of `modelInjected`. */
+export interface InjectedLaunchOptions {
+  /** The effort level whose flag was added. */
+  effort?: string;
+  /** The agent's skip-permissions flag was added. */
+  skipPermissions?: true;
 }
 
 export function applyRoleBinding(
   command: string,
   binding: RoleBinding | undefined,
   options?: ApplyRoleBindingOptions,
-): { command: string; changed: boolean; modelInjected: boolean; note?: string } {
+): {
+  command: string;
+  changed: boolean;
+  modelInjected: boolean;
+  /** Present only when at least one launch option was injected. */
+  optionsInjected?: InjectedLaunchOptions;
+  note?: string;
+} {
   const unchanged = { command, changed: false, modelInjected: false };
   if (!binding) return unchanged;
   const model = binding.model?.trim() || undefined;
-  const args = binding.args?.trim() || undefined;
-  if (!model && !args) return unchanged;
+  const roleArgs = binding.args?.trim() || undefined;
+  const effort = binding.effort && EFFORT_TOKEN_RE.test(binding.effort) ? binding.effort : undefined;
+  if (!model && !roleArgs && !effort && !(binding.skipPermissions && !options?.suppressSkipPermissions)) {
+    return unchanged;
+  }
 
   const tokens = tokenize(command);
   if (tokens.length === 0) return unchanged;
   const stem = launcherStem(tokens[0].value);
 
   // Gate 1 — only agent launches are ever rewritten (see the doc block).
-  if (!KNOWN_AGENT_STEMS.has(stem)) return unchanged;
+  if (!KNOWN_AGENT_STEMS.has(stem) && options?.extraAgents?.has(stem) !== true) return unchanged;
   // Gate 2 — and only when the line is an invocation, not prose. A spawned
   // process is one by construction (see ApplyRoleBindingOptions.spawnedProcess).
   if (!options?.spawnedProcess && !looksLikeLaunchInvocation(tokens)) return unchanged;
@@ -507,10 +726,81 @@ export function applyRoleBinding(
     }
   }
 
+  // Permission precedence (owner decision, #1681): an explicit, user-stated
+  // permission choice wins over the role's. Two sources count as explicit: the
+  // caller's suppressSkipPermissions (a toggle the user set OFF) and a
+  // permission flag the user typed on the line itself (`--permission-mode plan`,
+  // codex `-a never`, `-c approval_policy=never`).
+  //  - Either one withholds the role's skip flag AND drops the skip spellings
+  //    from the role's args, which would otherwise override the choice (claude
+  //    runs bypass when both flags are on one line).
+  //  - A typed permission flag also drops the permission flags (and their
+  //    values) from the role's args: they are appended after the user's, and
+  //    the last one wins.
+  // A permission flag inside the role's args is otherwise the role's own
+  // config, not the user's: it only stops the skip injection below. The role's
+  // args already trailing the line (a re-apply) are the role's too, so they are
+  // not read as the user's.
+  const stemGrammar = launchGrammarFor(stem);
+  const userTokens = roleArgs && alreadyEndsWithArgs(command, roleArgs)
+    ? tokens.slice(0, tokens.length - tokenize(roleArgs).length)
+    : tokens;
+  const userChosePermission = !!stemGrammar &&
+    hasPermissionChoice(stemGrammar, userTokens.slice(1).map((t) => t.value));
+  const withholdRoleSkip = !!options?.suppressSkipPermissions || userChosePermission;
+  let args = roleArgs;
+  let argsPermissionDropped = false;
+  if (args && withholdRoleSkip && stemGrammar) {
+    const argValues = tokenize(args).map((t) => t.value);
+    const choices = userChosePermission ? permissionChoiceIndexes(stemGrammar, argValues) : [];
+    const kept = dropArgTokens(
+      args,
+      (v, i) => isSkipPermissionsToken(stemGrammar, v) || choices.indexOf(i) !== -1,
+    );
+    if (kept !== args) {
+      argsPermissionDropped = true;
+      args = kept || undefined;
+    }
+  }
+  const skipPermissions = !!binding.skipPermissions && !withholdRoleSkip;
+  if (
+    userChosePermission && !options?.suppressSkipPermissions &&
+    ((binding.skipPermissions && binding.agent) || argsPermissionDropped)
+  ) {
+    const withheld =
+      "The role's permission settings were not applied: the command makes its own permission choice.";
+    note = note ? `${note} ${withheld}` : withheld;
+  }
+
+  // Launch options (effort, skip permissions) use the agent's verified grammar
+  // and, like the model, need the binding to name the agent. A flag already on
+  // the line OR in the binding's own args wins (D-4 for options): the args are
+  // appended below, so checking the line alone put two `--effort` on it. A
+  // permission flag in the args counts too: the role's own permission choice.
+  const launch = binding.agent ? stemGrammar : undefined;
+  const present = [...tokens, ...(args ? tokenize(args) : [])].map((t) => t.value);
+  const optionTokens: string[] = [];
+  const optionsInjected: InjectedLaunchOptions = {};
+  if (effort && launch?.effortFlag && !present.some((v) => launch.hasEffort?.(v))) {
+    optionTokens.push(...launch.effortFlag(effort));
+    optionsInjected.effort = effort;
+  }
+  if (
+    skipPermissions && launch?.skipPermissionsFlag &&
+    !present.some((v) => isSkipPermissionsToken(launch, v)) && !hasPermissionChoice(launch, present)
+  ) {
+    optionTokens.push(launch.skipPermissionsFlag);
+    optionsInjected.skipPermissions = true;
+  }
+
   let out = command;
-  if (injectModel && grammar) {
-    const at = tokens[0].end;
-    out = `${command.slice(0, at)} ${grammar.flag(model as string)}${command.slice(at)}`;
+  const at = tokens[0].end;
+  const inserted = [
+    ...(injectModel && grammar ? [grammar.flag(model as string)] : []),
+    ...optionTokens,
+  ];
+  if (inserted.length > 0) {
+    out = `${command.slice(0, at)} ${inserted.join(' ')}${command.slice(at)}`;
   }
   // Append extra args verbatim, but only when not already trailing (idempotence).
   if (args && !alreadyEndsWithArgs(out, args)) {
@@ -521,6 +811,7 @@ export function applyRoleBinding(
     command: out,
     changed: out !== command,
     modelInjected: injectModel,
+    ...(optionTokens.length > 0 ? { optionsInjected } : {}),
     ...(note ? { note } : {}),
   };
 }

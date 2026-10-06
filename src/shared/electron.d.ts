@@ -1,4 +1,28 @@
-import type { ElectronAPI, McpTargetStatusPayload } from '../preload/preload';
+import type { ElectronAPI, McpRegisterTargetResult, McpTargetStatusPayload } from '../preload/preload';
+import type { QuickLaunchAPI } from '../preload/quickLaunchPreload';
+import type {
+  AgySensorInstallResult,
+  AgySensorStatus,
+  QuotaReadRequest,
+  QuotaReadResult,
+} from './tokenUsage/quotaTypes';
+import type {
+  ProviderInventory,
+  SurfaceApplyResult,
+  SurfaceChangeRequest,
+  SurfaceInventoryRequest,
+  SurfacePreview,
+  SurfaceProviderId,
+} from './tokenUsage/surfaceTypes';
+import type {
+  ApplyProfileOptions,
+  ProfileApplyAggregateResult,
+  ProfilePreviewResult,
+  SaveProfileRequest,
+  SaveProfileResult,
+  SurfaceProfile,
+} from './tokenUsage/profileTypes';
+import type { SurfaceReconcileResult } from '../main/surfaces/reconcile/types';
 import type {
   RemoteInboxItem,
   LanLinkStatus,
@@ -11,14 +35,18 @@ import type {
   LanLinkPeersListResult,
 } from './lanlink';
 import type {
+  PairFlow,
   WebDeviceListError,
   WebDeviceRevokeResult,
   WebDeviceSetInputResult,
   WebDeviceSummary,
   WebStartArgs,
+  WebGrantArgs,
   WebTerminalInfo,
+  WebDiagnosis,
 } from './web';
-import type { PairFailureReason, RemoteAttachmentDescriptor, RemoteHostPublic, RemoteWorkspaceSummary } from './remoteHosts';
+import type { BrowserHelpOutcome, BrowserHelpRequestInfo } from './browserHelp';
+import type { PairFailureReason, RemoteAttachmentDescriptor, RemoteErrorReason, RemoteHostPublic, RemoteHostStatus, RemoteWorkspaceSummary } from './remoteHosts';
 import type {
   FirstRunCheckResult,
   RegisterMcpResult,
@@ -27,6 +55,8 @@ import type {
 
 declare global {
   interface Window {
+    /** Only in the quick-launch composer window (quickLaunchPreload.ts). */
+    quickLaunchAPI: QuickLaunchAPI;
     electronAPI: ElectronAPI & {
       onFileDrop: (callback: (paths: string[]) => void) => () => void;
       fs?: {
@@ -41,6 +71,24 @@ declare global {
         check: () => Promise<{ targets: McpTargetStatusPayload[] }>;
         reregister: () => Promise<{ targets: McpTargetStatusPayload[] }>;
         unregister: () => Promise<{ targets: McpTargetStatusPayload[] }>;
+        registerTarget: (targetId: string) => Promise<McpRegisterTargetResult>;
+      };
+      tokenUsage?: {
+        readQuota: (request?: QuotaReadRequest) => Promise<QuotaReadResult>;
+        agySensorStatus: () => Promise<AgySensorStatus>;
+        installAgySensor: () => Promise<AgySensorInstallResult>;
+        readInventory: (request: SurfaceInventoryRequest) => Promise<ProviderInventory>;
+        previewChanges: (request: SurfaceChangeRequest) => Promise<SurfacePreview>;
+        applyChanges: (request: SurfaceChangeRequest) => Promise<SurfaceApplyResult>;
+        listProfiles: () => Promise<SurfaceProfile[]>;
+        saveProfile: (
+          nameOrRequest: string | SaveProfileRequest,
+          providers?: SurfaceProviderId[],
+        ) => Promise<SaveProfileResult>;
+        deleteProfile: (id: string) => Promise<boolean>;
+        previewProfile: (id: string) => Promise<ProfilePreviewResult>;
+        applyProfile: (id: string, options?: ApplyProfileOptions) => Promise<ProfileApplyAggregateResult>;
+        reconcileSurface: (provider: SurfaceProviderId) => Promise<SurfaceReconcileResult>;
       };
       firstRun?: {
         check: () => Promise<FirstRunCheckResult>;
@@ -89,6 +137,22 @@ declare global {
         onClosed: (
           callback: (payload: { promptId: string }) => void,
         ) => () => void;
+      };
+      /**
+       * browser_request_help — the agent hands one browser step (login,
+       * CAPTCHA, OTP, payment confirmation) to the operator. `onOpen` pushes the
+       * request, `resolve` carries the operator's Done / Cancel, and `onClosed`
+       * clears the row whatever settled it — the human, the page condition, or
+       * main's deadline. Optional because an older preload bundle has no such
+       * member; every caller treats its absence as "no help UI".
+       */
+      browserHelp?: {
+        onOpen: (callback: (info: BrowserHelpRequestInfo) => void) => () => void;
+        resolve: (
+          requestId: string,
+          outcome: BrowserHelpOutcome,
+        ) => Promise<{ ok: boolean; error?: string }>;
+        onClosed: (callback: (payload: { requestId: string }) => void) => () => void;
       };
       /**
        * LanLink PR-2 — subscribe to materialized read-only REMOTE inbox items
@@ -140,8 +204,19 @@ declare global {
         status: (args?: { verifyFront?: boolean }) => Promise<WebTerminalInfo>;
         /** Start the server. `allowInput`/`expose` default false (read-only + loopback). */
         start: (args: WebStartArgs) => Promise<WebTerminalInfo>;
+        /**
+         * Change transcript / upload access on the RUNNING server in place.
+         * Resolves the current status untouched when the server is stopped.
+         */
+        setGrants: (args: WebGrantArgs) => Promise<WebTerminalInfo>;
         /** Stop the server. Resolves the post-stop state (`running:false`). */
         stop: () => Promise<WebTerminalInfo>;
+        /**
+         * Read-only readiness check (tailscale status + serve status + server
+         * status). Never starts, stops or configures anything. Optional: an
+         * older preload without it keeps the popover on the plain hub.
+         */
+        diagnose?: () => Promise<WebDiagnosis>;
         /**
          * Mint a fresh pairing code. Needed because a code is single-use and
          * expires, which would otherwise leave no way to pair another device
@@ -157,7 +232,9 @@ declare global {
          * rows cannot be operated — "which of these three do I revoke?" has no
          * answer six months later.
          */
-        pairStart: (name: string, allowInput?: boolean) => Promise<WebTerminalInfo>;
+        pairStart: (name: string, allowInput?: boolean, flow?: PairFlow) => Promise<WebTerminalInfo>;
+        /** End the pairing in progress, whichever card started it. */
+        pairCancel?: () => Promise<WebTerminalInfo>;
         /**
          * The paired-device roster.
          *
@@ -205,14 +282,21 @@ declare global {
          *  unauthenticated `GET /api/pair` route, then registers the host —
          *  the credential-in-clipboard-free alternative to hostsAdd's
          *  paste-URL flow. `reason` is machine-readable; the caller
-         *  translates it. */
-        hostsPair: (origin: string, code: string, label?: string) => Promise<
+         *  translates it. With `replaceHostId` the new credential replaces
+         *  that host's rejected one in place (same id, so its attachments
+         *  survive) instead of registering a new host. */
+        hostsPair: (origin: string, code: string, label?: string, replaceHostId?: string) => Promise<
           | { ok: true; host: RemoteHostPublic }
           | { ok: false; reason: PairFailureReason; attemptsLeft?: number }
         >;
         hostsRemove: (id: string) => Promise<boolean>;
+        /** Status per paired host for the Remote hub (hostId → status).
+         *  Probes are cached 60 s unless `force`; never rejects, and a host
+         *  that did not answer is `unreachable`, never `needs-repair`. */
+        hostsStatus?: (force?: boolean) => Promise<Record<string, RemoteHostStatus>>;
         workspacesList: (hostId: string) => Promise<
-          { ok: true; workspaces: RemoteWorkspaceSummary[] } | { ok: false; error: string }
+          | { ok: true; workspaces: RemoteWorkspaceSummary[] }
+          | { ok: false; error: string; reason?: RemoteErrorReason }
         >;
         /** Bootstraps the FIRST pane of a NEW workspace on `hostId` (#1001).
          *  The caller mints `workspaceId` — the daemon has no registry of its
@@ -221,7 +305,7 @@ declare global {
          *  unreachable host, a rejected token, or the remote's own daemon
          *  refusing the create. */
         workspaceCreate: (hostId: string, workspaceId: string, cwd?: string) => Promise<
-          { ok: true; sessionId: string } | { ok: false; error: string }
+          { ok: true; sessionId: string } | { ok: false; error: string; reason?: RemoteErrorReason }
         >;
         /** Destroy a session on `hostId` — the teardown twin of
          *  `workspaceCreate` (#1129). Detaches every live stream on that
@@ -231,7 +315,7 @@ declare global {
          *  own wording otherwise — notably on a host running without
          *  `--allow-input`, which refuses a close. Never rejects. */
         sessionClose: (hostId: string, sessionId: string) => Promise<
-          { ok: true } | { ok: false; error: string }
+          { ok: true } | { ok: false; error: string; reason?: RemoteErrorReason }
         >;
         /** Persisted attach descriptors — read on renderer boot to restore
          *  the attachments a reload/restart wiped out of the memory-only
@@ -247,10 +331,22 @@ declare global {
          *  (e.g. React StrictMode's double-effect) returns the SAME attachId
          *  rather than opening a second SSE stream on the remote. */
         paneAttach: (hostId: string, sessionId: string) => Promise<
-          { ok: true; attachId: string } | { ok: false; error: string }
+          { ok: true; attachId: string } | { ok: false; error: string; reason?: RemoteErrorReason }
         >;
         paneDetach: (attachId: string) => Promise<void>;
         paneWrite: (attachId: string, data: string) => void;
+        /** #1322 — ask the remote daemon to resize the PTY behind `attachId`
+         *  via the same `POST /api/sessions/:id/resize` route the phone uses
+         *  (#766). `{ ok: true }` only means the route accepted the request;
+         *  the applied geometry (which can differ, floored) arrives through
+         *  `onPaneResize` like any other resize on the remote. `{ ok: false }`
+         *  covers both an expected refusal (`409 desk-owns-size` — a desk
+         *  viewer on the remote host owns the size right now) and a transport
+         *  failure; the caller's remedy is the same either way: try again
+         *  next time the box changes. Never rejects. */
+        paneResize: (attachId: string, cols: number, rows: number) => Promise<
+          { ok: true; cols: number; rows: number } | { ok: false; reason: string }
+        >;
         onPaneMeta: (
           callback: (e: { attachId: string; cols: number; rows: number; snapshotB64: string; truncated?: boolean; omittedBytes?: number }) => void,
         ) => () => void;
@@ -262,8 +358,25 @@ declare global {
         onPaneData: (callback: (e: { attachId: string; dataB64: string }) => void) => () => void;
         onPaneExit: (callback: (e: { attachId: string }) => void) => () => void;
         /** Fires once reconnection gives up after too many consecutive
-         *  failures — the stream is dead until a fresh attach. */
-        onPaneError: (callback: (e: { attachId: string; message: string }) => void) => () => void;
+         *  failures — the stream is dead until a fresh attach. With
+         *  `reason: 'auth-rejected'` it fires at once instead: the host
+         *  answered 401, so no retry was attempted and only re-pairing helps. */
+        onPaneError: (
+          callback: (e: { attachId: string; message: string; reason?: RemoteErrorReason }) => void,
+        ) => () => void;
+        /**
+         * #1391 — ask MAIN to drive the `/api/workspaces` liveness cadence.
+         *
+         * RESOLVES to the unsubscribe; REJECTS when the subscribe did not land
+         * (no handler registered). Optional on top of that, because a renderer
+         * running against an older preload bundle has no such member at all.
+         * Both failures mean the same thing to the caller: drive the poll from
+         * its own (throttled) interval rather than stop polling altogether.
+         */
+        pollSubscribe?: () => Promise<() => void>;
+        /** Fires once per main-side poll round. No payload: it means only
+         *  "poll now" — every bit of polling policy stays in the renderer. */
+        onPollTick?: (callback: () => void) => () => void;
       };
     };
     clipboardAPI: {
@@ -282,6 +395,10 @@ declare global {
       readText: () => Promise<string>;
       readImage: (ptyId?: string) => Promise<string | null>;
       hasImage: () => Promise<boolean>;
+      /** Write text main takes back off after `ttlMs` or on quit, if still there. */
+      writeEphemeral?: (text: string, ttlMs: number) => Promise<void>;
+      /** Clear the ephemeral text now unless it is `stillValid` (`''` = nothing is). */
+      keepEphemeral?: (stillValid: string) => Promise<void>;
     };
   }
 }

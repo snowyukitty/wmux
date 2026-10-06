@@ -25,6 +25,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { IPty } from 'node-pty';
 import { DaemonPTYBridge } from '../DaemonPTYBridge';
+import { PromptEventLog } from '../PromptEventLog';
 import { RingBuffer } from '../RingBuffer';
 
 const BIG = 'x'.repeat(3000); // > ActivityMonitor's 2 KB active threshold
@@ -60,12 +61,26 @@ describe('DaemonPTYBridge turn priority', () => {
     active = [];
     bridge.on('idle', (e: { sessionId: string }) => idle.push(e.sessionId));
     bridge.on('active', (e: { sessionId: string }) => active.push(e.sessionId));
-    bridge.setupDataForwarding(fake.pty, new RingBuffer(65536), 'sess-1');
+    bridge.setupDataForwarding(fake.pty, new RingBuffer(65536), 'sess-1', new PromptEventLog());
   });
 
   afterEach(() => {
     bridge.cleanup();
     vi.useRealTimers();
+  });
+
+  it('requires positive empty prompt evidence and never treats a draft redraw as empty', () => {
+    expect(bridge.isEmptyShellPrompt()).toBe(false);
+    feed('\x1b]133;B\x07');
+    expect(bridge.isEmptyShellPrompt()).toBe(true);
+    bridge.noteInput('draft');
+    expect(bridge.isEmptyShellPrompt()).toBe(false);
+    feed('\x1b]133;A\x07\x1b]133;B\x07');
+    expect(bridge.isEmptyShellPrompt()).toBe(false);
+    feed('\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07');
+    expect(bridge.isEmptyShellPrompt()).toBe(true);
+    bridge.noteInput('codex -- hello\r');
+    expect(bridge.isEmptyShellPrompt()).toBe(false);
   });
 
   describe('baseline (unsettled pane)', () => {
@@ -316,6 +331,18 @@ describe('DaemonPTYBridge turn priority', () => {
   });
 
   describe('noteInput — what counts as a submitted turn', () => {
+    it('timestamps actual work for chat completion without treating paste or redraw as a new turn', () => {
+      expect(bridge.getLastTurnStartedAt()).toBe(0);
+      bridge.noteInput(`${PASTE_START}draft\nbody${PASTE_END}`);
+      bridge.noteAgentStatus('running');
+      expect(bridge.getLastTurnStartedAt()).toBe(0);
+      bridge.noteInput('\r');
+      const submitted = Date.now();
+      expect(bridge.getLastTurnStartedAt()).toBe(submitted);
+      vi.advanceTimersByTime(1000);
+      bridge.noteAgentStatus('running', true);
+      expect(bridge.getLastTurnStartedAt()).toBe(submitted + 1000);
+    });
     it('ordinary typing does NOT re-open the gate', () => {
       bridge.noteAgentStatus('waiting');
       bridge.noteInput('git st');
@@ -379,8 +406,10 @@ describe('DaemonPTYBridge turn priority', () => {
       expect(active).toEqual(['sess-1']);
     });
 
-    it('without forceSubmitted the same bare digit stays inert', () => {
-      bridge.noteAgentStatus('awaiting_input');
+    it('without forceSubmitted a bare digit on a pane that is not blocked stays inert', () => {
+      // On a pane blocked on a dialog the same digit IS the answer — see
+      // DaemonPTYBridge.answerRelease.test.ts.
+      bridge.noteAgentStatus('waiting');
       bridge.noteInput('2');
       feed('.');
       expect(active).toEqual([]);
@@ -513,4 +542,3 @@ describe('sparse-output turns after an explicit running edge (#1045)', () => {
     expect(active).toEqual(['sess-1']);
   });
 });
-

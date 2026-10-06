@@ -34,12 +34,24 @@ function hostPlatform(): NodeJS.Platform | string {
   return 'linux';
 }
 
+/**
+ * #1729 — a cwd read from terminal output can carry a control character that
+ * is not in the directory's name: a prompt that wrapped in a narrow pane
+ * arrives with the line break inside the path (`~/wslt` CR LF `est`). Stored,
+ * it named no directory and broke WSL pane recovery. POSIX does allow such
+ * names; they are deliberately rejected (the last good cwd stays), because a
+ * terminal cannot tell them from a wrap.
+ */
+export function containsControlChars(value: string): boolean {
+  return /[\u0000-\u001f\u007f]/.test(value);
+}
+
 /** Whether the cwd shape can exist on the current platform. platform defaults to the runtime environment. */
 export function isPlausibleCwd(
   cwd: string,
   platform: NodeJS.Platform | string = hostPlatform(),
 ): boolean {
-  if (!cwd) return false;
+  if (!cwd || containsControlChars(cwd)) return false;
   const isWinShape = /^[A-Za-z]:[\\/]/.test(cwd) || cwd.startsWith('\\\\');
   // Absolute (or ~-anchored) shapes only — a relative token is never a real cwd.
   const isPosixShape = cwd.startsWith('/') || cwd === '~' || cwd.startsWith('~/');

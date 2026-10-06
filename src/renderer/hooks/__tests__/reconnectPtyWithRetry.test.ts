@@ -88,3 +88,39 @@ describe('reconnectPtyWithRetry (RCA A1 non-destructive contract)', () => {
     expect(clearPtyId).not.toHaveBeenCalled(); // never mutate a torn-down terminal
   });
 });
+
+ it('retains a failed WSL recovery and reports the error until an explicit retry succeeds', async () => {
+   const clearPtyId = vi.fn(); const onRecoveryError = vi.fn();
+   const reconnect = vi.fn().mockResolvedValueOnce({ success: false, recoveryPending: true, error: 'Distro unavailable' }).mockResolvedValueOnce({ success: true });
+   const deps = { reconnect, clearPtyId, onRecoveryError, sleep: noSleep };
+   await reconnectPtyWithRetry('saved-pane', alwaysCurrent, deps);
+   expect(reconnect).toHaveBeenCalledTimes(1);
+   expect(clearPtyId).not.toHaveBeenCalled();
+   // #1305 — an ordinary pending recovery is NOT a missing directory: Retry is
+   // the only offer, and the banner must not grow a second action for it.
+   expect(onRecoveryError).toHaveBeenLastCalledWith('Distro unavailable', { cwdMissing: false });
+   await reconnectPtyWithRetry('saved-pane', alwaysCurrent, deps);
+   expect(onRecoveryError).toHaveBeenLastCalledWith(null);
+   expect(clearPtyId).not.toHaveBeenCalled();
+ });
+
+ // #1305 — the one pending failure Retry cannot clear. The flag rides the
+ // result rather than being read out of the message: that text is the
+ // distro's, and parsing it would be wrong in every language but one.
+ it('reports a missing WSL directory so the banner can offer a fresh start', async () => {
+   const clearPtyId = vi.fn(); const onRecoveryError = vi.fn();
+   const reconnect = vi.fn(async () => ({
+     success: false,
+     recoveryPending: true,
+     cwdMissing: true,
+     error: 'The directory "/home/dev/gone" no longer exists in Ubuntu.',
+   }));
+   await reconnectPtyWithRetry('saved-pane', alwaysCurrent, { reconnect, clearPtyId, onRecoveryError, sleep: noSleep });
+   expect(onRecoveryError).toHaveBeenLastCalledWith(
+     'The directory "/home/dev/gone" no longer exists in Ubuntu.',
+     { cwdMissing: true },
+   );
+   // Still non-destructive: the pane keeps its id and its scrollback, which is
+   // the whole point of offering the fresh start instead of a close.
+   expect(clearPtyId).not.toHaveBeenCalled();
+ });

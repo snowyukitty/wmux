@@ -6,7 +6,8 @@
 // supervising a fleet could not open one.
 //
 // The tool schema deliberately has NO agent-command, workspace, member or
-// repository input. Those are all derived server-side from the caller's
+// repository input. The CLI is chosen by NAME only — `agents[].agent` is a slug
+// from a closed table and `preset` names operator data — never by command. Those are all derived server-side from the caller's
 // verified identity (see src/main/pipe/handlers/fanout.rpc.ts); exposing them
 // here would only invite callers to send values the handler rejects — or, for
 // the agent command, would be arbitrary command execution.
@@ -24,6 +25,8 @@ import { sendRpc } from './wmux-client';
 import type { RpcMethod } from '../shared/rpc';
 import { FANOUT_MAX_TASKS, FANOUT_PROMPT_MAX_BYTES } from '../shared/workTask';
 import { ORCH_ROLES } from '../shared/orchestratorRole';
+import { FANOUT_MODEL_RE } from '../shared/fanoutPreset';
+import { EFFORT_TOKEN_RE } from '../shared/agentLaunchOptions';
 
 /** Resolvers the parent module injects (mirrors ChannelToolDeps). */
 export interface FanOutToolDeps {
@@ -86,8 +89,43 @@ const FANOUT_START_SHAPE = {
       // Kept terse on purpose: the commander tools/list payload is budgeted
       // (scripts/mcp-protocol-baseline.json), and the long form of this already
       // lives in the brain's `fanout` skill and the SDK system prompt.
-      `Per-task role (${ORCH_ROLES.join(' | ')}), index-aligned with titles. Picks that task's agent CLI and model from the operator's bindings — your only agent control. Omit for the default.`,
+      `Per-task role (${ORCH_ROLES.join(' | ')}), index-aligned with titles. Picks that task's agent CLI and model from the operator's bindings. Omit for the default.`,
     ),
+  // Fixed text on purpose: the operator's preset NAMES are never inlined here —
+  // tools/list is pinned per profile (scripts/mcp-protocol-baseline.json), and
+  // an unknown name is answered with the list instead.
+  preset: z
+    .string()
+    .min(1)
+    .max(64)
+    .optional()
+    .describe('Operator preset name (Settings). Task k runs on its row k; unknown names return the list.'),
+  agents: z
+    .array(
+      z
+        .object({
+          agent: z.string().min(1).max(48),
+          model: z.string().regex(FANOUT_MODEL_RE).max(64).optional(),
+          effort: z.string().regex(EFFORT_TOKEN_RE, 'effort must be one lowercase word, e.g. low, medium, high').optional(),
+        })
+        .strict(),
+    )
+    .max(FANOUT_MAX_TASKS)
+    .optional()
+    .describe(
+      'Per-task agent CLI slug (+ model, + effort), one per title. Effort overrides the CLI default; an agent without an effort flag ignores it with a warning. At most one of roles, preset, agents.',
+    ),
+  files: z
+    .array(z.array(z.string().min(1).max(256)).max(32))
+    .max(FANOUT_MAX_TASKS)
+    .optional()
+    .describe('Per-task write scope (repo-relative globs), one non-empty list per title. Overlap is refused unless one task depends on the other.'),
+  depends_on: z
+    .array(z.array(z.number().int().min(0)).max(FANOUT_MAX_TASKS))
+    .max(FANOUT_MAX_TASKS)
+    .optional()
+    .describe('Per-task 0-based indices of tasks that must reach review_requested/completed before this one is spawned from a fresh origin commit.'),
+  cancel_pending: z.boolean().optional().describe('With an existing key: drop its tasks still waiting on depends_on.'),
 };
 
 /** Register the fan-out tool on the given MCP server. */
@@ -111,12 +149,12 @@ export function registerFanOutTools(server: McpServer, deps: FanOutToolDeps): vo
       // the commander surface, so pointing a brain at it names a tool its
       // tools/list does not contain. Every profile can see the mission channels
       // themselves, which is the same answer.
-      'Returns { status: "accepted" } immediately: spawning outlasts one RPC, so poll with the SAME idempotency_key, or watch each mission channel appear in your channel list. ' +
-      'The user must approve first and that prompt is never auto-approved; unanswered, a poll reports { status: "denied", reason: "timeout" } rather than leaving you waiting. ' +
-      'Repository, owning workspace and agent command all come from your verified identity — fan-out runs in YOUR repository, the tasks are owned by you, and it is refused without that identity. ' +
-      'An accept may carry `warnings` (also printed as a WARNING line): the fan-out ran, but something will stop its reports reaching you — act on it.',
+      'Returns { status: "accepted", ownerWorkspaceId } immediately. ownerWorkspaceId (and its deprecated alias workspaceId) is YOUR workspace, never a task\'s — never close it; each task\'s own workspaceId is in the completed poll\'s result.tasks[]. Spawning outlasts one RPC, so poll with the SAME idempotency_key, or watch each mission channel appear in your channel list. ' +
+      'No approval prompt unless the user turned it on (unanswered, a poll says denied/timeout). A task cannot fan out again; over the cap (8 live, 24/h) it is refused. ' +
+      'Repository and owning workspace come from your verified identity — fan-out runs in YOUR repository, the tasks are owned by you, and it is refused without that identity. A preset may skip the worktree: each task then writes into its own folder. ' +
+      'An accept or the completed poll may carry `warnings` (also printed as WARNING lines): the fan-out ran, but something will stop its reports reaching you or the tasks did not start from a fresh origin commit — act on it.',
     FANOUT_START_SHAPE,
-    async ({ idempotency_key, titles, prompt, task_prompts, roles }) => {
+    async ({ idempotency_key, titles, prompt, task_prompts, roles, preset, agents, files, depends_on, cancel_pending }) => {
       const params: Record<string, unknown> = {
         idempotencyKey: idempotency_key,
         titles,
@@ -124,6 +162,11 @@ export function registerFanOutTools(server: McpServer, deps: FanOutToolDeps): vo
       if (prompt !== undefined) params['prompt'] = prompt;
       if (task_prompts !== undefined) params['taskPrompts'] = task_prompts;
       if (roles !== undefined) params['roles'] = roles;
+      if (preset !== undefined) params['preset'] = preset;
+      if (agents !== undefined) params['agents'] = agents;
+      if (files !== undefined) params['files'] = files;
+      if (depends_on !== undefined) params['dependsOn'] = depends_on;
+      if (cancel_pending === true) params['cancelPending'] = true;
       // The verified ptyId is the whole identity basis for this call — the
       // handler resolves it to the owning workspace and refuses without it.
       // Resolve identity FIRST: the walk that produces that ptyId is a side

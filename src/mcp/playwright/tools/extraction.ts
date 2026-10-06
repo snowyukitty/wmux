@@ -3,10 +3,17 @@ import { z } from 'zod';
 import { PlaywrightEngine } from '../PlaywrightEngine';
 import { withAutomationLease } from '../automationLease';
 import { getSmartSnapshot, getSmartSnapshotViaEval, smartPageToken } from '../dom-intelligence';
-import { extractMarkdown, extractStructuredData } from '../markdown-extractor';
+import { extractMarkdown, extractStructuredDataWithNotes } from '../markdown-extractor';
 import { resolveEvaluator, rpcEvaluator } from '../page-eval';
 import { formatSnapshotResult } from '../snapshotDiff';
 import { getSnapshotBaseline, setSnapshotBaseline, snapshotSurfaceKey } from '../snapshotCache';
+import {
+  capCaptureText,
+  continueSnapshotCapture,
+  cursorIgnoredNote,
+  windowBudgetForMaxBytes,
+  windowSnapshotText,
+} from '../snapshotCursor';
 import { captureSnapshotListing } from '../snapshotListing';
 import { allowScopedRpcFallback, type BrowserToolDeps } from '../browserScope';
 import { describeToolError } from '../toolError';
@@ -15,7 +22,23 @@ import { describeToolError } from '../toolError';
 const optionalSurfaceId = z
   .string()
   .optional()
-  .describe('Omit for the active surface.');
+  .describe('Omit for the surface you opened last.');
+
+// Per-call text-result cap, honoured by the dispatch-layer guard
+// (src/mcp/resultCap.ts) on tools whose output size the caller does not
+// directly control. Plain z.number(): the guard floors and clamps the value
+// itself (every zod numeric modifier costs bytes in tools/list).
+const maxBytesParam = z
+  .number()
+  .optional()
+  .describe('Cap the text result in bytes (default 65536, max 524288).');
+
+// Upper bounds for the caller-set extraction sizes. Clamped in the handlers,
+// not the schema, so an over-limit request is served at the ceiling rather
+// than rejected. maxContentLength matches the diff-baseline cost of one
+// listing; maxLength matches the 512 KiB result cap the guard can enforce.
+const MAX_SMART_CONTENT_CHARS = 100_000;
+const MAX_EXTRACT_TEXT_CHARS = 524_288;
 
 // Module-scope parameter shapes: hoisted out of the per-registration path so
 // every createWmuxServer() instance shares one set of zod schema objects.
@@ -23,9 +46,16 @@ const BROWSER_SMART_SNAPSHOT_SHAPE = {
   maxContentLength: z
     .number()
     .optional()
-    .describe('Content summary cap in characters (default 3000).'),
+    .describe('Content summary cap in characters (default 3000, max 100000).'),
   full: z.boolean().optional().describe('Force the complete tree instead of a diff.'),
+  cursor: z
+    .string()
+    .optional()
+    .describe(
+      'Continuation token from a truncated snapshot: returns the next lines of that same capture without re-reading the page (refs stay valid). Other parameters are ignored with a cursor.',
+    ),
   surfaceId: optionalSurfaceId,
+  maxBytes: maxBytesParam,
 };
 
 const BROWSER_EXTRACT_TEXT_SHAPE = {
@@ -36,12 +66,13 @@ const BROWSER_EXTRACT_TEXT_SHAPE = {
   maxLength: z
     .number()
     .optional()
-    .describe('Character cap on the markdown.'),
+    .describe('Character cap on the markdown (max 524288).'),
   includeLinks: z
     .boolean()
     .optional()
     .describe('Preserve hyperlinks (default false).'),
   surfaceId: optionalSurfaceId,
+  maxBytes: maxBytesParam,
 };
 
 const BROWSER_EXTRACT_DATA_SHAPE = {
@@ -52,6 +83,7 @@ const BROWSER_EXTRACT_DATA_SHAPE = {
     .record(z.string(), z.string())
     .describe('Field name to expected type, e.g. { name: "string", price: "number" }.'),
   surfaceId: optionalSurfaceId,
+  maxBytes: maxBytesParam,
 };
 
 /**
@@ -70,15 +102,42 @@ export function registerExtractionTools(server: McpServer, deps: BrowserToolDeps
   // -----------------------------------------------------------------------
   server.tool(
     'browser_smart_snapshot',
-    'Indexed interactive elements plus clean page text. Pass a returned ref to browser_click as smartRef. A repeat call returns a diff; pass full:true for the whole listing.',
+    'Indexed interactive elements plus clean page text. Pass a returned ref to browser_click as smartRef. On the chrome backend a repeat call returns a diff (full:true forces the whole listing); the packaged RPC lane numbers refs by position, so it returns the full listing every time and says so.',
     BROWSER_SMART_SNAPSHOT_SHAPE,
-    async ({ maxContentLength, full, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
+    async ({ maxContentLength, full, cursor, maxBytes, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
+        // This tool declares maxBytes, so its windows are sized to the ceiling
+        // the CALLER asked for rather than the default — raising maxBytes buys
+        // bigger windows instead of being silently overridden by a fixed one.
+        const budget = windowBudgetForMaxBytes(maxBytes);
+        // Continuation: the next window of a capture already stored for this
+        // surface, served before anything touches the page. No re-read means no
+        // new smart-ref numbering, so the refs in this window are the ones the
+        // capture listed and browser_click({smartRef}) still resolves them. Not
+        // diffed either — the baseline is neither read nor written here.
+        if (cursor) {
+          const continued = continueSnapshotCapture(
+            cursor,
+            budget,
+            scope.surfaceId ? snapshotSurfaceKey(scope.workspaceId, scope.surfaceId) : undefined,
+          );
+          const ignored = [
+            maxContentLength !== undefined && 'maxContentLength',
+            full !== undefined && 'full',
+          ].filter((name): name is string => typeof name === 'string');
+          const note = continued.isError ? '' : cursorIgnoredNote(ignored);
+          return {
+            content: [{ type: 'text' as const, text: note + continued.text }],
+            ...(continued.isError && { isError: true }),
+          };
+        }
+
         // Playwright path uses the CDP accessibility tree; when no Page is
         // available (packaged builds, issue #105) fall back to a DOM-based
         // snapshot over the RPC channel.
         const page = await engine.getPageForScope(scope).catch(allowScopedRpcFallback);
-        const capLength = maxContentLength ?? 3000;
+        // Clamp, not reject: an over-limit cap is served at the ceiling.
+        const capLength = Math.min(maxContentLength ?? 3000, MAX_SMART_CONTENT_CHARS);
         const snapshot = page
           ? await getSmartSnapshot(page, { maxContentLength: capLength, surfaceId: scope.surfaceId })
           : await getSmartSnapshotViaEval(rpcEvaluator(scope), {
@@ -105,7 +164,9 @@ export function registerExtractionTools(server: McpServer, deps: BrowserToolDeps
           lines.push(snapshot.content);
         }
 
-        const text = lines.join('\n');
+        // Bound what the diff baseline and the repl listing retain, the same cut
+        // browser_snapshot makes, leaving a line naming what it dropped.
+        const text = capCaptureText(lines.join('\n'));
 
         // Auto-diff, same machinery and same 50%/800-line fallback as
         // browser_snapshot (snapshotDiff.ts): a repeat call with the same
@@ -139,16 +200,42 @@ export function registerExtractionTools(server: McpServer, deps: BrowserToolDeps
         // it is handed a diff (snapshotListing.ts).
         captureSnapshotListing(text);
 
+        const notes: string[] = [];
         // The content summary is cut at maxContentLength, so a diff — "(no
         // changes)" most of all — speaks only for what fits (review 10).
         const truncated = snapshot.content.endsWith('... (truncated)');
-        const note =
-          rendered.usedDiff && truncated
-            ? `\n(page text is capped at ${capLength} characters; anything past the cut is not compared)`
-            : '';
+        if (rendered.usedDiff && truncated) {
+          notes.push(`(page text is capped at ${capLength} characters; anything past the cut is not compared)`);
+        }
+        // #1360: "a repeat call returns a diff" is true only where refs are
+        // keyed on DOM identity. On this lane they are positional, so the tool
+        // silently returned the full tree every time and looked broken. Say
+        // which it is instead of leaving the caller to infer it.
+        if (!page && !full) {
+          notes.push('(no diff on this backend: refs here are numbered by walk position, so a single insertion renumbers the listing and a diff would be noise. The chrome backend diffs.)');
+        }
+
+        // The caveats go directly UNDER the header line rather than at the end.
+        // The header's contract is to be the first line, but a windowed result's
+        // tail only reaches the LAST window — and "(page text is capped…)" is
+        // exactly what the agent needs while reading the first one.
+        const [header, ...body] = rendered.text.split('\n');
+        const annotated = [header, ...notes, ...body].join('\n');
+
+        // Truncation, last: the listing plus its notes is what the agent reads,
+        // so that is the text a cursor walks. Keyed on the BARE surface key, not
+        // the tool-namespaced diff key — a capture is one frozen view of a
+        // surface, and the next snapshot of it from either tool retires this one.
+        const captureKey = snapshotSurfaceKey(scope.workspaceId, scope.surfaceId);
+        const windowed = windowSnapshotText(
+          captureKey,
+          annotated,
+          snapshot.url || undefined,
+          budget,
+        );
 
         return {
-          content: [{ type: 'text' as const, text: rendered.text + note }],
+          content: [{ type: 'text' as const, text: windowed }],
         };
       } catch (error) {
         const message = describeToolError(error);
@@ -174,9 +261,11 @@ export function registerExtractionTools(server: McpServer, deps: BrowserToolDeps
         // is a string script, so both transports produce identical output.
         const evaluate = await resolveEvaluator(engine, scope);
 
+        // Clamp, not reject: an over-limit cap is served at the ceiling.
+        const maxLengthClamped = maxLength === undefined ? undefined : Math.min(maxLength, MAX_EXTRACT_TEXT_CHARS);
         const markdown = await extractMarkdown(evaluate, {
           selector,
-          maxLength,
+          maxLength: maxLengthClamped,
           includeLinks,
         });
 
@@ -206,13 +295,19 @@ export function registerExtractionTools(server: McpServer, deps: BrowserToolDeps
         // RPC fallback when not (packaged builds, issue #105).
         const page = await engine.getPageForScope(scope).catch(allowScopedRpcFallback);
 
-        const records = await extractStructuredData(page, scope, goal, fields);
+        const { records, notes } = await extractStructuredDataWithNotes(page, scope, goal, fields);
+
+        // Caveats ride along after the JSON, the same way browser_snapshot
+        // appends its truncation note (issue #1353): a positional column guess
+        // or a one-field-only mapping is still a result, but the agent has to
+        // know it is a guess.
+        const note = notes.length > 0 ? `\n\n(${notes.join('; ')})` : '';
 
         return {
           content: [
             {
               type: 'text' as const,
-              text: JSON.stringify(records, null, 2),
+              text: JSON.stringify(records, null, 2) + note,
             },
           ],
         };

@@ -15,11 +15,14 @@ import {
   findWorkspaceSurfaceByPtyId,
   findWorkspaceSurfaceById,
 } from '../utils/paneTraversal';
-import { getWorkspacePtyIds } from '../../shared/paneUtils';
+import { getWorkspaceLeafPanes, getWorkspacePtyIds } from '../../shared/paneUtils';
 import { unionSurfacePorts } from '../stores/slices/workspacePorts';
 import { FrameCoalescer } from '../utils/frameCoalescer';
 import { normalizeWorktreePath } from '../../shared/workTask';
 import { isBrainPtyId } from '../../shared/constants';
+import type { AppRoute } from '../stores/slices/uiSlice';
+import { showWorkspaces as revealWorkspaces } from '../utils/showWorkspaces';
+import { notePanePr } from './fanoutCallerNudge';
 
 /**
  * J3 §4 — cwd가 태스크 worktree 경계 안인지(best-effort, OSC 협조 기반). 정규화
@@ -83,6 +86,43 @@ export function resolveNotificationTarget(
   return { workspaceId: ws.id, surfaceId, paneId: leaf?.id };
 }
 
+// ─── OS toast location line ────────────────────────────────────────────────
+
+/** Longest pane title the OS toast repeats before eliding. */
+const OS_TOAST_TITLE_MAX = 60;
+
+/**
+ * Where a notification came from, as the operator sees it: `workspace › tab`.
+ * The in-app toast and panel sit next to the pane they name, but the native
+ * OS toast is read away from wmux, and with several agents running
+ * "Codex CLI: Task finished" doesn't say WHICH one finished. Falls back to
+ * whichever half exists; empty when neither does.
+ */
+export function describeNotificationSource(
+  ws: Pick<Workspace, 'name' | 'rootPane' | 'stashedPanes'> | undefined,
+  surfaceId: string | undefined,
+): string {
+  if (!ws) return '';
+  const surface = surfaceId
+    ? getWorkspaceLeafPanes(ws).flatMap((leaf) => leaf.surfaces).find((s) => s.id === surfaceId)
+    : undefined;
+  let tab = surface?.title?.trim() ?? '';
+  if (tab.length > OS_TOAST_TITLE_MAX) tab = `${tab.slice(0, OS_TOAST_TITLE_MAX - 1)}…`;
+  return [ws.name?.trim(), tab].filter(Boolean).join(' › ');
+}
+
+/**
+ * OS toast body with the source on the first line. The body is dropped when
+ * the title already ends with it — hook completions arrive as
+ * title "Codex CLI: Task finished" + body "Task finished", which renders the
+ * same words twice and nothing about the pane.
+ */
+export function osToastBody(title: string, body: string, source: string): string {
+  if (!source) return body;
+  const redundant = !body.trim() || title.trimEnd().endsWith(body.trim());
+  return redundant ? source : `${source}\n${body}`;
+}
+
 // ─── Toast click → pane jump (X2) ──────────────────────────────────────────
 
 /**
@@ -114,8 +154,20 @@ export interface FocusTargetState {
    * tree). Optional for the same reason as `unstashPane`: minimal test
    * fixtures without the remoteWorkspacesSlice mounted stay terse, and a
    * missing field reads as "no remote mirror is showing", the correct default.
+   * Deliberately the raw flag rather than `isRemoteMirrorVisible` (#1282): this
+   * interface is a minimal surface that callers satisfy with hand-built
+   * fixtures, and the predicate needs `remoteWorkspaces` too. The gap only
+   * matters for a key with no entry behind it, which nothing can produce today
+   * — and here it errs the safe way: the jump fires an extra activation.
    */
   activeRemoteKey?: string | null;
+  /**
+   * The rail page the sheet shows. A jump lands on a pane, so it swaps the
+   * sheet back to Workspaces. Optional like the fields above: a fixture
+   * without it reads as "already on Workspaces".
+   */
+  appRoute?: AppRoute;
+  setAppRoute?: (route: AppRoute) => void;
 }
 
 /**
@@ -181,6 +233,7 @@ export function focusNotificationTarget(
   payload: { ptyId?: string | null; workspaceId?: string | null; surfaceId?: string | null },
 ): boolean {
   const state = getState();
+  const showWorkspaces = (): void => revealWorkspaces(state);
   // Shared tail of both resolver branches: jump (workspace + pane +
   // surface + zoom coherence), then mark this surface's unread
   // notifications read and clear the ring iff something was marked.
@@ -194,6 +247,7 @@ export function focusNotificationTarget(
     // PANE_STASHED refusal instead — an agent rearranging the layout as a side
     // effect IS the surprise this feature exists to prevent.)
     if (stashed) state.unstashPane?.(paneId, workspaceId);
+    showWorkspaces();
     const fresh = activatePaneTarget(getState, { workspaceId, paneId, surfaceId });
     let markedAny = false;
     for (const n of fresh.notifications) {
@@ -235,6 +289,7 @@ export function focusNotificationTarget(
       if (ws.id !== state.activeWorkspaceId || state.activeRemoteKey) {
         state.setActiveWorkspace(ws.id);
       }
+      showWorkspaces();
       return true;
     }
   }
@@ -444,7 +499,14 @@ export function createNotificationHandler(deps: NotificationHandlerDeps) {
         case 'osToast':
           deps.showOsToast({
             title: action.payload.title,
-            body: action.payload.body,
+            body: osToastBody(
+              action.payload.title,
+              action.payload.body,
+              // Only a ptyId names the sending tab. Without one (CLI or MCP
+              // notify), target.surfaceId is just the workspace's active tab,
+              // which may be a different pane than the sender.
+              describeNotificationSource(ws, ptyId ? target.surfaceId : undefined),
+            ),
             ptyId: ptyId ?? null,
             workspaceId: target.workspaceId,
             // Codex review catches (rounds 1+2): main's ToastManager must
@@ -538,6 +600,7 @@ export function useNotificationListener() {
     });
     const gitBranchCoalescer = new FrameCoalescer<string, string>((ptyId, branch) => {
       const state = useStore.getState();
+      state.setSurfaceGitBranch(ptyId, branch);
       for (const ws of state.workspaces) {
         if (findSurfaceByPtyId(ws.rootPane, ptyId)) {
           state.updateWorkspaceMetadata(ws.id, { gitBranch: branch });
@@ -630,7 +693,7 @@ export function useNotificationListener() {
       // workspace metadata — pull it OUT here, alongside ptyId, so it can never
       // flow into `...rest` and get written into updateWorkspaceMetadata by
       // applyToWorkspace's spread.
-      const { ptyId, workspaceId: payloadWsId, activity, pendingQuestion, paneId, paneLabel, paneRole, agentSlug, hookKind, settled, ...rest } = payload;
+      const { ptyId, workspaceId: payloadWsId, activity, pendingQuestion, lastMessage, lastActivity, paneId, paneLabel, paneRole, agentSlug, hookKind, settled, ...rest } = payload;
 
       // The orchestrator's own brain pty (the `claude-pty` vendor's embedded
       // Claude Code TUI) is not a fleet agent. The daemon has no idea it is
@@ -641,6 +704,10 @@ export function useNotificationListener() {
       // Nothing downstream of here is meaningful for a brain, so drop the
       // payload whole.
       if (isBrainPtyId(ptyId)) return;
+
+      // The PR owner nudge needs every pane's PR, not only the active one's
+      // (the workspace record below keeps the active surface's alone).
+      if (ptyId && 'pr' in rest) notePanePr(ptyId, rest.pr);
 
       // P2 (checklist D): a paneId-only payload is the pane-label relay from
       // MetadataStore. Route it to the per-pane label + role mirrors and return
@@ -719,6 +786,11 @@ export function useNotificationListener() {
             state.settleSurfaceTurn(ptyId);
           }
         }
+        // The surface's own branch (Moa's view pointer): the workspace record
+        // above only follows the active pane, and only at the time it arrives.
+        if (typeof rest.gitBranch === 'string') {
+          state.setSurfaceGitBranch(ptyId, rest.gitBranch);
+        }
         // Part A: stamp per-surface agent IDENTITY (name + status) keyed by
         // ptyId so a2a_discover / surface_list / pane_list can label each pane
         // individually. setSurfaceAgent keeps an already-known name when only a
@@ -748,6 +820,8 @@ export function useNotificationListener() {
         // agent resumed after any older complete/waiting state. Reconcile both
         // mirrors here, where event order is known; a selector cannot compare
         // the timestamp with an attention state that carries no timestamp.
+        // A session start drops the retained last-activity line (a Stop keeps it).
+        if (lastActivity === '') state.clearSurfaceLastActivity(ptyId);
         if (typeof activity === 'string') {
           state.setSurfaceActivity(ptyId, activity);
           // Only activity-ONLY payloads need lifecycle reconciliation. When
@@ -764,6 +838,11 @@ export function useNotificationListener() {
         // signal for a pane whose previous turn ended on a question.
         if (typeof pendingQuestion === 'string') {
           state.setSurfacePendingQuestion(ptyId, pendingQuestion);
+        }
+        // Same shape again: main truncates, every turn boundary writes it, and
+        // '' clears.
+        if (typeof lastMessage === 'string') {
+          state.setSurfaceLastMessage(ptyId, lastMessage);
         }
         // Workspace-wide (#977): the one-shot agent-name backfill below lands
         // HERE and nowhere else. A stashed pane that missed the original
@@ -932,7 +1011,7 @@ export function useNotificationListener() {
     });
 
     // Phase 2 — Anthropic 5h/7d usage meter. Main pushes a PollerState
-    // snapshot on initial fetch, hourly tick, manual refresh, and on
+    // snapshot on initial fetch, 15-minute tick, manual refresh, and on
     // error transitions. Renderer treats the payload as opaque.
     const unsubUsage = window.electronAPI.usage.onUpdate((state) => {
       useStore.getState().setAnthropicUsage(state);

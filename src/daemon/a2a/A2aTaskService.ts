@@ -45,6 +45,8 @@ import {
   normalizeCompletionEvidenceWire,
   validateCompletionEvidence,
 } from '../../shared/completionEvidence';
+import { isVerifiedTaskSender } from '../../shared/a2aReopen';
+import { isReceiverPaneGone } from '../../shared/a2aOrphanedTask';
 import type {
   A2aTaskCancelPayload,
   A2aTaskCreatePayload,
@@ -79,6 +81,8 @@ function evidenceGateHint(code: string): string {
       return 'evidence.files must be repo-relative paths (no absolute, drive, ADS, url-scheme, or ".." segments)';
     case 'failure_reason_missing':
       return "status 'failed' requires an evidence summary (the failure reason)";
+    case 'cancel_reason_missing':
+      return "status 'canceled' requires an evidence summary (why the task is dropped)";
     default:
       return 'attach valid completion evidence and retry';
   }
@@ -127,6 +131,21 @@ export interface TransitionInput {
    * 렌더러 검증 경로로 폴백한다(오늘의 판정 지점 보존, 서버측 이관은 PR5/§7).
    */
   callerHasPaneIdentity?: boolean;
+  /**
+   * The caller must prove its pane to move a pane-pinned task (external
+   * callers). Without it, a caller that simply omits senderPtyId fell back to
+   * workspace authz and could move another pane's task. Trusted in-process
+   * lanes and the headless ClaudeWorker do not set it.
+   */
+  requirePaneIdentity?: boolean;
+  /**
+   * Live pane ids of the caller's workspace (stashed included), resolved by
+   * main from the pane tree in the same read as `callerAddr` — so it carries
+   * the same trust as `callerAddr`. When it is known and lacks the task's
+   * `to.paneId`, the addressed pane is gone and a verified pane of the receiver
+   * workspace may move the task (#1598). Absent = unknown: no relaxation.
+   */
+  livePaneIds?: readonly string[];
   /** 사람용 상태 메시지(있을 때만). */
   message?: Message;
   /** §6.M 완료증거(raw). 서비스가 재정규화(sanitize)해 저장 — 게이트 없음. */
@@ -149,6 +168,7 @@ export type OpErr = { ok: false; error: string };
 export type TransitionOk = { ok: true; verifiedItemCount?: number; task: Task };
 export type CancelOk = { ok: true; task: Task };
 export type CreateOk = { ok: true; taskId: string; task: Task };
+export type ReopenOk = { ok: true; reopened: boolean; task: Task };
 
 export interface QueryFilters {
   status?: TaskState;
@@ -316,7 +336,13 @@ export class A2aTaskService {
       // pane-granular authz(S-C2): 호출자 페인이 알려졌고(callerAddr) 태스크가 특정
       // 수신 페인에 핀됐으면(to.paneId) 그 페인이어야 한다. callerAddr 부재(헤드리스
       // ClaudeWorker)면 ws-authz — 이 불변식이 워커 완료 전이를 막지 않게 한다.
-      if (input.callerAddr && task.metadata.to.paneId && task.metadata.to.paneId !== input.callerAddr.paneId) {
+      // #1598: a pinned task whose receiver pane no longer exists is adopted by
+      // any verified pane of the receiver workspace (checked above), instead of
+      // being stuck forever. A live receiver pane keeps the rule.
+      if (
+        input.callerAddr && task.metadata.to.paneId && task.metadata.to.paneId !== input.callerAddr.paneId
+        && !isReceiverPaneGone(task.metadata.to, input.callerWorkspaceId, input.livePaneIds)
+      ) {
         return { ok: false, error: 'a2a.task.update: caller pane is not the addressed receiver pane' };
       }
       // S-C2 soft-defer: 페인 핀 태스크 + 페인 신원 주장 호출자인데 callerAddr가
@@ -325,6 +351,9 @@ export class A2aTaskService {
       // 폴백하도록 soft 거부한다(main의 A2A_DAEMON_SOFT_ERRORS 계약).
       if (input.callerHasPaneIdentity && !input.callerAddr && task.metadata.to.paneId) {
         return { ok: false, error: 'a2a.task.update: pane-authz deferred to renderer (pane-pinned task)' };
+      }
+      if (input.requirePaneIdentity && !input.callerAddr && task.metadata.to.paneId) {
+        return { ok: false, error: 'a2a.task.update: this task is pinned to a pane; only that pane can update it (no verified pane identity)' };
       }
       // §4 멱등: 앞서 커밋된 동일 키면 append 없이 원본 결과. 위치는 authz·soft-defer
       // **뒤**(리뷰 codex 델타: 히트가 authz를 앞지르면 키를 아는 비참여자가 커밋 스냅샷을
@@ -364,7 +393,8 @@ export class A2aTaskService {
       // 강제한다. pane-authz·불법 전이 거부(위)가 게이트보다 먼저라 게이트는 합법 전이에만
       // 도달한다(기존 에러 메시지·도그푸드 어서션 보존). verified≥1은 게이트가 아니라
       // 등급(E9) — verdict가 verifiedItemCount를 정직 산출한다(0 허용).
-      if (input.to === 'completed' || input.to === 'failed') {
+      // A receiver's cancel needs a reason (evidence.summary), like failed.
+      if (input.to === 'completed' || input.to === 'failed' || input.to === 'canceled') {
         const verdict = validateCompletionEvidence(input.to, evidence);
         if (!verdict.ok) {
           return { ok: false, error: `a2a.task.update: ${verdict.code}: ${evidenceGateHint(verdict.code)}` };
@@ -454,6 +484,49 @@ export class A2aTaskService {
   }
 
   /**
+   * Reopen an ended task because its sender wrote to it again. A message on a
+   * completed/failed/canceled task is new work for the receiver, so the task
+   * goes back to `submitted` and shows up in the receiver's inbox like a new
+   * one. Only the sender may do this. A task that has not ended is left as it
+   * is (a `working` task stays `working`), and that is not an error.
+   *
+   * VALID_TRANSITIONS has no edge out of a terminal state, so this entry point
+   * bypasses it on purpose, the same posture as failTasksForWorkspaceRemoved;
+   * the regular transition API still refuses terminal -> submitted. The commit
+   * is a plain `task.transition` payload (plus a `reopened` marker), so a log
+   * replayed by an older daemon still lands on `submitted`.
+   */
+  reopenTask(input: { taskId: string; callerWorkspaceId: string; callerPaneId?: string }): Promise<ReopenOk | OpErr> {
+    return this.withTaskLock(input.taskId, async () => {
+      const task = this.tasks.get(input.taskId);
+      if (!task) return { ok: false, error: `a2a.task.reopen: task not found: ${input.taskId}` };
+      // Only a provable sender: in a same-workspace task that means the `from`
+      // pane itself (main resolves callerPaneId from the caller's pane tree).
+      if (!isVerifiedTaskSender(task.metadata, input.callerWorkspaceId, input.callerPaneId)) {
+        return { ok: false, error: 'a2a.task.reopen: caller is not the verified sender of this task' };
+      }
+      if (!(TERMINAL_STATES as readonly string[]).includes(task.status.state)) {
+        return { ok: true, reopened: false, task };
+      }
+      const payload: A2aTaskTransitionPayload = {
+        kind: 'task.transition',
+        taskId: input.taskId,
+        to: 'submitted',
+        timestamp: this.isoNow(),
+        reopened: 'sender_message',
+      };
+      const committed = await this.log.append(
+        this.envelope(payload, input.callerWorkspaceId, this.derivePrincipalId(task, 'from', input.callerWorkspaceId)),
+      );
+      if (!committed) {
+        return { ok: false, error: 'a2a.task.reopen: daemon log append failed (uncommitted)' };
+      }
+      this.applyPayload(payload);
+      return { ok: true, reopened: true, task };
+    });
+  }
+
+  /**
    * B(패널·완료증거 설계 §③ E10) — workspace teardown 전용 강제-실패 진입점.
    * 수신 workspace가 제거되면 그 workspace로 향한 non-terminal 태스크는 어떤
    * 전진도 불가하다(수신자 소멸). `VALID_TRANSITIONS`를 **의도적으로 우회**해
@@ -467,7 +540,11 @@ export class A2aTaskService {
    *
    * @returns 실제로 failed로 커밋된 태스크 수.
    */
-  async failTasksForWorkspaceRemoved(workspaceId: string, reason: string): Promise<number> {
+  async failTasksForWorkspaceRemoved(
+    workspaceId: string,
+    reason: string,
+    onFailed?: (task: Task) => void,
+  ): Promise<number> {
     // 스냅샷 후 순회 — 락 안에서 status가 바뀌므로 순회 중 Map 변형 회피.
     const targets = [...this.tasks.values()].filter(
       (t) =>
@@ -501,7 +578,14 @@ export class A2aTaskService {
         this.applyPayload(payload);
         return true;
       });
-      if (ok) failed++;
+      if (ok) {
+        failed++;
+        // Main records the transition on the task's work link (its report).
+        const task = this.tasks.get(target.id);
+        if (task) {
+          try { onFailed?.(task); } catch { /* a reader's failure never undoes the commit */ }
+        }
+      }
     }
     return failed;
   }

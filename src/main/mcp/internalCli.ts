@@ -52,6 +52,8 @@ export const WMUX_CLI_METHODS: ReadonlySet<RpcMethod> = new Set<RpcMethod>([
   'workspace.focus',
   'workspace.new',
   'workspace.close',
+  // orphan Deck state prune (`wmux deck state --prune --yes`), run in the app
+  'deck.state.prune',
   // surface + pane (`wmux surface ...` / `wmux pane ...`)
   'surface.list',
   'surface.new',
@@ -85,7 +87,7 @@ export const WMUX_CLI_METHODS: ReadonlySet<RpcMethod> = new Set<RpcMethod>([
  * True when `clientName` identifies the bundled first-party wmux CLI. Exact
  * match — `clientName` is already trimmed by RpcRouter when it builds the
  * RpcContext. `undefined` / unknown names are NOT the CLI (they fall through to
- * the legacy grandfather / normal enforcement).
+ * normal enforcement, which refuses an envelope-less caller since #1111).
  */
 export function isInternalCliClient(clientName: string | undefined): boolean {
   return clientName === WMUX_CLI_CLIENT_NAME;

@@ -27,7 +27,7 @@ export function resolveActivePanePtyId(
   if (!surface) return null;
   // Empty ptyId means the surface is mid-create / cleared by reconcile — no
   // xterm is registered for it yet, so there is nothing to focus.
-  if (!surface.ptyId) return null;
+  if (!surface.ptyId || surface.viewMode === 'chat') return null;
   // Browser / editor surfaces have no xterm. The registry lookup below would
   // miss them anyway, but skipping here keeps the retry loop from spinning
   // 10 frames every time the user lands on a browser pane.
@@ -68,7 +68,7 @@ export function computeFocusKey(
   // unrelated edits (adding/removing OTHER workspaces) and needlessly re-steal
   // focus to the terminal.
   const activeInGrid = state.multiviewIds.length >= 2 && state.multiviewIds.includes(state.activeWorkspaceId);
-  return `${state.activeWorkspaceId} ${ws.activePaneId} ${leaf?.activeSurfaceId ?? ''} ${surface?.ptyId ?? ''} ${activeInGrid ? 'grid' : 'single'}`;
+  return `${state.activeWorkspaceId} ${ws.activePaneId} ${leaf?.activeSurfaceId ?? ''} ${surface?.ptyId ?? ''} ${activeInGrid ? 'grid' : 'single'}${surface?.viewMode === 'chat' ? ' chat' : ''}`;
 }
 
 export interface FocusDriverDeps {
@@ -236,9 +236,17 @@ export function useActivePaneFocus(): void {
   // changes. Logic + rationale (why multiviewIds is in the key) live in
   // computeFocusKey.
   const focusKey = useStore(computeFocusKey);
+  // Back on the Workspaces page from another rail page: the target did not
+  // change, but the pane is reachable again (no longer inert) and takes input.
+  const onWorkspaces = useStore((s) => s.appRoute === 'workspaces');
 
   useEffect(() => {
-    const ptyId = resolveActivePanePtyId(useStore.getState());
+    if (!onWorkspaces) return;
+    // An overlay above the page (palette, notifications) keeps the keyboard;
+    // when it closes, the self-heal below hands focus back to the pane.
+    const now = useStore.getState();
+    if (now.commandPaletteVisible || now.notificationPanelVisible) return;
+    const ptyId = resolveActivePanePtyId(now);
     if (!ptyId) return;
     return driveFocusToTerminal(ptyId, {
       getTerminal: (id) => terminalRegistry.get(id),
@@ -246,7 +254,7 @@ export function useActivePaneFocus(): void {
       raf: (cb) => requestAnimationFrame(cb),
       caf: (handle) => cancelAnimationFrame(handle),
     });
-  }, [focusKey]);
+  }, [focusKey, onWorkspaces]);
 
   // Self-heal: reclaim focus when an overlay (search bar / command palette /
   // notification panel / agent-toolbar RichInput) closes and drops DOM focus to
@@ -262,7 +270,12 @@ export function useActivePaneFocus(): void {
     // that refocuses a terminal from a torn-down effect instance.
     const pending = new Set<number>();
     const onSignal = (ev?: Event): void => reassertFocusIfOrphaned({
-      resolveTarget: () => resolveActivePanePtyId(useStore.getState()),
+      // Another rail page covers the panes (inert): focus there belongs to
+      // the page, never pulled back into a hidden terminal.
+      resolveTarget: () => {
+        const state = useStore.getState();
+        return state.appRoute === 'workspaces' ? resolveActivePanePtyId(state) : null;
+      },
       getActiveElement: () => document.activeElement,
       getBody: () => document.body,
       focusTerminal: (id) => {

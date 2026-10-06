@@ -1,21 +1,41 @@
+import { isPhoneWorkspaceId, PHONE_WORKSPACE_REQUEST_LIMIT } from '../../shared/phoneWorkspaceRequests';
 import { useEffect } from 'react';
 import { useStore } from '../stores';
 import { resolveStartupCwd, shellDisplayName, withDefaultShell, withRoleBinding, withWorkspaceProfile } from '../utils/ptyCreateOptions';
 import type { Pane, PaneLeaf, Surface, Workspace } from '../../shared/types';
 import { computePaneAutoName, paneDisplayName } from '../utils/paneNaming';
+import { paneForegroundProgram, surfaceForegroundProgram } from '../utils/surfaceProgram';
+import { originFromCaller } from '../utils/fanoutProvenance';
+import { sanitizeFanoutOrigin } from '../../shared/fanoutOrigin';
 import { validateMessage } from '../../shared/types';
 import type { Message, Part, TaskState, Artifact, AgentSkill, Task, CompletionEvidence } from '../../shared/types';
 import { normalizeCompletionEvidenceWire, isVerifiedItem } from '../../shared/completionEvidence';
 import type { PaneSearchResult, PaneSearchResponse } from '../../shared/types';
 import { generateId } from '../../shared/types';
-import { getLeafPanes, getWorkspaceLeafPanes, getWorkspacePtyIds } from '../../shared/paneUtils';
+import { isTaskEnded, isVerifiedTaskSender } from '../../shared/a2aReopen';
+import { applyTaskQueryView } from '../../shared/a2aTaskQueryView';
+import { getLeafPanes, getWorkspaceLeafPanes, getWorkspacePtyIds, getWorkspaceRemoteSessions } from '../../shared/paneUtils';
 import { findStashedEntry, paneStashedError, stashedPaneLiveness } from '../../shared/paneStash';
-import { applyRoleAgent, bindingEnforcesModel, normalizeRoleBinding, sanitizeOrchRole } from '../../shared/orchestratorRole';
-import { reattachModelEnvMarker, splitModelEnvMarker } from '../../shared/workerLaunch';
+import { applyRoleAgent, bindingEnforcesModel, launchRefusesPositionalPrompt, normalizeRoleBinding, sanitizeOrchRole } from '../../shared/orchestratorRole';
+import {
+  FANOUT_EXTRA_AGENT_STEMS,
+  applyFanoutAgentFlags,
+  commandLauncherStem,
+  fanoutChoiceBinding,
+  validateFanoutAgentChoice,
+  type FanoutAgentChoice,
+} from '../../shared/fanoutPreset';
+import {
+  applyWorkerPermissionFlags,
+  isFanoutWorkerPermissionMode,
+  reattachModelEnvMarker,
+  splitModelEnvMarker,
+} from '../../shared/workerLaunch';
 import { handleCompanyRpc } from '../../company/renderer/rpcHandlers';
-import { formatA2aMessage, formatA2aBroadcast, sanitizeA2aName } from '../utils/a2aFormat';
+import { t } from '../i18n';
+import { formatA2aMessage, formatA2aBroadcast, sanitizeA2aName, type A2aFormatOptions } from '../utils/a2aFormat';
 import type { A2aPriority } from '../utils/a2aFormat';
-import { requestExecuteApproval, requestFanOutApproval, requestTaskApproval } from '../utils/executeApprovalGate';
+import { findPendingExecuteRequest, requestExecuteApproval, requestFanOutApproval, requestTaskApproval } from '../utils/executeApprovalGate';
 import { openUrlInBrowserPane } from '../utils/browserPaneActions';
 import {
   closeBrowserTabInWorkspace,
@@ -23,20 +43,32 @@ import {
   handleBrowserTabsRpc,
 } from '../utils/browserTabs';
 import { terminalRegistry, hydrateTerminalForRead } from './useTerminal';
-import { readPtyBufferLines, readPtyBufferTail, DEFAULT_READ_TAIL_LINES } from '../utils/terminalTail';
+import { readPtyBufferLines, readPtyBufferTail, rowsBelowCursor, DEFAULT_READ_TAIL_LINES } from '../utils/terminalTail';
+import { terminalReadCoverage } from '../../shared/terminalReadCoverage';
 import {
   searchInBuffer,
   normalizeSearchTailLines,
   SEARCH_TAIL_MAX,
   type SearchableBuffer,
 } from '../utils/searchEngine';
-import { submitBracketedPasteToPty } from '../utils/ptyMessageDelivery';
+import { gatedSubmitToPty, submitBracketedPasteToPty } from '../utils/ptyMessageDelivery';
+import type { GatedSubmitRefusal, GatedSubmitResult } from '../../shared/ptyMessageDelivery';
+import type { FreshContextReply } from '../../shared/freshContext';
+import { paneAddressOfPty, paneHasOtherOpenA2aTask } from './a2aFreshContext';
 import { publishA2aTask } from '../events/publisher';
-import { resolvePaneAddress, activePaneTerminalPty, decideSameWsSend, decideReplyDelivery, REPLY_SUPPRESS_HINTS, countRoundTrips, maxSideMessages, REPLY_ROUND_CAP, isTerminalPtyInLeaves, resolveSelfPaneIdentity, resolveSenderPaneAddress, resolvePaneRole, findLeafPanes, type PaneAddress } from './a2aAddressing';
+import { isReceiverPaneGone } from '../../shared/a2aOrphanedTask';
+import { resolvePaneAddress, activePaneTerminalPty, resolveUnaddressedDelivery, paneHasDetectedAgent, describeAmbiguousDelivery, wsMetadataMayStandIn, NO_AGENT_PANE_HINT, decideSameWsSend, decideReplyDelivery, REPLY_SUPPRESS_HINTS, submitReceiptFields, countRoundTrips, maxSideMessages, REPLY_ROUND_CAP, isTerminalPtyInLeaves, resolveSelfPaneIdentity, resolveSenderPaneAddress, resolvePaneRole, findLeafPanes, detectedAgentTuiSlug, type PaneAddress } from './a2aAddressing';
 import { resolveWorkspaceTarget } from './workspaceTargeting';
 import { destroyRemoteSessions, destroySurfaceRemoteSession, destroyWorkspaceRemoteSessions } from '../utils/remoteSessionTeardown';
+import { remoteAgentKey } from '../../shared/remoteHosts';
 import { collectPaneTreeRemoteSessions } from '../../shared/paneUtils';
 import { findActivePtyId, buildWorkspaceListEntries } from './workspaceMirrorSnapshot';
+import { buildPhoneSidebarSnapshot } from './phoneSidebarSnapshot';
+import type { MoaPendingDecision } from '../../shared/moa';
+import type { WorkLink } from '../../shared/workLink';
+import { createSidebarDropLog } from '../../shared/phoneFleetSidebar';
+import { buildFleetTriage, fleetTriageScopeError } from '../utils/fleetTriage';
+import { workspaceCloseRefusal } from '../components/Moa/moaHqGuard';
 
 // ---------------------------------------------------------------------------
 // Cold-park (TASK-9) daemon-backed read fallback
@@ -60,30 +92,37 @@ import { findActivePtyId, buildWorkspaceListEntries } from './workspaceMirrorSna
  * Saying "codex --model o3" when o3 will not be passed is the exact failure the
  * enforcement predicate exists to prevent elsewhere.
  *
- * Returns '' when no task carries a role, so the ordinary preview is unchanged.
+ * Returns [] when no task carries a role. The same lines go into the fan-out
+ * audit record, so what was shown and what was logged cannot differ.
  */
-function describeFanOutRoles(raw: unknown): string {
-  if (!Array.isArray(raw)) return '';
+function fanOutRoleLines(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
   const seen: string[] = [];
   for (const entry of raw) {
     const role = typeof entry === 'string' ? entry.trim() : '';
     if (role && !seen.includes(role)) seen.push(role);
   }
-  if (seen.length === 0) return '';
+  if (seen.length === 0) return [];
   const bindings = useStore.getState().orchestratorRoleBindings;
-  const lines = seen.map((role) => {
+  return seen.map((role) => {
     const b = bindings[role];
-    if (!b || (!b.agent && !b.model && !b.args)) return `  ${role} → the default agent (no binding)`;
+    if (!b || (!b.agent && !b.model && !b.args)) return `${role} → the default agent (no binding)`;
     const parts: string[] = [b.agent || 'the default agent'];
     if (b.model) parts.push(bindingEnforcesModel(b) ? `--model ${b.model}` : `(model "${b.model}" is configured but will NOT be applied)`);
     if (b.args) parts.push(b.args);
-    return `  ${role} → ${parts.join(' ')}`;
+    return `${role} → ${parts.join(' ')}`;
   });
-  return `\n\nRoles resolve to:\n${lines.join('\n')}`;
+}
+
+/** The role lines as the approval dialog shows them; '' when no task has a
+ *  role, so the ordinary preview is unchanged. */
+function describeFanOutRoles(lines: string[]): string {
+  if (lines.length === 0) return '';
+  return `\n\nRoles resolve to:\n${lines.map((l) => `  ${l}`).join('\n')}`;
 }
 
 interface DaemonTextRow { text: string; wrapped: boolean }
-interface ParkedPaneRead { rows: DaemonTextRow[]; truncated: boolean }
+interface ParkedPaneRead { rows: DaemonTextRow[]; bufferType?: 'normal' | 'alternate'; rowsBelowCursor?: number; truncated: boolean }
 
 /** Fetch a parked pane's grid from the daemon as plain-text rows, or null.
  *  `truncated` is true when the daemon dropped oldest rows to fit the RPC frame
@@ -93,7 +132,7 @@ async function fetchParkedPaneRows(ptyId: string, scrollback?: number): Promise<
   if (!api || typeof api.readText !== 'function') return null; // stale preload
   try {
     const res = await api.readText(ptyId, scrollback !== undefined ? { scrollback } : undefined);
-    return res?.success ? { rows: res.rows, truncated: res.truncated === true } : null;
+    return res?.success ? { rows: res.rows, bufferType: res.bufferType, rowsBelowCursor: res.rowsBelowCursor, truncated: res.truncated === true } : null;
   } catch {
     return null;
   }
@@ -235,8 +274,187 @@ function findOwnedSurface(
 // individual keystrokes.
 // ---------------------------------------------------------------------------
 
+// #1337 — the gap before Enter, and whether that Enter may be reported as a
+// real submit, both depend on WHICH AGENT owns the pty being written to. Read
+// it from the per-ptyId surfaceAgent map at write time rather than taking it
+// from the caller: the caller's liveness metadata can fall back to
+// workspace-level `metadata.agentName`, which in a multi-agent workspace names
+// a different pane than the one `activePaneTerminalPty` resolved. A receipt
+// about the wrong pane is the same false receipt this is fixing.
+function ptyAgent(ptyId: string): { name?: string; status?: string } {
+  const a = useStore.getState().surfaceAgent[ptyId];
+  return a ? { name: a.name, status: a.status } : {};
+}
+
 function submitToPty(ptyId: string, text: string): void {
-  submitBracketedPasteToPty(ptyId, text);
+  submitBracketedPasteToPty(ptyId, text, { agent: ptyAgent(ptyId).name });
+}
+
+// ---------------------------------------------------------------------------
+// Approval gate for A2A deliveries. Every A2A write is a paste plus Enter, and
+// an Enter into a pane that shows an approval selects its highlighted option.
+// `terminal_send` refuses that for any caller but the operator
+// (input.rpc.ts `assertNotTypingAtAnApproval`). A non-operator delivery is
+// therefore handed to main, which pastes and submits it behind the same guard
+// and checks again right before the Enter. Only a delivery main stamped
+// `operatorOrigin` at the router (the human's own surface) is written here.
+// ---------------------------------------------------------------------------
+
+/** Whether an A2A delivery skips the approval gate: main-stamped operator
+ *  origin only, and not when the send asks for the gated delivery (the Git
+ *  page's hand-off, which also waits for the person to stop typing). */
+/** The shape of a task id main may preset (generateId('task')). */
+const PRESET_TASK_ID_RE = /^task-[0-9a-f-]{36}$/;
+
+function a2aOperatorOrigin(params: RpcParams): boolean {
+  return params.operatorOrigin === true && params.gatedDelivery !== true;
+}
+
+/**
+ * The outcome of one A2A pane write: the pty written to, or null — with the
+ * gate's refusal when it withheld the write (null alone: no pty to write to).
+ */
+export interface A2aPtyWrite {
+  ptyId: string | null;
+  refused?: GatedSubmitRefusal;
+  /** What a new-task delivery's fresh-context step did (#1680). Absent for
+   *  every other delivery, and when the pane's role does not ask for one. */
+  freshContext?: FreshContextReply;
+}
+
+/**
+ * A NEW task's delivery (#1680): main may give the pane a fresh conversation
+ * first, when its role asks for one. Only the new-task branch of a2a.task.send
+ * passes this — a reply, a status update or a broadcast never does.
+ */
+interface NewTaskDelivery {
+  taskId: string;
+  /** Hold the paste while the person is typing in the pane (gatedDelivery sends). */
+  waitQuiet?: boolean;
+  /** With waitQuiet: the agent the sender saw in the pane; main refuses if it changed. */
+  expectAgent?: string;
+  /** With waitQuiet: main's deadline for the whole delivery (epoch ms). */
+  deadlineAt?: number;
+  /** With waitQuiet: main's own check for this delivery (GatedSubmitOptions.guardKey). */
+  guardKey?: string;
+}
+
+/** The fields a new-task delivery's receipt carries about the fresh-context
+ *  step. `not_bound` is left out: a role that never asked has nothing to say. */
+function freshContextOf(result: GatedSubmitResult): FreshContextReply | undefined {
+  if (!result.ok || !result.freshContext || result.freshContext === 'not_bound') return undefined;
+  return {
+    freshContext: result.freshContext,
+    ...(result.freshContextCommand ? { freshContextCommand: result.freshContextCommand } : {}),
+    ...(result.freshContextSignal ? { freshContextSignal: result.freshContextSignal } : {}),
+    ...(result.freshContextReason ? { freshContextReason: result.freshContextReason } : {}),
+  };
+}
+
+/** The single A2A write path in this file. */
+async function deliverA2aText(
+  ptyId: string,
+  text: string,
+  operator: boolean,
+  newTask?: NewTaskDelivery,
+): Promise<A2aPtyWrite> {
+  // The operator's own deliveries are excluded from fresh context in v1.
+  if (operator) {
+    submitToPty(ptyId, text);
+    return { ptyId };
+  }
+  const s = useStore.getState();
+  const keep =
+    newTask && paneHasOtherOpenA2aTask(Object.values(s.a2aTasks), s.workspaces, ptyId, newTask.taskId)
+      ? ({ keepContext: 'open_a2a_task' } as const)
+      : {};
+  // Main also asks the daemon's task store (this list is not reloaded after a
+  // restart), keyed by where the pane sits; a pane it cannot place is kept.
+  const pane = newTask ? paneAddressOfPty(s.workspaces, ptyId) : undefined;
+  const result = await gatedSubmitToPty(ptyId, text, {
+    agent: ptyAgent(ptyId).name,
+    ...(newTask ? { newTask: true, taskId: newTask.taskId, ...keep, ...(pane ? { pane } : {}) } : {}),
+    ...(newTask?.waitQuiet ? { waitQuiet: true } : {}),
+    ...(newTask?.waitQuiet && newTask.expectAgent ? { expectAgent: newTask.expectAgent } : {}),
+    ...(newTask?.waitQuiet && newTask.deadlineAt !== undefined ? { deadlineAt: newTask.deadlineAt } : {}),
+    ...(newTask?.waitQuiet && newTask.guardKey ? { guardKey: newTask.guardKey } : {}),
+  });
+  if (!result.ok) return { ptyId: null, refused: result };
+  const fresh = freshContextOf(result);
+  return fresh ? { ptyId, freshContext: fresh } : { ptyId };
+}
+
+/** Sender-facing hints for a delivery the gate withheld, by reason. */
+const DELIVERY_REFUSED_HINTS: Record<GatedSubmitRefusal['reason'], string> = {
+  guard_refused:
+    "wmux's own check for this delivery refused it right before the paste or the Enter, so nothing was " +
+    'submitted. The task is stored; the receiver can find it with a2a_task_query.',
+  approval_pending:
+    'The target pane is waiting on an approval, so the message was not submitted there: an Enter would ' +
+    'answer the prompt. The task is stored; the receiver can find it with a2a_task_query. Send again once ' +
+    'the approval has been answered.',
+  gate_unavailable:
+    'wmux could not check the target pane for an approval (its screen or the gate was unavailable), so ' +
+    'the message was not submitted. The task is stored; the receiver can find it with a2a_task_query. ' +
+    'Retry in a few seconds.',
+  write_failed:
+    'The write to the target pane failed (it may have just closed). The task is stored; the receiver can ' +
+    'find it with a2a_task_query.',
+  fresh_context_timeout:
+    "The target pane's role starts each task in a fresh conversation. wmux typed the agent's fresh-context " +
+    'command but could not confirm it finished (it did not finish in time, or other input reached the pane), ' +
+    'so the message was NOT pasted, and the pane may hold the command or already be cleared. The task is ' +
+    'stored; the receiver can find it with a2a_task_query. Read the pane before sending again.',
+  fresh_context_busy:
+    'Another new task was still being delivered to the target pane, so nothing was written to it. The task is ' +
+    'stored; the receiver can find it with a2a_task_query. Send again in a few seconds.',
+  usage_limited:
+    "The target pane hit its provider's usage limit and is held until the limit resets, so nothing was " +
+    'written to it. The task is stored; the receiver can find it with a2a_task_query. Send again after the ' +
+    'reset (the detail names the reset time when it is known).',
+  user_typing:
+    'Someone was typing in the target pane (or left a draft in its composer), so nothing was submitted there. ' +
+    'The task is stored; the receiver can find it with a2a_task_query. Send again once the pane is idle.',
+  agent_changed:
+    'The agent this was sent to left the target pane or was replaced before the message could be submitted, ' +
+    'so nothing was submitted there. The task is stored. Pick the pane again and resend.',
+  agent_unverified:
+    "wmux could not read the target pane's agent, so it could not confirm the message would reach that agent " +
+    'and submitted nothing. The task is stored. Retry in a few seconds.',
+  deadline:
+    'The delivery waited too long (someone kept typing, or the pane was busy) and gave up without submitting. ' +
+    'The task is stored. Send again once the pane is idle.',
+};
+
+/** The `delivery` receipt for a refused write. */
+function refusedDelivery(mode: string, refused: GatedSubmitRefusal): Record<string, unknown> {
+  return {
+    stored: true,
+    notified: false,
+    mode,
+    reason: refused.reason,
+    hint: DELIVERY_REFUSED_HINTS[refused.reason],
+    detail: refused.detail,
+    ...(refused.pasted ? { pastedNotSubmitted: true } : {}),
+  };
+}
+
+const BROADCAST_WITHHELD_HINT =
+  'Some agent panes were not written to (see `withheld`): an approval was in front of them, or the gate ' +
+  'could not check them. Broadcast again once those approvals have been answered.';
+
+// Whether an A2A envelope bound for `ptyId` may keep its body's real newlines:
+// only when the pane runs a detected, still-live agent TUI. A shell (or an
+// unknown pane) keeps the `␤` fold. Read at write time for the same reason as
+// ptyAgent.
+function a2aFormatOptionsFor(ptyId: string): A2aFormatOptions {
+  const s = useStore.getState();
+  return {
+    multiline: !!detectedAgentTuiSlug(ptyId, s.surfaceAgent, {
+      agentAlive: s.agentAliveByPtyId,
+      commandRunning: s.commandRunningByPtyId,
+    }),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +467,16 @@ type RpcResult = unknown;
 // ---------------------------------------------------------------------------
 // Hook
 // ---------------------------------------------------------------------------
+
+/** One notice per burst: a fan-out of N agy tasks hits this N times. */
+const AGY_TRUST_NOTE_INTERVAL_MS = 60_000;
+let lastAgyTrustNoteAt = 0;
+
+function noteAgyTrustScreen(now: number = Date.now()): void {
+  if (now - lastAgyTrustNoteAt < AGY_TRUST_NOTE_INTERVAL_MS) return;
+  lastAgyTrustNoteAt = now;
+  useStore.getState().pushToast({ level: 'warn', message: t('fanout.agyTrustScreenNote'), durationMs: 15_000 });
+}
 
 export function useRpcBridge(): void {
   useEffect(() => {
@@ -416,27 +644,38 @@ export function useRpcBridge(): void {
 // active terminal. Extracted to avoid duplication across send/reply/update.
 // ---------------------------------------------------------------------------
 
-// Returns whether a pty was actually written to. A workspace whose active pane
+// Resolves to the ptyId actually written to, or null (with `refused` when the
+// approval gate withheld the write). A workspace whose active pane
 // has no terminal (browser surface, empty) resolves no pty and this is a no-op
 // — callers that report a `delivery` outcome MUST use the return value instead
 // of assuming success (review 2-MODEL finding: the unconditional
 // `notified:true` was the same false receipt this PR set out to remove).
-function deliverPtyNotification(
+//
+// #1337: the ptyId, not a bare boolean, because the receipt has to describe the
+// pane that received the bytes — see `ptyAgent`.
+// Exported for tests only (a2aFormat.delivery.test.ts).
+export async function deliverPtyNotification(
   targetWs: { rootPane: Pane; activePaneId: string; name: string; stashedPanes?: Workspace['stashedPanes'] },
   senderName: string,
   message: string,
   explicitPtyId?: string,
-): boolean {
+  operator = false,
+  newTask?: NewTaskDelivery,
+): Promise<A2aPtyWrite> {
   // getWorkspaceLeafPanes puts VISIBLE leaves first, so the "first leaf with a
   // live terminal" fallback still prefers something on screen (#977); a stashed
   // pane only catches the message when nothing visible can take it, which beats
   // dropping it.
   const ptyId = explicitPtyId ?? activePaneTerminalPty(getWorkspaceLeafPanes(targetWs), targetWs.activePaneId);
   if (ptyId) {
-    submitToPty(ptyId, formatA2aMessage(senderName, targetWs.name, message));
-    return true;
+    return deliverA2aText(
+      ptyId,
+      formatA2aMessage(senderName, targetWs.name, message, undefined, a2aFormatOptionsFor(ptyId)),
+      operator,
+      newTask,
+    );
   }
-  return false;
+  return { ptyId: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -448,30 +687,31 @@ function deliverPtyNotification(
 // it cannot corrupt a multi-line readline state.
 // ---------------------------------------------------------------------------
 
-// Returns whether a pty was actually written to — see deliverPtyNotification.
-function deliverPtyNudge(
+// Resolves like deliverPtyNotification — see there.
+async function deliverPtyNudge(
   targetWs: { rootPane: Pane; activePaneId: string; stashedPanes?: Workspace['stashedPanes'] },
-  nudge: string,
+  // A function builds the line for the pane actually chosen, at write time.
+  nudge: string | ((ptyId: string) => string),
   explicitPtyId?: string,
-): boolean {
+  operator = false,
+  newTask?: NewTaskDelivery,
+): Promise<A2aPtyWrite> {
   // getWorkspaceLeafPanes puts VISIBLE leaves first, so the "first leaf with a
   // live terminal" fallback still prefers something on screen (#977); a stashed
   // pane only catches the message when nothing visible can take it, which beats
   // dropping it.
   const ptyId = explicitPtyId ?? activePaneTerminalPty(getWorkspaceLeafPanes(targetWs), targetWs.activePaneId);
-  if (ptyId) {
-    submitToPty(ptyId, nudge);
-    return true;
-  }
-  return false;
+  if (ptyId) return deliverA2aText(ptyId, typeof nudge === 'function' ? nudge(ptyId) : nudge, operator, newTask);
+  return { ptyId: null };
 }
 
 // ---------------------------------------------------------------------------
 // A2A silent-default for TUI receivers (S-C2 ②). A receiver running a live
 // TUI agent gets its input box corrupted by a full bracketed-paste; for those
 // we DEFAULT to the EventBus pointer + a one-line nudge instead of the body.
-// A receiver with NO live agent keeps today's loud full-body paste (never
-// regress a peer that never polls). An explicit params.silent === true still
+// A receiver whose detected agent is not live keeps the loud full-body paste
+// (never regress a peer that never polls); a pane with no detected agent gets
+// nothing at all (a2aTargetHasAgent). An explicit params.silent === true still
 // fully suppresses (handled at the call sites).
 //
 // "live TUI agent" = an agentName is present AND agentStatus is one of the
@@ -501,17 +741,96 @@ function deliveryLiveMeta(
   return a ? { agentName: a.name, agentStatus: a.status } : undefined;
 }
 
+// #1489 — may an A2A delivery write to `pty` (or, with no pty, the target's
+// active pane) at all? Only a pane with a detected agent, or the single visible
+// terminal of a workspace whose metadata evidences a live agent (detection not
+// landed per pane, remote panes — see wsMetadataMayStandIn). Neither an explicit
+// pane_id / pinned task anchor nor `silent:false` overrides this: the `␤` fold
+// keeps a body on one line, but that line still runs once a shell gets Enter.
+function a2aTargetHasAgent(
+  targetWs: Pick<Workspace, 'rootPane' | 'metadata'>,
+  pty: string | undefined,
+): boolean {
+  const s = useStore.getState();
+  if (pty && paneHasDetectedAgent(pty, s.surfaceAgent, {
+    agentAlive: s.agentAliveByPtyId,
+    commandRunning: s.commandRunningByPtyId,
+  })) return true;
+  const visible = findLeafPanes(targetWs.rootPane);
+  return isLiveTuiAgent(targetWs.metadata)
+    && wsMetadataMayStandIn(visible)
+    && (!pty || isTerminalPtyInLeaves(visible, pty));
+}
+
 /**
  * One-line nudge for a live-agent receiver. SINGLE LINE — no embedded
  * newlines, no message body (the body rides the dual-party-scoped task store,
  * fetched via a2a_task_query). Kept short so it doesn't wrap the prompt.
  */
-function buildA2aNudge(taskId: string, senderName: string): string {
+/**
+ * Whether a message from this caller should reopen `task`: the task has ended
+ * and the caller is provably its sender (shared rule, also enforced by the
+ * daemon). An unverified caller, a sibling pane or the receiver never reopens.
+ */
+function wantsSenderReopen(task: Task, callerWorkspaceId: string, callerAddr: PaneAddress | null): boolean {
+  return isTaskEnded(task) && isVerifiedTaskSender(task.metadata, callerWorkspaceId, callerAddr?.paneId);
+}
+
+/**
+ * Apply the reopen main decided on: the daemon's committed snapshot
+ * (`daemonReopenedTask`), or a cache-only reopen (`localReopen`) for a task
+ * the daemon does not hold. Main strips both from the wire, so neither can be
+ * forged by a caller. Returns whether the task reopened.
+ */
+function applySenderReopen(taskId: string, params: RpcParams): boolean {
+  const store = useStore.getState();
+  const snapshot = params.daemonReopenedTask;
+  if (snapshot && typeof snapshot === 'object' && (snapshot as { id?: unknown }).id === taskId) {
+    store.applyDaemonTaskUpdate(snapshot as Task);
+    return store.getTask(taskId)?.status.state === 'submitted';
+  }
+  if (params.localReopen === true) return store.reopenTask(taskId);
+  return false;
+}
+
+// `kind` says whether the line announces a new task or a reply/update on an
+// existing one (#1573). Both parties of a same-workspace task share the
+// workspace name, so a reply labeled "new task" reads, in the sender's pane,
+// exactly like its own send's nudge landing there too.
+/** Longest task title a nudge carries, in code points. */
+const NUDGE_TITLE_MAX_CHARS = 60;
+
+/**
+ * A task title reduced to text that is inert wherever the nudge lands. The
+ * line is typed and submitted into a pane another workspace chose; if that
+ * pane is really a shell, or the agent reads `@` as a file mention, anything
+ * beyond words is an instruction. So this is an allowlist, not a blocklist:
+ * Unicode letters, digits, space and `. , : - _ /`; everything else (quotes,
+ * `;|&<>()#$`, `@`, control, bidi and zero-width characters, emoji) becomes a
+ * space. Cut by code point so a surrogate pair is never split.
+ */
+export function nudgeTitlePreview(title: string): string {
+  const clean = title.replace(/[^\p{L}\p{N} .,:_/-]/gu, ' ').replace(/ +/g, ' ').trim();
+  const chars = Array.from(clean);
+  return chars.length <= NUDGE_TITLE_MAX_CHARS
+    ? clean
+    : `${chars.slice(0, NUDGE_TITLE_MAX_CHARS).join('').trimEnd()}...`;
+}
+
+// A new task names its title (never its body) so the receiver knows what
+// arrived; `title` is passed only when the pane is re-checked as a live agent
+// at write time. An untitled task gets no preview at all: the body is never a
+// stand-in for the title. The full id lets the receiver fetch the task directly.
+export function buildA2aNudge(taskId: string, senderName: string, kind: 'new' | 'reply', title?: string): string {
   const id8 = taskId.replace(/^task[-_]?/, '').slice(0, 8);
+  const what = kind === 'new' ? 'new A2A task' : 'reply on A2A task';
+  const preview = kind === 'new' && title ? nudgeTitlePreview(title) : '';
+  const about = preview ? ` — title: "${preview}"` : '';
+  const safeId = taskId.replace(/[^A-Za-z0-9_-]/g, '');
   // Sanitize the user-editable workspace name: a CR/LF in it would otherwise
   // split this "single line" into a multi-line bracketed paste (submitted with
   // `\r\r`) and inject text into the very live-agent prompt this path protects.
-  return `[wmux] new A2A task ${id8} from ${sanitizeA2aName(senderName)} — a2a_task_query`;
+  return `[wmux] ${what} ${id8} from ${sanitizeA2aName(senderName)}${about} — a2a_task_query task_id:${safeId}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -574,7 +893,8 @@ function isSelectableBrowserPartition(partition: string): boolean {
   );
 }
 
-async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcResult> {
+// Exported for tests only (a2aFormat.delivery.test.ts).
+export async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcResult> {
   // Always read the freshest state via getState() to avoid stale closures.
   const store = useStore.getState();
 
@@ -598,6 +918,61 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     // the mirror snapshot can never diverge from this reply (see
     // buildWorkspaceListEntries).
     return buildWorkspaceListEntries(store.workspaces);
+  }
+
+  if (method === 'quickLaunch.context') {
+    // The global quick-launch composer (main/quickLaunch): which workspaces it
+    // may start an agent in, and the theme to paint itself in.
+    return {
+      workspaces: store.workspaces.map((w) => ({ id: w.id, name: w.name, cwd: w.metadata?.cwd ?? '' })),
+      activeWorkspaceId: store.activeWorkspaceId,
+      theme: store.theme,
+      locale: store.locale,
+      ...(store.theme === 'custom' ? { customThemeColors: store.customThemeColors } : {}),
+    };
+  }
+
+  if (method === 'workspace.phoneSidebar') {
+    // Phone Fleet only (reached through main's PhoneWorkspaces, never the
+    // public RPC router): the sidebar's own labels, projected and bounded.
+    const drops = createSidebarDropLog();
+    // Pending hand-off cards for the read-only notice; main's in-memory list,
+    // read per call so it is never staler than the snapshot itself.
+    let moaDecisions: MoaPendingDecision[] | undefined;
+    try {
+      const reply = await window.electronAPI?.deck?.moa?.decisions?.();
+      if (Array.isArray(reply?.decisions)) moaDecisions = reply.decisions;
+    } catch {
+      drops.report('moa.decisions');
+    }
+    // Main's WorkLinks for Moa's delegated jobs (Fleet's ticket source).
+    let workLinks: { links: WorkLink[]; now: number } | undefined;
+    try {
+      const links = await window.electronAPI?.workLinks?.list({});
+      if (Array.isArray(links)) workLinks = { links, now: Date.now() };
+    } catch {
+      drops.report('moa.workLinks');
+    }
+    const snapshot = buildPhoneSidebarSnapshot(store, drops.report, moaDecisions, workLinks);
+    const dropped = drops.summary();
+    if (dropped) console.warn(`[phone] sidebar projection left out: ${dropped}`);
+    return snapshot;
+  }
+
+  if (method === 'workspace.phoneCreate') {
+    const id = params.id;
+    const name = params.name;
+    const cwd = params.cwd;
+    if (!isPhoneWorkspaceId(id) ||
+        typeof name !== 'string' || !name.trim() || name.length > 100 ||
+        (cwd !== undefined && typeof cwd !== 'string')) return { error: 'Invalid phone workspace' };
+    const existing = store.workspaces.find(w => w.id === id);
+    if (existing) return { id: existing.id, name: existing.name };
+    if (store.phoneWorkspaceRequestIds.includes(id)) return { error: 'workspace-request-closed' };
+    if (store.phoneWorkspaceRequestIds.length >= PHONE_WORKSPACE_REQUEST_LIMIT) return { error: 'workspace-request-history-full' };
+    store.addWorkspace(name, typeof cwd === 'string' ? { startupCwd: cwd } : undefined, id);
+    const created = useStore.getState().workspaces.find(w => w.id === id);
+    return created ? { id: created.id, name: created.name } : { error: 'Workspace was not created' };
   }
 
   if (method === 'workspace.new') {
@@ -642,12 +1017,54 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     if (!ws) {
       return { error: `workspace.close: no workspace with id "${id}"` };
     }
-    if (store.workspaces.length <= 1) {
+    // The shared pre-close check (moaHqGuard): Moa's HQ is never closed, and
+    // the HQ does not count toward the last-workspace guard. With [HQ, A] the
+    // old total-count check let A through, disposed its sessions, and then
+    // removeWorkspace refused — A was left open, dead and empty.
+    const refusal = workspaceCloseRefusal(store, id);
+    if (refusal === 'moa-hq') {
+      return {
+        error:
+          `workspace.close: refusing to close "${id}" — it is Moa's workspace, ` +
+          'which Moa manages. Turn Moa off in Settings → Moa instead.',
+      };
+    }
+    if (refusal === 'last-workspace') {
       return {
         error:
           `workspace.close: refusing to close "${id}" — it is the only workspace, ` +
           'and wmux always keeps one open. Create another workspace first.',
       };
+    }
+    // A CLI/pipe close of a workspace with agents still running in it needs
+    // `force`: closing it kills those agents mid-work, and a caller holding the
+    // wrong id (a fan-out accept's owner workspace read as a task's) did
+    // exactly that. Same "has a live agent" test as Fleet: a detected agent
+    // name on any pty the workspace owns, stashed panes included. The UI close
+    // paths are unchanged — the sidebar asks for confirmation.
+    if (params.force !== true) {
+      const agents = getWorkspacePtyIds(ws)
+        .map((ptyId) => store.surfaceAgent[ptyId]?.name)
+        .filter((name): name is string => !!name);
+      if (agents.length > 0) {
+        return {
+          error:
+            `workspace.close: refusing to close "${ws.name}" (${id}) — ${agents.length} agent pane(s) ` +
+            `are still running in it (${[...new Set(agents)].join(', ')}). ` +
+            'Check that this is the workspace you mean, then re-run with --force.',
+        };
+      }
+      // A remote-terminal surface has no local pty, so no agent is detected
+      // in it here — yet the close ends its session on the remote host. Treat
+      // every session the workspace owns there as possibly holding one.
+      const remote = getWorkspaceRemoteSessions(ws).length;
+      if (remote > 0) {
+        return {
+          error:
+            `workspace.close: refusing to close "${ws.name}" (${id}) — closing it ends ${remote} ` +
+            'remote session(s) it owns, and whatever runs in them. Re-run with --force if that is intended.',
+        };
+      }
     }
     // #977 — getWorkspacePtyIds, not the visible tree: closing a workspace
     // kills everything it owns, and a stashed pane left running would be an
@@ -749,11 +1166,12 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
   }
 
   if (method === 'fanout.requestApproval') {
-    // 파이프/MCP fan-out의 승인 게이트. 큐·다이얼로그·30s 타이머는 A2A execute
-    // 게이트와 공유하지만 전역 auto-approve 토글(a2aAutoApproveExecute)은 타지
-    // 않는다 — 그 토글은 백그라운드 에이전트 스폰에 대한 동의지 worktree N개
-    // 생성에 대한 동의가 아니다(requestFanOutApproval). 렌더러 다이얼로그가
-    // 시작하는 fan-out(FanOutDialog)은 사람 클릭이 곧 승인이라 이 경로를 타지 않는다.
+    // The pipe/MCP fan-out approval gate. Main decides whether to ask
+    // (`requireApproval`; off by default): off, the fan-out runs unattended
+    // (outcome 'auto') behind main's depth-1, caps and audit log, and gets one
+    // toast so it is never invisible. Anything but a literal `false` asks. On, it shares the A2A execute queue, dialog and 30s timer, but never the
+    // a2aAutoApproveExecute toggle (requestFanOutApproval). A fan-out the GUI
+    // FanOutDialog starts is a human click and does not come through here.
     //
     // outcome을 그대로 돌려준다: main은 이미 호출자에게 accepted를 반환한 뒤라,
     // 자동 거부가 "조용히 사라지는" 대신 폴 응답에 이유로 실려야 한다.
@@ -767,14 +1185,22 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     // binding silently adds a different CLI, another model, or extra flags
     // would make the approved text and the executed command two different
     // things — the one property this gate exists to hold.
-    const previewWithRoles = promptPreview + describeFanOutRoles(params.roles);
+    const roleCommands = fanOutRoleLines(params.roles);
+    const previewWithRoles = promptPreview + describeFanOutRoles(roleCommands);
     const verdict = await requestFanOutApproval({
       workspaceId: callerWsId,
       repoPath,
       taskCount,
       messagePreview: previewWithRoles,
+      requireApproval: params.requireApproval !== false,
     });
-    return { approved: verdict.approved, outcome: verdict.outcome };
+    if (verdict.outcome === 'auto') {
+      useStore.getState().pushToast({
+        message: t('fanout.autoRunToast', { count: taskCount, repo: repoPath }),
+        level: 'info',
+      });
+    }
+    return { approved: verdict.approved, outcome: verdict.outcome, roleCommands };
   }
 
   if (method === 'task.requestApproval') {
@@ -822,7 +1248,28 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     // unknown or unbound role is a silent no-op: the task still launches on the
     // default command rather than failing over a preference.
     const role = sanitizeOrchRole(params.role);
-    const roleBinding = role ? useStore.getState().orchestratorRoleBindings[role] : undefined;
+    // A preset row or a caller's `agents[k]` arrives as data, never as a
+    // command. It is re-validated HERE against the same closed table main used
+    // (a renderer that trusted main's word would launch whatever a torn or
+    // future caller put in the field) and then becomes a RoleBinding on the
+    // unchanged path below. Invalid = the task fails; it is never launched on
+    // the default agent instead of the one that was asked for.
+    let agentChoice: FanoutAgentChoice | undefined;
+    if (params.agentChoice !== undefined) {
+      const checked = validateFanoutAgentChoice(params.agentChoice, { allowUnattended: true, allowEffort: true });
+      const normalized = checked.ok ? normalizeRoleBinding(fanoutChoiceBinding(checked.choice)) : undefined;
+      if (!checked.ok || !normalized || normalized.agent !== checked.choice.agent || normalized.model !== checked.choice.model ||
+        normalized.effort !== checked.choice.effort) {
+        return { error: `fanout.spawnWorkspace: invalid agent choice — ${checked.ok ? 'normalization changed it' : checked.error}` };
+      }
+      agentChoice = checked.choice;
+    }
+    const roleBinding = agentChoice
+      ? fanoutChoiceBinding(agentChoice)
+      : role
+        ? useStore.getState().orchestratorRoleBindings[role]
+        : undefined;
+    const extraAgents = agentChoice ? FANOUT_EXTRA_AGENT_STEMS : undefined;
     // Two steps, and BOTH are needed. applyRoleBinding (inside withRoleBinding
     // below) refuses to touch a command whose launcher differs from the
     // binding's agent — right for a line a human typed, wrong here, where wmux
@@ -839,13 +1286,50 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     // cannot see the bindings — an unbound role, or one bound to an agent with no
     // model, injects nothing).
     const { marker, command: bareCommand } = splitModelEnvMarker(initialCommand);
-    const swap = applyRoleAgent(bareCommand, roleBinding);
+    const swap = applyRoleAgent(bareCommand, roleBinding, extraAgents ? { extraAgents } : undefined);
+    // A preset row / agents[k] is a promise about WHICH CLI runs. A refused
+    // swap would launch the default claude line instead, so the task fails —
+    // before any workspace exists — rather than run on an agent nobody chose.
+    if (agentChoice && !swap.changed && commandLauncherStem(swap.command) !== agentChoice.agent) {
+      return {
+        error: `fanout.spawnWorkspace: could not launch ${agentChoice.agent} for this task${swap.note ? ` — ${swap.note}` : ''}`,
+      };
+    }
     if (swap.note) {
       // A refusal (unknown agent, or flags that would not survive the swap) is
       // fail-soft — the task still launches, so the reason must be visible
       // somewhere rather than silently discarded.
       console.warn('[wmux:role-binding] fan-out agent not swapped', { role, note: swap.note });
     }
+
+    // agy stops on its "Do you trust…" screen in any folder it has not been told
+    // to trust, and a fresh task worktree never is. Main lists THIS folder in
+    // agy's trustedWorkspaces (only while this spawn is in flight). Done here,
+    // before addWorkspace: nothing may await between that and pty.create. The
+    // launcher is final after the swap (later steps only add flags). A failure
+    // is not fatal — agy's own screen is then the fallback.
+    if (cwd && commandLauncherStem(swap.command) === 'agy' && launchRefusesPositionalPrompt(swap.command)) {
+      // Never trust a folder for a launch agy will reject anyway.
+      console.warn('[wmux:fanout] agy line has no prompt flag; folder not pre-trusted', { cwd });
+    } else if (cwd && commandLauncherStem(swap.command) === 'agy') {
+      try {
+        const trusted = await window.electronAPI.agentModels?.trustAgyFolder?.(cwd);
+        if (trusted && !trusted.ok) {
+          console.warn('[wmux:fanout] agy folder not pre-trusted', { cwd, reason: trusted.reason });
+          // Off by default (opt-in setting): say so where the operator looks,
+          // because the task now waits on agy's own trust screen.
+          if (trusted.disabled) noteAgyTrustScreen();
+        }
+      } catch (err) {
+        console.warn('[wmux:fanout] agy folder not pre-trusted', { cwd, err });
+      }
+    }
+
+    // Who asked: main resolved it ONCE when the fan-out was requested
+    // (fanout.resolveOrigin below) and sends the same origin with every task.
+    // Never re-resolved against today's layout — the requesting pane may have
+    // closed since, and its ptyId may belong to another pane by now.
+    const fanoutOrigin = sanitizeFanoutOrigin(params.fanoutOrigin);
 
     store.addWorkspace(name);
     const afterAdd = useStore.getState();
@@ -855,6 +1339,19 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     }
     const newWsId = newWs.id;
     const paneId = newWs.activePaneId;
+
+    // Depth-1 lineage: main stamps this workspace as a task of its owner
+    // INSIDE pty.create, before the PTY (and the agent) exists; a failed stamp
+    // fails the create and the rollback below runs. No separate round-trip
+    // here: an await between addWorkspace and pty.create would let the
+    // empty-leaf funnel spawn a plain shell into this pane first.
+    const fanoutTaskOf = typeof params.fanoutTaskOf === 'string' ? params.fanoutTaskOf : '';
+    // Quick launch in the person's own checkout: nested in the sidebar under
+    // the workspace it was started from, but NOT stamped as a fan-out task —
+    // it must not count toward the fan-out cap or the depth rule.
+    const nestUnder = !fanoutTaskOf && typeof params.nestUnder === 'string' ? params.nestUnder : '';
+    // #1481 — lets the sidebar nest this workspace under its owner right away.
+    if (fanoutTaskOf || nestUnder) useStore.getState().noteFanoutSpawn?.(newWsId, fanoutTaskOf || nestUnder, fanoutOrigin);
 
     // Unnested so the FINAL command is readable: withDefaultShell first (there
     // has to be a command to rewrite), then the role binding, then the marker
@@ -869,7 +1366,32 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
       },
       useStore.getState().defaultShell,
     );
-    const bound = withRoleBinding(seeded, roleBinding, role);
+    const roleBoundRaw = withRoleBinding(seeded, roleBinding, role, extraAgents);
+    // Per-CLI flags the role rewrite has no notion of: codex's one-session trust
+    // of the task folder, and a preset row's unattended flags (non-claude).
+    const roleBound =
+      agentChoice && roleBoundRaw.initialCommand
+        ? {
+            ...roleBoundRaw,
+            initialCommand: applyFanoutAgentFlags(
+              roleBoundRaw.initialCommand,
+              agentChoice,
+              cwd,
+              window.electronAPI?.platform ?? 'darwin',
+            ),
+          }
+        : roleBoundRaw;
+    // Worker permission mode + allow-list, AFTER the role rewrite: only then is
+    // the final launcher known (a binding may have swapped claude for codex,
+    // which rejects these flags), and only then can a permission flag the
+    // binding's args added be replaced rather than doubled.
+    const workerMode = isFanoutWorkerPermissionMode(params.workerPermissionMode)
+      ? params.workerPermissionMode
+      : undefined;
+    const bound =
+      workerMode && roleBound.initialCommand
+        ? { ...roleBound, initialCommand: applyWorkerPermissionFlags(roleBound.initialCommand, workerMode) }
+        : roleBound;
     // `bound.initialCommand` stays undefined for the "environment only" launch,
     // and it has to: withWorkspaceProfile fills a MISSING command from the
     // profile's defaultPaneCommand, and an empty string is not missing.
@@ -893,7 +1415,9 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
 
     let ptyId: string;
     try {
-      const created = await window.electronAPI.pty.create(createOptions);
+      const created = await window.electronAPI.pty.create(
+        fanoutTaskOf ? { ...createOptions, fanoutTaskOf, ...(fanoutOrigin ? { fanoutOrigin } : {}) } : createOptions,
+      );
       ptyId = created.id;
     } catch (err) {
       const rollback = useStore.getState();
@@ -936,7 +1460,7 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     // task would come back on the default (expensive) one with nothing said.
     // It carries the model-env marker exactly as launched, so main can tell
     // whether the neutralisation survived when it reports a stuck worker.
-    return { workspaceId: newWsId, ptyId, initialCommand: launchCommand };
+    return { workspaceId: newWsId, ptyId, initialCommand: launchCommand, ...(fanoutOrigin ? { fanoutOrigin } : {}) };
   }
 
   // -------------------------------------------------------------------------
@@ -974,6 +1498,7 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
           ptyId: s.ptyId,
           title: s.title,
           shell: s.shell,
+          foregroundProgram: surfaceForegroundProgram(s, store.surfaceAgent, store),
           cwd: s.cwd || liveCwd,
           gitBranch: liveGitBranch,
           surfaceType: s.surfaceType || 'terminal',
@@ -983,7 +1508,7 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
           // activeSurfaceId as `isActive: true` would tell a client that a
           // surface nobody can see is the focused one.
           isActive: !stashedIds.has(leaf.id) && s.id === leaf.activeSurfaceId,
-          agentName: agent?.name ?? null,
+          agentName: surfaceForegroundProgram(s, store.surfaceAgent, store),
           agentStatus: agent?.status ?? null,
           // Always a boolean, never omitted: "key absent" and "false" must not
           // be the same wire shape, or a client has to guess whether it is
@@ -1221,6 +1746,19 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
   // pane.*
   // -------------------------------------------------------------------------
 
+  if (method === 'fleet.triage') {
+    // The Fleet overlay's own board (selectFleetBoard), so an agent is told
+    // exactly what the human sees. The whole fleet unless a workspaceId narrows
+    // it — never the active workspace: "who needs me?" is a fleet question.
+    const scope = typeof params.workspaceId === 'string' ? params.workspaceId : undefined;
+    const scopeError = fleetTriageScopeError(store, scope);
+    if (scopeError) return { error: scopeError, retryable: false };
+    return buildFleetTriage(store, {
+      workspaceId: scope,
+      includeIdle: params.includeIdle === true,
+    }, Date.now());
+  }
+
   if (method === 'pane.list') {
     const targetWsId = typeof params.workspaceId === 'string' ? params.workspaceId : store.activeWorkspaceId;
     const ws = store.workspaces.find((w) => w.id === targetWsId);
@@ -1239,6 +1777,7 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
       return {
         id: l.id,
         surfaceCount: l.surfaces.length,
+        foregroundProgram: paneForegroundProgram(l, store.surfaceAgent, store),
         active: !isStashed && l.id === ws.activePaneId,
         // Explicit boolean on every row — see surface.list.
         stashed: isStashed,
@@ -1257,7 +1796,39 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
         // Part A: per-surface agent labels for this leaf. A split pane can hold
         // more than one terminal surface; each detected agent is listed so the
         // pane is individually addressable (gaps 1/8).
+        //
+        // #1322 — a remote-terminal surface always has ptyId '' (createRemoteSurface,
+        // shared/types.ts), so it can never match store.surfaceAgent, which is
+        // keyed exclusively by LOCAL ptyIds. Left unhandled, this tool reports
+        // agents: [] for a remote pane no matter how long a real agent has been
+        // running on the host — the exact gap the sidebar's WorkspaceAgentRoster
+        // already closed for its own listing (#1163, selectors/workspaceAgentRoster.ts)
+        // by reading state.remoteWorkspaces instead of the ptyId map. This mirrors
+        // that same lookup here so pane_list (the MCP-facing read) sees what the
+        // sidebar already sees, instead of silently disagreeing with it.
         agents: l.surfaces.flatMap((s) => {
+          if (s.surfaceType === 'remote-terminal') {
+            const hostId = s.remoteHostId;
+            const sessionId = s.remoteSessionId;
+            if (!hostId || !sessionId) return [];
+            // A stale entry (host unreachable) keeps its last snapshot for the
+            // mirror but its agent status is frozen — same "no live metadata, no
+            // row" rule as the roster, so a disconnected host cannot be reported
+            // as a live or blocked agent indefinitely.
+            const attached = store.remoteWorkspaces.find(
+              (r) => r.hostId === hostId && !r.stale && r.panes.some((p) => p.sessionId === sessionId),
+            );
+            const pane = attached?.panes.find((p) => p.sessionId === sessionId);
+            if (!pane?.agentName) return [];
+            return [{
+              ptyId: remoteAgentKey(hostId, sessionId),
+              surfaceId: s.id,
+              agentName: pane.agentName,
+              agentStatus: pane.agentStatus ?? 'idle',
+              // The host snapshot has no event channel: no transcript-derived
+              // pending question, same as the roster's remote branch.
+            }];
+          }
           const a = store.surfaceAgent[s.ptyId];
           // pendingQuestion answers "is this pane blocked on me?" — a status of
           // 'waiting' alone can't, and reading the terminal to find out is what
@@ -1273,7 +1844,7 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
           return [{
             ptyId: s.ptyId,
             surfaceId: s.id,
-            agentName: a?.name ?? null,
+            agentName: surfaceForegroundProgram(s, store.surfaceAgent, store),
             agentStatus: a?.status ?? null,
             ...(q ? { pendingQuestion: q } : {}),
           }];
@@ -1742,6 +2313,18 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
   // map (orchestratorRoleBindings) live in the renderer store, so the renderer
   // is the natural place to resolve the pair. Fields are additive — legacy
   // callers that read only `workspaceId` are unaffected.
+  // Fan-out requester (#1575): main asks, once per fan-out and before any
+  // approval or git work, which pane holds the caller's ptyId. Scoped to the
+  // workspace main verified as the fan-out's owner: a pane found anywhere
+  // else is not recorded as the requester. Renderer-only (sendToRenderer from
+  // pipe/handlers/fanout.rpc.ts), never exposed on the pipe.
+  if (method === 'fanout.resolveOrigin') {
+    const ptyId = typeof params.ptyId === 'string' ? params.ptyId : '';
+    const workspaceId = typeof params.workspaceId === 'string' ? params.workspaceId : '';
+    if (!ptyId || !workspaceId) return { origin: null };
+    return { origin: originFromCaller(store, { kind: 'pane', ptyId }, workspaceId) ?? null };
+  }
+
   if (method === 'input.findOwnerWorkspace') {
     const ptyId = typeof params.ptyId === 'string' ? params.ptyId : '';
     if (!ptyId) return { workspaceId: null };
@@ -1812,6 +2395,13 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     if (!ptyId) return { ptyId: null, text: '' };
 
     const raw = params as Record<string, unknown>;
+    // Internal (#1595): end at the cursor row instead of the last screen row,
+    // for a probe that measures positions up from the cursor (the submit
+    // receipt's composer check). Not exposed as an MCP parameter.
+    const endAtCursor = raw.endAtCursor === true;
+    // Rows the read returned from below the cursor. A live TUI draws them (an
+    // option picker's other choices); after it exits they may be leftovers.
+    const below = (n: number) => (n > 0 ? { rowsBelowCursor: n } : {});
 
     const terminal = terminalRegistry.get(ptyId);
     if (!terminal) {
@@ -1830,17 +2420,25 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
       const depth = wantsFull ? store.scrollbackLines : capP;
       const read = await fetchParkedPaneRows(ptyId, depth);
       if (!read) return { ptyId, text: '' }; // legacy daemon / local / gone
-      const texts = read.rows.map((r) => r.text);
+      let texts = read.rows.map((r) => r.text);
+      // A legacy daemon sends no count; then nothing is dropped or reported.
+      let parkedBelow = read.rowsBelowCursor ?? 0;
+      if (endAtCursor && parkedBelow > 0) {
+        texts = texts.slice(0, texts.length - parkedBelow);
+        while (texts.length > 0 && texts[texts.length - 1] === '') texts.pop();
+        parkedBelow = 0;
+      }
       if (wantsFull) {
         // full_scrollback promises the ENTIRE backlog — if the daemon dropped
         // oldest rows to fit the RPC frame, surface truncated so the caller
         // doesn't read partial history as complete (callRpc serializes the whole
         // result object, so the field reaches the agent).
-        return { ptyId, text: texts.join('\n'), ...(read.truncated && { truncated: true }) };
+        return { ptyId, text: texts.join('\n'), ...below(Math.min(parkedBelow, texts.length)), ...terminalReadCoverage(read.bufferType), ...(read.truncated && { truncated: true }) };
       }
       // Bounded tail read: only the last capP rows were requested, so older
       // history missing is by design, not a truncation to report.
-      return { ptyId, text: texts.slice(-capP).join('\n') };
+      const tail = texts.slice(-capP);
+      return { ptyId, text: tail.join('\n'), ...below(Math.min(parkedBelow, tail.length)), ...terminalReadCoverage(read.bufferType) };
     }
 
     // Phase 3 hydrate-before-read — see pane.search above. Agents reading a
@@ -1859,19 +2457,20 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     //   - neither              → the last DEFAULT rows, read in O(DEFAULT).
     // The bounded reader never walks past its window, so a 10k-row backlog costs
     // the same as a fresh pane.
+    const coverage = terminalReadCoverage(terminal.buffer.active.type);
     const fullScrollback = raw.full_scrollback === true;
     if (fullScrollback) {
-      // Explicit opt-in to the exact, unbounded read (walk 0..baseY+cursorY).
-      const lines = readPtyBufferLines(ptyId);
-      return { ptyId, text: lines.join('\n') };
+      // Explicit opt-in to the exact, unbounded read (walk 0..last screen row).
+      const lines = readPtyBufferLines(ptyId, { endAtCursor });
+      return { ptyId, text: lines.join('\n'), ...below(endAtCursor ? 0 : rowsBelowCursor(ptyId, lines.length)), ...coverage };
     }
     const rawTail = raw.tail_lines;
     const cap =
       typeof rawTail === 'number' && Number.isFinite(rawTail) && rawTail > 0
         ? Math.floor(rawTail)
         : DEFAULT_READ_TAIL_LINES;
-    const lines = readPtyBufferTail(ptyId, cap);
-    return { ptyId, text: lines.join('\n') };
+    const lines = readPtyBufferTail(ptyId, cap, { endAtCursor });
+    return { ptyId, text: lines.join('\n'), ...below(endAtCursor ? 0 : rowsBelowCursor(ptyId, lines.length)), ...coverage };
   }
 
   if (method === 'input.getActivePtyId') {
@@ -2152,6 +2751,7 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
   }
 
   if (method === 'a2a.task.send') {
+    const operator = a2aOperatorOrigin(params);
     const taskId = typeof params.taskId === 'string' ? params.taskId : '';
     const executeRequested = params.execute === true;
     const rawMessage = typeof params.message === 'string' ? params.message : '';
@@ -2175,7 +2775,9 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     // one-line nudge (its prompt is not flooded); a receiver with no live
     // agent keeps today's loud full-body paste (don't regress a non-poller).
     // An explicit silent (true OR false) is honored verbatim — explicit true
-    // = full suppression, explicit false = loud full paste.
+    // = full suppression, explicit false = loud full paste. #1489: the loud
+    // paste only ever reaches a pane with a detected agent; a pane without one
+    // gets nothing written, exactly as when silent is omitted.
     //
     // Only a real BOOLEAN counts as explicit. A direct main-pipe RPC client
     // (which bypasses the MCP zod schema) may serialize an omitted optional as
@@ -2253,6 +2855,12 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
         };
       }
       const role = paneRole ?? (task.metadata.from.workspaceId === workspaceId ? 'user' : 'agent');
+      // A verified sender writing to a task that already ended is new work for
+      // the receiver: the task reopens. Main asks first (preflight), commits the
+      // reopen in the daemon, then replays the call with the daemon's snapshot.
+      const reopenWanted = wantsSenderReopen(task, workspaceId, callerAddr);
+      if (params.reopenPreflight === true) return { ok: true, preflight: { reopen: reopenWanted } };
+      const reopened = applySenderReopen(taskId, params);
       const msg: Message = { kind: 'message', messageId: generateId('msg'), role, parts };
       store.addTaskMessage(taskId, msg);
 
@@ -2330,26 +2938,74 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
               hint: REPLY_SUPPRESS_HINTS[decision.reason],
             };
           } else {
+            // #1336 — same unaddressed-target rule as the create path: a reply
+            // with no pinned anchor picks the lone agent pane, refuses when the
+            // choice is ambiguous, and never presses Enter on a pane with no
+            // detected agent. A same-ws reply always has an anchor (an
+            // anchorless one is suppressed above), so only the cross-ws
+            // active-pane fallback reaches this.
+            let replyPty = explicitPty;
+            let ambiguous = false;
+            if (!replyPty) {
+              const pick = resolveUnaddressedDelivery(findLeafPanes(targetWs.rootPane), store.surfaceAgent, {
+                agentAlive: store.agentAliveByPtyId,
+                commandRunning: store.commandRunningByPtyId,
+              });
+              if (pick.kind === 'ambiguous') ambiguous = true;
+              else if (pick.kind === 'agent') replyPty = pick.address.ptyId;
+            }
+            if (ambiguous) {
+              // The reply is already stored on the task (addTaskMessage above),
+              // so this is a delivery outcome, not an error. The hint does NOT
+              // tell the sender to re-send with pane_id: the reply branch is
+              // keyed by task_id and never reads pane_id/surface_id, so that
+              // advice would be a loop. The honest next step is the receiver's
+              // own poll.
+              delivery = {
+                stored: true,
+                notified: false,
+                reason: 'ambiguous_target_pane',
+                hint:
+                  'The reply is stored but was not pushed: this task has no pinned receiver pane and the ' +
+                  'target workspace runs several agent panes, so there is no non-arbitrary pane to write to ' +
+                  '(a reply cannot be re-addressed — pane_id applies to NEW tasks only). The receiver will ' +
+                  'find it with a2a_task_query; open a new addressed task if it must be pushed.',
+              };
+            } else {
             // `notified` comes from the delivery helpers' actual outcome — they
             // resolve a pty at write time and are a no-op when none exists (e.g.
             // the cross-ws active pane is a browser surface). Assuming success
             // here would recreate the exact false receipt this change removes.
-            let wrote: boolean;
-            let mode: 'nudge' | 'notification' = 'nudge';
-            if (decision.sameWs) {
+            let write: A2aPtyWrite = { ptyId: null };
+            let mode: 'nudge' | 'notification' | 'no-agent-pane' = 'nudge';
+            // Same gate as the create path (a2aTargetHasAgent): a target
+            // evidenced only at workspace level still gets its nudge, and a
+            // pinned anchor or silent:false no longer reaches a shell (#1489).
+            const replyNoAgentTarget = !a2aTargetHasAgent(targetWs, replyPty);
+            // The no-agent check comes first for a same-ws sibling too: a
+            // sender pane back at its shell would run the nudge line (#1573).
+            if (replyNoAgentTarget) {
+              // Nothing written — see NO_AGENT_PANE_HINT.
+              mode = 'no-agent-pane';
+            } else if (decision.sameWs) {
               // Same-ws sibling: pointer-only nudge (no full-body injection).
-              wrote = deliverPtyNudge(targetWs, buildA2aNudge(taskId, senderName), explicitPty);
+              write = await deliverPtyNudge(targetWs, buildA2aNudge(taskId, senderName, 'reply'), replyPty, operator);
             } else {
-              const liveMeta = deliveryLiveMeta(store.surfaceAgent, explicitPty, targetWs.metadata);
+              const liveMeta = deliveryLiveMeta(store.surfaceAgent, replyPty, targetWs.metadata);
               if (!silentExplicit && isLiveTuiAgent(liveMeta)) {
-                wrote = deliverPtyNudge(targetWs, buildA2aNudge(taskId, senderName), explicitPty);
+                write = await deliverPtyNudge(targetWs, buildA2aNudge(taskId, senderName, 'reply'), replyPty, operator);
               } else {
-                wrote = deliverPtyNotification(targetWs, senderName, message, explicitPty);
+                write = await deliverPtyNotification(targetWs, senderName, message, replyPty, operator);
                 mode = 'notification';
               }
             }
-            delivery = wrote
-              ? { stored: true, notified: true, mode }
+            const wrotePty = write.ptyId;
+            delivery = mode === 'no-agent-pane'
+              ? { stored: true, notified: false, mode, reason: 'no_agent_pane', hint: NO_AGENT_PANE_HINT }
+              : write.refused
+              ? refusedDelivery(mode, write.refused)
+              : wrotePty
+              ? { stored: true, notified: true, mode, ...submitReceiptFields(ptyAgent(wrotePty)) }
               : {
                   stored: true,
                   notified: false,
@@ -2358,6 +3014,7 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
                     'The target workspace has no terminal pane to write to (its active pane may ' +
                     'be a browser surface). The reply is stored; the receiver must poll a2a_task_query.',
                 };
+            }
           }
         }
       }
@@ -2367,7 +3024,8 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
       // silent, target workspace gone, and a failed pty write. Delivered
       // replies deliberately do NOT emit (the nudge already signals; emitting
       // per delivered message is the flood the create-path comment forbids).
-      if (delivery.notified !== true) {
+      // A reopen is a state change, so it always tees the pointer.
+      if (delivery.notified !== true || reopened) {
         const updatedTask = store.getTask(taskId);
         if (updatedTask) emitA2aTaskEvent(updatedTask, 'updated');
       }
@@ -2403,6 +3061,17 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     if (!target) {
       const available = store.workspaces.map((w) => w.name).join(', ');
       return { error: `a2a.task.send: target "${to}" not found. Available: ${available}` };
+    }
+    // Main stamps this on a new task from Moa, the HQ brain (never from the
+    // wire): work for another workspace goes through the operator's card.
+    const hqOnly = params.hqHandoffOnly as { allowedTargets?: unknown } | undefined;
+    if (!taskId && hqOnly && Array.isArray(hqOnly.allowedTargets) && !hqOnly.allowedTargets.includes(target.id)) {
+      return {
+        error:
+          `a2a.task.send: Moa does not send work straight to another workspace's agent ("${target.name}"). ` +
+          'Call moa_propose_handoff with that pane (ptyId from pane_list) and the task as plain instructions; ' +
+          'the operator approves it with one click and it arrives as their own instruction.',
+      };
     }
     // The same-workspace self-guard moved BELOW pane-address resolution (see
     // decideSameWsSend) so a precise sibling-pane address is honored. A same-ws
@@ -2451,23 +3120,88 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     const sameWsDecision = decideSameWsSend(target.id === workspaceId, resolvedAddr?.ptyId, senderPtyId);
     if (sameWsDecision.kind === 'reject') return { error: `a2a.task.send: ${sameWsDecision.error}` };
 
+    // #1336 — an UNADDRESSED send no longer degrades to "whatever pane is
+    // active". Resolved here, BEFORE the task is created, because an ambiguous
+    // target is a refusal and a refusal must not leave a task behind. An
+    // explicit pane_id/surface_id (resolvedAddr) skips this entirely.
+    // Only the VISIBLE tree is scanned (a stashed agent pane must neither
+    // create an ambiguity nor become the delivery target — nobody is looking at
+    // it), and a pane whose agent is known gone is not a candidate.
+    let resolvedFallback: PaneAddress | undefined;
+    if (!silent && !sameWsDecision.suppressPaste && !resolvedAddr) {
+      const pick = resolveUnaddressedDelivery(findLeafPanes(target.rootPane), store.surfaceAgent, {
+        agentAlive: store.agentAliveByPtyId,
+        commandRunning: store.commandRunningByPtyId,
+      });
+      if (pick.kind === 'ambiguous') {
+        return { error: `a2a.task.send: ${describeAmbiguousDelivery(target.name, pick.candidates)}` };
+      }
+      // 'no_agent' leaves resolvedFallback unset: no pane is written to at all,
+      // unless the workspace-level metadata still evidences a live TUI agent
+      // (detection sources differ — see a2aTargetHasAgent).
+      if (pick.kind === 'agent') resolvedFallback = pick.address;
+    }
+
     // S-C2: capture the sender's pane anchor (symmetric with `to`) so a reply can
     // return to THIS exact pane and the stored history role is computed per-pane.
     // senderPtyId is already validated against the sender's own tree above, so an
     // absent/forged value resolves to null → `from` stays ws-only (no regression).
     const senderAddr = resolveSenderPaneAddress(senderLeaves, senderPtyId);
 
+    // Explicit address first, then the agent pane resolved from an unaddressed
+    // send — both are pinned on the task identically (see `to` below).
+    const toAnchor = resolvedAddr ?? resolvedFallback;
+
     const initialMessage: Message = { kind: 'message', messageId: generateId('msg'), role: 'user', parts };
-    const newTaskId = generateId('task');
+    // A task id main minted for its own operator send (Moa's hand-off names the
+    // task in the text it delivers); main keeps it on the operator lane only.
+    const presetTaskId = typeof params.presetTaskId === 'string' && PRESET_TASK_ID_RE.test(params.presetTaskId)
+      && !store.getTask(params.presetTaskId)
+      ? params.presetTaskId
+      : null;
+    const newTaskId = presetTaskId ?? generateId('task');
 
     if (executeRequested) {
       const cwd = typeof params.cwd === 'string' ? params.cwd : null;
+      // #1462 — a caller that resends while its first request is still on the
+      // approval prompt joins that prompt instead of raising a second one, and
+      // gets its verdict. The first request creates the task and main spawns
+      // its worker; the retry reports that task and must not spawn another,
+      // so it never claims executeApproved.
+      const identity = {
+        senderWorkspaceId: workspaceId,
+        senderPtyId,
+        receiverWorkspaceId: target.id,
+        targetPtyId: toAnchor?.ptyId ?? '',
+        cwd,
+        message,
+      };
+      const pending = findPendingExecuteRequest(identity);
+      if (pending) {
+        const joinedApproved = await pending.verdict;
+        if (!joinedApproved) {
+          return {
+            ok: false,
+            error: `a2a.task.send: execute approval denied (this resend joined the pending request for task ${pending.taskId})`,
+          };
+        }
+        return {
+          ok: true,
+          taskId: pending.taskId,
+          toWorkspaceId: target.id,
+          joinedPendingRequest: true,
+          hint:
+            'An identical execute request was already waiting for approval; this send joined it. ' +
+            `Task ${pending.taskId} was approved and started once, by that request.`,
+        };
+      }
       const approved = await requestExecuteApproval({
         taskId: newTaskId,
         senderWorkspaceId: workspaceId,
         receiverWorkspaceId: target.id,
         messagePreview: message.slice(0, 500),
         cwd,
+        identity,
       });
       if (!approved) {
         return { ok: false, error: 'a2a.task.send: execute approval denied' };
@@ -2485,7 +3219,11 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
       to: {
         workspaceId: target.id,
         name: target.name,
-        ...(resolvedAddr && { paneId: resolvedAddr.paneId, surfaceId: resolvedAddr.surfaceId }),
+        // The agent pane resolved from an unaddressed send is pinned exactly
+        // like an explicitly addressed one: every later message on this task
+        // (reply, status update) follows the anchor, instead of falling back to
+        // "whatever pane is active" and landing the follow-up in a shell.
+        ...(toAnchor && { paneId: toAnchor.paneId, surfaceId: toAnchor.surfaceId }),
       },
       history: [initialMessage],
       artifacts: [],
@@ -2495,7 +3233,8 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     // When silent, the task is only persisted in the store and the
     // receiver must poll via a2a_task_query to discover it. silent-default:
     // an unset silent + live-TUI receiver gets a one-line nudge (prompt not
-    // flooded); no live agent (or explicit silent:false) keeps the loud paste.
+    // flooded); a detected but not live agent (or explicit silent:false) keeps
+    // the loud paste; a pane with no detected agent gets nothing (#1336, #1489).
     // Suppress the PTY paste when the user asked (silent) OR when a same-ws send
     // can't be proven non-self (decideSameWsSend → suppressPaste). The task is
     // still created + teed onto the EventBus below, so a sibling can poll it via
@@ -2507,20 +3246,68 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     // silently while the response looked identical to a delivered one.
     let delivery: Record<string, unknown>;
     if (!suppressPaste) {
-      const explicitPty = resolvedAddr?.ptyId;
+      // The resolved single agent pane (#1336) is as explicit as an addressed
+      // one for every decision below — liveness, nudge-vs-paste, and the write
+      // itself must all see the pane we actually chose.
+      const explicitPty = resolvedAddr?.ptyId ?? resolvedFallback?.ptyId;
       // Liveness for the nudge-vs-paste choice must reflect the ADDRESSED pane's
       // agent (a workspace can host >1 agent), not ws-level metadata.
       const liveMeta = deliveryLiveMeta(store.surfaceAgent, explicitPty, target.metadata);
-      let wrote: boolean;
-      let mode: 'nudge' | 'notification' = 'nudge';
-      if (!silentExplicit && isLiveTuiAgent(liveMeta)) {
-        wrote = deliverPtyNudge(target, buildA2aNudge(newTaskId, fromName), explicitPty);
+      // Two independent agent sources exist: the per-pty surfaceAgent map the
+      // candidate scan reads, and the workspace-level metadata this path has
+      // always trusted. A target that only has the latter (detection not landed
+      // per-pane, remote panes) must keep waking up as before — dropping it to
+      // "no agent" would silently stop delivering to a real agent. Both are
+      // read by a2aTargetHasAgent, which also checks an explicitly addressed
+      // pane. #1489: silent:false no longer overrides it — it was the
+      // "paste it loudly anyway" switch, and into a shell that runs the body.
+      const noAgentTarget = !a2aTargetHasAgent(target, explicitPty);
+      // A Git page hand-off (operator only; main stamps operatorOrigin): the
+      // body is a fixed reference built in main, pasted as is instead of a
+      // nudge, and only into the addressed pane's own detected agent: anything
+      // else counts as no agent. Absence is decided by the agent's name, not
+      // its status: an agent idle at its first prompt is live, and one that
+      // left is dropped from the pane's entry (the workspace-level name is not).
+      const referenceDelivery = params.operatorOrigin === true && params.referenceDelivery === true && typeof message === 'string';
+      const panes = useStore.getState();
+      const referencePaneHasAgent = !!explicitPty && paneHasDetectedAgent(explicitPty, panes.surfaceAgent, {
+        agentAlive: panes.agentAliveByPtyId,
+        commandRunning: panes.commandRunningByPtyId,
+      });
+      const gated: Omit<NewTaskDelivery, 'taskId'> = params.gatedDelivery === true
+        ? {
+            waitQuiet: true,
+            ...(liveMeta?.agentName ? { expectAgent: liveMeta.agentName } : {}),
+            ...(typeof params.deliveryDeadlineAt === 'number' ? { deadlineAt: params.deliveryDeadlineAt } : {}),
+            ...(typeof params.deliveryGuardKey === 'string' ? { guardKey: params.deliveryGuardKey } : {}),
+          }
+        : {};
+      let write: A2aPtyWrite = { ptyId: null };
+      let mode: 'nudge' | 'notification' | 'no-agent-pane' = 'nudge';
+      if (noAgentTarget || (referenceDelivery && !referencePaneHasAgent)) {
+        // Nothing is written: a body pasted into a shell prompt is the #1336
+        // hazard whether or not we press Enter. The task is stored and teed
+        // onto the EventBus below, so the receiver can still poll it.
+        mode = 'no-agent-pane';
+      } else if (!silentExplicit && referenceDelivery) {
+        // One line for a pane that cannot take a multi-line paste.
+        write = await deliverPtyNudge(target, (pty) => (a2aFormatOptionsFor(pty).multiline ? message : message.replace(/\n+/g, ' — ')), explicitPty, operator, { taskId: newTaskId, ...gated });
+        mode = 'notification';
+      } else if (!silentExplicit && isLiveTuiAgent(liveMeta)) {
+        // #1680 — this branch is the task boundary: the pane's role may ask
+        // for a fresh conversation before the task lands (both modes).
+        write = await deliverPtyNudge(target, (pty) => buildA2aNudge(newTaskId, fromName, 'new', a2aFormatOptionsFor(pty).multiline ? title : undefined), explicitPty, operator, { taskId: newTaskId, ...gated });
       } else {
-        wrote = deliverPtyNotification(target, fromName, message, explicitPty);
+        write = await deliverPtyNotification(target, fromName, message, explicitPty, operator, { taskId: newTaskId, ...gated });
         mode = 'notification';
       }
-      delivery = wrote
-        ? { stored: true, notified: true, mode }
+      const wrotePty = write.ptyId;
+      delivery = mode === 'no-agent-pane'
+        ? { stored: true, notified: false, mode, reason: 'no_agent_pane', hint: NO_AGENT_PANE_HINT }
+        : write.refused
+        ? refusedDelivery(mode, write.refused)
+        : wrotePty
+        ? { stored: true, notified: true, mode, ...submitReceiptFields(ptyAgent(wrotePty)), ...(write.freshContext ?? {}) }
         : {
             stored: true,
             notified: false,
@@ -2582,10 +3369,15 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
       }
     }
     const tasks = store.queryTasks(workspaceId, { status, role, updatedSince });
-    return { workspaceId, tasks };
+    // view: 'page' (a2a_task_query) → summaries, or the one named task in full.
+    return { workspaceId, tasks: applyTaskQueryView(tasks, params) };
   }
 
   if (method === 'a2a.task.update') {
+    const operator = a2aOperatorOrigin(params);
+    // The pane write this update made, if any: a refusal is reported back.
+    let updateWrite: A2aPtyWrite = { ptyId: null };
+    let updateReopened = false;
     const taskId = typeof params.taskId === 'string' ? params.taskId : '';
     const workspaceId = typeof params.workspaceId === 'string' ? params.workspaceId : '';
     if (!taskId) return { error: 'a2a.task.update: missing "taskId"' };
@@ -2598,12 +3390,9 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     // pointer for a half-applied task).
     let nextState: TaskState | undefined;
     if (typeof params.status === 'string') {
-      // Block 'canceled' — must use a2a.task.cancel instead
-      if (params.status === 'canceled') {
-        return { error: 'a2a.task.update: use a2a.task.cancel instead' };
-      }
-      // Validate status value
-      const validStatuses = ['working', 'completed', 'failed', 'input-required'];
+      // Validate status value. 'canceled' is the receiver dropping the task
+      // (#1598); it needs a reason, like 'failed'.
+      const validStatuses = ['working', 'completed', 'failed', 'input-required', 'canceled'];
       if (!validStatuses.includes(params.status)) {
         return { error: `a2a.task.update: invalid status "${params.status}"` };
       }
@@ -2661,7 +3450,9 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
         store.applyDaemonTaskUpdate(committedTask);
         transitioned = true;
       } else {
-        const result = store.updateTaskStatus(taskId, nextState, workspaceId, callerAddrUpdate, undefined, evidence);
+        const result = store.updateTaskStatus(
+          taskId, nextState, workspaceId, callerAddrUpdate, undefined, evidence, params.requirePaneIdentity === true,
+        );
         if (!result.ok) return { error: `a2a.task.update: ${result.error}` };
         transitioned = true;
       }
@@ -2678,7 +3469,14 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
       // Per-pane role (S-C2): same model as the a2a.task.send reply branch, using
       // the callerAddr resolved above. Falls back to the ws-level role when the
       // caller's pane is unknown (preserves cross-ws behavior exactly).
-      const paneRole = resolvePaneRole(task.metadata, callerAddrUpdate);
+      // #1598: a verified pane of the receiver workspace that adopted a task
+      // whose receiver pane is gone speaks as the receiver, as its status
+      // update did (otherwise a status+message call commits the status and
+      // then refuses the message).
+      const adoptedOrphan = !!callerWsUpdate && !!callerAddrUpdate && isReceiverPaneGone(
+        task.metadata.to, workspaceId, callerLeavesUpdate.map((l) => l.id),
+      );
+      const paneRole = resolvePaneRole(task.metadata, callerAddrUpdate) ?? (adoptedOrphan ? 'agent' : null);
       // A fully pane-anchored same-ws task only admits its from/to panes (mirror
       // of the reply branch). A verified non-participant pane is rejected rather
       // than defaulting to the ws-level 'user' role. (A status-only update from a
@@ -2689,6 +3487,32 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
         return { error: 'a2a.task.update: caller pane is not a participant of this task' };
       }
       const role = paneRole ?? (task.metadata.from.workspaceId === workspaceId ? 'user' : 'agent');
+
+      // A message-only update is a reply by another name, so it carries the
+      // reply path's round cap: without it a sender "thanks" -> reopen ->
+      // re-complete -> ... loop had no end. A status update is the receiver
+      // closing out the task and is not capped (nothing was mutated yet here
+      // when there is no status).
+      if (!nextState && (
+        countRoundTrips(task.history) >= REPLY_ROUND_CAP ||
+        maxSideMessages(task.history) > REPLY_ROUND_CAP * 2
+      )) {
+        return {
+          error:
+            `a2a.task.update: round cap reached — this thread has completed ${REPLY_ROUND_CAP} ` +
+            'round trips (or one side exceeded its message ceiling). Escalate to the human, or ' +
+            'have a NEW task opened that references this task id.',
+          reason: 'cap_reached',
+          roundTrips: countRoundTrips(task.history),
+        };
+      }
+
+      // Same rule as the reply branch: a verified sender's message reopens an
+      // ended task. Never in a call that also carries a status: only the
+      // receiver may transition, and its completion must stay closed.
+      const reopenWanted = !nextState && wantsSenderReopen(task, workspaceId, callerAddrUpdate);
+      if (params.reopenPreflight === true) return { ok: true, preflight: { reopen: reopenWanted } };
+      updateReopened = !nextState && applySenderReopen(taskId, params);
 
       const parts: Part[] = [{ kind: 'text', text: message }];
       const msg: Message = { kind: 'message', messageId: generateId('msg'), role, parts };
@@ -2725,13 +3549,37 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
         const sameWsUnverified = sameWsTask && !callerPtyIdUpdate;
         if (!pinnedAddressLost && !sameWsNoAnchor && !selfLoop && !sameWsUnverified) {
           if (sameWsTask) {
-            deliverPtyNudge(targetWs, buildA2aNudge(taskId, callerName), explicitPty);
+            // #1573 — the same #1489 gate as below: a sibling pane back at its
+            // shell would run the nudge line as a command. Write nothing then.
+            if (a2aTargetHasAgent(targetWs, explicitPty)) {
+              updateWrite = await deliverPtyNudge(targetWs, buildA2aNudge(taskId, callerName, 'reply'), explicitPty, operator);
+            }
           } else {
-            const liveMeta = deliveryLiveMeta(store.surfaceAgent, explicitPty, targetWs.metadata);
-            if (isLiveTuiAgent(liveMeta)) {
-              deliverPtyNudge(targetWs, buildA2aNudge(taskId, callerName), explicitPty);
+            // #1336 — the same unaddressed rule as send/reply. Without it the
+            // status-update message on a pin-less task still pasted its body
+            // into whatever pane was focused, so the very bug the other two
+            // paths now refuse survived on the third one.
+            let updatePty = explicitPty;
+            if (!updatePty) {
+              const pick = resolveUnaddressedDelivery(findLeafPanes(targetWs.rootPane), store.surfaceAgent, {
+                agentAlive: store.agentAliveByPtyId,
+                commandRunning: store.commandRunningByPtyId,
+              });
+              // Ambiguous is treated like no-agent here: this delivery is a
+              // side-effect of a status change (the transition is already
+              // committed and teed onto the bus), so an arbitrary pick is the
+              // only thing worth refusing.
+              if (pick.kind === 'agent') updatePty = pick.address.ptyId;
+            }
+            const liveMeta = deliveryLiveMeta(store.surfaceAgent, updatePty, targetWs.metadata);
+            // #1489 — a pinned anchor on a shell pane is refused like an
+            // unaddressed one.
+            if (!a2aTargetHasAgent(targetWs, updatePty)) {
+              // Write nothing; the receiver follows the EventBus pointer.
+            } else if (isLiveTuiAgent(liveMeta)) {
+              updateWrite = await deliverPtyNudge(targetWs, buildA2aNudge(taskId, callerName, 'reply'), updatePty, operator);
             } else {
-              deliverPtyNotification(targetWs, callerName, message, explicitPty);
+              updateWrite = await deliverPtyNotification(targetWs, callerName, message, updatePty, operator);
             }
           }
         }
@@ -2756,9 +3604,19 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     // fire last.
     if (transitioned && nextState) {
       const updatedTask = store.getTask(taskId);
-      if (updatedTask) emitA2aTaskEvent(updatedTask, 'updated', nextState);
+      if (updatedTask) emitA2aTaskEvent(updatedTask, nextState === 'canceled' ? 'cancelled' : 'updated', nextState);
+    } else if (updateWrite.refused || updateReopened) {
+      // The message is stored but its push was withheld: tee the pointer so a
+      // receiver polling wmux_events_poll still learns the thread moved (the
+      // reply branch does the same for every not-notified outcome). A reopen
+      // is a state change and tees the pointer too.
+      const updatedTask = store.getTask(taskId);
+      if (updatedTask) emitA2aTaskEvent(updatedTask, 'updated');
     }
 
+    if (updateWrite.refused) {
+      return { ok: true, taskId, delivery: refusedDelivery('update', updateWrite.refused) };
+    }
     return { ok: true, taskId };
   }
 
@@ -2807,24 +3665,55 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
     const sender = store.workspaces.find((w) => w.id === workspaceId);
     const fromName = sender?.name ?? workspaceId.substring(0, 8);
 
-    // Deliver to all other workspaces via PTY paste
+    // Deliver to all other workspaces via PTY paste. A broadcast is
+    // unaddressed BY DEFINITION, so it carried the #1336 hazard at the widest
+    // possible blast radius: it pasted the body plus Enter into each
+    // workspace's first terminal leaf — brain ptys and plain shells included —
+    // and counted every one of them as `sent`. It now writes only to a pane
+    // with a detected agent (the first one, keeping the historical
+    // one-pane-per-workspace volume), and the counts say what really happened.
     let sent = 0;
+    let skipped = 0;
+    const withheld: Array<{ workspace: string; reason: string; detail: string }> = [];
+    const operator = a2aOperatorOrigin(params);
     for (const ws of store.workspaces) {
       if (ws.id === workspaceId) continue;
-      // Workspace-wide (#977) — visible leaves first, so a broadcast still
-      // lands on an on-screen terminal when there is one.
-      const leaves = getWorkspaceLeafPanes(ws);
-      for (const leaf of leaves) {
-        const termSurface = leaf.surfaces.find((s) => s.surfaceType !== 'browser' && s.ptyId);
-        if (termSurface) {
-          const formatted = formatA2aBroadcast(fromName, message);
-          submitToPty(termSurface.ptyId, formatted);
-          break;
-        }
+      const pick = resolveUnaddressedDelivery(findLeafPanes(ws.rootPane), store.surfaceAgent, {
+        agentAlive: store.agentAliveByPtyId,
+        commandRunning: store.commandRunningByPtyId,
+      });
+      // Several agent panes: write to ALL of them rather than picking one
+      // arbitrarily (CodeRabbit, Major) — an announcement addressed to nobody
+      // in particular belongs to every agent in the workspace, and dropping it
+      // would silence the broadcast for exactly the busiest workspaces.
+      // `sent` still counts WORKSPACES reached, so its meaning is unchanged.
+      const ptyIds = pick.kind === 'agent'
+        ? [pick.address.ptyId]
+        : pick.kind === 'ambiguous'
+          ? pick.candidates.map((c) => c.ptyId)
+          : [];
+      if (ptyIds.length === 0) {
+        skipped++;
+        continue;
       }
-      sent++;
+      // Each pane is gated on its own: an approval in front of one agent pane
+      // withholds only that write.
+      const writes = await Promise.all(ptyIds.map((ptyId) => deliverA2aText(
+        ptyId,
+        formatA2aBroadcast(fromName, message, undefined, a2aFormatOptionsFor(ptyId)),
+        operator,
+      )));
+      for (const w of writes) {
+        if (w.refused) withheld.push({ workspace: ws.name, reason: w.refused.reason, detail: w.refused.detail });
+      }
+      if (writes.some((w) => w.ptyId)) sent++;
     }
-    return { ok: true, sent };
+    // `skipped` counts workspaces with no detected agent pane — previously
+    // these were counted as delivered while their shells got the paste.
+    // `withheld` names each agent pane write the approval gate refused.
+    return withheld.length > 0
+      ? { ok: true, sent, skipped, withheld, hint: BROADCAST_WITHHELD_HINT }
+      : { ok: true, sent, skipped };
   }
 
   if (method === 'meta.setSkills') {

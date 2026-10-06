@@ -5,7 +5,10 @@ import {
   resumeOfferForRecovered,
   permissionFlagFor,
   mergeResumeBinding,
+  isProvisionalCapture,
   normalizeResumeCwd,
+  isUsableResumeBinding,
+  resumeGrammarFor,
   PERMISSION_FLAG,
   type ResumeBinding,
   type PermissionMode,
@@ -341,19 +344,20 @@ describe('toResumeCommand (X6)', () => {
     });
   });
 
-  describe('permissionFlagFor (pill helper) — the 4-mode mapping', () => {
+  describe('permissionFlagFor (pill helper) — the 5-mode mapping', () => {
     it('maps every mode', () => {
       expect(permissionFlagFor('bypassPermissions')).toBe('--dangerously-skip-permissions');
       expect(permissionFlagFor('acceptEdits')).toBe('--permission-mode acceptEdits');
       expect(permissionFlagFor('plan')).toBe('--permission-mode plan');
+      expect(permissionFlagFor('auto')).toBe('--permission-mode auto');
       expect(permissionFlagFor('default')).toBe('');
     });
     it('undefined → empty string', () => {
       expect(permissionFlagFor(undefined)).toBe('');
     });
-    it('PERMISSION_FLAG table covers exactly the 4 modes', () => {
+    it('PERMISSION_FLAG table covers exactly the 5 modes', () => {
       expect(Object.keys(PERMISSION_FLAG).sort()).toEqual(
-        (['acceptEdits', 'bypassPermissions', 'default', 'plan'] as PermissionMode[]).sort(),
+        (['acceptEdits', 'auto', 'bypassPermissions', 'default', 'plan'] as PermissionMode[]).sort(),
       );
     });
   });
@@ -389,5 +393,70 @@ describe('toResumeCommand (X6)', () => {
     it('EXCLUDES supervised units', () => {
       expect(resumeOfferForRecovered({ supervision: { restart: 'always' }, lastDetectedAgent: 'claude' })).toBeUndefined();
     });
+  });
+});
+
+describe('isUsableResumeBinding', () => {
+  it('accepts a complete binding', () => {
+    expect(isUsableResumeBinding(binding())).toBe(true);
+    expect(isUsableResumeBinding({ agent: 'codex', sessionId: 's', cwd: '/x', ts: 0 })).toBe(true);
+  });
+
+  it('rejects a binding missing its folder, session id or agent, or of the wrong shape', () => {
+    const noCwd: Partial<ResumeBinding> = binding();
+    delete noCwd.cwd;
+    expect(isUsableResumeBinding(noCwd)).toBe(false);
+    expect(isUsableResumeBinding(binding({ cwd: '' }))).toBe(false);
+    expect(isUsableResumeBinding({ ...binding(), cwd: 42 })).toBe(false);
+    expect(isUsableResumeBinding(binding({ sessionId: '' }))).toBe(false);
+    expect(isUsableResumeBinding({ ...binding(), agent: undefined })).toBe(false);
+    for (const value of [undefined, null, 'claude', 7, []]) expect(isUsableResumeBinding(value)).toBe(false);
+    // The exact shape a caller of daemon.setResumeBinding can send without a folder.
+    expect(isUsableResumeBinding({ agent: 'claude', sessionId: 'abc-123' })).toBe(false);
+  });
+});
+
+describe('resumeGrammarFor (#1342 — slugs now arrive from another machine)', () => {
+  it('answers only for its own launchers, never off the prototype chain', () => {
+    expect(resumeGrammarFor('claude')).toBeDefined();
+    expect(resumeGrammarFor('codex')).toBeDefined();
+    // A bare index would return Object's own members here: truthy, with no
+    // `withId` to call — a remote-supplied slug crashing the renderer mid-render.
+    expect(resumeGrammarFor('constructor')).toBeUndefined();
+    expect(resumeGrammarFor('toString')).toBeUndefined();
+    expect(resumeGrammarFor('__proto__')).toBeUndefined();
+    expect(resumeGrammarFor('gemini')).toBeUndefined();
+  });
+});
+
+describe('isProvisionalCapture (#1624 — Codex first-turn title thread)', () => {
+  const REAL = '01a0e712-ff3d-77f3-834b-4854dcc549f1';
+  const TITLE = '01a0e713-2a61-7593-9d58-782daa920c8d';
+  const rollout = `/h/.codex/sessions/2026/09/28/rollout-2026-09-28T17-12-57-${REAL}.jsonl`;
+  const real = binding({ agent: 'codex', sessionId: REAL, transcriptPath: rollout });
+
+  it('keeps the bound rollout when a second id with no rollout arrives in the same pane', () => {
+    expect(isProvisionalCapture(real, binding({ agent: 'codex', sessionId: TITLE, ts: 2 }))).toBe(true);
+  });
+
+  it("rebinds a real session switch once discovery supplies the new id's rollout", () => {
+    const next = binding({ agent: 'codex', sessionId: TITLE, transcriptPath: rollout.replace(REAL, TITLE), ts: 2 });
+    expect(isProvisionalCapture(real, next)).toBe(false);
+  });
+
+  it('does not hold back when nothing transcript-backed is bound yet (title thread finished first)', () => {
+    const title = binding({ agent: 'codex', sessionId: TITLE });
+    expect(isProvisionalCapture(title, binding({ agent: 'codex', sessionId: REAL, ts: 2 }))).toBe(false);
+    expect(isProvisionalCapture(undefined, title)).toBe(false);
+  });
+
+  it('never holds back an agent switch or the same session re-reporting', () => {
+    expect(isProvisionalCapture(real, binding({ agent: 'claude', sessionId: TITLE }))).toBe(false);
+    expect(isProvisionalCapture(real, binding({ agent: 'codex', sessionId: REAL, ts: 2 }))).toBe(false);
+  });
+
+  it('keeps the existing Claude SessionStart rule', () => {
+    const prev = binding({ transcriptPath: '/p/abc-123.jsonl' });
+    expect(isProvisionalCapture(prev, binding({ sessionId: 'new-456' }))).toBe(true);
   });
 });

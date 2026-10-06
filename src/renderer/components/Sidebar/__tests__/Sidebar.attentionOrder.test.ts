@@ -20,18 +20,12 @@ const sidebarSrc = readFileSync(resolve(SIDEBAR_DIR, 'Sidebar.tsx'), 'utf8');
 const miniSrc = readFileSync(resolve(SIDEBAR_DIR, 'MiniSidebar.tsx'), 'utf8');
 const itemSrc = readFileSync(resolve(SIDEBAR_DIR, 'WorkspaceItem.tsx'), 'utf8');
 
-describe('Sidebar — needs-you-first ordering wiring', () => {
-  it('imports and applies orderByAttention', () => {
-    expect(sidebarSrc).toMatch(/import\s+\{\s*orderByAttention\s*\}\s+from\s+['"]\.\/attentionOrder['"]/);
-    expect(sidebarSrc).toContain('orderByAttention(');
-  });
+// The displayed order itself is asserted by rendering the sidebar:
+// Sidebar.glanceOrder.dynamic.test.tsx. What stays here is index wiring.
+describe('Sidebar — ordering wiring (#1481: manual / needs-you-first / recent)', () => {
 
-  it('reads the opt-in setting from the store', () => {
-    expect(sidebarSrc).toMatch(/useStore\(\(s\)\s*=>\s*s\.sidebarAttentionFirst\)/);
-  });
-
-  it('renders the ordered list, not the filtered one', () => {
-    expect(sidebarSrc).toContain('orderedWorkspaces.map(');
+  it('builds the rendered tree from the ordered list, not the filtered one', () => {
+    expect(sidebarSrc).toMatch(/buildSidebarTree\(\s*orderedWorkspaces,/);
     expect(sidebarSrc).not.toContain('filteredWorkspaces.map(');
   });
 
@@ -42,11 +36,7 @@ describe('Sidebar — needs-you-first ordering wiring', () => {
   });
 });
 
-describe('MiniSidebar — needs-you-first ordering wiring', () => {
-  it('imports and applies orderByAttention', () => {
-    expect(miniSrc).toMatch(/import\s+\{\s*orderByAttention\s*\}\s+from\s+['"]\.\/attentionOrder['"]/);
-    expect(miniSrc).toContain('orderByAttention(');
-  });
+describe('MiniSidebar — ordering wiring', () => {
 
   it('renders the ordered rail', () => {
     expect(miniSrc).toContain('orderedWorkspaces.map(');
@@ -64,18 +54,30 @@ describe('MiniSidebar — needs-you-first ordering wiring', () => {
     expect(miniSrc).not.toMatch(/fromIndex\s*===?\s*i\b/);
   });
 
-  it('mirrors the error cross instead of a second red dot', () => {
-    expect(miniSrc).toContain("agentIcon.shape === 'cross'");
+  it('draws status by shape with the sidebar\'s own mark, never a text glyph', () => {
+    expect(miniSrc).toContain('<StatusMarkView status={agentStatus}');
+    expect(miniSrc).not.toMatch(/'✕'|'○'|agentIcon\.dot/);
   });
 });
 
 describe('drag reorder is paused while the ordering is on', () => {
   // A drop is judged against the DISPLAY order while the index it reorders is
-  // the array position, so with rows pinned the indicator and the result
+  // the array position, so in a sorted order the indicator and the result
   // disagree. Both surfaces gate `draggable` on the setting rather than each
-  // shipping its own translation between the two orders.
+  // shipping its own translation between the two orders. The one exception is
+  // the pinned group (2026-09-26): it shows as stored, so there the two orders
+  // agree and pinned rows stay draggable among themselves.
   it('gates draggable on the setting, on both surfaces', () => {
-    expect(itemSrc).toContain('draggable={!sidebarAttentionFirst}');
-    expect(miniSrc).toContain('draggable={!sidebarAttentionFirst}');
+    // WorkspaceItem folds the sort mode, pin, task rows and Moa's HQ row
+    // (never a reorder source or target) into one flag.
+    expect(itemSrc).toContain("const sortPaused = sortMode !== 'manual';");
+    expect(itemSrc).toContain('const reorderOff = taskRow || moaHq || (sortPaused && !pinned);');
+    // The row itself always drags (its markdown hand-off to an agent pane);
+    // reorderOff only withholds the reorder source.
+    expect(itemSrc).toContain('draggable={!!workspace && !editing && !readOnly}');
+    expect(itemSrc).toContain('if (!reorderOff) setDraggedWorkspaceIndex(index);');
+    expect(miniSrc).toContain('const reorderOff = readOnly || (sidebarAttentionFirst && !isPinned);');
+    expect(miniSrc).toContain('draggable={!reorderOff}');
+    expect(miniSrc).toContain("const sidebarAttentionFirst = sidebarSortMode !== 'manual';");
   });
 });

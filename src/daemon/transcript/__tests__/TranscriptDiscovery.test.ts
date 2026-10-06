@@ -14,6 +14,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { TranscriptDiscovery, scanForTranscript } from '../TranscriptDiscovery';
 import { checkTranscriptPath } from '../../hooks/transcriptPathGuard';
+import { shortPathOf } from '../../../test-utils/shortPath';
 
 const ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
@@ -143,5 +144,53 @@ describe('Windows-shaped paths (pure function)', () => {
 
   it('refuses a Windows-separated agent session id outright', () => {
     expect(scanForTranscript(`..\\elsewhere\\${ID}`, env)).toEqual([]);
+  });
+});
+
+describe('8.3 short root spelling (#984)', () => {
+  it.runIf(process.platform === 'win32')('arms fs.watch on the long spelling of a short-spelled root', (ctx) => {
+    // libuv 1.52 builds with asserts on abort the process on the first event
+    // for a directory watched through a short alias.
+    const shortHome = shortPathOf(home);
+    if (!shortHome) return ctx.skip(); // 8.3 names are off for this volume
+    const watch = vi.spyOn(fs, 'watch');
+    const discovery = new TranscriptDiscovery({
+      getSessionEnv: () => ({ CLAUDE_CONFIG_DIR: path.join(shortHome, 'config') }),
+      onFound: () => undefined,
+      deadlineMs: 50,
+    });
+    try {
+      discovery.start('pty-1', ID, '/repo');
+      const targets = watch.mock.calls.map((call) => String(call[0]).toLowerCase());
+      expect(targets).toContain(fs.realpathSync.native(root).toLowerCase());
+      expect(targets.some((t) => t.startsWith(shortHome.toLowerCase()))).toBe(false);
+    } finally {
+      discovery.dispose();
+    }
+  });
+});
+
+describe('codex rollout discovery (#1624)', () => {
+  const REAL = '01a0e712-ff3d-77f3-834b-4854dcc549f1';
+  const TITLE = '01a0e713-2a61-7593-9d58-782daa920c8d';
+
+  it('adopts an existing rollout synchronously, so the binding holds a path before the title thread reports', () => {
+    const codexEnv = { CODEX_HOME: path.join(home, 'codex') };
+    const file = writeTranscript(
+      path.join(home, 'codex', 'sessions', '2026', '09', '28'),
+      `rollout-2026-09-28T17-12-57-${REAL}.jsonl`,
+    );
+    const onFound = vi.fn();
+    const discovery = new TranscriptDiscovery({ getSessionEnv: () => codexEnv, onFound, deadlineMs: 50 });
+    try {
+      discovery.start('pty-1', REAL, '/w', 'codex');
+      expect(onFound).toHaveBeenCalledTimes(1);
+      expect(onFound.mock.calls[0][0]).toMatchObject({ agent: 'codex', agentSessionId: REAL, transcriptPath: file });
+      // The title thread never writes a rollout, so it is never adopted.
+      discovery.start('pty-1', TITLE, '/w', 'codex');
+      expect(onFound).toHaveBeenCalledTimes(1);
+    } finally {
+      discovery.dispose();
+    }
   });
 });

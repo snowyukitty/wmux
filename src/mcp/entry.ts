@@ -12,6 +12,7 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { COMMANDER_MODE_ARG } from '../shared/commanderSurface';
 import { CORE_MODE_ARG } from '../shared/coreSurface';
+import { roleArgValue } from '../shared/roleSurfaces';
 import { clearClientIdentity } from './wmux-client';
 import { PlaywrightEngine } from './playwright/PlaywrightEngine';
 import { createWmuxServer } from './index';
@@ -24,6 +25,7 @@ async function main(): Promise<void> {
     commanderToken: process.env.WMUX_COMMANDER_TOKEN,
     commanderMode: process.argv.includes(COMMANDER_MODE_ARG),
     coreMode: process.argv.includes(CORE_MODE_ARG),
+    roleSurface: roleArgValue(process.argv),
     callerPid: process.pid,
     callerPpid: process.ppid,
   });
@@ -32,10 +34,11 @@ async function main(): Promise<void> {
   await server.connect(transport);
 
   // Clean up Playwright connection when transport closes. Also drop the
-  // declared plugin identity so any trailing RPC traffic falls back to
-  // the substrate's legacy audit path instead of stamping a stale name —
-  // a reconnect must re-run the MCP initialize handshake to re-establish
-  // identity (see wireClientIdentityHook in index.ts).
+  // declared plugin identity so any trailing RPC traffic goes out
+  // envelope-less (refused by the substrate since #1111) instead of stamping
+  // a stale name — none of the teardown below makes a wmux RPC. A reconnect
+  // must re-run the MCP initialize handshake to re-establish identity (see
+  // wireClientIdentityHook in index.ts).
   transport.onclose = async () => {
     // stdout belongs exclusively to MCP JSON-RPC for the lifetime of a stdio
     // child. Diagnostics must stay on stderr, including during shutdown.
@@ -55,6 +58,10 @@ async function main(): Promise<void> {
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
+  // stdin EOF is the client leaving. Under WSL interop the Linux claude's
+  // SIGTERM is not guaranteed to reach this Windows process, so EOF must be
+  // enough to release Playwright and REPL children.
+  process.stdin.once('end', shutdown);
 }
 
 main().catch((err) => {

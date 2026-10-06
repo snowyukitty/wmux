@@ -12,14 +12,17 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useStore } from '../../stores';
 import { selectActiveWorkspace } from '../../stores/selectors/workspaceProjections';
-import { findLeafPanes } from '../../hooks/a2aAddressing';
+import { openTaskDiff } from '../../utils/openTaskDiff';
 import { generateId } from '../../../shared/types';
 import { FANOUT_MAX_TASKS, FANOUT_PROMPT_MAX_BYTES } from '../../../shared/workTask';
-import { ORCH_ROLES } from '../../../shared/orchestratorRole';
+import { ORCH_ROLES, promptFlagForLauncher } from '../../../shared/orchestratorRole';
 import { useT } from '../../hooks/useT';
 import { t } from '../../i18n';
 import Button from '../ui/Button';
 import Input from '../ui/Input';
+import Checkbox from '../ui/Checkbox';
+import { FOCUS_RING } from '../focusRing';
+import { IconWarning } from '../icons';
 import {
   SKIP_PERMISSIONS_FLAG,
   applySkipPermissions,
@@ -155,6 +158,11 @@ export default function FanOutDialog({ onClose, workspaceId, align = 'left' }: F
   // would otherwise hide the checkbox with the Claude-only flag still on the
   // line — and fire it at a CLI that rejects it (panel review, GLM).
   const staleSkipPermissions = hasStaleSkipPermissions(effectiveAgentCmd);
+  // agy reads ignored files (owner decision C): warn when this fan-out can put
+  // a task on agy, by the command above or by a task's role binding.
+  const usesAgy =
+    fanoutAgentStem(effectiveAgentCmd) === 'agy' ||
+    roles.some((r) => !!r && roleBindings[r]?.agent === 'agy');
 
   const setTitleAt = useCallback((k: number, v: string) => {
     setTitles((prev) => {
@@ -232,6 +240,8 @@ export default function FanOutDialog({ onClose, workspaceId, align = 'left' }: F
       // 배경 폴링을 기다리지 않고 사이드바 "Missions" 섹션을 바로 채운다).
       const parentId = workspace?.id;
       if (parentId) void useStore.getState().refreshMissions(parentId);
+      // #1481 — the launch record now exists; pick up its provenance.
+      void useStore.getState().refreshFanoutProvenance?.();
       onClose();
     } catch (err) {
       pushToast({ level: 'error', message: t('fanout.failed', { error: err instanceof Error ? err.message : String(err) }) });
@@ -240,7 +250,7 @@ export default function FanOutDialog({ onClose, workspaceId, align = 'left' }: F
     }
   }, [submitting, prompt, promptOverCap, promptAllEmpty, confirmEmpty, repoPath, titles, effectiveTaskPrompts, roles, n, effectiveAgentCmd, workspace, pushToast, t]);
 
-  const label = 'text-[11px] text-[var(--text-sub)] mb-1 block';
+  const label = 'text-[13px] font-medium text-[var(--text-main)] mb-1.5 block';
 
   return (
     <div
@@ -248,18 +258,18 @@ export default function FanOutDialog({ onClose, workspaceId, align = 'left' }: F
       // overflow-x-hidden is explicit: the sticky footer's `-mx-3` reaches past
       // the padding box, and `overflow-y-auto` alone computes overflow-x to
       // `auto` — which would hand a 420px dialog a horizontal scrollbar.
-      className={`${align === 'right' ? 'ml-auto' : ''} relative z-50 max-h-[70vh] overflow-y-auto overflow-x-hidden rounded-[7px] border border-[var(--bg-overlay)] bg-[var(--bg-mantle)] p-3 shadow-xl`}
-      style={{ width: 'min(420px, calc(100vw - 24px))' }}
+      className={`${align === 'right' ? 'ml-auto' : ''} ui-popover ui-surface relative z-50 max-h-[70vh] overflow-y-auto overflow-x-hidden`}
+      style={{ width: 'min(420px, calc(100vw - 24px))', padding: 16 }}
       data-testid="fanout-dialog"
     >
-      <div className="text-[12px] font-semibold text-[var(--text-main)] mb-2">{t('fanout.title')}</div>
+      <div className="text-[14px] font-semibold text-[var(--text-main)] mb-3">{t('fanout.title')}</div>
 
-      <div className="flex rounded-[5px] border border-[var(--bg-overlay)] p-0.5 mb-2" role="tablist" data-testid="fanout-mode">
+      <div className="flex rounded-full p-[3px] mb-2 bg-[color-mix(in_srgb,var(--text-main)_6%,transparent)]" role="tablist" data-testid="fanout-mode">
         <button
           type="button"
           role="tab"
           aria-selected={mode === 'compete'}
-          className={`flex-1 text-[11px] rounded-[4px] py-1 transition-colors ${mode === 'compete' ? 'bg-[var(--bg-overlay)] text-[var(--text-main)]' : 'text-[var(--text-sub)]'}`}
+          className={`flex-1 text-[13px] font-medium rounded-full py-1 transition-colors ${FOCUS_RING} ${mode === 'compete' ? 'bg-[color-mix(in_srgb,var(--text-main)_12%,transparent)] text-[var(--text-main)]' : 'text-[var(--text-sub)] hover:text-[var(--text-main)]'}`}
           onClick={() => setMode('compete')}
           data-testid="fanout-mode-compete"
         >
@@ -269,40 +279,41 @@ export default function FanOutDialog({ onClose, workspaceId, align = 'left' }: F
           type="button"
           role="tab"
           aria-selected={mode === 'parallel'}
-          className={`flex-1 text-[11px] rounded-[4px] py-1 transition-colors ${mode === 'parallel' ? 'bg-[var(--bg-overlay)] text-[var(--text-main)]' : 'text-[var(--text-sub)]'}`}
+          className={`flex-1 text-[13px] font-medium rounded-full py-1 transition-colors ${FOCUS_RING} ${mode === 'parallel' ? 'bg-[color-mix(in_srgb,var(--text-main)_12%,transparent)] text-[var(--text-main)]' : 'text-[var(--text-sub)] hover:text-[var(--text-main)]'}`}
           onClick={() => setMode('parallel')}
           data-testid="fanout-mode-parallel"
         >
           {t('fanout.modeParallel')}
         </button>
       </div>
-      <div className="text-[10px] text-[var(--text-muted)] mb-2">
+      <div className="text-[11px] text-[var(--text-sub)] mb-3">
         {mode === 'compete' ? t('fanout.modeCompeteHint') : t('fanout.modeParallelHint')}
       </div>
 
       <label className={label}>{t('fanout.promptLabel')}</label>
       <textarea
-        className="ui-input h-20 resize-none font-mono text-[12px]"
+        className="ui-input h-20 resize-none text-[13px]"
         value={prompt}
         onChange={(e) => setPrompt(e.target.value)}
         placeholder={t('fanout.promptPlaceholder')}
         data-testid="fanout-prompt"
       />
-      <div className={`text-[10px] mb-2 ${promptOverCap ? 'text-[var(--accent-red)]' : 'text-[var(--text-muted)]'}`}>
+      <div className={`text-[11px] mt-1 mb-3 tabular-nums ${promptOverCap ? 'text-[var(--accent-red)]' : 'text-[var(--text-sub)]'}`}>
         {t('fanout.bytes', { bytes: promptBytes, max: FANOUT_PROMPT_MAX_BYTES })}
       </div>
 
       <label className={label}>{t('fanout.taskCount', { n })}</label>
-      <div className="flex gap-1 mb-2" data-testid="fanout-n">
+      <div className="flex gap-1 mb-3" data-testid="fanout-n">
         {Array.from({ length: FANOUT_MAX_TASKS }, (_, i) => i + 1).map((count) => (
           <button
             key={count}
             type="button"
             aria-pressed={n === count}
-            className={`flex-1 h-7 rounded-[4px] text-[11px] border transition-colors ${
+            // Neutral selection: the warm fill is kept for Launch.
+            className={`flex-1 h-7 rounded-[8px] text-[13px] tabular-nums border transition-colors ${FOCUS_RING} ${
               n === count
-                ? 'border-[var(--accent)] bg-[var(--accent)] text-[var(--bg-base)]'
-                : 'border-[var(--bg-overlay)] text-[var(--text-sub)] hover:border-[var(--text-muted)]'
+                ? 'border-transparent bg-[color-mix(in_srgb,var(--text-main)_12%,transparent)] text-[var(--text-main)] font-medium'
+                : 'border-[var(--surface-hairline)] text-[var(--text-sub)] hover:bg-[var(--surface-fill-hover)]'
             }`}
             onClick={() => setN(count)}
             data-testid={`fanout-n-${count}`}
@@ -313,9 +324,9 @@ export default function FanOutDialog({ onClose, workspaceId, align = 'left' }: F
       </div>
 
       <label className={label}>{t('fanout.titlesLabel')}</label>
-      <div className="space-y-2 mb-2">
+      <div className="space-y-2 mb-3">
         {Array.from({ length: n }, (_, k) => (
-          <div key={k} className="rounded-[5px] border border-[var(--bg-overlay)] p-1.5">
+          <div key={k} className="rounded-[12px] border border-[var(--surface-hairline)] bg-[var(--surface-fill)] p-2.5">
             {/* Title + role on one row, the derived branch name on its own line
                 below. All three competed for a 420px dialog: the title Input
                 was `flex-1` WITHOUT `min-w-0` (so its `min-width: auto` refused
@@ -326,7 +337,7 @@ export default function FanOutDialog({ onClose, workspaceId, align = 'left' }: F
                 not belong in the same competition. */}
             <div className="flex items-center gap-2 mb-1">
               <Input
-                className="min-w-0 flex-1 text-[12px]"
+                className="min-w-0 flex-1 text-[13px]"
                 value={titles[k] ?? ''}
                 onChange={(e) => setTitleAt(k, e.target.value)}
                 data-testid={`fanout-title-${k}`}
@@ -343,7 +354,7 @@ export default function FanOutDialog({ onClose, workspaceId, align = 'left' }: F
                   ceiling stays so it cannot squeeze the title field. */}
               <select
                 aria-label={t('fanout.roleLabel', { k: k + 1 })}
-                className="ui-input shrink-0 text-[11px] py-0.5"
+                className="ui-input shrink-0 text-[12px] py-1"
                 style={{ minWidth: 132, maxWidth: 168 }}
                 value={roles[k] ?? ''}
                 onChange={(e) => setRoleAt(k, e.target.value)}
@@ -358,7 +369,7 @@ export default function FanOutDialog({ onClose, workspaceId, align = 'left' }: F
               </select>
             </div>
             <div
-              className="mb-1 truncate text-[10px] text-[var(--text-muted)] font-mono"
+              className="mb-1.5 truncate text-[11px] text-[var(--text-sub)] font-mono"
               title={`wtask/${previewSlug(titles[k] ?? '')}`}
               data-testid={`fanout-slug-${k}`}
             >
@@ -367,14 +378,14 @@ export default function FanOutDialog({ onClose, workspaceId, align = 'left' }: F
             {mode === 'parallel' && (
               <>
                 <textarea
-                  className="ui-input h-14 resize-none font-mono text-[11px]"
+                  className="ui-input h-14 resize-none text-[12px]"
                   value={taskPrompts[k] ?? ''}
                   onChange={(e) => setTaskPromptAt(k, e.target.value)}
                   placeholder={t('fanout.taskPromptPlaceholder', { k: k + 1 })}
                   data-testid={`fanout-task-prompt-${k}`}
                 />
                 {effectiveBytes[k] > FANOUT_PROMPT_MAX_BYTES && (
-                  <div className="text-[10px] text-[var(--accent-red)]">
+                  <div className="text-[11px] tabular-nums text-[var(--accent-red)]">
                     {t('fanout.bytes', { bytes: effectiveBytes[k], max: FANOUT_PROMPT_MAX_BYTES })}
                   </div>
                 )}
@@ -385,74 +396,83 @@ export default function FanOutDialog({ onClose, workspaceId, align = 'left' }: F
       </div>
 
       {promptAllEmpty && (
-        <div className="text-[10px] text-[var(--text-muted)] mb-2" data-testid="fanout-empty-hint">
+        <div className="text-[11px] text-[var(--text-sub)] mb-3" data-testid="fanout-empty-hint">
           {t('fanout.envOnlyHint')}
         </div>
       )}
 
       <label className={label}>{t('fanout.repoLabel')}</label>
-      <Input className="mb-2 font-mono text-[12px]" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} data-testid="fanout-repo" />
+      <Input className="mb-3 font-mono text-[12px]" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} data-testid="fanout-repo" />
 
       <label className={label}>{t('fanout.agentLabel')}</label>
       <Input className="mb-2 font-mono text-[12px]" value={agentCmd} onChange={(e) => setAgentCmd(e.target.value)} data-testid="fanout-agent" />
 
       {canSkipPermissions ? (
-        <label className="mb-1 flex items-center gap-2 cursor-pointer select-none text-[11px] text-[var(--text-sub)]">
-          <input
-            type="checkbox"
+        <label className="mb-1 flex items-center gap-2 cursor-pointer select-none text-[12px] text-[var(--text-sub)]">
+          <Checkbox
             checked={skipPermissions}
             // Toggle the EFFECTIVE command, not the raw field: with the field
             // empty the preview already reads `claude`, so toggling the raw ''
             // silently did nothing (panel review, Codex).
-            onChange={(e) => setAgentCmd(applySkipPermissions(effectiveAgentCmd, e.target.checked))}
-            style={{ accentColor: 'var(--accent-cursor)', cursor: 'pointer', margin: 0 }}
+            onCheckedChange={(next) => setAgentCmd(applySkipPermissions(effectiveAgentCmd, next))}
             data-testid="fanout-skip-permissions"
           />
           <span className="font-mono">{SKIP_PERMISSIONS_FLAG}</span>
         </label>
       ) : staleSkipPermissions ? (
-        <div className="mb-1 flex items-center gap-2 text-[10px] text-[var(--accent-red)]" data-testid="fanout-skip-permissions-stale">
+        <div className="mb-1 flex items-center gap-2 text-[11px] text-[var(--accent-red)]" data-testid="fanout-skip-permissions-stale">
           <span>{t('fanout.skipPermissionsStale', { agent: fanoutAgentStem(effectiveAgentCmd) })}</span>
-          <button
-            type="button"
-            className="shrink-0 rounded-[4px] border border-[var(--bg-overlay)] px-1.5 py-0.5 text-[10px] text-[var(--text-sub)] hover:border-[var(--text-muted)]"
+          <Button
+            size="sm"
+            variant="secondary"
+            className="shrink-0"
             onClick={() => setAgentCmd(applySkipPermissions(effectiveAgentCmd, false))}
             data-testid="fanout-skip-permissions-strip"
           >
             {t('fanout.skipPermissionsStrip')}
-          </button>
+          </Button>
         </div>
       ) : (
-        <div className="mb-1 text-[10px] text-[var(--text-muted)]" data-testid="fanout-skip-permissions-unsupported">
+        <div className="mb-1 text-[11px] text-[var(--text-sub)]" data-testid="fanout-skip-permissions-unsupported">
           {t('fanout.skipPermissionsUnsupported')}
         </div>
       )}
       {skipPermissions && canSkipPermissions && (
-        <div className="mb-1 text-[10px] text-[var(--accent-red)]">{t('fanout.skipPermissionsWarning')}</div>
+        <div className="mb-1 text-[11px] text-[var(--accent-red)]">{t('fanout.skipPermissionsWarning')}</div>
+      )}
+      {usesAgy && (
+        <div className="mb-1 text-[11px] text-[var(--accent-red)]" data-testid="fanout-agy-warning">
+          {t('fanout.agyReadsIgnoredFiles')}
+        </div>
       )}
 
       {/* Launch command — the line the task pane fires, and the value remembered
           for the next fan-out. main appends the prompt file as one argument
           (FanOutService.buildInitialCommand), so show that too rather than
           claiming a bare agent command is the whole line (panel review, 2/2). */}
-      <label className={label}>{t('fanout.commandPreviewLabel')}</label>
+      <label className={`${label} mt-3`}>{t('fanout.commandPreviewLabel')}</label>
       <code
-        className="mb-3 block rounded-[4px] border border-[var(--bg-overlay)] bg-[var(--bg-base)] px-1.5 py-1 font-mono text-[11px] text-[var(--text-sub)] select-text"
+        className="mb-3 block rounded-[10px] border border-[var(--surface-hairline)] bg-[var(--surface-fill)] px-2.5 py-2 font-mono text-[12px] text-[var(--text-main)] select-text"
         style={{ overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}
         data-testid="fanout-command-preview"
       >
         {effectiveAgentCmd}
+        {/* agy takes its prompt only from -i: main puts it there, so does the preview. */}
+        {!promptAllEmpty && promptFlagForLauncher(effectiveAgentCmd) && ` ${promptFlagForLauncher(effectiveAgentCmd)}`}
         {!promptAllEmpty && (
-          <span className="text-[var(--text-muted)]"> {t('fanout.commandPreviewPromptArg')}</span>
+          <span className="text-[var(--text-sub)]"> {t('fanout.commandPreviewPromptArg')}</span>
         )}
       </code>
 
       {confirmEmpty && (
         <div
-          className="mb-2 rounded-[4px] border border-[var(--accent-amber,var(--accent))] px-2 py-1 text-[10px] text-[var(--text-sub)]"
+          className="ui-notice mb-3 flex items-start gap-2 px-3 py-2 text-[11px] leading-4 text-[var(--text-main)]"
           role="alert"
           data-testid="fanout-confirm-empty"
         >
+          <span className="shrink-0 pt-px" style={{ color: 'var(--accent-yellow)' }} aria-hidden="true">
+            <IconWarning size={12} />
+          </span>
           {t('fanout.confirmEmpty', { n })}
         </div>
       )}
@@ -463,11 +483,12 @@ export default function FanOutDialog({ onClose, workspaceId, align = 'left' }: F
           Launch reachable at every scroll position; the negative margins undo
           the dialog's own padding so the bar spans the full width and content
           scrolls under it rather than beside it. */}
-      <div className="sticky bottom-0 -mx-3 -mb-3 flex items-center justify-end gap-2 border-t border-[var(--bg-overlay)] bg-[var(--bg-mantle)] px-3 py-2">
-        <Button variant="secondary" onClick={onClose}>
+      <div className="sticky -bottom-4 -mx-4 -mb-4 flex items-center justify-end gap-2 border-t border-[var(--surface-hairline)] bg-[var(--bg-base)] px-4 py-3">
+        <Button size="md" variant="secondary" onClick={onClose}>
           {t('fanout.cancel')}
         </Button>
         <Button
+          size="md"
           variant="primary"
           disabled={submitting || promptOverCap}
           onClick={handleSubmit}
@@ -492,6 +513,8 @@ function didLaunch(res: unknown): boolean {
 interface FanOutResultLike {
   ok?: boolean;
   error?: string;
+  /** T3 — e.g. the tasks branched from HEAD because origin could not be fetched. */
+  warnings?: string[];
   tasks?: Array<{
     ok?: boolean;
     title?: string;
@@ -514,20 +537,6 @@ type PushToast = (t: {
   message: string;
   action?: { label: string; onClick: () => void };
 }) => string;
-
-// F5 — 태스크 워크스페이스의 첫 leaf 페인에 diff 서피스를 연다. 워크스페이스가
-// 아직 없거나 leaf가 없으면(레이스) 조용히 무시. F1: owner(부모) ws id를 서피스에
-// 실어 close/PR/resolveTaskMeta가 owner 스코프 RPC를 올바른 신원으로 부르게 한다.
-function openTaskDiff(taskId: string, workspaceId: string, title: string, ownerWorkspaceId: string): void {
-  const st = useStore.getState();
-  const ws = st.workspaces.find((w) => w.id === workspaceId);
-  if (!ws) return;
-  const leaf = findLeafPanes(ws.rootPane)[0];
-  if (!leaf) return;
-  st.addDiffSurface(leaf.id, taskId, `diff: ${title}`, workspaceId, ownerWorkspaceId);
-  // 태스크 워크스페이스로 전환해 방금 연 diff가 바로 보이게.
-  st.setActiveWorkspace(workspaceId);
-}
 
 function reportResult(res: unknown, pushToast: PushToast, ownerWorkspaceId: string): void {
   const r = (res ?? {}) as FanOutResultLike;
@@ -564,6 +573,9 @@ function reportResult(res: unknown, pushToast: PushToast, ownerWorkspaceId: stri
     level: fail > 0 ? 'error' : disconnected > 0 || unmaterialized > 0 ? 'warn' : 'info',
     message: parts.join(' · '),
   });
+  for (const w of r.warnings ?? []) {
+    if (typeof w === 'string' && w.trim()) pushToast({ level: 'warn', message: w });
+  }
 
   // F5 — ONE toast for the diff entry point, not one per task. A fan-out of 8
   // pushed 8 identical-looking cards on top of the summary that had just been

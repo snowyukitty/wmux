@@ -1,6 +1,7 @@
 import { Notification, BrowserWindow, app } from 'electron';
 import { isWindows, isMac } from '../../shared/platform';
 import { IPC } from '../../shared/constants';
+import { focusedPrimaryWindow, primaryWindow } from '../window/auxiliaryWindows';
 
 /**
  * Originating context for a toast. When present, clicking the toast not only
@@ -50,7 +51,7 @@ export class ToastManager {
    */
   show(title: string, body: string, context?: ToastFocusContext): void {
     // Only show toast when app is not focused
-    const focusedWindow = BrowserWindow.getFocusedWindow();
+    const focusedWindow = focusedPrimaryWindow();
     if (focusedWindow) return;
 
     this.showDirect(title, body, context);
@@ -62,11 +63,22 @@ export class ToastManager {
    * policy (`osToast` action, emitted only when `!windowFocused`), relayed
    * over IPC.NOTIFICATION_OS_TOAST. The click handler / flashFrame / dock
    * bounce behavior is identical to the legacy show() path.
+   *
+   * `ignoreToastSetting` is for security notices only (a paired phone started
+   * an agent with approvals off): the host user must see those even with
+   * toasts turned off in Settings.
    */
-  showDirect(title: string, body: string, context?: ToastFocusContext): void {
-    if (!this.enabled) return;
+  showDirect(
+    title: string,
+    body: string,
+    context?: ToastFocusContext,
+    // `onClick` runs after the window is restored and focused — for toasts
+    // whose target is not a pane yet (a scheduled run's detached session).
+    options?: { ignoreToastSetting?: boolean; onClick?: () => void },
+  ): boolean {
+    if (!this.enabled && !options?.ignoreToastSetting) return false;
 
-    if (!Notification.isSupported()) return;
+    if (!Notification.isSupported()) return false;
 
     const notification = new Notification({
       title,
@@ -78,7 +90,7 @@ export class ToastManager {
       // Bring app to front when toast is clicked. Windows Action Center
       // keeps toasts clickable long after they fire — the window may be
       // gone or mid-teardown by now, so guard isDestroyed before touching it.
-      const win = BrowserWindow.getAllWindows()[0];
+      const win = primaryWindow();
       if (win && !win.isDestroyed()) {
         if (win.isMinimized()) win.restore();
         win.focus();
@@ -92,6 +104,7 @@ export class ToastManager {
             workspaceId: context.workspaceId ?? null,
           });
         }
+        options?.onClick?.();
       }
     });
 
@@ -104,7 +117,7 @@ export class ToastManager {
     // Each platform's gate is independent (see ToastFocusContext) — the
     // renderer-decided path suppresses ONLY the Windows flash (it owns that
     // itself) while still wanting the macOS bounce (which it can't do).
-    const win = BrowserWindow.getAllWindows()[0];
+    const win = primaryWindow();
     if (win) {
       if (isWindows && context?.windowsFlashEnabled !== false) {
         win.flashFrame(true);
@@ -124,6 +137,7 @@ export class ToastManager {
       }
       // Linux: intentionally no-op beyond the Notification.show() above.
     }
+    return true;
   }
 }
 

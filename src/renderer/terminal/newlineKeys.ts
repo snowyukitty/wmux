@@ -19,8 +19,13 @@
  *
  * Returned byte:
  *   - Shift+Enter → protocol-aware (see encodeShiftEnter): kitty CSI-u,
- *     win32-input-mode (`?9001h`, Codex on Windows — #1152), or xterm's
- *     own encoding when the caller says the app never negotiated.
+ *     win32-input-mode (`?9001h`, Codex on Windows — #1152), modifyOtherKeys,
+ *     or LF when the local pane never negotiated. CSI-u without a kitty push
+ *     is Escape + `[13;2u` to Claude Code inside wmux (TERM_PROGRAM=wmux is
+ *     not on Claude's kitty whitelist), which is why Shift+Enter submitted
+ *     after #1228 (#1152 follow-up). LF is the same byte Ctrl+J already sends.
+ *   - Native Windows Codex → Alt+Enter (`ESC CR`) for all three keys (see
+ *     `altEnterNewline`, #1694).
  *   - Ctrl+Enter → LF (`\n`): same intent as Ctrl+J. With no extended keyboard
  *     protocol enabled, xterm sends a bare CR for Ctrl+Enter — byte-identical
  *     to plain Enter — so an in-pane TUI submits instead of inserting a
@@ -59,13 +64,15 @@ export interface KeyboardProtocolHint {
 }
 
 /**
- * When no keyboard protocol is negotiated, a local pane still sends CSI-u
- * (Claude Code never emits a kitty push, yet understands the byte — the
- * historical newlineKeys behaviour). A mirror / web viewer must not: the
- * app on the other side never negotiated with this xterm, so CSI-u is
- * Escape + garbage. Those callers pass `'xterm'` and we return null.
+ * When no keyboard protocol is negotiated:
+ *   - `'lf'` — local pane. Send the same newline byte as Ctrl+J. Claude Code
+ *     inside wmux never pushes kitty (`TERM_PROGRAM=wmux` is not on its
+ *     whitelist) and does not treat unsolicited CSI-u as newline.
+ *   - `'csi-u'` — opt into the historical kitty byte even without a push.
+ *   - `'xterm'` — mirror / web viewer. Return null so xterm encodes the
+ *     legacy CR. CSI-u without a push is Escape + garbage on the far side.
  */
-export type ShiftEnterFallback = 'csi-u' | 'xterm';
+export type ShiftEnterFallback = 'lf' | 'csi-u' | 'xterm';
 
 export interface NewlineKeyOptions {
   /**
@@ -80,23 +87,48 @@ export interface NewlineKeyOptions {
   protocol?: KeyboardProtocolHint;
   /**
    * What to send for Shift+Enter when `protocol` names no encoding.
-   * Defaults to `'csi-u'` (local pane). Remote/web pass `'xterm'`.
+   * Defaults to `'lf'` (local pane). Remote/web pass `'xterm'`.
    */
   shiftEnterFallback?: ShiftEnterFallback;
+  /**
+   * The pane runs native Windows Codex (#1694). Shift+Enter, Ctrl+Enter and
+   * Ctrl+J all send Alt+Enter (`ESC CR`) instead of LF.
+   *
+   * The protocol flag cannot say this on Windows: every ConPTY session emits
+   * `?9001h` itself, so the fold ignores it there (#1363) and `win32Input`
+   * never arms. ConPTY turns a bare LF into Ctrl+Enter, which Codex does not
+   * take as a newline. Alt+Enter is the one chord measured to insert a
+   * newline in Codex on Windows (the #1694 report); a win32 Shift+Enter record
+   * may lose SHIFT inside ConPTY and submit (#1363). Set only through
+   * `wantsAltEnterNewline`.
+   */
+  altEnterNewline?: boolean;
 }
 
-/** Kitty CSI-u Shift+Enter. Claude Code inserts a newline instead of submitting. */
+/** Kitty CSI-u Shift+Enter. Only meaningful after the pane pushed kitty. */
 export const SHIFT_ENTER_CSI_U = '\x1b[13;2u';
+
+/** Bare LF. Claude Code / readline "insert newline, do not submit" (Ctrl+J). */
+export const SHIFT_ENTER_LF = '\n';
 
 /**
  * win32-input-mode Shift+Enter (`CSI Vk;Sc;Uc;Kd;Cs;Rc _`).
  *
- * VK_RETURN=13, scan 0x1C=28, Unicode CR=13, key-down, SHIFT_PRESSED=0x10,
+ * VK_RETURN=13, scan 0x1C=28, Unicode LF=10, key-down, SHIFT_PRESSED=0x10,
  * repeat 1 — then the matching key-up (Unicode 0, key-down 0). Codex on
  * Windows negotiates `?9001h` and does not understand CSI-u (#1152).
+ *
+ * The Unicode field carries LF, not CR: ConPTY hands the client the record's
+ * character and the SHIFT modifier does not survive that trip, so `Uc=13` is
+ * read as a plain Enter and the TUI submits. Measured 2026-09-17 against a
+ * live Claude Code pane on Windows — `Uc=13` submitted, `Uc=10` inserted a
+ * newline, same as the literal `\n` Ctrl+J sends (#1363).
  */
 export const SHIFT_ENTER_WIN32 =
-  '\x1b[13;28;13;1;16;1_\x1b[13;28;0;0;16;1_';
+  '\x1b[13;28;10;1;16;1_\x1b[13;28;0;0;16;1_';
+
+/** Alt+Enter as xterm encodes it. Native Windows Codex reads it as newline. */
+export const ALT_ENTER = '\x1b\r';
 
 /** xterm modifyOtherKeys mode 2: CSI 27 ; 2 ; 13 ~ */
 export const SHIFT_ENTER_MODIFY_OTHER_KEYS = '\x1b[27;2;13~';
@@ -116,7 +148,117 @@ export function encodeShiftEnter(
   if (protocol?.win32Input) return SHIFT_ENTER_WIN32;
   if (protocol?.kitty) return SHIFT_ENTER_CSI_U;
   if (protocol?.modifyOtherKeys === 2) return SHIFT_ENTER_MODIFY_OTHER_KEYS;
-  return fallback === 'csi-u' ? SHIFT_ENTER_CSI_U : null;
+  if (fallback === 'csi-u') return SHIFT_ENTER_CSI_U;
+  if (fallback === 'lf') return SHIFT_ENTER_LF;
+  return null;
+}
+
+/** What `wantsAltEnterNewline` reads, per keystroke. */
+export interface AltEnterNewlineScope {
+  /** The pane's host OS (the daemon's in the browser build), null if unknown. */
+  hostPlatform: string | null | undefined;
+  /** The pane's shell enters WSL; undefined until the shell is known. */
+  isWsl: boolean | undefined;
+  /** The pane's detected agent. */
+  agentSlug: string | undefined;
+  /** The shell reported a prompt (OSC 133;A) since the last command start. */
+  atPrompt: boolean;
+  /**
+   * When a prompt last ended a running Codex (see `noteCodexEndedByPrompt`),
+   * or null. Cleared as soon as the slug stops being `codex`.
+   */
+  codexEndedAt?: number | null;
+  /** Clock for `codexEndedAt`; defaults to `Date.now()`. */
+  now?: number;
+}
+
+/**
+ * How long a prompt that ended Codex keeps the mapping off, even across a new
+ * command start. The slug is only dropped by a liveness snapshot, and the
+ * slowest of those is the 15 s `pty.list` poll; past that, a slug that is
+ * still `codex` belongs to a Codex that really is running again.
+ */
+export const CODEX_END_GRACE_MS = 16_000;
+
+/**
+ * Whether a pane gets `altEnterNewline` (#1694): Codex running natively on a
+ * Windows host, while its command is still running.
+ *
+ * - WSL: a Linux Codex behind wsl.exe reads VT bytes, not console key events,
+ *   so the old LF / negotiated encoding stays. A shell not yet known counts
+ *   as WSL — LF is the safe side.
+ * - `atPrompt`: the detected slug outlives Codex by up to one liveness poll,
+ *   so the prompt marker ends the mapping at once.
+ * - `codexEndedAt`: a command started inside that stale window (OSC 133;C)
+ *   must not re-arm it either, or that command gets Alt+Enter for Codex's
+ *   sake. The mapping stays off until the slug is dropped (the latch clears)
+ *   or `CODEX_END_GRACE_MS` has passed with the slug still `codex`.
+ */
+export function wantsAltEnterNewline(scope: AltEnterNewlineScope): boolean {
+  const endedRecently = scope.codexEndedAt != null
+    && (scope.now ?? Date.now()) - scope.codexEndedAt < CODEX_END_GRACE_MS;
+  return scope.hostPlatform === 'win32'
+    && scope.isWsl === false
+    && scope.agentSlug === 'codex'
+    && !scope.atPrompt
+    && !endedRecently;
+}
+
+/**
+ * Track when a prompt ended a running Codex. A prompt edge (not at a prompt →
+ * at a prompt) while the slug is `codex` stamps `now`; anything else keeps
+ * `prev`. The caller clears the stamp when the slug stops being `codex`.
+ */
+export function noteCodexEndedByPrompt(
+  prev: number | null,
+  wasAtPrompt: boolean,
+  atPrompt: boolean,
+  agentSlug: string | undefined,
+  now: number,
+): number | null {
+  return !wasAtPrompt && atPrompt && agentSlug === 'codex' ? now : prev;
+}
+
+const PROMPT_START_MARK = '\x1b]133;A';
+const COMMAND_START_MARK = '\x1b]133;C';
+// Every marker is ASCII, so a latin1 view of a byte chunk is exact for them.
+const latin1 = new TextDecoder('latin1');
+
+/**
+ * Fold one chunk of the pane's output into "is the shell at its prompt".
+ * The later of OSC 133;A (prompt) and 133;C (command started) wins; a chunk
+ * with neither keeps `prev`. Without shell integration the state never
+ * leaves `false`, and only the liveness edges end the mapping.
+ */
+export function foldAtPrompt(prev: boolean, bytes: string | Uint8Array): boolean {
+  const chunk = typeof bytes === 'string' ? bytes : latin1.decode(bytes);
+  const prompt = chunk.lastIndexOf(PROMPT_START_MARK);
+  const command = chunk.lastIndexOf(COMMAND_START_MARK);
+  if (prompt === -1 && command === -1) return prev;
+  return prompt > command;
+}
+
+/** Both markers are this long, so a shorter tail can never hold a whole one. */
+const MARK_TAIL = PROMPT_START_MARK.length - 1;
+
+/**
+ * `foldAtPrompt` across chunk boundaries. PTY output can split a marker
+ * between two data events, and neither half matches on its own. The caller
+ * keeps `tail` per pane: the last `MARK_TAIL` characters already scanned,
+ * which is too short to repeat a marker, so nothing is counted twice.
+ */
+export function foldAtPromptCarry(
+  prev: boolean,
+  tail: string,
+  bytes: string | Uint8Array,
+): { atPrompt: boolean; tail: string } {
+  const scan = tail + (typeof bytes === 'string' ? bytes : latin1.decode(bytes));
+  return { atPrompt: foldAtPrompt(prev, scan), tail: scan.slice(-MARK_TAIL) };
+}
+
+/** Enter / NumpadEnter, including an IME that mangled `key` to 'Process'. */
+function isEnterKey(e: NewlineKeyEventLike): boolean {
+  return e.key === 'Enter' || e.code === 'Enter' || e.code === 'NumpadEnter';
 }
 
 export function resolveNewlineKeyByte(
@@ -124,10 +266,20 @@ export function resolveNewlineKeyByte(
   opts?: NewlineKeyOptions,
 ): string | null {
   // Shift+Enter. Encoding depends on what the pane negotiated (kitty CSI-u,
-  // win32-input-mode, modifyOtherKeys). metaKey is intentionally not
-  // constrained — preserves the original inline handler's exact predicate.
-  if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.altKey) {
-    return encodeShiftEnter(opts?.protocol, opts?.shiftEnterFallback ?? 'csi-u');
+  // win32-input-mode, modifyOtherKeys). Match physical `code` so a CJK IME
+  // that reports `key === 'Process'` still takes this path — otherwise xterm
+  // encodes a bare CR and the TUI submits (#1152). metaKey is intentionally
+  // not constrained — preserves the original inline handler's exact predicate.
+  // `!isComposing` defers to an open IME preedit, same as Ctrl+J / Ctrl+Enter.
+  if (
+    isEnterKey(e) &&
+    e.shiftKey &&
+    !e.ctrlKey &&
+    !e.altKey &&
+    !e.isComposing
+  ) {
+    if (opts?.altEnterNewline) return ALT_ENTER;
+    return encodeShiftEnter(opts?.protocol, opts?.shiftEnterFallback ?? 'lf');
   }
 
   // Ctrl+Enter → LF, same intent as Ctrl+J: insert a newline without
@@ -135,19 +287,18 @@ export function resolveNewlineKeyByte(
   // bare CR (\r) for Ctrl+Enter — indistinguishable from plain Enter — and an
   // in-pane TUI (Claude Code, codex) submits instead of adding a line. Emitting
   // LF ourselves gives the editor the "newline, don't submit" byte it expects.
-  // Keyed on `key === 'Enter'` to mirror the Shift+Enter predicate above
-  // (NumpadEnter also reports key 'Enter'). The other modifiers are excluded so
-  // only the pure Ctrl+Enter chord matches, and `!isComposing` defers to an
-  // active IME preedit exactly like the Ctrl+J path below.
+  // Keyed on Enter / NumpadEnter (and physical `code` under an IME). The other
+  // modifiers are excluded so only the pure Ctrl+Enter chord matches, and
+  // `!isComposing` defers to an active IME preedit exactly like Ctrl+J.
   if (
-    e.key === 'Enter' &&
+    isEnterKey(e) &&
     e.ctrlKey &&
     !e.shiftKey &&
     !e.altKey &&
     !e.metaKey &&
     !e.isComposing
   ) {
-    return '\n';
+    return opts?.altEnterNewline ? ALT_ENTER : '\n';
   }
 
   // Ctrl+J → LF. Match the physical key so it survives a CJK IME where
@@ -173,7 +324,7 @@ export function resolveNewlineKeyByte(
     !e.altKey &&
     !e.metaKey
   ) {
-    return '\n';
+    return opts?.altEnterNewline ? ALT_ENTER : '\n';
   }
 
   return null;

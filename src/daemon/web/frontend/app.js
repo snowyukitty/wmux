@@ -9,7 +9,7 @@
  * <select>), a dot-vocabulary connection chip, and explicit loading / empty /
  * error / auth states instead of a bare status string.
  */
-/* global Terminal, wmuxAttentionFormat, pairQuery, wmuxTouchScroll */ // provided by the inlined bundles
+/* global Terminal, ImageAddon, wmuxAttentionFormat, pairQuery, wmuxTouchScroll, wmuxInlineImages */ // provided by the inlined bundles
 (function () {
   'use strict';
   var $ = function (s) { return document.querySelector(s); };
@@ -178,8 +178,48 @@
     if (owner && owner.focus && owner !== document.body) { try { owner.focus(); } catch (e) { /* torn down */ } }
   }
 
+  // Inline images (#1641). The server can switch them off
+  // (`wmux web --no-inline-images`), and inlineImages.js refuses to load the
+  // addon where WebAssembly cannot compile, since its decoders would throw
+  // inside the parser and lose the output that follows an image.
+  var inlineImagesEnabled = true;
+  function loadImageAddon(t) {
+    if (!t) return;
+    wmuxInlineImages.sync(t, {
+      enabled: inlineImagesEnabled,
+      ImageAddon: typeof ImageAddon === 'object' ? ImageAddon : null,
+      WebAssembly: typeof WebAssembly === 'object' ? WebAssembly : null,
+      createImageBitmap: typeof createImageBitmap === 'function' ? createImageBitmap : null,
+      capSixel: window.wmuxTerminalShared ? window.wmuxTerminalShared.capSixelImageSize : null
+    });
+  }
+  // A phone stays connected across a server-side switch, so every snapshot's
+  // `meta` carries the switch and it is applied to every open terminal before
+  // that snapshot repaints — otherwise the first paint after a switch shows
+  // the old state.
+  function applyInlineImages(enabled) {
+    inlineImagesEnabled = enabled;
+    loadImageAddon(term);
+    tiles.forEach(function (tl) { loadImageAddon(tl.term); });
+  }
+  // Only for a daemon whose snapshot meta predates the switch: ask
+  // /api/config instead, which lands after the snapshot it was asked for.
+  var inlineImagesCheck = null;
+  function refreshInlineImages() {
+    if (inlineImagesCheck) return;
+    inlineImagesCheck = api('/api/config').then(function (r) { return r.json(); }).then(function (cfg) {
+      applyInlineImages(cfg.inlineImages !== false);
+    }).catch(function () { /* the next snapshot asks again */ }).then(function () { inlineImagesCheck = null; });
+  }
+  /** Apply the switch a snapshot `meta` carries; true when it carried one. */
+  function inlineImagesFromMeta(m) {
+    if (!m || typeof m.inlineImages !== 'boolean') return false;
+    inlineImagesEnabled = m.inlineImages;
+    return true;
+  }
+
   function newTerm(cols, rows) {
-    return new Terminal({
+    return withPromptModeReset(new Terminal({
       cols: cols || 80,
       rows: rows || 24,
       fontFamily: 'ui-monospace, SFMono-Regular, "Cascadia Code", Menlo, Consolas, "DejaVu Sans Mono", monospace',
@@ -198,7 +238,46 @@
       // structurally (xterm.js#594), and this covers the perceptual half.
       smoothScrollDuration: 90,
       disableStdin: !allowInput
-    });
+    }));
+  }
+
+  /**
+   * #1792: clear the mouse / focus reporting a killed TUI left armed once the
+   * pane's shell prints its prompt again (OSC 133;A), so this page stops
+   * typing reports into that shell. The desktop's own module
+   * (src/shared/terminal/shellPromptModeReset.ts, via `wmuxTerminalShared`);
+   * without the shared bundle the terminal is returned unchanged.
+   */
+  function withPromptModeReset(t) {
+    var shared = window.wmuxTerminalShared;
+    if (shared && shared.installShellPromptModeReset) shared.installShellPromptModeReset(t);
+    return t;
+  }
+
+  /** The guard installed on `t` by withPromptModeReset, or null. */
+  function promptModeGuard(t) {
+    var shared = window.wmuxTerminalShared;
+    return shared && shared.shellPromptModeResetFor ? shared.shellPromptModeResetFor(t) || null : null;
+  }
+
+  /**
+   * #1794: this page reuses one terminal across panes, and a snapshot replay
+   * starts the stream over. Next to every `reset()`, the guard forgets the
+   * old stream too, or the new session's ConPTY `?1004h` is taken for a
+   * command's arm and focus reporting is cleared at its first prompt.
+   */
+  function resetPromptModeGuard(t) {
+    var g = promptModeGuard(t);
+    if (g) g.reset();
+  }
+
+  /**
+   * #1794: while a reset is owed but has not applied (it is queued behind
+   * output still being parsed), the mouse / focus reports are the dead TUI's.
+   */
+  function dropsLeakedReport(t, d) {
+    var g = promptModeGuard(t);
+    return !!(g && g.dropsReport(d));
   }
 
   /**
@@ -260,18 +339,72 @@
   // Both are bigger than this file.
   var termRepaints = 0;
 
-  /** Replay `bytes` into `t` with the gate held for as long as it parses. */
-  function repaint(t, bytes, inc, dec) {
+  /**
+   * Replay `bytes` into `t` with the gate held for as long as it parses, and
+   * `tail` (terminal-side mode resets, see staleReplayTail) inside the SAME
+   * gated span: the gate releases only once the tail has parsed too, so no
+   * mouse report the snapshot re-armed can slip out between the two writes.
+   */
+  function repaint(t, bytes, inc, dec, tail) {
     t.reset();
+    resetPromptModeGuard(t);
     inc();
     try {
-      t.write(bytes, dec);
+      if (tail) {
+        t.write(bytes);
+        t.write(tail, dec);
+      } else {
+        t.write(bytes, dec);
+      }
     } catch (e) {
       // write() can throw before the callback is ever queued (xterm refuses
       // past its discard watermark). Not releasing here would latch the gate
       // and silently swallow every keystroke for the rest of the page's life.
       dec();
     }
+  }
+
+  /**
+   * An onData listener that forwards only what the user produced, never the
+   * answers xterm gives by itself to queries in the pane output — the desktop
+   * mirror's own gate (src/shared/terminal/userInputGate.ts). Without the
+   * shared bundle it forwards everything, as before the gate.
+   */
+  function gateUserInput(t, send) {
+    var shared = window.wmuxTerminalShared;
+    return shared && shared.gateUserInput ? shared.gateUserInput(t, send) : send;
+  }
+
+  /**
+   * Stale-replay mode reset — the desktop's own module (src/shared/terminal/
+   * staleReplayModeReset.ts, published as `wmuxTerminalShared`), not a copy.
+   *
+   * A snapshot re-arms whatever input modes the pane's output last left on. A
+   * TUI (claude) that armed any-motion mouse tracking and exited without
+   * disabling it leaves ?1003h in there, and this xterm then types an SGR
+   * report (`35;55;12M`) into the shell for every pointer move. `meta` is the
+   * snapshot's own `meta` frame: the daemon stamps it, at the same instant it
+   * reads the ring, with the SAME two gate inputs `pty.list` gives the desktop —
+   * `commandRunning` (OSC 133) and `resumeAgent` (recovered this daemon boot,
+   * agent not re-detected) — and the shared gate decides WHETHER to reset.
+   *
+   * What it resets is capped at the alive-shell set: every pane this page
+   * streams has a live shell, and that shell owns ?2004. The gate's 'full'
+   * (resumeAgent) would clear bracketed paste too, and resumeAgent persists
+   * until the agent is re-detected, so every attach would leave a recovered
+   * zsh expecting wrapped pastes that this page no longer wraps — a multi-line
+   * paste then runs its first line at once. The desktop applies 'full' once at
+   * recovery attach; the web never does. Written to the terminal only.
+   */
+  function staleReplayTail(meta) {
+    var shared = window.wmuxTerminalShared;
+    if (!shared || !meta) return '';
+    var level = shared.staleReplayResetLevel({
+      resumeAgent: meta.resumeAgent,
+      commandRunning: meta.commandRunning
+    });
+    if (level === 'none') return '';
+    return shared.STALE_REPLAY_ALIVE_SHELL_RESETS + shared.STALE_REPLAY_DISPLAY_RESETS;
   }
 
   /**
@@ -418,6 +551,7 @@
     if (!term) {
       term = newTerm(cols, rows);
       term.open(termHost);
+      loadImageAddon(term);
       // Swipe to reach scrollback. A phone has no wheel and no Shift+PageUp, so
       // without this the only history it can ever see is the opening snapshot.
       attachTouchScroll(term, termHost, {
@@ -425,10 +559,14 @@
         sendKeys: sendInput,
         notify: touchScrollNotice
       });
-      if (allowInput) term.onData(function (d) {
+      // Answers xterm gives to device queries in the output (DA1, cursor and
+      // size reports, XTSMGRAPHICS) are the pane owner's to give; only what
+      // the user typed is sent (src/shared/terminal/userInputGate.ts).
+      if (allowInput) term.onData(gateUserInput(term, function (d) {
         if (termRepaints > 0) return; // parser reply to a replayed query
+        if (dropsLeakedReport(term, d)) return;
         sendInput(d);
-      });
+      }));
       attachTerminalKeys(term, sendInput, !allowInput, function () { return paneAcceptsCsiU(currentSession); }, function () { return paneAcceptsWin32(currentSession); });
       // Auto-focus so typing and Ctrl+V work without a click first — a browser
       // only delivers the paste event to the focused xterm textarea.
@@ -1416,7 +1554,7 @@
     if (es) { es.close(); es = null; }
     currentSession = sessionId;
     if (attn[sessionId]) { delete attn[sessionId]; }
-    if (term) term.reset();
+    if (term) { term.reset(); resetPromptModeGuard(term); }
     var s = sessions.filter(function (x) { return x.id === sessionId; })[0];
     updateSwitcher(s);
     renderSheet();
@@ -1424,10 +1562,19 @@
     setConn('connecting', 'connecting…');
     showOverlay('loading', 'Attaching to pane', 'Loading scrollback and live output.');
 
+    // The `meta` that precedes each snapshot (a mid-stream resize meta has no
+    // snapshot behind it, so it must not replace this).
+    var snapMeta = null;
     es = openStream(sessionId, {
       attention: true,
-      meta: function (m) { ensureTerm(m.cols, m.rows); },
+      meta: function (m) {
+        if (!m.resize) snapMeta = m;
+        var carried = !m.resize && inlineImagesFromMeta(m);
+        ensureTerm(m.cols, m.rows);
+        if (carried) applyInlineImages(inlineImagesEnabled);
+      },
       snapshot: function (bytes) {
+        if (!snapMeta || typeof snapMeta.inlineImages !== 'boolean') refreshInlineImages();
         // Snapshot replays the pane's screen, kitty negotiation included —
         // reset before folding so a protocol the app turned off earlier does
         // not survive as stale.
@@ -1435,7 +1582,8 @@
         if (term) {
           repaint(term, bytes,
             function () { termRepaints += 1; },
-            function () { termRepaints = Math.max(0, termRepaints - 1); });
+            function () { termRepaints = Math.max(0, termRepaints - 1); },
+            staleReplayTail(snapMeta));
         }
         hideOverlay();
         setConn('live', 'live');
@@ -1553,6 +1701,7 @@
     var tile = { sessionId: s.id, term: null, es: null, el: el, head: head, scaler: scaler, ended: false, repaints: 0 };
     tile.term = newTerm(s.cols, s.rows);
     tile.term.open(host);
+    loadImageAddon(tile.term);
     // Same reason as the single-pane host: on iOS the keyboard only comes up
     // for a focus made inside a user gesture.
     host.addEventListener('click', function () { focusFromGesture(tile.term); });
@@ -1574,10 +1723,11 @@
       // focus back on each reply, which pinned the page to whichever pane
       // chattered most (caught in live dogfood — a tap looked like it did
       // nothing). Focus moves on an explicit tap only.
-      tile.term.onData(function (d) {
+      tile.term.onData(gateUserInput(tile.term, function (d) {
         if (tile.repaints > 0) return; // parser reply to a replayed query
+        if (dropsLeakedReport(tile.term, d)) return;
         sendTo(tile.sessionId, d);
-      });
+      }));
     }
     // Same copy/newline/paste handling as the 1-up terminal — Ctrl+C with a
     // selection must copy here too, never SIGINT the tile's process. Sends go
@@ -1590,20 +1740,25 @@
     renderTileHead(tile);
     el.addEventListener('pointerdown', function () { focusTile(tile); });
 
+    var snapMeta = null; // see connect()
     tile.es = openStream(s.id, {
       attention: isAttentionSource,
       meta: function (m) {
+        if (!m.resize) snapMeta = m;
+        if (!m.resize && inlineImagesFromMeta(m)) applyInlineImages(inlineImagesEnabled);
         if (tile.term && m.cols && m.rows) tile.term.resize(m.cols, m.rows);
         rescale();
       },
       snapshot: function (bytes) {
+        if (!snapMeta || typeof snapMeta.inlineImages !== 'boolean') refreshInlineImages();
         // Snapshot replays the pane's screen, kitty negotiation included —
         // reset before folding (see connect()'s snapshot for the rationale).
         foldKeyboardState(tile.sessionId, bytes, true);
         if (tile.term) {
           repaint(tile.term, bytes,
             function () { tile.repaints += 1; },
-            function () { tile.repaints = Math.max(0, tile.repaints - 1); });
+            function () { tile.repaints = Math.max(0, tile.repaints - 1); },
+            staleReplayTail(snapMeta));
         }
         rescale();
         if (tile.sessionId === currentSession) setConn('live', 'live');
@@ -1841,6 +1996,9 @@
     showOverlay('loading', 'Connecting to wmux', 'Attaching to the daemon and loading live panes.');
     api('/api/config').then(function (r) { return r.json(); }).then(function (cfg) {
       allowInput = cfg.allowInput === true;
+      // Absent on a daemon predating the switch, which reads as on; the wasm
+      // probe still decides whether the addon can run at all.
+      inlineImagesEnabled = cfg.inlineImages !== false;
       bannerEl.textContent = allowInput ? 'input enabled' : 'read-only';
       bannerEl.setAttribute('data-mode', allowInput ? 'rw' : 'ro');
       // The bar is always available for zoom; the keys only when input is on
@@ -1873,7 +2031,20 @@
 
   // The /pair route always opens the pairing screen (even if a stale token is
   // stored) — the operator explicitly navigated here to key in a code.
-  if (location.pathname === '/pair') {
+  if (location.pathname === '/pair' && pairQuery.hasDesktopCode(location.hash)) {
+    // A COMPUTER pairing link, opened in a browser. It is meant for the wmux
+    // app on another computer, so this page must not redeem it, must not put
+    // it in the form, and must not leave it in the address bar. The code is
+    // never read: only the marker is checked. The fragment never reached the
+    // server, so dropping it here is the last copy this page holds.
+    try { history.replaceState(null, '', location.pathname); } catch (e) { /* non-fatal */ }
+    setConn('error', 'not paired');
+    showOverlay(
+      'info',
+      'This link is for the wmux app',
+      'Paste this link into the wmux app on the other computer. This browser was not paired.'
+    );
+  } else if (location.pathname === '/pair') {
     showPairing();
     // A scanned QR arrives as /pair?code=ABCD2345. Strip the code from the
     // address bar FIRST, before anything can fail: a code left parked in

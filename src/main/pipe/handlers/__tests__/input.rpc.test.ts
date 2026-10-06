@@ -13,11 +13,13 @@ import {
   isTurnStart,
   rowFromBottom,
   submitNeedle,
+  pasteSubmitDelayMs,
   type SubmitProbe,
   type RoleBindingResolver,
 } from '../input.rpc';
 import { noteGateVerdict, resetGateVerdicts } from '../../../deck/stopGateState';
 import type { PTYManager } from '../../../pty/PTYManager';
+import type { DaemonClient } from '../../../DaemonClient';
 import type { RoleBinding } from '../../../../shared/orchestratorRole';
 
 // Mock the renderer bridge so we can drive input.findOwnerWorkspace (the
@@ -314,11 +316,24 @@ describe('input.rpc — assertWorkspaceOwnsPty parity (source invariant)', () =>
     return src.slice(start, next > start ? next : src.length);
   }
 
+  // assertCallerMayAccessPty (fan-out T5) runs assertWorkspaceOwnsPty first
+  // and only adds the owner lane on top, so either call satisfies parity.
   for (const method of ['input.send', 'input.sendKey', 'input.readScreen', 'terminal.readEvents']) {
     it(`${method} calls assertWorkspaceOwnsPty`, () => {
-      expect(handlerBlock(method)).toMatch(/assertWorkspaceOwnsPty\(/);
+      expect(handlerBlock(method)).toMatch(/(assertWorkspaceOwnsPty|assertCallerMayAccessPty)\(/);
     });
   }
+
+  it('assertCallerMayAccessPty itself runs assertWorkspaceOwnsPty', () => {
+    const owner = fs.readFileSync(
+      path.join(__dirname, '..', '..', '..', 'workspace', 'ptyOwnership.ts'),
+      'utf-8',
+    );
+    const start = owner.indexOf('export async function assertCallerMayAccessPty(');
+    expect(start).toBeGreaterThan(0);
+    const body = owner.slice(start, owner.indexOf('\n}\n', start));
+    expect(body).toMatch(/await assertWorkspaceOwnsPty\(/);
+  });
 });
 
 // P0 — terminal_send / terminal_send_key self-loop guard. A first-party agent
@@ -380,12 +395,12 @@ describe('input.send / input.sendKey — omitted-target self-loop guard (P0)', (
     });
     expect(res.ok).toBe(true);
     expect(writeMock).toHaveBeenCalledWith('pty-self', expect.any(String));
-    // No active-pane resolution happened (explicit ptyId bypassed it).
-    expect(sendToRendererMock).not.toHaveBeenCalledWith(
-      expect.anything(),
-      'input.readScreen',
-      expect.anything(),
+    // No active-pane resolution happened (explicit ptyId bypassed it). The
+    // approval guard may read THIS pane's screen by id; that is not resolution.
+    const resolutionReads = sendToRendererMock.mock.calls.filter(
+      (c: unknown[]) => c[1] === 'input.readScreen' && !(c[2] as { ptyId?: string } | undefined)?.ptyId,
     );
+    expect(resolutionReads).toHaveLength(0);
   });
 
   it('resolves the active pane scoped to the caller workspace for an external caller (no senderPtyId)', async () => {
@@ -500,6 +515,131 @@ describe('input.send — submit sends text and Enter as two separate writes', ()
       params: { text: 'no submit', ptyId: 'pty-a', workspaceId: 'ws-self' },
     });
     expect(writeMock.mock.calls).toEqual([['pty-a', 'no submit']]);
+  });
+});
+
+// #1594 — a multi-line message typed raw was split by the TUI (Claude Code: a
+// placeholder plus typed text; Codex: text AND Enter absorbed by its paste
+// burst). An agent pane whose app enabled bracketed paste gets one paste; a
+// shell keeps typed input, where each newline is the Enter that runs a line.
+describe('input.send — multi-line text to an agent is pasted, not typed (#1594)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  /** A daemon-backed pty (not in the local PTYManager). `screens` are the
+   *  successive viewport reads the submit receipt makes. */
+  function setupPaste(
+    target: { agent: string | null; bracketedPaste: boolean | null } | null,
+    screens: string[] = [],
+  ): { router: RpcRouter; writeMock: ReturnType<typeof vi.fn> } {
+    const writeMock = vi.fn((_id: string, _data: string) => true);
+    const pty = { get: vi.fn(() => undefined), write: vi.fn() } as unknown as PTYManager;
+    const dc = {
+      isConnected: true,
+      writeToSession: (id: string, data: string) => writeMock(id, data),
+      getSendTarget: vi.fn(() => Promise.resolve(target)),
+    } as unknown as DaemonClient;
+    const router = new RpcRouter();
+    registerInputRpc(router, pty, () => fakeWindow, () => dc);
+    let read = 0;
+    sendToRendererMock.mockImplementation((_w: unknown, method: string, params?: { tail_lines?: number }) => {
+      if (method === 'input.findOwnerWorkspace') return Promise.resolve({ workspaceId: 'ws-self' });
+      // Only the receipt probe's bounded reads advance the sequence; the
+      // approval gate's full read before the write is not one of them.
+      if (method === 'input.readScreen' && params?.tail_lines !== undefined) {
+        const text = screens[Math.min(read++, screens.length - 1)] ?? '';
+        return Promise.resolve({ ptyId: 'pty-a', text });
+      }
+      return Promise.resolve(null);
+    });
+    return { router, writeMock };
+  }
+
+  const LONG = '1. first item\r\n2. second item\n3. third item';
+  const CLAUDE = { agent: 'Claude Code', bracketedPaste: true };
+
+  it('pastes the body in one bracketed write (LF separators), then a lone Enter once', async () => {
+    const { router, writeMock } = setupPaste(CLAUDE);
+    const res = await router.dispatch({
+      id: 'p1',
+      method: 'input.send',
+      params: { text: LONG, ptyId: 'pty-a', workspaceId: 'ws-self', submit: true },
+    });
+    expect(res.ok).toBe(true);
+    expect(writeMock.mock.calls[0]).toEqual([
+      'pty-a',
+      '\x1b[200~1. first item\n2. second item\n3. third item\x1b[201~',
+    ]);
+    expect(writeMock.mock.calls[1]).toEqual(['pty-a', '\r']);
+    // The Enter is never doubled onto the paste.
+    expect(writeMock.mock.calls.some(([, d]) => d === '\r\r')).toBe(false);
+  });
+
+  it('keeps typing into a shell even though its readline enabled bracketed paste', async () => {
+    const { router, writeMock } = setupPaste({ agent: null, bracketedPaste: true });
+    for (const text of ['npm test\n', 'cd /tmp\nls -la\n']) {
+      await router.dispatch({ id: 's', method: 'input.send', params: { text, ptyId: 'pty-a', workspaceId: 'ws-self' } });
+    }
+    // Each newline stays the Enter that runs its line.
+    expect(writeMock.mock.calls).toEqual([
+      ['pty-a', 'npm test\n'],
+      ['pty-a', 'cd /tmp\nls -la\n'],
+    ]);
+  });
+
+  it('decides on the daemon mode, not the renderer — a hidden pane is not guessed', async () => {
+    // A hidden pane's xterm can miss the app turning 2004 off; the daemon saw it.
+    const off = setupPaste({ agent: 'Claude Code', bracketedPaste: false });
+    await off.router.dispatch({ id: 'h', method: 'input.send', params: { text: 'a\nb', ptyId: 'pty-a', workspaceId: 'ws-self' } });
+    expect(off.writeMock.mock.calls).toEqual([['pty-a', 'a\nb']]);
+    expect(sendToRendererMock).not.toHaveBeenCalledWith(expect.anything(), 'input.sendTarget', expect.anything());
+
+    // An older daemon that cannot say: typed, as before.
+    const unknown = setupPaste({ agent: 'Claude Code', bracketedPaste: null });
+    await unknown.router.dispatch({ id: 'u', method: 'input.send', params: { text: 'a\nb', ptyId: 'pty-a', workspaceId: 'ws-self' } });
+    expect(unknown.writeMock.mock.calls).toEqual([['pty-a', 'a\nb']]);
+  });
+
+  it('a trailing newline on a submit is the Enter, not a second line', async () => {
+    const { router, writeMock } = setupPaste(CLAUDE);
+    await router.dispatch({
+      id: 't',
+      method: 'input.send',
+      params: { text: 'make a calculator\n', ptyId: 'pty-a', workspaceId: 'ws-self', submit: true },
+    });
+    expect(writeMock.mock.calls.slice(0, 2)).toEqual([
+      ['pty-a', 'make a calculator'],
+      ['pty-a', '\r'],
+    ]);
+  });
+
+  it('accepts a collapsed paste when its placeholder leaves the composer', async () => {
+    const before = ['● earlier turn', '', '────', '❯ [Pasted text #1 +2 lines]', '────', '  footer'].join('\n');
+    const after = ['● earlier turn', '', '● working', '', '────', '❯ ', '────', '  footer'].join('\n');
+    const { router } = setupPaste(CLAUDE, [before, after]);
+    const res = await router.dispatch({
+      id: 'c',
+      method: 'input.send',
+      params: { text: LONG, ptyId: 'pty-a', workspaceId: 'ws-self', submit: true },
+    });
+    if (!res.ok) throw new Error(res.error);
+    expect(res.result).toMatchObject({ accepted: true, receiptSignal: 'composer_cleared' });
+  });
+
+  it('an unconfirmed paste says not to re-send, never a plain accepted:false', async () => {
+    const { router } = setupPaste(CLAUDE, ['']);
+    const res = await router.dispatch({
+      id: 'n',
+      method: 'input.send',
+      params: { text: LONG, ptyId: 'pty-a', workspaceId: 'ws-self', submit: true },
+    });
+    if (!res.ok) throw new Error(res.error);
+    expect(res.result).toMatchObject({ accepted: false, receiptSignal: 'paste_unconfirmed', enterRetried: false });
+    expect((res.result as { note?: string }).note).toMatch(/Do not re-send/);
+  });
+
+  it('waits longer before Enter as the pasted body grows, within a cap', () => {
+    expect(pasteSubmitDelayMs('Claude Code', 100)).toBeLessThan(pasteSubmitDelayMs('Claude Code', 32 * 1024));
+    expect(pasteSubmitDelayMs('Codex CLI', 10_000_000)).toBeLessThanOrEqual(500 + 1_500);
   });
 });
 
@@ -644,6 +784,67 @@ describe('input.send — role→model enforcement (D2)', () => {
     expect(writeMock.mock.calls[0]).toEqual(['pty-a', 'claude --model opus --foo']);
     const payload = res.ok ? (res.result as { enforcedModel?: string }) : {};
     expect(payload.enforcedModel).toBeUndefined();
+  });
+
+  // #1681 — an injected effort / skip flag changes the line too, so the reply
+  // says so; absent when nothing was added.
+  it('reports enforcedOptions for an injected effort and skip flag', async () => {
+    const { router, writeMock } = setupWithResolver(
+      bind({ agent: 'codex', effort: 'high', skipPermissions: true }),
+    );
+    const res = await router.dispatch({
+      id: '10b',
+      method: 'input.send',
+      params: { text: 'codex', ptyId: 'pty-a', workspaceId: 'ws-self', submit: true },
+    });
+    expect(writeMock.mock.calls[0]).toEqual([
+      'pty-a',
+      'codex -c model_reasoning_effort=high --dangerously-bypass-approvals-and-sandbox',
+    ]);
+    const payload = res.ok ? (res.result as { enforcedModel?: string; enforcedOptions?: unknown }) : {};
+    expect(payload.enforcedOptions).toEqual({ effort: 'high', skipPermissions: true });
+    expect(payload.enforcedModel).toBeUndefined();
+  });
+
+  it('reports only the injected effort when the line makes its own permission choice', async () => {
+    const { router, writeMock } = setupWithResolver(
+      bind({ agent: 'claude', model: 'haiku', effort: 'low', skipPermissions: true }),
+    );
+    const res = await router.dispatch({
+      id: '10c',
+      method: 'input.send',
+      params: { text: 'claude --permission-mode plan', ptyId: 'pty-a', workspaceId: 'ws-self', submit: true },
+    });
+    expect(writeMock.mock.calls[0]).toEqual(['pty-a', 'claude --model haiku --effort low --permission-mode plan']);
+    const payload = res.ok
+      ? (res.result as { enforcedModel?: string; enforcedOptions?: unknown; note?: string })
+      : {};
+    expect(payload.enforcedModel).toBe('haiku');
+    expect(payload.enforcedOptions).toEqual({ effort: 'low' });
+    expect(payload.note).toMatch(/own permission choice/);
+  });
+
+  it('omits enforcedOptions when the options were already on the line', async () => {
+    const { router, writeMock } = setupWithResolver(
+      bind({ agent: 'claude', model: 'haiku', effort: 'low', skipPermissions: true }),
+    );
+    const res = await router.dispatch({
+      id: '10d',
+      method: 'input.send',
+      params: {
+        text: 'claude --effort max --dangerously-skip-permissions',
+        ptyId: 'pty-a',
+        workspaceId: 'ws-self',
+        submit: true,
+      },
+    });
+    expect(writeMock.mock.calls[0]).toEqual([
+      'pty-a',
+      'claude --model haiku --effort max --dangerously-skip-permissions',
+    ]);
+    const payload = res.ok ? (res.result as Record<string, unknown>) : {};
+    expect(payload.enforcedModel).toBe('haiku');
+    expect('enforcedOptions' in payload).toBe(false);
   });
 
   // P1-1 — the handler runs on EVERY submitted line in a bound pane.
@@ -814,7 +1015,7 @@ describe('input.send — submit receipt', () => {
    */
   function fakeProbe(
     frames: string[],
-    statuses: Array<{ status: string; ts: number } | null>,
+    statuses: Array<{ status: string; ts: number; turnStartedAt?: number } | null>,
   ): { probe: SubmitProbe; screenReads: () => number } {
     const state = { polls: 0, screens: 0 };
     const at = <T,>(arr: T[], i: number): T => arr[Math.min(i, arr.length - 1)]!;
@@ -836,8 +1037,9 @@ describe('input.send — submit receipt', () => {
   }
 
   const ENTER_AT = 5_000;
-  /** A reading the mirror pushed AFTER our Enter — the only kind that counts. */
+  /** A snapshot built after Enter; receipt evidence still needs a fresh hook. */
   const fresh = (status: string) => ({ status, ts: ENTER_AT + 10 });
+  const hookStarted = () => ({ ...fresh('running'), turnStartedAt: ENTER_AT + 5 });
   /** A reading from before the Enter: our own echo, byte-promoted (#935). */
   const stale = (status: string) => ({ status, ts: ENTER_AT - 10 });
 
@@ -863,13 +1065,13 @@ describe('input.send — submit receipt', () => {
     '  ? for shortcuts',
   ].join('\n');
 
-  it('accepts on a turn start reported AFTER the Enter', async () => {
-    const { probe } = fakeProbe([COMPOSER], [fresh('running')]);
+  it('accepts a Claude Code prompt-submit hook reported AFTER the Enter', async () => {
+    const { probe } = fakeProbe([COMPOSER], [hookStarted()]);
     const resend = vi.fn();
     const receipt = await awaitSubmitReceipt(
       probe,
       NEEDLE,
-      { screen: COMPOSER, agentStatus: 'idle' },
+      { screen: COMPOSER, agentStatus: 'running' },
       resend,
       waitOpts(),
     );
@@ -881,7 +1083,7 @@ describe('input.send — submit receipt', () => {
 
   // #935 — agentStatus is byte-promoted, so the pane echoing our own text can
   // flip it to running. A snapshot from before the \r must not sign for it.
-  it('ignores a running status whose snapshot predates the Enter', async () => {
+  it('does not infer submission from running even when the renderer clock differs', async () => {
     const { probe } = fakeProbe([COMPOSER], [stale('running')]);
     const receipt = await awaitSubmitReceipt(
       probe,
@@ -891,11 +1093,12 @@ describe('input.send — submit receipt', () => {
       waitOpts(),
     );
     expect(receipt.accepted).toBe(false);
-    expect(receipt.signal).toBe('none');
+    expect(receipt.signal).toBe('running_unconfirmed');
+    expect(receipt.retried).toBe(false);
   });
 
   it('checks the status BEFORE the first screen poll (a hook-fast turn costs no IPC)', async () => {
-    const p = fakeProbe([COMPOSER], [fresh('running')]);
+    const p = fakeProbe([COMPOSER], [hookStarted()]);
     const receipt = await awaitSubmitReceipt(
       p.probe,
       NEEDLE,
@@ -920,12 +1123,13 @@ describe('input.send — submit receipt', () => {
     expect(receipt.signal).toBe('composer_cleared');
   });
 
-  // THE regression this change exists for: bytes arrived (the TUI repainted its
-  // box and cursor) but nothing was committed. Byte activity is not a receipt.
-  it('does NOT accept on echo-only byte activity, and retries the Enter once', async () => {
-    const echo1 = ['claude> ready', '', '│ > write me a haiku│', '  ? for shortcuts'].join('\n');
-    const echo2 = ['claude> ready', '', '│ > write me a haiku ▌│', '  ? for shortcuts'].join('\n');
-    const { probe } = fakeProbe([echo1, echo2], [fresh('idle')]);
+  it.each(['idle', 'running'])('keeps missing submit evidence honest while status is %s', async (status) => {
+    const frame = status === 'running'
+      ? ['› write me a haiku', '• Working (esc to interrupt)', '›', '  ? for shortcuts'].join('\n')
+      : ['claude> ready', '', '│ > write me a haiku ▌│', '  ? for shortcuts'].join('\n');
+    // A real turn can retain the prompt near the bottom; sending Enter again
+    // would duplicate input. Idle echo alone still permits the bounded retry.
+    const { probe } = fakeProbe([frame], [fresh(status)]);
     const resend = vi.fn();
     const receipt = await awaitSubmitReceipt(
       probe,
@@ -935,11 +1139,39 @@ describe('input.send — submit receipt', () => {
       waitOpts({ windowMs: 100 }),
     );
     expect(receipt.accepted).toBe(false);
-    expect(receipt.signal).toBe('none');
-    expect(resend).toHaveBeenCalledTimes(1);
-    // The caller gets the pane's own words back instead of a bare false.
+    expect(receipt.signal).toBe(status === 'running' ? 'running_unconfirmed' : 'none');
+    expect(resend).toHaveBeenCalledTimes(status === 'running' ? 0 : 1);
     expect(receipt.screenTail).toContain('write me a haiku');
   });
+
+  it.each([undefined, ENTER_AT - 10, ENTER_AT])(
+    'rejects fresh Codex redraw promotion with no new prompt-submit hook (%s)',
+    async (turnStartedAt) => {
+      const composer = ['╭ Codex ╮', '', '› write me a haiku', '  ? for shortcuts'].join('\n');
+      const redraw = ['╭ Codex ╮', '', '› write me a haiku ▌', '  ? for shortcuts'].join('\n');
+      // Echo/redraw promotes the status after Enter, but the input is unsent.
+      const { probe } = fakeProbe([composer, redraw], [
+        fresh('idle'),
+        { ...fresh('running'), turnStartedAt },
+      ]);
+      const resend = vi.fn();
+      const receipt = await awaitSubmitReceipt(
+        probe,
+        NEEDLE,
+        { screen: composer, agentStatus: 'idle', turnStartedAt },
+        resend,
+        waitOpts(),
+      );
+      expect(receipt).toMatchObject({
+        accepted: false,
+        signal: 'running_unconfirmed',
+        agentStatusAfter: 'running',
+        retried: false,
+      });
+      expect(receipt.screenTail).toContain('› write me a haiku');
+      expect(resend).not.toHaveBeenCalled();
+    },
+  );
 
   // A soft newline pushed the text up one row and it is STILL uncommitted —
   // the precise failure the receipt exists to catch, so "moved" is not enough.
@@ -963,8 +1195,8 @@ describe('input.send — submit receipt', () => {
   });
 
   it('accepts on the retry when the turn starts late', async () => {
-    // Nothing for the whole first window, running only after the re-send.
-    const statuses = [null, null, null, null, null, fresh('running')];
+    // Byte promotion arrives first; the prompt-submit hook follows the retry.
+    const statuses = [null, null, null, null, null, fresh('running'), hookStarted()];
     const { probe } = fakeProbe([COMPOSER], statuses);
     const resend = vi.fn();
     const receipt = await awaitSubmitReceipt(
@@ -1052,6 +1284,51 @@ describe('input.send — submit receipt', () => {
     expect(rowFromBottom(COMPOSER, 'nowhere')).toBe(-1);
   });
 
+  // #1596 — at ~25 columns the 24-char needle never fit on one visual row, so a
+  // wrapped input was never seen in the composer and a real submit read as
+  // accepted:false. The same logical screen must give the same verdict at any
+  // width.
+  it('matches a needle wrapped across rows, the same as the unwrapped screen', () => {
+    const prompt = 'Reply with the single word pong, nothing else please';
+    const needle = submitNeedle(prompt);
+    const wideBefore = ['header', '', `› ${prompt}`, '', '  model · ~/dir'].join('\n');
+    const narrowBefore = [
+      'header',
+      '',
+      '› Reply with the single',
+      '  word pong, nothing',
+      '  else please',
+      '',
+      '  model · ~/dir',
+    ].join('\n');
+    const narrowAfter = [
+      '› Reply with the single',
+      '  word pong, nothing',
+      '  else please',
+      '• pong',
+      '',
+      '  10:29 AM',
+      '',
+      '› Ask Codex to do anythi',
+      '',
+      '  model · ~/dir',
+    ].join('\n');
+    expect(rowFromBottom(wideBefore, needle)).toBe(2);
+    expect(rowFromBottom(narrowBefore, needle)).toBe(2);
+    expect(needleInComposer(narrowBefore, needle)).toBe(true);
+    expect(composerCleared(narrowBefore, narrowAfter, needle)).toBe(true);
+    // Box-drawing composer borders are not part of the typed text either.
+    expect(rowFromBottom('│ > Reply with the single word pong, │\n│   nothing else please │\n╰──╯', needle)).toBe(1);
+  });
+
+  it('does not stitch a needle across a blank row (echo above, composer below)', () => {
+    const needle = submitNeedle('run the migration now please');
+    // The echo ends "...now" and an unrelated composer line below starts
+    // "please": joined across the gap they would fake the needle in the composer.
+    const screen = ['› run the migration now', '', '› please wait…', '  footer'].join('\n');
+    expect(rowFromBottom(screen, needle)).toBe(-1);
+  });
+
   it('needleInComposer is the bottom region only', () => {
     expect(needleInComposer(COMPOSER, NEEDLE)).toBe(true);
     // On screen, but up in the transcript — not the input line.
@@ -1064,17 +1341,13 @@ describe('input.send — submit receipt', () => {
     expect(composerCleared('unrelated', 'still unrelated', 'ghost')).toBe(false);
   });
 
-  it('isTurnStart only fires on a move INTO a turn', () => {
-    expect(isTurnStart('idle', 'running')).toBe(true);
-    expect(isTurnStart('waiting', 'running')).toBe(true);
-    expect(isTurnStart(null, 'running')).toBe(true);
-    // A PREVIOUS turn ending inside our window, not ours beginning.
-    expect(isTurnStart('running', 'awaiting_input')).toBe(false);
-    expect(isTurnStart('idle', 'awaiting_input')).toBe(false);
-    expect(isTurnStart('running', 'running')).toBe(false);
-    // decay, not a turn start
-    expect(isTurnStart('running', 'idle')).toBe(false);
-    expect(isTurnStart('idle', null)).toBe(false);
+  it('isTurnStart uses main hook time independently of the renderer clock', () => {
+    expect(isTurnStart(hookStarted(), ENTER_AT)).toBe(true);
+    expect(isTurnStart(fresh('running'), ENTER_AT)).toBe(false);
+    expect(isTurnStart({ ...hookStarted(), turnStartedAt: ENTER_AT - 1 }, ENTER_AT)).toBe(false);
+    expect(isTurnStart({ ...hookStarted(), ts: ENTER_AT - 60_000 }, ENTER_AT)).toBe(true);
+    expect(isTurnStart({ ...hookStarted(), ts: ENTER_AT + 60_000 }, ENTER_AT)).toBe(true);
+    expect(isTurnStart({ ...hookStarted(), status: 'awaiting_input' }, ENTER_AT)).toBe(false);
   });
 
   describe('the RPC result', () => {

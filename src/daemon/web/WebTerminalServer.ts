@@ -1,27 +1,115 @@
+import { LiveSettingsError, type LiveAgentSettings } from './codexLiveSettings';
+import type { PaneSettingsChoice } from './paneCodexSettings';
+import { buildAgentLaunch, type AgentLaunchChoice, type AgentLaunchOptions } from './agentLaunch';
+import { DesktopPhoneError, type DesktopPhoneBridge } from '../phone/DesktopPhoneBridge';
+import type { RunHistoryStore } from '../history/RunHistoryStore';
+import { applyPaneAccount, handoffRowOf, paneAccountFailure, resolvePaneAccount, verifyHandoff, type ResolvedPaneAccount } from '../phone/paneAccount';
+import { resolveWorkspaceAccountKeys } from '../phone/workspaceAccountEnv';
+import { DESKTOP_ACCOUNT_ENV_COMMAND, parsePaneAccountFields, type StoredHandoffFrom } from '../../shared/phonePaneAccount';
+import type { InputReceiptStore } from './InputReceiptStore';
+import { sessionPullRequests } from './sessionPullRequests';
+import { SessionGitController, SessionGitError } from './sessionGit';
+import { PhoneGitReads, type PhoneGitSessionRef } from './phoneGitRead';
+import type { PhoneWorktreeService } from './phoneWorktree';
+import { PHONE_WORKTREE_REQUEST_ID } from '../../shared/phoneGitV1';
+import { sessionFiles, searchSessionFiles, SessionFileError } from './sessionFiles';
+import { openResolvedFile } from './openResolvedFile';
+import { SENT_FILE_CLOCK_SKEW_MS, SentFileIndex, sentFileParts } from '../transcript/sentFiles';
+import { listFolders, FolderBrowseError, homeIsBrowsable } from './phoneFolders';
+import {
+  createSearchCursorCodec,
+  joinWrappedRows,
+  MAX_CONCURRENT_SEARCHES,
+  parseSearchRequest,
+  runSearch,
+  ScrollbackExtractions,
+  ScrollbackTextCache,
+  SearchAdmission,
+  SearchError,
+  searchForbidden,
+  type SearchPane,
+  type SearchRequest,
+  type SearchScope,
+  type SearchAfter,
+  type TurnPage,
+  type TurnSource,
+} from './hostSearch';
 import http from 'node:http';
+import type { AgentStatus } from '../../shared/types';
+import { isRemoteAgentStatus } from '../../shared/remoteHosts';
+import { createSidebarDropLog, parsePhoneSidebarSnapshot, phoneTaskNesting, phoneWorkspaceLayout, type PhoneSidebarSnapshot, type PhoneSidebarTaskSummary, type PhoneSidebarWorkspace, type PhoneTaskNestedUnder } from '../../shared/phoneFleetSidebar';
 import https from 'node:https';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import fs from 'node:fs';
+import { expandTilde } from '../../shared/expandTilde';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { Readable } from 'node:stream';
+import { finished } from 'node:stream/promises';
 import type { DaemonSessionManager, ManagedSession } from '../DaemonSessionManager';
 // Types only — the registry implementation, its persistence and its
 // headless-terminal dependency chain stay out of this module. The web server is
 // a CONSUMER: it lists, it resolves, it republishes lifecycle events. It never
 // constructs a request, and it never decides what bytes a decision means.
-import type { ApprovalEvent, ApprovalRegistryApi, ApprovalRequest } from '../approvals/types';
+import type { ApprovalEvent, ApprovalRegistryApi, ApprovalRequest, ApprovalResolveResult, DecisionFormKind } from '../approvals/types';
+import {
+  DECISION_V2_WEB_ANSWER,
+  TERMINAL_PROMPT_WEB_ANSWER,
+  TERMINAL_PROMPT_WEB_DECLINE,
+  isNativeDecision,
+  needsInputGrant,
+} from '../approvals/types';
+import {
+  receiptHash,
+  type AnswerReceiptBegin,
+  type AnswerReceiptResponse,
+  type AnswerReceiptStore,
+} from '../approvals/AnswerReceiptStore';
+import { parseDecisionAnswerBody } from './decisionAnswer';
+import { askOtherMaxWidth } from '../approvals/askPicker';
+import { decisionForChoiceLabel } from '../approvals/terminalPromptParse';
+import { TERMINAL_PROMPT_MIN_ANSWER_AGE_MS } from '../approvals/ApprovalRegistry';
 // Type only — the projector's implementation (transcript parsing, watch state,
 // fs watching) stays out of this module. The web server is a STATELESS consumer
 // of its `delta()` for the phone turn view (#782); it must never `subscribe()`.
 import type { TranscriptProjector } from '../transcript/TranscriptProjector';
 // Type only — the projection from hook envelope to header state lives in the
 // hooks layer (see agentLiveness.ts). This module only fans the result out.
-import { isTerminalLiveness, type AgentLivenessBody } from '../hooks/agentLiveness';
+import {
+  isTerminalLiveness,
+  type AgentLivenessBody,
+  type AgentLivenessState,
+} from '../hooks/agentLiveness';
+// Value import from main, the same precedent HookIngest sets (it imports
+// AgentDetector): this is a pure, dependency-free reader of a transcript file,
+// not a piece of the Electron main process.
+import { readLastAssistantMessageAsync } from '../../main/claude/lastAssistantMessage';
+// Same precedent, same reasoning: a pure, dependency-free disk reader that
+// happens to live under main/. It owns the CLI's on-disk convention for
+// `.claude/skills` and `.claude/commands`, and duplicating it here would be a
+// second answer to "what can this pane run".
+import {
+  scanSkillCatalog,
+  type SkillCatalogEntry,
+} from '../../main/deck/skillCatalogScan';
 import { ENV_KEYS, isBrainPty } from '../../shared/constants';
-import { webHostIsLoopback, type PairRefusal, type WebTlsConfig } from '../../shared/web';
-import type { RemotePaneSummary } from '../../shared/remoteHosts';
+import { resolveMoaPane, type MoaPaneFact } from './moaPane';
+import {
+  DEVICE_KIND_HEADER,
+  normalizeDeviceKind,
+  webHostIsLoopback,
+  type DeviceKind,
+  type PairFlow,
+  type PairRefusal,
+  type WebTlsConfig,
+} from '../../shared/web';
+import type { RemotePaneSummary, RemoteResumeInfo } from '../../shared/remoteHosts';
+import { normalizeResumeCwd, type ResumeBinding } from '../../shared/agentResume';
+import { assistantPreview } from '../../shared/assistantPreview';
 import { capSnapshot } from './snapshotWindow';
+import { revokeDeviceAndDisconnect } from './deviceRevoke';
+import type { DeviceActor } from './deviceAudit';
 import {
   collectSessionDiff,
   createGitRunner,
@@ -34,7 +122,52 @@ import {
   PHONE_PROTOCOL_VERSION,
 } from './protocolVersion';
 import { startSseHeartbeat } from './sseHeartbeat';
-import { buildWebCsp } from './webCsp';
+import { StreamResponseLimits } from './StreamResponseLimits';
+import {
+  CHAT_LAUNCH_RETENTION_MS,
+  checkChatId,
+  projectChatBlocked,
+  type ChatBlocked,
+  type ChatBridge,
+  type ChatOwner,
+  type ChatQueueEvent,
+  type ChatResolution,
+  type ChatUnavailableCause,
+} from '../chat/chatBridge';
+import type { TranscriptCursor } from '../../shared/transcript/turnEvents';
+import { cursorMatches, decodeChatCursor, encodeChatCursor, type ReadSource } from './chatCursor';
+import { ChatLaunchReceiptStore, type LaunchReceiptState } from './chatLaunchReceipts';
+import { cancelEventBody, cancelReceiptResponse } from './chatCancelOutcome';
+import type { CodexAccountStatus } from '../../shared/phoneCodexAccountStatus';
+import type { ChatCancelEvent } from '../chat/chatCancelObserver';
+import {
+  ChatV2Cancels,
+  buildChatObject,
+  buildChatV2Object,
+  cancelResponse,
+  chatV2Identity,
+  chatV2LaunchResponse,
+  chatV2Page,
+  chatV2SendResponse,
+  dequeueResponse,
+  hasConversation,
+  launchResponse,
+  parseCancelBody,
+  parseLaunchBody,
+  parseSendBody,
+  resolutionAgentSessionId,
+  resolutionEpoch,
+  sendResponse,
+  type ChatV2PhoneHost,
+  type WireResponse,
+} from './chatWire';
+import type { ChatV2Binding } from '../../shared/chatv2/ipc';
+import { buildWebCsp, WEB_APP_FONT_FILE } from './webCsp';
+// Type only — the channel service implementation stays out of this module.
+// The web server is a STATELESS consumer of its phone projection (§9): it
+// lists, pages, acks, joins and republishes mention notifications. The
+// production adapter lives in channelsApi.ts.
+import type { ChannelMentionNotification, ChannelPhoneApi } from './channelsApi';
 
 /**
  * Opaque cursor for `/api/sessions/:id/turns` (#782). Encodes head+tail offsets
@@ -115,21 +248,60 @@ function decodeTurnCursor(
  *   GET  /api/pair?code=       the ONLY unauthenticated API route; mints this
  *                              device's own credential (refused over plaintext
  *                              off-machine transports — see mintRefusal)
+ *   POST /api/live-activity-registration  push-to-start / activity tokens (merges)
+ *   GET  /api/devices          paired-device roster, scoped to the caller
+ *   POST /api/devices/:id/revoke   remove a device (a device: only itself)
+ *   PATCH /api/devices/:id/grants  lower a device's input grant (never raise)
  *   GET  /api/config           allowInput + allowUpload flags, plus the phone
  *                              protocol handshake (see protocolVersion.ts)
  *   GET  /api/sessions         pane list
+ *   GET  /api/search?q=        search turns, pane metadata + run history and
+ *                              scrollback across this host (hostSearch.ts)
  *   POST /api/sessions         spawn a pane — 403 unless `--allow-input`
  *   DELETE /api/sessions/:id   close a pane — 403 unless `--allow-input`
  *   GET  /api/sessions/:id/diff  what this pane's repo has changed (read-only git)
+ *   GET  /api/sessions/:id/commands  slash commands + skills this pane can run
+ *   GET  /api/sessions/:id/turns/image?path=  one image the transcript named,
+ *                              from the pane's spawn cwd or the uploads dir —
+ *                              403 unless `--allow-transcript`
+ *   GET  /api/sessions/:id/turns/file?path=   the same reading, widened to the
+ *                              video an agent produced and STREAMED rather than
+ *                              buffered — same gate, same roots
  *   POST /api/stream-ticket    device → short-lived `?ticket=` capability
  *   GET  /api/stream?session=  SSE pane bytes (`?token=`/`?ticket=` — EventSource)
  *   GET  /api/events           attention + approval channel; SSE (`?token=`
  *                              allowed) or JSON backlog (Bearer only)
- *   POST /api/input?session=   free-form bytes — 403 unless `--allow-input`
+ *   POST /api/input?session=   free-form bytes — 403 unless `--allow-input`;
+ *                              409 `terminal-prompt-active` while the pane
+ *                              shows a `terminal_prompt` dialog (lone Esc /
+ *                              Ctrl-C excepted)
  *   POST /api/upload           raw JPEG/PNG bytes → a path on disk — 403
  *                              unless `--allow-upload` (its own grant)
  *   GET  /api/approvals        pending + recently resolved approval requests
  *   POST /api/approvals/:id    resolve one — ALLOWED on a read-only server
+ *   GET  /api/approvals/:id/detail   the full command of a pending, bound
+ *                              `terminal_prompt` (≤64 KB) + its hash
+ *   POST /api/approvals/:id/decline  cancel a `terminal_prompt` dialog with one
+ *                              Esc, only while it is pending and on screen (a
+ *                              native decision: rejected by the agent's server)
+ *   POST /api/approvals/:id/answer   a `decision-v2` answer, journaled under the
+ *                              client's `clientAnswerId`; input grant required
+ *   GET  /api/approvals/:id/answer/:clientAnswerId   the caller's own receipt
+ *   GET  /api/channels         every channel the human workspace can observe
+ *                              (§9: public + joined + observed private), with
+ *                              server-computed unread for seated channels
+ *   GET  /api/channels/:id/messages?since=&limit=
+ *                              cursor-paged channel messages (oldest-first,
+ *                              default 50 / max 200)
+ *   POST /api/channels/:id/ack  advance the human seat's read cursor
+ *                              (clamped, advance-only; no-seat → 400)
+ *   POST /api/channels/:id/join take the human seat (idempotent, full
+ *                              history, archived → 400); input grant required
+ *
+ * List, messages and ack are read-side and, like approvals, work on a
+ * read-only server and for a read-only device. Join plants a seat, so it needs
+ * the caller's input grant. Posting stays behind its own future grant. All four
+ * answer 503 `channels-unavailable` when the `channels` seam is not wired.
  */
 
 export interface WebTerminalStartOptions {
@@ -155,6 +327,22 @@ export interface WebTerminalStartOptions {
    * missing `allowUpload` does). (#782)
    */
   allowTranscript?: boolean;
+  /**
+   * Whether `POST /api/sessions/:id/chat/launch` may start an agent with its
+   * approvals (Claude `bypass`) or approvals and sandbox (Codex `yolo`) turned
+   * off (`--allow-dangerous-launch`). A server CEILING, not a device grant:
+   * from a phone this is a category change — an agent that runs tools on this
+   * machine without asking anyone — so the operator opts in on the host, and
+   * every request still has to name the exact combination in `confirm`.
+   * Absent → false, like `allowTranscript`. (contract §3.4)
+   */
+  allowDangerousLaunch?: boolean;
+  /**
+   * Whether the web client draws inline images (sixel, iTerm2) (#1641).
+   * Absent → on; `wmux web --no-inline-images` turns it off. Advertised on
+   * `/api/config` as `inlineImages`.
+   */
+  inlineImages?: boolean;
   /**
    * Terminate HTTPS in the daemon with operator-supplied PEM files.
    *
@@ -199,6 +387,10 @@ export interface WebTerminalInfo {
   allowUpload?: boolean;
   /** Whether `GET /api/sessions/:id/turns` is armed. Its own opt-in (#782). */
   allowTranscript?: boolean;
+  /** Whether chat launch may use `bypass`/`yolo`. Its own opt-in (contract §3.4). */
+  allowDangerousLaunch?: boolean;
+  /** Whether the web client draws inline images (#1641). */
+  inlineImages?: boolean;
   /** True when this listener terminates HTTPS inside the daemon. */
   tls?: boolean;
   token?: string;
@@ -231,6 +423,10 @@ export interface WebTerminalInfo {
    * refusal shape is a fourth thing to forget.
    */
   pairRefusal?: PairRefusal;
+  /** Name, grant and flow of the pending pairing; present only with a live code. */
+  pendingDeviceName?: string;
+  pendingDeviceAllowInput?: boolean;
+  pendingPairFlow?: PairFlow;
   /** Which transport this server was started on. Reported, never acted on. */
   tailscale?: boolean;
   /**
@@ -286,7 +482,7 @@ export type DeviceAuthResult =
  */
 export interface WebDeviceResolver {
   resolve(deviceId: string, secret: string): Promise<DeviceAuthResult> | DeviceAuthResult;
-  mint(params: { name?: string; allowInput?: boolean }): Promise<{ deviceId: string; deviceSecret: string }>;
+  mint(params: { name?: string; allowInput?: boolean; kind?: DeviceKind }): Promise<{ deviceId: string; deviceSecret: string }>;
   /**
    * Record a successful auth. Optional because it is bookkeeping, not
    * authorization: a store that does not track `lastSeenAt` is still a valid
@@ -304,6 +500,55 @@ export interface WebDeviceResolver {
     deviceId: string,
     input: { apnsToken: string; publicKey: string; apnsEnvironment?: unknown },
   ): { ok: boolean; reason?: string };
+  /**
+   * Record where to reach this device's Live Activity. Optional for the same
+   * reason `registerPush` is, and MERGING rather than replacing — the two
+   * tokens are issued at different moments, so a replace would mean the daemon
+   * never holds both. `null` removes one; an omitted field is left alone.
+   */
+  registerLiveActivity?(
+    deviceId: string,
+    input: { hostID?: unknown; pushToStartToken?: unknown; activityToken?: unknown; apnsEnvironment?: unknown },
+  ): { ok: boolean; reason?: string };
+  /**
+   * Device management from the phone (`/api/devices`). The three verbs are ONE
+   * capability: a resolver missing any of them gets 503 on all three routes
+   * and no `deviceManagement` key in `/api/config`, so a phone never shows a
+   * roster it cannot act on. Shapes mirror DeviceStore's, which is what the
+   * daemon injects here.
+   */
+  list?(): WebDeviceSummary[];
+  revoke?(deviceId: string, actor: DeviceActor): { ok: boolean; reason?: 'not-found' | 'persist-failed' };
+  setInput?(
+    deviceId: string,
+    allowInput: boolean,
+    actor: DeviceActor,
+  ): WebDeviceSetInputResult;
+}
+
+/**
+ * What `setInput` answers. `changed` is true only when the call changed the
+ * grant; `retried` when it re-attempted the write of an earlier change that
+ * had not reached disk.
+ */
+export interface WebDeviceSetInputResult {
+  ok: boolean;
+  reason?: 'not-found' | 'revoked' | 'persist-failed';
+  changed: boolean;
+  retried?: boolean;
+}
+
+/** One roster row as the resolver reports it. Carries no secret material. */
+export interface WebDeviceSummary {
+  deviceId: string;
+  name: string;
+  createdAt: number;
+  lastSeenAt: number;
+  /** The device's own resolved grant; the server flag is applied separately. */
+  allowInput: boolean;
+  revokedAt?: number;
+  /** Display-only self-description from pairing. Never used for authorization. */
+  kind?: DeviceKind;
 }
 
 /**
@@ -330,7 +575,7 @@ type AuthOutcome = { ok: true; principal: WebPrincipal } | { ok: false; reason: 
  */
 export type WebPairStartResult =
   | { ok: true; code: string; expiresAt: number }
-  | { ok: false; error: string };
+  | { ok: false; error: string; reason?: 'busy' };
 
 /**
  * Pane lifecycle as far as the HTTP surface is concerned.
@@ -352,14 +597,55 @@ export type WebPairStartResult =
  * here is a real, monitored, persisted daemon session that the desktop GUI has
  * no layout node for.
  */
+/** The grant a create was authorized under is gone by the time the PTY spawns.
+ * Distinct from a create the daemon refuses on its own terms (409) — this one
+ * means "ask again with a credential that still holds", so it maps to 401. */
+export class SessionAuthorizationExpiredError extends Error {
+  constructor() { super('authorization-expired'); }
+}
+
 export interface WebSessionLifecycle {
-  /** Spawn a pane. Resolves to the new session's id. */
-  create(params: { workspaceId?: string; cwd?: string }): Promise<{ id: string }>;
+  /** Spawn a pane. Resolves to the new session's id.
+   *
+   * `authorized` is re-checked by the daemon IMMEDIATELY before the spawn. The
+   * route's own re-check happens before this call, and `create` then awaits the
+   * workspace account environment, the installed-CLI lookup and the Codex relay
+   * reservation — every one of them a round trip to another process. A device
+   * revoked or narrowed inside that window must not end up with a shell.
+   * Rejects with `SessionAuthorizationExpiredError` when it no longer holds. */
+  create(params: {
+    workspaceId?: string; cwd?: string; agentLaunch?: AgentLaunchChoice; authorized?: () => Promise<boolean>;
+    /** The desktop-resolved account for this pane only (contract v-next item 4). Requires `workspaceId`. */
+    account?: ResolvedPaneAccount;
+    /** Lineage to store on the new pane. */
+    handoffFrom?: StoredHandoffFrom;
+  }): Promise<{ id: string }>;
   /** Close a pane and dispose its PTY. Called only for an id already resolved. */
   destroy(id: string): Promise<void>;
 }
 
 interface WebTerminalServerDeps {
+  agentSettings?: (id:string, authorized:()=>Promise<boolean>, choice?:PaneSettingsChoice)=>Promise<LiveAgentSettings>;
+  /**
+   * Contract v-next item 2. `accountHome`: the Codex home of the account
+   * server a pane's live relay talks to, or undefined. `liveIds`: panes with
+   * a live relay. `read`: that account's status (cached per account).
+   */
+  codexAccountStatus?: {
+    accountHome(id: string): string | undefined;
+    liveIds(): string[];
+    read(codeHome: string): Promise<CodexAccountStatus>;
+  };
+  agentLaunchOptions?: (env?: NodeJS.ProcessEnv) => Promise<AgentLaunchOptions[]>;
+  desktop?: () => DesktopPhoneBridge | null;
+  runHistory?: () => RunHistoryStore;
+  inputReceipts?: () => InputReceiptStore;
+  /** Receipts for `POST /api/approvals/:id/answer`. Absent ⇒ that route is 503. */
+  answerReceipts?: () => AnswerReceiptStore;
+  /** The `decision-v2` form kinds this daemon produces now (`/api/config` `decisionForms`). Absent ⇒ none. */
+  decisionForms?: () => DecisionFormKind[];
+  /** Refresh agent-native decision records before a list; never awaited. */
+  reconcileDecisions?: () => void;
   sessionManager: DaemonSessionManager;
   log: (level: 'info' | 'warn' | 'error', msg: string) => void;
   /**
@@ -394,6 +680,8 @@ interface WebTerminalServerDeps {
    * tested without a repository on the test machine's disk.
    */
   git?: GitRunner;
+  /** Phone worktree creation (contract item 5). Absent: the routes 503 and `gitWorktrees` is omitted. */
+  phoneWorktrees?: () => PhoneWorktreeService;
   /**
    * Where `POST /api/upload` writes photos. Optional like `approvals`: a daemon
    * that did not wire one still serves every other route, and the upload route
@@ -404,6 +692,27 @@ interface WebTerminalServerDeps {
    * by `browser_file_upload` without a second policy.
    */
   uploadsDir?: string;
+  /**
+   * Records one file served because the pane's agent sent it with
+   * `SendUserFile` (the device audit log). Device, pane, basename and size
+   * only — never the full path or the content. `deviceId` is empty for the
+   * operator token.
+   */
+  auditSentFile?: (entry: { deviceId: string; sessionId: string; file: string; bytes: number }) => void;
+  /**
+   * The Moa (HQ brain) pane main last pushed (`daemon.moa.set`), or null: Moa
+   * off, no HQ, HQ missing, no brain TUI, or no main connected. Read on every
+   * check; `moaSession` re-validates it against the live session.
+   */
+  moaPane?: () => MoaPaneFact | null;
+  /** Records one phone send to the Moa pane (the device audit log). */
+  auditMoaSend?: (entry: { deviceId: string; sessionId: string; route: 'chat' | 'input' }) => void;
+  /**
+   * #1772 — an answer or decline to the Moa pane's `terminal_prompt` was
+   * refused as `prompt-changed`: the daemon looks at the screen once, so a
+   * dialog declined in the terminal (Esc sends no hook) loses its card.
+   */
+  moaPromptRefused?: (sessionId: string) => void;
   /**
    * Overrides for the upload bounds. Test seam only — production takes the
    * module constants, and there is no operator surface for these. Filling a
@@ -418,6 +727,12 @@ interface WebTerminalServerDeps {
    */
   now?: () => number;
   /**
+   * How long the FIRST `/api/sessions` / `/api/workspaces` poll with no
+   * sidebar snapshot yet may wait for the desktop's first answer. Test seam;
+   * defaults to DESKTOP_SIDEBAR_FIRST_PAINT_MS.
+   */
+  desktopSidebarFirstPaintMs?: number;
+  /**
    * The daemon's transcript projector — the phone turn-view contract (#782).
    * Optional like `approvals`: a daemon/test that has not wired one still serves
    * every other route, and `/api/sessions/:id/turns` answers 503 rather than
@@ -430,6 +745,21 @@ interface WebTerminalServerDeps {
    */
   projector?: () => TranscriptProjector | null;
   /**
+   * Phone native chat bridge (contract v0.3.1): binding resolution, shared send
+   * receipts, guarded launch and skills. Lazy like `projector`, because the
+   * daemon builds it after the server. Absent → the chat routes answer 503
+   * `chat-unavailable` and `/api/config` does not advertise them.
+   */
+  chat?: () => ChatBridge | null;
+  /**
+   * The chat-v2 host (src/daemon/chat/v2). Lazy like `chat`: the daemon builds
+   * it after the server. A pane with a live v2 record (any status but
+   * `handed-off`) is served from it ahead of the bridge: `/turns` reads as a
+   * `managed` binding, send answers `409 managed-read-only`, launch is refused
+   * and cancel interrupts the driver. Absent → those routes are unchanged.
+   */
+  chatV2?: () => ChatV2PhoneHost | null;
+  /**
    * #783 — the gated-tools list from daemon config, so `/api/config` can expose
    * it and the phone can explain "why is this call waiting?". A getter (not a
    * static ref) because the list is editable at runtime via `wmux gate --add`.
@@ -437,6 +767,17 @@ interface WebTerminalServerDeps {
    * `/api/config` reports an empty list.
    */
   gateConfig?: () => { gatedTools: string[] };
+  /**
+   * Phone channel Inbox (contract §9) — the daemon's channel service, adapted to the
+   * phone projection. Optional like `approvals`: a daemon that did not wire it
+   * (or a unit test that does not care) still serves every other route, and
+   * the four `/api/channels*` routes answer 503 rather than pretending the
+   * surface exists. The adapter maps the authenticated principal to the
+   * reserved human workspace SERVER-SIDE (no identity field is ever read from
+   * a request), so read state and mentions cannot fork between the desktop
+   * and the phone.
+   */
+  channels?: ChannelPhoneApi;
   /**
    * #783 — runtime escape hatch. `POST /api/gate/off` / `/api/gate/on` call
    * this to disarm or re-arm the permission gate. Turning it off also defers
@@ -455,6 +796,58 @@ interface WebTerminalServerDeps {
    * the same answer as "off".
    */
   gateEnabled?: () => boolean;
+  /**
+   * Whether this daemon can actually push a Live Activity — i.e. whether the
+   * relay transport behind the pusher is configured. A GETTER for the same
+   * reason `projector` is one: the server is built before the pusher, so the
+   * daemon wires a closure that resolves the live instance per request.
+   *
+   * Optional, and absent (or false) means `/api/config` OMITS the key rather
+   * than reporting `false`. A phone reads a missing key exactly as an older
+   * daemon's missing key — "start the activity locally" — so the two cases are
+   * the same answer and should be the same shape on the wire.
+   */
+  liveActivityPush?: () => boolean;
+  /**
+   * A device's Live Activity tokens just changed. The pusher sends only when
+   * the approval numbers move, so without this an activity token that lands
+   * AFTER the numbers moved (the start went out at 1, a second approval
+   * arrived while the token was in flight) would leave the lock screen on the
+   * old number until the next approval event. The daemon re-runs the decision
+   * against the numbers as they are now.
+   */
+  liveActivityRegistered?: () => void;
+  /**
+   * #1163 — the daemon's CANONICAL per-session agent state (the answer
+   * daemon.getAgentName gives the desktop), for GET /api/workspaces. Resolved
+   * per request: the reader is registered with the RPC handlers, which may run
+   * after this server is built. Absent, or undefined for a session, means the
+   * pane carries no detected-agent fields.
+   */
+  agentState?: (sessionId: string) => { agentName: string | null; agentStatus: AgentStatus } | undefined;
+  /**
+   * #1342 — the daemon's resume state for a session, for GET /api/workspaces:
+   * the captured conversation binding (already transcript-probed, so a purged
+   * conversation is never offered) plus the two liveness signals the desktop's
+   * resume chip gates on. Resolved per request for the same reason
+   * `agentState` is. Absent, or undefined for a session, means the pane
+   * carries no resume block.
+   */
+  resumeState?: (sessionId: string) => {
+    binding?: ResumeBinding;
+    commandRunning?: boolean;
+    agentProcessAlive?: boolean;
+    /** Recovered this daemon boot, agent not re-detected — the same hint
+     *  `pty.list` carries. Only the snapshot meta reads it. */
+    resumeAgent?: string;
+  } | undefined;
+  /**
+   * A pane's ring as plain-text rows — the `daemon.readSessionText` parse, on
+   * the daemon's shared concurrency-1 snapshot queue — for the scrollback
+   * scope of `GET /api/search`. Optional: without it that scope answers
+   * `unavailable` for every pane and `/api/config` does not advertise it.
+   */
+  sessionText?: (sessionId: string) => Promise<ReadonlyArray<{ text: string; wrapped: boolean }> | null>;
 }
 
 /** Cap a single input POST body so a hostile client cannot exhaust memory. */
@@ -519,6 +912,13 @@ const ATTENTION_CAP = 100;
 /** Attention entries older than this are dropped even if the cap allows them. */
 const ATTENTION_TTL_MS = 30 * 60 * 1000;
 /**
+ * Phone channel Inbox (§9) — how many `channel.mention` entries the replay
+ * window may hold at once. Mentions are already coalesced to one per channel;
+ * this bounds the many-channels case, so mention traffic can never take more
+ * than this share of ATTENTION_CAP and push pending approvals out of the ring.
+ */
+const ATTENTION_MENTION_CAP = 20;
+/**
  * #782 — coalescing window for the non-recording transcript nudge. A single
  * turn raises several hook signals in quick succession (activity then stop),
  * and the phone refetches on every nudge, so one-per-second is the floor that
@@ -535,8 +935,74 @@ const TRANSCRIPT_NUDGE_COALESCE_MS = 1000;
  * states skip the window entirely (`isTerminalLiveness`).
  */
 const AGENT_LIVENESS_COALESCE_MS = 1000;
+/**
+ * How long a WORKING liveness state stays believable in the `/api/sessions`
+ * snapshot. The SSE header is a live channel — it gets a new state whenever one
+ * happens — but the list is a poll, and the last state it kept may be the one a
+ * pane was in when its agent crashed, lost its hooks, or was killed by a signal
+ * no hook reports. Past this age a `busy`/`tool` row is omitted rather than
+ * rendered as a pane that has been "running Bash" for an hour.
+ *
+ * Only the working states expire. `idle` and `awaiting_*` are RESTING states:
+ * an agent that stopped an hour ago is still stopped, and aging those out would
+ * blank the one part of the list a user is scanning for.
+ */
+const LIVENESS_SNAPSHOT_STALE_MS = 300_000;
+/**
+ * How many transcript tails one `/api/sessions` poll may START reading.
+ *
+ * The reads are off the event loop, but they are still disk: a fleet of forty
+ * panes that all rotated their transcripts at once would otherwise fire forty
+ * concurrent 256 KB reads on one poll. The panes that miss out are read on the
+ * next poll — the field is a summary, and arriving a second late costs nothing.
+ */
+const MAX_LAST_ASSISTANT_READS_PER_POLL = 8;
+/**
+ * The desktop sidebar fields on `/api/sessions` and `/api/workspaces`, served
+ * stale-while-revalidate. Both routes are polled by every paired device (and
+ * `/api/workspaces` by attached remote desktops), so a poll never waits on the
+ * desktop once a snapshot exists:
+ *   - TTL: a snapshot older than this starts ONE background refresh;
+ *   - MAX_STALE: a good snapshot is served up to this age while refreshes
+ *     fail transiently (bridge busy, timeout, a failed request) — past it the
+ *     fields are omitted. A desktop that is gone drops them at once;
+ *   - RETRY: after a failed refresh, how long before the next attempt, so a
+ *     failing desktop is not asked on every poll;
+ *   - FIRST_PAINT: with no servable snapshot (none yet, or one past MAX_STALE
+ *     because nobody polled for a while), polls may wait this long after the
+ *     refresh STARTED (a deadline shared by every such poll, not a wait each),
+ *     so a phone opening or returning to the Fleet paints with the fields when
+ *     the desktop is healthy; a slow desktop costs this once, not per poll.
+ */
+const DESKTOP_SIDEBAR_TTL_MS = 1000;
+const DESKTOP_SIDEBAR_MAX_STALE_MS = 10_000;
+const DESKTOP_SIDEBAR_RETRY_MS = 2000;
+const DESKTOP_SIDEBAR_FIRST_PAINT_MS = 250;
 /** A decision body is two fields; anything larger is not one of ours. */
 const MAX_JSON_BODY_BYTES = 8 * 1024;
+/**
+ * Chat send body cap (contract §3.5): 16,000 UTF-16 units at the 6-byte
+ * worst case of a client that escapes every unit as `\uXXXX`, plus the
+ * envelope. The unit rule itself is the daemon's, checked after parsing.
+ */
+const CHAT_SEND_MAX_BODY_BYTES = 96 * 1024;
+/** Chat launch body cap: 2,000 units × 6 bytes plus the envelope. */
+const CHAT_LAUNCH_MAX_BODY_BYTES = 16 * 1024;
+/** Chat cancel body cap: four short strings. */
+const CHAT_CANCEL_MAX_BODY_BYTES = 4 * 1024;
+/** A transcript row may carry a timestamp slightly before the daemon noted the delivery. */
+const CHAT_DELIVERY_SKEW_MS = 5_000;
+/** Same 1 Hz floor as the nudge: a blocked badge must be right, not instant. */
+const CHAT_BLOCKED_COALESCE_MS = 1000;
+/** Moa card ids remembered until they settle (see `moaCardIds`). */
+const MOA_CARD_IDS_MAX = 32;
+/**
+ * N7 — a bridge watch outlives its last reader by at most this long: four of
+ * the client's 30 s stale windows (contract §5.5). A visible chat reads every
+ * 10 s, so it never loses its watch.
+ */
+const CHAT_WATCH_IDLE_MS = 120_000;
+const CHAT_WATCH_SWEEP_MS = 30_000;
 /**
  * Ceiling on ONE expanded code block / tool body served to a phone. The desktop
  * reads these over a local pipe; a phone may be on cellular, and a `cat` of a
@@ -550,6 +1016,26 @@ const MAX_JSON_BODY_BYTES = 8 * 1024;
  * (2-MODEL review).
  */
 const MAX_BLOCK_BODY_BYTES = 256 * 1024;
+/**
+ * Ceiling on ONE image served to a phone by `/turns/image`.
+ *
+ * Generous next to the block cap because an image is not truncatable: a head is
+ * not a smaller picture, it is a corrupt file. Over the cap the route refuses
+ * with 413 and the phone shows the filename chip instead, which is the same
+ * fallback it already has for every other refusal on this route.
+ */
+const MAX_TURN_IMAGE_BYTES = 8 * 1024 * 1024;
+/**
+ * Ceiling on ONE video served to a phone by `/turns/file`.
+ *
+ * Sixteen times the image cap because the things it exists for — a screen
+ * recording, an ffmpeg render an agent just produced — are that much bigger,
+ * and like an image a video is not truncatable. The number is only affordable
+ * because that route STREAMS: the buffered route could not have carried this
+ * cap without holding 128 MB of one request in memory, which is why it keeps
+ * the smaller one.
+ */
+const MAX_TURN_VIDEO_BYTES = 128 * 1024 * 1024;
 /**
  * Who the registry records as having answered, for anything resolved over HTTP.
  *
@@ -627,6 +1113,16 @@ let activeDiffs = 0;
  * very run it would otherwise have started.
  */
 const inFlightDiffs = new Map<string, Promise<SessionDiffResult>>();
+
+/**
+ * How long a scanned skill/command catalog stays fresh.
+ *
+ * The phone asks for this list every time someone types `/`, so without a cache
+ * a fast typist turns a directory walk into a poll. Thirty seconds is the
+ * trade: a skill file added while the composer is open shows up on the next
+ * `/`, and nobody edits `.claude/commands` faster than they notice.
+ */
+const SKILL_CATALOG_TTL_MS = 30_000;
 
 /**
  * Widest geometry `POST /api/sessions/:id/resize` will forward to a PTY.
@@ -735,6 +1231,8 @@ interface EventClient {
   res: http.ServerResponse;
   detach: () => void;
   principal: WebPrincipal;
+  /** What the client declared it understands (`X-Wmux-Client-Caps`). */
+  caps: ClientCaps;
 }
 
 /**
@@ -746,7 +1244,7 @@ interface EventClient {
  * while the phone was in a tunnel is exactly the event that must survive the
  * reconnect.
  */
-type EventKind = 'critical' | 'notify' | 'approval';
+type EventKind = 'critical' | 'notify' | 'approval' | 'channel.mention';
 
 /**
  * How much of a human this event is asking for.
@@ -809,6 +1307,11 @@ interface AttentionEntry {
  * LINE, never the classification.
  */
 function tierFor(kind: EventKind, payload: Record<string, unknown>): EventTier {
+  // A channel.mention fires only for a verified mention of a seated human (§9:
+  // a mention into a channel with no human seat is dropped at post time), so
+  // there is nothing further in the payload to consult — always act. info is
+  // reserved for possible future non-mention echoes.
+  if (kind === 'channel.mention') return 'act';
   if (kind === 'notify') return 'info';
   if (kind === 'critical') return payload['riskLevel'] === 'review' ? 'info' : 'act';
   return payload['phase'] === 'create' ? 'act' : 'info';
@@ -821,6 +1324,7 @@ interface AttentionCursor {
 }
 
 export class WebTerminalServer {
+  private readonly inputEpoch = crypto.randomUUID();
   private server: http.Server | https.Server | null = null;
   private token = '';
   private opts: WebTerminalStartOptions | null = null;
@@ -835,12 +1339,103 @@ export class WebTerminalServer {
    * keys, not principal objects, so the set stays cheap to consult per nudge.
    */
   private readonly transcriptWatchers = new Map<string, Set<string>>();
+  /** Files each pane's agent sent with `SendUserFile`, read from its transcript. */
+  private readonly sentFiles = new SentFileIndex();
   /** Per-pane coalescing timers for the non-recording transcript nudge. */
   private readonly transcriptNudgeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Cancels of chat-v2 turns, with their receipts and outcome (the bridge's store covers terminal bindings only). */
+  private readonly chatV2Cancels = new ChatV2Cancels({ now: () => this.now(), emit: (event) => this.emitChatCancel(event) });
+  /** The chat-v2 host whose pushes nudge phone watchers, subscribed on first use. */
+  private chatV2PushHost: ChatV2PhoneHost | null = null;
+  private chatV2PushOff: (() => void) | null = null;
   /** Per-pane coalescing timers for the non-recording liveness event. */
   private readonly livenessTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * #1772 — approval ids published as Moa cards, until they settle. Moa can
+   * be switched off (or the HQ change) before a card settles, and the phone
+   * that was shown it must still hear it close. Bounded: a pane holds one
+   * pending prompt at a time, so a handful is all this ever holds.
+   */
+  private readonly moaCardIds = new Set<string>();
+  /**
+   * N3 — the last read-time `chat.blocked` value per pane, as a comparable
+   * key ('' = not blocked). Only transitions become live events; the value
+   * itself is never served from here, `/turns` recomputes it on every read.
+   */
+  private readonly chatBlockedState = new Map<string, string>();
+  /** Per-pane coalescing timers for the `chat.blocked` recompute. */
+  private readonly chatBlockedTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * N7 — per pane, per watcher key: when that principal last read the pane's
+   * OpenCode conversation successfully. A pane is in this map exactly while
+   * this server holds a bridge watch on it.
+   */
+  private readonly chatWatchReads = new Map<string, Map<string, number>>();
+  private chatWatchSweep: ReturnType<typeof setInterval> | null = null;
+  /** Memory-only, owner-bound launch receipts (contract §6.4). */
+  private readonly chatLaunchReceipts = new ChatLaunchReceiptStore();
   /** Latest liveness state per pane, held for the open coalescing window. */
+  private readonly phoneGit = new SessionGitController();
+  private phoneGitRequests = 0;
+  /** Phone Git v1 reads (contract item 5); built on first use. */
+  private phoneGitReads?: PhoneGitReads;
+  private readonly agentSettingsRequests = new Set<string>();
   private readonly pendingLiveness = new Map<string, AgentLivenessBody>();
+  /** `GET /api/search`: the cursor key lives and dies with this server. */
+  private readonly searchCursors = createSearchCursorCodec(crypto.randomBytes(32));
+  private readonly scrollbackText = new ScrollbackTextCache();
+  private readonly scrollbackExtractions = new ScrollbackExtractions();
+  private readonly searchAdmission = new SearchAdmission(() => this.now());
+  private searchesInFlight = 0;
+  /** Last GOOD desktop sidebar snapshot and when it was taken. */
+  private desktopSidebarCache: { at: number; value: PhoneSidebarSnapshot } | null = null;
+  /** The one background refresh in flight, and when it started. */
+  private desktopSidebarInFlight: { promise: Promise<void>; startedAt: number } | null = null;
+  /** When the last refresh failed (0 = not since the last success). */
+  private desktopSidebarFailedAt = 0;
+  /**
+   * Bumped by stop(). A refresh started under an older generation may still
+   * land after a restart; it must touch neither the cache nor the slot.
+   */
+  private desktopSidebarGeneration = 0;
+  /** The last sidebar drop summary logged (see warnDesktopSidebar). */
+  private desktopSidebarLastWarning = '';
+  /**
+   * Last liveness state seen per pane, for the `/api/sessions` snapshot.
+   *
+   * DELIBERATE WIDENING (and the reason this map exists at all): until now
+   * liveness was watcher-only — it reached a device's SSE channel only for
+   * panes whose turn view that device had opened. The list field publishes the
+   * same state to any bearer-authenticated device BEFORE it has read any pane,
+   * because a fleet list that cannot say which panes are working is a list you
+   * have to open every row of to use. What is widened is the STATE only: the
+   * tool name never rides along (see `livenessSummary`), so the list still says
+   * "working", not what it is working on.
+   *
+   * Recorded only for sessions the daemon actually knows — see
+   * `emitAgentLiveness` — and dropped on delete.
+   */
+  private readonly latestLiveness = new Map<string, { state: AgentLivenessState; at: number }>();
+  /**
+   * Memoized `lastAssistantText` per pane, keyed by (path, size, mtime).
+   *
+   * `/api/sessions` is polled, and re-reading every pane's transcript tail on
+   * every poll would put a 256 KB read per pane on a route that answers in
+   * microseconds today. The key is the projector's own change signal, so an
+   * appended transcript invalidates itself. A null text is cached too —
+   * otherwise a pane whose transcript holds no assistant message (a fresh
+   * session, a tool-only turn) would be re-read on every single poll.
+   */
+  private readonly lastAssistantCache = new Map<string, { key: string; text: string | null }>();
+  /**
+   * Panes whose transcript tail is being read right now.
+   *
+   * `/api/sessions` may be polled by several devices at once, and a poll that
+   * missed the cache starts the read rather than waiting for it — without this
+   * set, three phones polling a busy fleet would each start the same read of
+   * the same file.
+   */
+  private readonly lastAssistantReads = new Set<string>();
 
   /**
    * Attention replay state.
@@ -857,6 +1452,15 @@ export class WebTerminalServer {
   private readonly attentionEpoch = crypto.randomUUID();
   private attentionSeq = 0;
   private attentionLog: AttentionEntry[] = [];
+  /**
+   * Highest id whose event was LOST (evicted by the cap or the TTL, or dropped
+   * by the mention cap) — the replay continuity watermark. A cursor below it
+   * missed something and gets a `reset`. Held separately rather than read off
+   * the log's oldest entry because a superseded `channel.mention` is removed
+   * from the middle of the log without losing anything (its channel's newer
+   * mention is still held), and that removal must not look like a gap.
+   */
+  private attentionLostThrough = 0;
 
   // Pairing state (single active code per running server).
   private pairCode = '';
@@ -900,6 +1504,20 @@ export class WebTerminalServer {
    * unticked checkbox still means read-only on an input-enabled server.
    */
   private pendingDeviceAllowInput = false;
+  /**
+   * Which card the pending name and grant belong to. Held, replaced and
+   * cleared together with them, so a re-mint on expiry or a burned attempt
+   * budget can never carry the phone card's name onto a computer link (or the
+   * other way round). Absent exactly when `pendingDeviceName` is.
+   */
+  private pendingPairFlow: PairFlow | undefined;
+  /**
+   * Bumped whenever the code slot changes hands (a mint or a burn). A
+   * redemption records it before its await, so a slot re-minted meanwhile —
+   * the other card starting — is never burned or restored by the request
+   * that belonged to the old code.
+   */
+  private pairGeneration = 0;
 
   /**
    * The grant a pairing code carries when nobody said. Typing `--allow-input`
@@ -917,6 +1535,8 @@ export class WebTerminalServer {
    * stream against THIS running server, so there is nothing to carry across a
    * restart — the client asks for another one, which costs it one request.
    */
+  private readonly streamResponses = new StreamResponseLimits();
+
   private readonly streamTickets = new Map<string, StreamTicket>();
 
   // Bound so on()/off() reference the SAME listener across start()/stop().
@@ -925,12 +1545,30 @@ export class WebTerminalServer {
   private readonly onSessionNotification = (payload: { sessionId: string; event?: unknown }): void =>
     this.broadcastEvent('notify', payload);
   private readonly onApprovalEvent = (e: ApprovalEvent): void => this.publishApproval(e);
+
+  /**
+   * Phone channel Inbox (§9) — the human-mention promotion listener. Raises a
+   * mention the service verified at post time as a recorded `channel.mention`
+   * attention event; publish() stamps id/epoch/tier last, so only the content
+   * fields are carried here.
+   */
+  private readonly onChannelMention = (n: ChannelMentionNotification): void => {
+    this.publish('channel.mention', {
+      channelId: n.channelId,
+      seq: n.seq,
+      fromMemberName: n.fromMemberName,
+      text: n.text,
+      postedAt: n.postedAt,
+    });
+  };
   /**
    * The registry hands back an unsubscribe closure rather than taking off() —
    * so unlike the sessionManager listeners this one is held, not re-derived.
    * Non-null exactly while the server is running.
    */
   private approvalUnsub: (() => void) | null = null;
+  /** §9 — channels seam's mention subscription; same restart hygiene as above. */
+  private channelMentionUnsub: (() => void) | null = null;
 
   // Static assets, loaded once on start and cached in memory (all small).
   private terminalHtml: Buffer | null = null;
@@ -938,6 +1576,15 @@ export class WebTerminalServer {
   private manifest: Buffer | null = null;
   private serviceWorker: Buffer | null = null;
   private icon: Buffer | null = null;
+  /**
+   * The browser app page (`/app`, opt-in): the desktop renderer's components,
+   * built by vite.web.config.ts. Its own policy, derived from its own bytes the
+   * same way `csp` is — the two pages inline different scripts.
+   */
+  private appHtml: Buffer | null = null;
+  private appCsp: string = buildWebCsp(null);
+  /** `/app/assets/<name>` → font bytes. Exact names from the build, so no path is ever joined from a request. */
+  private appFonts = new Map<string, Buffer>();
   /**
    * The CSP for the assets currently loaded. Initialized to the asset-less
    * policy (`script-src 'none'`) so a request that somehow arrives before
@@ -947,6 +1594,17 @@ export class WebTerminalServer {
 
   /** Lazily-built git runner for `/api/sessions/:id/diff` (see that handler). */
   private git: GitRunner | null = null;
+
+  /**
+   * Skill/command catalogs already scanned, keyed by the directory scanned.
+   * Keyed by cwd rather than by session id because the catalog is a property of
+   * the directory: two panes in the same repo share one answer.
+   *
+   * Per server, like `lastResizeAt` and unlike the diff concurrency counter:
+   * this bounds disk reads for sessions THIS server can see, and a test that
+   * starts two servers must not have one inherit the other's cache.
+   */
+  private skillCatalogCache = new Map<string, { at: number; entries: SkillCatalogEntry[] }>();
 
   /**
    * When each session was last resized through `/api/sessions/:id/resize`.
@@ -964,6 +1622,42 @@ export class WebTerminalServer {
    * not cover this.
    */
   private inFlightUploads = 0;
+
+  /**
+   * When an authenticated `/api/*` call last landed here (#1316).
+   *
+   * The daemon's idle-shutdown clock used to be anchored to the CONTROL PIPE
+   * alone (`DaemonPipeServer.getLastDisconnectAt`), on the assumption that a
+   * daemon with no desktop client attached and no live PTY is a daemon nobody
+   * is using. A phone breaks that assumption: it holds no pipe connection at
+   * all, so a person answering approvals and reading panes from
+   * `wmux-ios` for an hour looked exactly like an abandoned daemon, and the
+   * five-minute idle timer took the server out from under them.
+   *
+   * Stamped for EVERY authenticated route — not just the ones that change
+   * something — because polling `/api/approvals` or `/api/workspaces` is what
+   * a phone in someone's hand actually does. Unauthenticated traffic is
+   * deliberately excluded: `/api/pair` and the static shell are reachable by
+   * anything that can open the port, and "a stranger can keep my daemon alive"
+   * is not a property worth having.
+   *
+   * This is a TIMESTAMP, not a connection count, and that is the whole scope
+   * of the fix: an SSE viewer that sits silent still does NOT hold the daemon
+   * up, which is the decision already recorded beside `pendingApprovals` in
+   * the daemon's `onIdleCheck`. It does not have to — a phone watching a live
+   * pane is watching a live PTY, and `sessions` already covers that case.
+   */
+  private lastApiActivityAt: number | null = null;
+
+  /**
+   * Newest authenticated-request timestamp, or `null` if none has arrived.
+   *
+   * Read by the daemon's `onIdleCheck` and folded into the same idle anchor as
+   * the pipe's `lastDisconnectAt` — see `src/daemon/index.ts`.
+   */
+  getLastActivityAt(): number | null {
+    return this.lastApiActivityAt;
+  }
 
   constructor(private readonly deps: WebTerminalServerDeps) {}
 
@@ -991,6 +1685,11 @@ export class WebTerminalServer {
     tailscale: boolean;
     host: string;
     token: string;
+    allowInput: boolean;
+    allowUpload: boolean;
+    allowTranscript: boolean;
+    allowDangerousLaunch: boolean;
+    inlineImages: boolean;
   } | undefined {
     if (!this.server || !this.opts) return undefined;
     return {
@@ -998,6 +1697,12 @@ export class WebTerminalServer {
       tailscale: this.opts.tailscale === true,
       host: this.opts.host,
       token: this.token,
+      // What a start that inherits unsent grants keeps (resolveWebStartGrants).
+      allowInput: this.opts.allowInput === true,
+      allowUpload: this.opts.allowUpload === true,
+      allowTranscript: this.opts.allowTranscript === true,
+      allowDangerousLaunch: this.opts.allowDangerousLaunch === true,
+      inlineImages: this.opts.inlineImages !== false,
     };
   }
 
@@ -1031,6 +1736,7 @@ export class WebTerminalServer {
     this.token = options.token || crypto.randomUUID();
     this.opts = options;
     this.pendingDeviceName = undefined;
+    this.pendingPairFlow = undefined;
     // AFTER `this.opts` is set — the default reads the flag from it.
     this.pendingDeviceAllowInput = this.defaultPendingGrant();
     this.generatePairCode();
@@ -1055,6 +1761,7 @@ export class WebTerminalServer {
         this.pairExpiresAt = 0;
         this.pairAttempts = 0;
         this.pendingDeviceName = undefined;
+        this.pendingPairFlow = undefined;
         this.pendingDeviceAllowInput = false;
         reject(err);
       };
@@ -1090,6 +1797,9 @@ export class WebTerminalServer {
     // Approval lifecycle rides the same channel; same attach point, same
     // restart hygiene (unsubscribed in stop(), so a restart never doubles up).
     this.approvalUnsub = this.deps.approvals?.onEvent(this.onApprovalEvent) ?? null;
+    // §9 — channel.mention rides the same recorded channel; same attach point,
+    // same restart hygiene (unsubscribed in stop(), so a restart never doubles up).
+    this.channelMentionUnsub = this.deps.channels?.onMention(this.onChannelMention) ?? null;
 
     // Record the ACTUAL bound port so status()/urls report it even when the
     // caller requested port 0 (ephemeral — used by the unit tests for a
@@ -1124,23 +1834,31 @@ export class WebTerminalServer {
 
     this.deps.log(
       'info',
-      `[web] ${options.tls ? 'HTTPS' : 'HTTP'} listening on ${this.opts.host}:${this.opts.port} (input ${options.allowInput ? 'ENABLED' : 'read-only'}, uploads ${options.allowUpload ? 'ENABLED' : 'off'})`,
+      `[web] ${options.tls ? 'HTTPS' : 'HTTP'} listening on ${this.opts.host}:${this.opts.port} (input ${options.allowInput ? 'ENABLED' : 'read-only'}, uploads ${options.allowUpload ? 'ENABLED' : 'off'}${options.allowDangerousLaunch ? ', dangerous chat launch ENABLED' : ''})`,
     );
+    // N7 — the bridge's OpenCode watches poll the plugin once a second, so a
+    // watch nobody reads any more has to end on its own. Unref'd: this timer
+    // must never be what keeps the daemon alive.
+    this.chatWatchSweep = setInterval(() => this.sweepChatWatches(), CHAT_WATCH_SWEEP_MS);
+    this.chatWatchSweep.unref?.();
     return this.status();
   }
 
   /** Stop the server, end every SSE stream, and drop all bridge listeners. */
-  async stop(): Promise<{ stopped: boolean }> {
+  async stop(opts: { shutdown?: boolean } = {}): Promise<{ stopped: boolean }> {
     if (!this.server) return { stopped: false };
 
     this.deps.sessionManager.off('session:critical', this.onSessionCritical);
     this.deps.sessionManager.off('session:notification', this.onSessionNotification);
     this.approvalUnsub?.();
     this.approvalUnsub = null;
+    this.channelMentionUnsub?.();
+    this.channelMentionUnsub = null;
     this.pairCode = '';
     this.pairExpiresAt = 0;
     this.pairAttempts = 0;
     this.pendingDeviceName = undefined;
+    this.pendingPairFlow = undefined;
     this.pendingDeviceAllowInput = false;
     // Capabilities against a server that is going away. Nothing to preserve.
     this.streamTickets.clear();
@@ -1175,11 +1893,43 @@ export class WebTerminalServer {
     this.livenessTimers.clear();
     this.pendingLiveness.clear();
     this.transcriptWatchers.clear();
+    // Chat: no reader survives the stop, so every bridge watch this server
+    // opened ends here rather than polling the plugin until the next start.
+    if (this.chatWatchSweep) clearInterval(this.chatWatchSweep);
+    this.chatWatchSweep = null;
+    this.chatV2PushOff?.();
+    this.chatV2PushOff = null;
+    this.chatV2PushHost = null;
+    this.chatV2Cancels.dispose();
+    const chat = this.deps.chat?.() ?? null;
+    for (const id of this.chatWatchReads.keys()) {
+      try {
+        chat?.unwatch(id);
+      } catch (err) {
+        this.deps.log('warn', `[web] chat unwatch failed for ${id}: ${errMsg(err)}`);
+      }
+    }
+    this.chatWatchReads.clear();
+    for (const timer of this.chatBlockedTimers.values()) clearTimeout(timer);
+    this.chatBlockedTimers.clear();
+    this.chatBlockedState.clear();
+    this.moaCardIds.clear();
+    // A restarted server asks the desktop afresh rather than serving a
+    // snapshot (or a remembered miss) from before the stop, and a refresh
+    // still in flight from before it lands in a dead generation.
+    this.desktopSidebarGeneration += 1;
+    this.desktopSidebarCache = null;
+    this.desktopSidebarInFlight = null;
+    this.desktopSidebarFailedAt = 0;
 
     const server = this.server;
     this.server = null;
     this.opts = null;
     this.token = '';
+    // A policy change restarts the server: nothing a phone queued under the
+    // old one may be typed. The desktop never queues. A daemon shutdown is a
+    // restart, not a revocation, and reads as one.
+    this.dropChatQueue((owner) => owner !== 'desktop', opts.shutdown ? 'daemon-restart' : 'authorization-revoked');
 
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
@@ -1220,18 +1970,65 @@ export class WebTerminalServer {
    * walks to the phone, types it, and only then learns the server would never
    * have minted anything.
    */
-  startPairing(params: { name?: string; allowInput?: boolean } = {}): WebPairStartResult {
+  startPairing(
+    params: { name?: string; allowInput?: boolean; flow?: PairFlow } = {},
+  ): WebPairStartResult {
     if (!this.server) return { ok: false, error: 'the web server is not running — start it first' };
     const refusal = this.mintRefusal();
     if (refusal) return { ok: false, error: refusal };
+    // A caller that predates flows is the phone card, which is all there was.
+    const flow: PairFlow = params.flow === 'computer' ? 'computer' : 'phone';
+    // One code slot, two cards. Refuse BEFORE minting: minting first would
+    // rotate the code under the other card's QR or link on every refused
+    // click. The operator ends the other pairing explicitly (`cancelPairing`).
+    if (this.pendingPairFlow !== undefined && this.pendingPairFlow !== flow && this.pairIsLive()) {
+      return {
+        ok: false,
+        reason: 'busy',
+        error: 'another pairing is in progress — cancel it first',
+      };
+    }
     const label = typeof params.name === 'string' ? params.name.trim() : '';
     this.generatePairCode();
     this.pendingDeviceName = label || undefined;
+    this.pendingPairFlow = label ? flow : undefined;
     // `??`, not `===`: an omitted grant inherits the server's, an explicit
     // `false` stays false. Collapsing those two would either mute the GUI's
     // unticked box or mute every headless pairing.
     this.pendingDeviceAllowInput = params.allowInput ?? this.defaultPendingGrant();
     return { ok: true, code: this.pairCode, expiresAt: this.pairExpiresAt };
+  }
+
+  /**
+   * `daemon.web.pairCancel` — end the pairing in progress, whichever card
+   * started it. Burns the code with its name, grant and flow, so nothing the
+   * operator was about to hand out survives the cancel.
+   */
+  cancelPairing(): WebTerminalInfo {
+    if (!this.server) return { running: false };
+    this.burnPairCode();
+    return this.status();
+  }
+
+  /** Whether a named pairing is still redeemable (a live code with a name). */
+  private pairIsLive(): boolean {
+    return this.pendingDeviceName !== undefined && this.pairCode !== '' && Date.now() <= this.pairExpiresAt;
+  }
+
+  /**
+   * Devices holding a live stream right now. One half of "active now": a
+   * stream is opened with a ticket and never re-authenticates, so a phone
+   * watching a pane for an hour has a stale `lastSeenAt` while plainly present.
+   */
+  liveDeviceIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const client of this.clients) {
+      if (client.principal.kind === 'device') ids.add(client.principal.deviceId);
+    }
+    for (const client of this.eventClients) {
+      if (client.principal.kind === 'device') ids.add(client.principal.deviceId);
+    }
+    return ids;
   }
 
   /**
@@ -1282,7 +2079,18 @@ export class WebTerminalServer {
     if (closed > 0) {
       this.deps.log('info', `[web] revoked device ${deviceId}: closed ${closed} live stream(s)`);
     }
+    // Revoke and a withdrawn input grant both land here: the device's queued
+    // chat messages go with its streams, before any of them could be typed.
+    this.dropChatQueue((owner) => owner === `device:${deviceId}`, 'authorization-revoked');
     return closed;
+  }
+
+  private dropChatQueue(match: (owner: ChatOwner) => boolean, reason: 'authorization-revoked' | 'daemon-restart'): void {
+    try {
+      this.deps.chat?.()?.dropQueue?.(match, reason);
+    } catch (err) {
+      this.deps.log('warn', `[web] chat queue drop failed: ${errMsg(err)}`);
+    }
   }
 
   /**
@@ -1428,6 +2236,8 @@ export class WebTerminalServer {
         allowInput: this.opts.allowInput,
         allowUpload: this.opts.allowUpload,
         allowTranscript: this.opts?.allowTranscript === true,
+        allowDangerousLaunch: this.opts.allowDangerousLaunch === true,
+        inlineImages: this.opts.inlineImages !== false,
         tls: this.opts.tls !== undefined,
         token: this.token,
         urls: this.buildUrls(),
@@ -1446,6 +2256,8 @@ export class WebTerminalServer {
       allowInput: this.opts.allowInput,
       allowUpload: this.opts.allowUpload,
       allowTranscript: this.opts.allowTranscript === true,
+      allowDangerousLaunch: this.opts.allowDangerousLaunch === true,
+      inlineImages: this.opts.inlineImages !== false,
       tls: this.opts.tls !== undefined,
       token: this.token,
       urls: this.buildUrls(),
@@ -1462,6 +2274,7 @@ export class WebTerminalServer {
         ? {
             pendingDeviceName: this.pendingDeviceName,
             pendingDeviceAllowInput: this.pendingDeviceAllowInput,
+            pendingPairFlow: this.pendingPairFlow ?? 'phone',
           }
         : {}),
     };
@@ -1516,9 +2329,20 @@ export class WebTerminalServer {
       return this.json(res, 403, { error: 'host not allowed' });
     }
 
-    // Static, unauthenticated app shell (no secrets live in these). `/pair`
-    // is the same SPA shell — the frontend renders the pairing screen for it.
-    if (req.method === 'GET' && (p === '/' || p === '/index.html' || p === '/pair')) {
+    // Static, unauthenticated pages (no secrets live in these). `/` is the
+    // browser app (the desktop's own UI, app.html); `/classic` is the flat
+    // client it falls back to on browsers that cannot run it, and `/pair` is
+    // that same classic shell, which renders the pairing screen. A daemon
+    // whose app page was not built keeps serving the classic page at `/`.
+    const appPage = p === '/' || p === '/index.html' || p === '/app';
+    if (req.method === 'GET' && appPage && this.appHtml) {
+      // Same no-store reasoning as the classic shell below.
+      return this.serveStatic(res, this.appHtml, 'text/html; charset=utf-8', {
+        'Cache-Control': 'no-store',
+        'Content-Security-Policy': this.appCsp,
+      });
+    }
+    if (req.method === 'GET' && (appPage || p === '/classic' || p === '/pair')) {
       // The whole app is inlined into this one file and it is rebuilt on every
       // release, so a stale copy is not a slightly-old page — it is the old
       // client talking to a new daemon. With no Cache-Control and no validator
@@ -1530,6 +2354,12 @@ export class WebTerminalServer {
         'Cache-Control': 'no-store',
         ...(this.csp ? { 'Content-Security-Policy': this.csp } : {}),
       });
+    }
+    if (req.method === 'GET' && p.startsWith('/app/assets/')) {
+      const font = this.appFonts.get(p.slice('/app/assets/'.length));
+      if (!font) return this.json(res, 404, { error: 'not found' });
+      // Content-hashed names: a changed font is a new URL.
+      return this.serveStatic(res, font, 'font/woff2', { 'Cache-Control': 'public, max-age=31536000, immutable' });
     }
     if (req.method === 'GET' && p === '/manifest.webmanifest') {
       // Same reasoning as the shell: a cached manifest pins an installed app's
@@ -1564,7 +2394,7 @@ export class WebTerminalServer {
       if (req.headers['sec-fetch-site'] === 'cross-site') {
         return this.json(res, 403, { error: 'cross-site request refused' });
       }
-      this.handlePair(res, url).catch((err: unknown) => this.failRequest(res, err));
+      this.handlePair(req, res, url).catch((err: unknown) => this.failRequest(res, err));
       return;
     }
 
@@ -1620,6 +2450,22 @@ export class WebTerminalServer {
       return this.json(res, 401, { error: 'unauthorized', reason: auth.reason });
     }
     const principal = auth.principal;
+    // Admit before opening a file or registering any long-lived listeners.
+    const streamsResponse = isStream || (req.method === 'GET'
+      && /^\/api\/sessions\/[^/]+\/turns\/(file|image)$/.test(p));
+    if (streamsResponse && !this.streamResponses.acquire(this.watcherKey(principal), res, {
+      exemptCeiling: principal.kind === 'operator',
+      maxQueuedBytes: p === '/api/stream' ? 16 * 1024 * 1024 : undefined,
+      log: (reason) => this.deps.log('warn', `[web] stream closed: ${reason}`),
+    })) {
+      res.setHeader('Retry-After', '1');
+      return this.json(res, 429, { error: 'too-many-streams' });
+    }
+
+    // #1316 — one stamp for the whole authenticated surface. Placed after the
+    // gate and before the route table so no route can forget it, and so a
+    // failed credential never counts as someone using the daemon.
+    this.lastApiActivityAt = this.now();
     if (req.method === 'GET' && p === '/api/config') {
       // The handshake rides HERE rather than on a route of its own: this is
       // already the first call a client makes after pairing, so a dedicated
@@ -1628,6 +2474,16 @@ export class WebTerminalServer {
       // talking to one of those gets a body with no version keys at all, which
       // reads as "protocol 0", the same way a missing `allowUpload` reads as
       // false.
+      //
+      // The desktop flags below ask the same question the desktop routes ask,
+      // through the same helper, at request time. The getter is always wired,
+      // so testing it for `undefined` advertised routes that answered 503.
+      const desktopAvailable = this.availableDesktop() !== null;
+      // `moa` comes from the desktop sidebar snapshot the list routes share:
+      // immediate while one is cached, and on a cold start bounded by the same
+      // first-paint wait — this is the first call a phone makes, so a
+      // cache-only read would leave `moa` out of exactly the answer it keeps.
+      const sidebar = await this.desktopSidebar();
       return this.json(res, 200, {
         // THIS CALLER's effective grant, not the server flag. A phone paired
         // read-only asks the same question a phone paired with input does, and
@@ -1635,8 +2491,78 @@ export class WebTerminalServer {
         // write routes then refuse — a read-only device showing a live composer
         // that 403s on every keystroke.
         allowInput: this.mayInput(principal),
+        inputReceipts: this.mayInput(principal) && this.deps.inputReceipts !== undefined,
+        // The panes' host OS: key encodings follow the machine the PTY runs on
+        // (ConPTY's own ?9001h on win32), not the client drawing it.
+        hostPlatform: process.platform,
         allowUpload: this.opts?.allowUpload === true,
+        generalFileUpload: this.opts?.allowUpload === true && this.deps.uploadsDir !== undefined,
         allowTranscript: this.opts?.allowTranscript === true,
+        // Whether the browser terminal may draw inline images (#1641). The
+        // client still refuses where WebAssembly cannot compile.
+        inlineImages: this.opts?.inlineImages !== false,
+        // Whether `/api/sessions/:id/turns/image` exists on this daemon, so the
+        // phone decides ONCE instead of learning it from a 404 per thumbnail.
+        // Only alongside the grant that opens the route: a client that reads
+        // this as "images available" and then meets a 403 on every fetch is
+        // worse off than one that never tried. A daemon predating the route
+        // omits the key entirely, which a phone reads as false.
+        ...(this.opts?.allowTranscript === true ? { turnImages: true } : {}),
+        // Whether `/api/sessions/:id/turns/file` exists — the same question
+        // `turnImages` answers for its route, behind the same grant, and
+        // omitted rather than `false` for the same reason: that is the shape a
+        // daemon predating the route serves, and a phone reads both as false.
+        ...(this.opts?.allowTranscript === true ? { turnFiles: true } : {}),
+        // Whether those two routes also serve a file the pane's agent sent with
+        // `SendUserFile` (outside the spawn cwd and uploads). Same grant, same
+        // omit-when-off shape; the phone shows chips for those files only on true.
+        ...(this.opts?.allowTranscript === true ? { turnSentFiles: true } : {}),
+        // Advertised only when BOTH grants the route needs are held, the same
+        // way `agentSettings` is: a phone that reads this as "browsable" and
+        // then meets a 403 on every listing is worse off than one that never
+        // showed the browser.
+        workspaceFiles: this.mayInput(principal) && this.opts?.allowTranscript === true,
+        liveActivityHostScope: true,
+        agentSettings: this.mayInput(principal) && this.opts?.allowTranscript === true && this.deps.agentSettings !== undefined,
+        // Contract v-next item 2. OMITTED, not false: needs the transcript
+        // grant and a pane this caller may read that has a live Codex relay.
+        ...(this.codexAccountStatusVisible() ? { codexAccountStatus: true } : {}),
+        agentLaunch: this.mayInput(principal) && this.deps.agentLaunchOptions !== undefined,
+        // Contract v-next item 4. OMITTED, not false: `paneAccount` needs both
+        // grants and a desktop that announced the account command on this connection.
+        ...(this.mayInput(principal) && this.opts?.allowTranscript === true && this.deps.lifecycle &&
+          this.availableDesktop()?.supports(DESKTOP_ACCOUNT_ENV_COMMAND) ? { paneAccount: true } : {}),
+        ...(this.mayInput(principal) && this.deps.lifecycle ? { paneHandoff: true } : {}),
+        folderBrowse: this.mayInput(principal) && homeIsBrowsable(),
+        browserScrolling: this.mayInput(principal) && this.opts?.allowTranscript === true && desktopAvailable,
+        workspaceBrowsers: this.mayInput(principal) && this.opts?.allowTranscript === true && desktopAvailable,
+        browserCreation: this.mayInput(principal) && this.opts?.allowTranscript === true && desktopAvailable,
+        browserKeyboard: this.mayInput(principal) && this.opts?.allowTranscript === true && desktopAvailable,
+        browserPreview: this.opts?.allowTranscript === true && desktopAvailable,
+        workspaceCreation: this.mayInput(principal) && desktopAvailable,
+        quickCommands: this.opts?.allowTranscript === true && desktopAvailable,
+        desktopAccounts: this.opts?.allowTranscript === true && desktopAvailable,
+        gitControl: this.mayInput(principal),
+        // Phone Git v1 (contract item 5): OMITTED, not false, without the grant.
+        ...(this.mayInput(principal) ? { gitProjects: true, gitChecks: true } : {}),
+        ...(this.mayInput(principal) && this.phoneWorktreeService()?.available ? { gitWorktrees: true } : {}),
+        runHistory: this.opts?.allowTranscript === true && this.deps.runHistory !== undefined,
+        // `GET /api/search`, and which of its scopes can answer. OMITTED, not
+        // false, when none can — the shape a daemon predating the route serves.
+        ...this.searchConfig(),
+        // Native chat (contract §4). OMITTED, not false, when the bridge is not
+        // wired: that is the shape a daemon predating the routes serves, and a
+        // phone reads both as "no native chat here".
+        ...this.chatConfig(principal),
+        // Whether this daemon can drive a Live Activity over APNs. A phone that
+        // sees it true registers a push-to-start token and lets the daemon
+        // start the activity; a phone talking to a daemon that omits the key
+        // keeps starting it locally, which is what every build did before this.
+        //
+        // OMITTED, not `false`, when the pusher is inert (no relay configured)
+        // or the getter was never wired — the same shape an older daemon
+        // serves, because it is the same instruction to the phone.
+        ...(this.deps.liveActivityPush?.() === true ? { liveActivityPush: true } : {}),
         // #783 — the gated-tools list so the phone can say "this Bash call is
         // waiting because Bash is in the gate list". Absent gateConfig → empty
         // array (a daemon that predates the gate or did not wire it).
@@ -1655,24 +2581,139 @@ export class WebTerminalServer {
         ...(this.deps.gateEnabled
           ? { gateEnabled: this.deps.gateEnabled() && this.canResolveGates }
           : {}),
+        // This daemon merges the desktop sidebar's fields into
+        // `/api/sessions` and `/api/workspaces` whenever the desktop answers.
+        // It says the daemon SUPPORTS them — a desktop bridge is wired — not
+        // that they are present now: each field is omitted while the desktop
+        // is away. Omitted without a bridge, and by an older daemon.
+        ...(this.deps.desktop ? { fleetSidebar: true } : {}),
+        // `/api/workspaces` can carry Moa's delegated jobs (`moaDelegations`).
+        // Same meaning as `fleetSidebar`: supported here, present only while
+        // a desktop new enough to compute it answers.
+        ...(this.deps.desktop ? { moaDelegations: true } : {}),
+        // Moa (the desktop's HQ main bot) is on and its HQ workspace exists.
+        // OMITTED, not false, otherwise — Moa off, no HQ, no desktop attached,
+        // or an older desktop or daemon: the phone reads all of them as "no Moa".
+        ...(sidebar?.moa === true ? { moa: true } : {}),
+        // The Moa pane's session id, for its turns, chat and input routes.
+        // Only beside `moa` and only while main vouches for a live HQ brain
+        // TUI (see moaSession): omitted with Moa off, the HQ missing or
+        // changed, or before the brain's first turn has started its TUI.
+        ...(sidebar?.moa === true ? this.moaSessionIdField() : {}),
+        // Phone channel Inbox (§9): the four `/api/channels*` routes answer
+        // here. OMITTED, not false, exactly when they would answer 503
+        // `channels-unavailable` — the shape a pre-channels daemon serves.
+        ...(this.deps.channels ? { channels: true } : {}),
+        // Whether `/api/devices` answers here, and how much of the roster this
+        // caller may see and act on (see handleDeviceList). OMITTED, not
+        // false, when the device store cannot list, revoke and set grants —
+        // the shape an older daemon serves.
+        ...(this.deviceManagement() ? { deviceManagement: { scope: this.deviceScope(principal) } } : {}),
+        // `terminal_prompt` extras: `GET /api/approvals/:id/detail` (the full
+        // command) and `POST /api/approvals/:id/decline` (one Esc). OMITTED,
+        // not false, when approvals are not wired — the shape an older daemon
+        // serves. Decline, like every write, only with this caller's input grant.
+        ...(this.deps.approvals
+          ? {
+              terminalPromptDetail: this.opts?.allowTranscript === true,
+              terminalPromptDecline: this.mayInput(principal),
+              // decision-v2 (docs/phone-client-contract.md): the form kinds
+              // this daemon produces, and whether this caller may use
+              // `/chat/cancel` (the route's own caller gates, plus a chat bridge).
+              decisionForms: this.decisionForms(),
+              chatCancel: this.chatWritable(principal),
+              // Contract v-next item 3: `cancel` progress, its receipt route and SSE `chat.cancel`.
+              ...(this.chatWritable(principal) && this.deps.chat?.()?.cancelOutcomeEnabled?.() === true ? { chatCancelOutcome: true } : {}),
+              // Whether this caller's `chat-queue` sends are held by the daemon,
+              // and DELETE …/chat/queue/:id (which needs `dequeue`) answers.
+              chatQueue: this.chatWritable(principal) && this.deps.chat?.()?.queueEnabled?.() === true && typeof this.deps.chat?.()?.dequeue === 'function',
+            }
+          : {}),
         protocolVersion: PHONE_PROTOCOL_VERSION,
         minProtocolVersion: MIN_PHONE_PROTOCOL_VERSION,
         serverVersion: daemonServerVersion(),
       });
     }
     if (req.method === 'GET' && p === '/api/sessions') {
-      return this.json(res, 200, { sessions: this.listSessions() });
+      return this.handleSessionsList(res, principal);
+    }
+    if (req.method === 'GET' && p === '/api/history') {
+      if (this.opts?.allowTranscript !== true) return this.json(res, 403, {error:'history-disabled'});
+      if (!this.deps.runHistory) return this.json(res, 503, {error:'history-unavailable'});
+      const offset = Number(url.searchParams.get('offset') ?? 0);
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1000) return this.json(res, 400, {error:'invalid-offset'});
+      try { return this.json(res, 200, this.deps.runHistory().list(offset), {'Cache-Control':'no-store'}); }
+      catch { return this.json(res, 503, {error:'history-unavailable'}); }
+    }
+    if (req.method === 'GET' && p === '/api/search') {
+      return this.handleSearch(res, url, principal);
+    }
+    if (req.method === 'GET' && p === '/api/git/projects') {
+      return this.handlePhoneGitRead(res, null, principal, 'projects');
     }
     if (req.method === 'GET' && p === '/api/workspaces') {
       return this.handleWorkspacesList(res);
     }
     if (req.method === 'POST' && p === '/api/sessions') {
-      return this.handleSessionCreate(req, res, principal);
+      return this.handleSessionCreate(req, res, principal, url);
     }
     if (p.startsWith('/api/sessions/')) {
       const rest = p.slice('/api/sessions/'.length);
+      // Native chat writes and their receipts nest under the pane (contract
+      // §3.2), so the pane is resolved and checked before any body is read.
+      const chatRoute = /^([^/]+)\/chat\/(messages|launch|cancel|queue)(?:\/([^/]+))?$/.exec(rest);
+      if (chatRoute) {
+        const [, rawId, kind, rawReceipt] = chatRoute;
+        if (kind === 'queue') {
+          if (req.method === 'DELETE' && rawReceipt !== undefined) return this.handleChatDequeue(res, rawId, rawReceipt, principal);
+        } else if (kind === 'cancel') {
+          if (req.method === 'POST' && rawReceipt === undefined) return this.handleChatCancel(req, res, rawId, url, principal);
+          if (req.method === 'GET' && rawReceipt !== undefined) return this.handleChatCancelReceipt(res, rawId, rawReceipt, principal);
+        } else if (req.method === 'POST' && rawReceipt === undefined) {
+          return kind === 'messages'
+            ? this.handleChatSend(req, res, rawId, url, principal)
+            : this.handleChatLaunch(req, res, rawId, url, principal);
+        }
+        if ((kind === 'messages' || kind === 'launch') && req.method === 'GET' && rawReceipt !== undefined) {
+          return kind === 'messages'
+            ? this.handleChatSendReceipt(res, rawId, rawReceipt, principal)
+            : this.handleChatLaunchReceipt(res, rawId, rawReceipt, principal);
+        }
+      }
+      if ((req.method === 'GET' || req.method === 'POST') && rest.endsWith('/agent-settings')) return this.handleAgentSettings(req,res,rest.slice(0,-'/agent-settings'.length),url,principal);
+      if ((req.method === 'GET' || req.method === 'POST') && rest.endsWith('/browser')) return this.handlePhoneBrowser(req,res,rest.slice(0,-'/browser'.length),url,principal);
+      if (req.method === 'GET' && rest.endsWith('/codex/account-status')) {
+        return this.handleCodexAccountStatus(res, rest.slice(0, -'/codex/account-status'.length));
+      }
+      if ((req.method === 'GET' || req.method === 'POST') && rest.endsWith('/accounts')) {
+        return this.handleSessionAccounts(req,res,rest.slice(0,-'/accounts'.length),url,principal);
+      }
+      const phoneGitRead = req.method === 'GET' ? /^([^/]+)\/git\/(branches|checks)$/.exec(rest) : null;
+      if (phoneGitRead) return this.handlePhoneGitRead(res, phoneGitRead[1], principal, phoneGitRead[2] as 'branches' | 'checks');
+      const worktreeRoute = /^([^/]+)\/git\/worktree(?:\/([^/]+))?$/.exec(rest);
+      if (worktreeRoute && (req.method === 'POST' ? worktreeRoute[2] === undefined : req.method === 'GET' && worktreeRoute[2] !== undefined)) {
+        return this.handlePhoneWorktree(req, res, worktreeRoute[1], worktreeRoute[2], url, principal);
+      }
+      if (req.method === 'GET' && rest.endsWith('/git/pr')) {
+        return this.handleSessionGit(req, res, rest.slice(0, -'/git/pr'.length), url, principal, true);
+      }
+      if ((req.method === 'GET' || req.method === 'POST') && rest.endsWith('/git')) {
+        return this.handleSessionGit(req, res, rest.slice(0, -'/git'.length), url, principal);
+      }
+      if (req.method === 'GET' && rest.endsWith('/files')) {
+        return this.handleSessionFiles(res, rest.slice(0, -'/files'.length), url, principal);
+      }
       if (req.method === 'GET' && rest.endsWith('/diff')) {
-        return this.handleSessionDiff(res, rest.slice(0, -'/diff'.length));
+        return this.handleSessionDiff(res, rest.slice(0, -'/diff'.length), principal);
+      }
+      if (req.method === 'GET' && rest.endsWith('/commands')) {
+        return this.handleSessionCommands(res, rest.slice(0, -'/commands'.length), url, principal);
+      }
+      if (req.method === 'GET' && rest.endsWith('/turns/image')) {
+        return this.handleSessionTurnImage(req, res, rest.slice(0, -'/turns/image'.length), principal);
+      }
+      if (req.method === 'GET' && rest.endsWith('/turns/file')) {
+        return this.handleSessionTurnFile(req, res, rest.slice(0, -'/turns/file'.length), principal);
       }
       if (req.method === 'GET' && rest.endsWith('/turns/block')) {
         return this.handleSessionTurnBlock(req, res, rest.slice(0, -'/turns/block'.length));
@@ -1681,12 +2722,63 @@ export class WebTerminalServer {
         return this.handleSessionTurns(req, res, rest.slice(0, -'/turns'.length), principal);
       }
       if (req.method === 'POST' && rest.endsWith('/resize')) {
-        return this.handleSessionResize(req, res, rest.slice(0, -'/resize'.length));
+        return this.handleSessionResize(req, res, rest.slice(0, -'/resize'.length), principal);
       }
       if (req.method === 'DELETE') {
         return this.handleSessionDelete(res, rest, principal);
       }
     }
+    if (req.method === 'GET' && p === '/api/agent-launch-options') {
+      if (!this.mayInput(principal)) return this.refuseInput(res,principal,'Agent launch requires input permission');
+      if (!this.deps.agentLaunchOptions) return this.json(res,503,{error:'agent-launch-unavailable'});
+      const workspaceId = url.searchParams.get('workspaceId') ?? '';
+      const accountId = url.searchParams.get('accountId');
+      if (accountId !== null) {
+        if (this.opts?.allowTranscript !== true) return this.refuseTranscript(res);
+        const parsed = parsePaneAccountFields({accountId,...(workspaceId ? {workspaceId} : {})});
+        if (!parsed.ok) return this.json(res,400,{error:parsed.error,effect:'none'});
+      }
+      if (workspaceId) { const bad = this.rejectWorkspaceId(workspaceId,principal); if (bad) return this.json(res,400,bad); }
+      void (async () => {
+        // Every answer below follows a desktop round trip, so an account
+        // answer is given only to a caller that still holds the grant.
+        const stillAuthorized = async () => {
+          const now = await this.authenticate(req,url,false).catch(() => ({ok:false as const}));
+          return now.ok && this.mayInput(now.principal);
+        };
+        const chosen = accountId === null ? null : await resolvePaneAccount(this.availableDesktop(),workspaceId,accountId);
+        if (chosen && !await stillAuthorized()) return this.json(res,401,{error:'authorization-expired'});
+        if (chosen && !chosen.ok) return this.json(res,chosen.refusal.status,chosen.refusal.body);
+        let agents: AgentLaunchOptions[];
+        try { agents = await this.agentOptionsForWorkspace(workspaceId,chosen?.account); }
+        catch (error) {
+          const failure = paneAccountFailure(error);
+          if (!failure) throw error;
+          if (chosen && !await stillAuthorized()) return this.json(res,401,{error:'authorization-expired'});
+          return this.json(res,failure.status,failure.body);
+        }
+        if (chosen && !await stillAuthorized()) return this.json(res,401,{error:'authorization-expired'});
+        return this.json(res,200,{agents},{'Cache-Control':'no-store'});
+      })().catch(() => this.json(res,503,{error:'agent-launch-unavailable'}));
+      return;
+    }
+    if (req.method === 'GET' && p === '/api/folders') {
+      // Folder names under home, for choosing where a new pane starts. The
+      // pane it feeds already needs input permission, so the picker does too.
+      if (!this.mayInput(principal)) return this.refuseInput(res,principal,'Folder browsing requires input permission');
+      void listFolders(url.searchParams.get('path') ?? undefined, { hidden: url.searchParams.get('hidden') === '1' })
+        .then(listing => this.json(res,200,listing,{'Cache-Control':'no-store'}))
+        .catch(error => error instanceof FolderBrowseError
+          ? this.json(res,error.status,{error:error.tag})
+          : this.json(res,500,{error:'folder-list-failed'}));
+      return;
+    }
+    if ((req.method === 'GET' || req.method === 'POST') && p.startsWith('/api/desktop-workspaces/') && p.endsWith('/browser')) {
+      void this.handleWorkspaceBrowser(req,res,p.slice('/api/desktop-workspaces/'.length,-'/browser'.length),url,principal);
+      return;
+    }
+    if ((req.method === 'GET' && p === '/api/desktop-workspaces') || (req.method === 'POST' && p === '/api/workspaces')) return this.handlePhoneWorkspaces(req,res,url,principal);
+    if ((req.method === 'GET' || req.method === 'POST') && p === '/api/quick-commands') return this.handleQuickCommands(req,res,url,principal);
     if (req.method === 'GET' && p === '/api/stream') {
       return this.handleStream(req, res, url, principal);
     }
@@ -1710,17 +2802,52 @@ export class WebTerminalServer {
     if (req.method === 'POST' && p === '/api/push-registration') {
       return this.handlePushRegistration(req, res, principal);
     }
+    if (req.method === 'POST' && p === '/api/live-activity-registration') {
+      return this.handleLiveActivityRegistration(req, res, principal);
+    }
+    const deviceRoute = /^\/api\/devices(?:\/([^/]+)\/(revoke|grants))?$/.exec(p);
+    if (deviceRoute) {
+      const [, rawId = '', verb] = deviceRoute;
+      if (req.method === 'GET' && !verb) return this.handleDeviceList(res, principal);
+      if (req.method === 'POST' && verb === 'revoke') return this.handleDeviceRevoke(res, rawId, principal);
+      if (req.method === 'PATCH' && verb === 'grants') return this.handleDeviceGrants(req, res, rawId, principal);
+    }
     if (req.method === 'POST' && p === '/api/input') {
       return this.handleInput(req, res, url, principal);
     }
     if (req.method === 'POST' && p === '/api/upload') {
       return this.handleUpload(req, res);
     }
+    if (req.method === 'POST' && p === '/api/upload-file') {
+      const extension = req.headers['x-wmux-file-extension'] ?? 'bin';
+      if (typeof extension !== 'string' || !/^[a-zA-Z0-9]{1,12}$/.test(extension)) {
+        return this.json(res, 400, { error: 'invalid-file-extension' });
+      }
+      return this.handleUpload(req, res, extension.toLowerCase());
+    }
     if (req.method === 'GET' && p === '/api/approvals') {
-      return this.handleApprovalsList(res);
+      return this.handleApprovalsList(res, principal, {
+        ...clientCaps(req),
+        terminalPromptDetail: this.opts?.allowTranscript === true,
+      });
+    }
+    // Before the `/api/approvals/:id` catch-all below, which would read
+    // `:id/answer` as an id with a slash in it.
+    const answerRoute = /^\/api\/approvals\/([^/]+)\/answer(?:\/([^/]+))?$/.exec(p);
+    if (answerRoute && req.method === 'POST' && answerRoute[2] === undefined) {
+      return this.handleApprovalAnswer(req, res, answerRoute[1]!, principal, url);
+    }
+    if (answerRoute && req.method === 'GET' && answerRoute[2] !== undefined) {
+      return this.handleAnswerReceipt(res, answerRoute[1]!, answerRoute[2], principal);
+    }
+    if (req.method === 'GET' && p.startsWith('/api/approvals/') && p.endsWith('/detail')) {
+      return this.handleApprovalDetail(req, res, p.slice('/api/approvals/'.length, -'/detail'.length), principal);
+    }
+    if (req.method === 'POST' && p.startsWith('/api/approvals/') && p.endsWith('/decline')) {
+      return this.handleApprovalDecline(req, res, p.slice('/api/approvals/'.length, -'/decline'.length), principal, url);
     }
     if (req.method === 'POST' && p.startsWith('/api/approvals/')) {
-      return this.handleApprovalResolve(req, res, p.slice('/api/approvals/'.length), principal);
+      return this.handleApprovalResolve(req, res, p.slice('/api/approvals/'.length), principal, url);
     }
     // #783 — runtime escape hatch: stop holding tool calls for a remote answer,
     // from the next call on. This WIDENS what proceeds without remote review
@@ -1752,6 +2879,24 @@ export class WebTerminalServer {
           : 'gate off — the next tool call proceeds without prompting',
       });
     }
+    // Phone channel Inbox (contract §9) — read, read cursor and join. Reading and
+    // acking work on a read-only server and for a read-only device (marking what
+    // you read is part of reading); join is a write and needs the input grant.
+    if (req.method === 'GET' && p === '/api/channels') {
+      return this.handleChannelsList(res);
+    }
+    if (p.startsWith('/api/channels/')) {
+      const rest = p.slice('/api/channels/'.length);
+      if (req.method === 'GET' && rest.endsWith('/messages')) {
+        return this.handleChannelsMessages(res, url, rest.slice(0, -'/messages'.length));
+      }
+      if (req.method === 'POST' && rest.endsWith('/ack')) {
+        return this.handleChannelsAck(req, res, url, principal, rest.slice(0, -'/ack'.length));
+      }
+      if (req.method === 'POST' && rest.endsWith('/join')) {
+        return this.handleChannelsJoin(res, principal, rest.slice(0, -'/join'.length));
+      }
+    }
     return this.json(res, 404, { error: 'not found' });
   }
 
@@ -1766,19 +2911,110 @@ export class WebTerminalServer {
     }
   }
 
-  private listSessions(): Array<{
+  private listSessions(principal?: WebPrincipal): Array<{
     id: string;
+    incarnationId?: string;
     cwd: string;
+    /**
+     * The directory the daemon actually spawned the pane in. `cwd` follows
+     * OSC 7 and the prompt, so it can name a deleted worktree or a remote
+     * path; this one existed when the shell started. Absent for a session
+     * record written before the field existed.
+     */
+    spawnCwd?: string;
     cols: number;
     rows: number;
     state: string;
     agent: string | null;
     lastActivity: string;
     workspace?: string;
+    /**
+     * The pane's workspace id — the `WMUX_WORKSPACE_ID` main stamps at spawn,
+     * the same provenance `/api/workspaces` groups by. Daemon-side, so it is
+     * present with or without the desktop.
+     */
+    workspaceId?: string;
     /** Short program name (`pwsh`, `bash`) — what to call a pane with no agent. */
     shell?: string;
+    /**
+     * The agent the daemon last DETECTED running in this pane, as the canonical
+     * slug (`claude`, `codex`, …) — #1319.
+     *
+     * `agent` above is a mixed vocabulary: creation-time role metadata when the
+     * pane has any, otherwise this same slug, otherwise null. A client holding
+     * only that field cannot tell "Codex" the role label from `codex` the
+     * detection, and cannot tell a plain shell from an agent whose role was
+     * never stamped — which is how every shell pane's chip collapsed to the
+     * word "pane". This says one thing and says it in one vocabulary.
+     *
+     * Nothing new is exposed: the same value already reaches the phone through
+     * `agent`'s fallback.
+     *
+     * STICKY, and that is the one thing a client must know about it. It is the
+     * persisted last detection, so it outlives the agent process and every
+     * reboot — `/api/workspaces` refuses this very field for exactly that
+     * reason (a ROSTER row has to vanish when its agent exits). Here it is a
+     * LABEL and stickiness is the point: a pane that ran Claude is still "the
+     * Claude pane" while the shell sits at a prompt. It answers "what is this
+     * pane", never "is an agent running right now" — `liveness` below and the
+     * `agent.liveness` frames answer that, and a client that reads this one as
+     * presence will show a dead agent as alive forever.
+     *
+     * Typed `string` on the wire rather than the `AgentSlug` union it comes
+     * from: the daemon rehydrates the field from persisted JSON without
+     * re-validating it (`src/daemon/index.ts` recovery path), so promising a
+     * closed 9-value set here would strand a client that switched on it. Treat
+     * an unrecognised value as "some agent", the same additive rule the
+     * liveness `state` union follows.
+     */
+    lastDetectedAgent?: string;
+    /**
+     * Last segment of `cwd` — the phone's label of last resort (#1319). See
+     * `cwdLeafOf`. Absent for a pane whose cwd is empty or a bare root.
+     *
+     * Deliberately ONE segment, which is what the issue asked for and what the
+     * field name promises. The bundled browser client builds its own row label
+     * from the last TWO segments (`shortenCwd` in `frontend/app.js`); that is a
+     * client's presentation choice and is left alone rather than renamed into
+     * this contract.
+     */
+    cwdLeaf?: string;
+    /**
+     * What the pane's agent is doing, when the daemon has seen a liveness
+     * signal for it recently enough to believe. ADDITIVE and OPTIONAL: absent
+     * means "not known", never "idle".
+     *
+     * See `latestLiveness` for why this is a deliberate widening of a
+     * watcher-only channel, and `livenessSummary` for what is withheld.
+     */
+    liveness?: { state: AgentLivenessState; at: number };
+    /**
+     * The agent's last message to the human, flattened to one line and cut to
+     * `LAST_ASSISTANT_GRAPHEMES`. Present only on a server started with
+     * `--allow-transcript` — it is conversation content, and it rides the same
+     * grant `/api/sessions/:id/turns` does.
+     *
+     * ABSENT UNTIL READ. The transcript tail is read off the event loop, so the
+     * first poll after a pane's transcript changes carries no field and the
+     * next one carries the new text. A polled list may lag by one poll; it may
+     * not hold the HTTP surface behind a disk read.
+     */
+    lastAssistantText?: string;
+    /**
+     * The daemon recovered this pane after its own restart and is holding its
+     * output until a viewer attaches. Opening the pane's stream or sending it
+     * input activates it; the held output (the shell's prompt) then arrives as
+     * live bytes.
+     */
+    deferred: boolean;
   }> {
-    return this.deps.sessionManager.listLiveSessions()
+    const sessions = this.deps.sessionManager.listLiveSessions();
+    // Against the FULL live set, not the filtered rows: the brain pane is
+    // excluded from the list but is a real session, and evicting its entries
+    // here would just make the next liveness signal re-create them.
+    this.evictClosedSessionState(new Set(sessions.map((s) => s.id)));
+    const reads = { left: MAX_LAST_ASSISTANT_READS_PER_POLL };
+    return sessions
       // The orchestrator brain's own TUI is not a worker pane: it must not show
       // up in the phone's pane list (nor be attachable/approvable from there),
       // exactly as the fleet pane listing already excludes it. Same shared
@@ -1786,15 +3022,141 @@ export class WebTerminalServer {
       .filter((s) => !isBrainPty({ id: s.id, env: s.env }))
       .map((s) => ({
         id: s.id,
+        incarnationId: this.deps.sessionManager.getSession(s.id)?.meta.incarnationId,
         cwd: s.cwd,
+        ...spawnCwdOf(this.deps.sessionManager.getSession(s.id)?.meta.spawnCwd),
         cols: s.cols,
         rows: s.rows,
         state: s.state,
         agent: s.agent?.displayName ?? s.lastDetectedAgent ?? null,
         lastActivity: s.lastActivity,
+        ...(s.lastDetectedAgent ? { lastDetectedAgent: s.lastDetectedAgent } : {}),
+        ...cwdLeafOf(s.cwd),
         ...workspaceLabelOf(s.env),
+        ...workspaceIdOf(s.env),
         ...shellLabelOf(s.cmd),
+        ...this.handoffRow(this.deps.sessionManager.getSession(s.id)?.meta.handoffFrom, principal),
+        ...this.livenessSummary(s.id),
+        ...this.lastAssistantSummary(s.id, reads),
+        deferred: this.deps.sessionManager.getSession(s.id)?.deferred === true,
       }));
+  }
+
+  /**
+   * Drop per-session snapshot state for panes that are no longer live.
+   *
+   * `DELETE /api/sessions/:id` cleans up its own pane, but that is not the only
+   * way a pane ends: a process exits, a machine sleeps, an agent is killed. The
+   * web server does not observe PTY exit (it subscribes to `session:critical` /
+   * `session:notification`, neither of which is a death), so without this sweep
+   * a long-lived daemon accumulates one liveness entry and one cached preview
+   * per pane it has ever seen. `/api/sessions` is the natural place for it:
+   * it already has the authoritative live set in hand.
+   *
+   * In-flight reads are dropped from the set but not cancelled — the read
+   * itself checks the session is still there before it writes a cache entry.
+   */
+  private evictClosedSessionState(liveIds: Set<string>): void {
+    for (const id of this.latestLiveness.keys()) {
+      if (!liveIds.has(id)) this.latestLiveness.delete(id);
+    }
+    for (const id of this.lastAssistantCache.keys()) {
+      if (!liveIds.has(id)) this.lastAssistantCache.delete(id);
+    }
+    for (const id of this.lastAssistantReads) {
+      if (!liveIds.has(id)) this.lastAssistantReads.delete(id);
+    }
+  }
+
+  /**
+   * The list row's view of a pane's liveness, or nothing.
+   *
+   * `tool` — the name of the tool the agent is running — is deliberately NOT
+   * carried. It is agent-authored text off the hook pipe, and the SSE channel
+   * that does carry it only ever reaches a device that already opened the
+   * pane's turn view. Widening the STATE to every paired device is the point of
+   * the field; widening what the pane is typing is not.
+   */
+  private livenessSummary(sessionId: string): { liveness?: { state: AgentLivenessState; at: number } } {
+    const seen = this.latestLiveness.get(sessionId);
+    if (!seen) return {};
+    const working = seen.state === 'busy' || seen.state === 'tool';
+    if (working && this.now() - seen.at > LIVENESS_SNAPSHOT_STALE_MS) return {};
+    return { liveness: { state: seen.state, at: seen.at } };
+  }
+
+  /**
+   * The list row's one-line summary of the agent's last message, or nothing.
+   *
+   * Gated on `--allow-transcript`, the same grant `/api/sessions/:id/turns`
+   * refuses without (`transcript-disabled:`) — this is a shorter serving of
+   * exactly the same content, so it cannot be readable where that route is not.
+   * A daemon with no projector wired has no path to read and returns nothing,
+   * matching that route's 503 rather than inventing a fallback.
+   */
+  private lastAssistantSummary(
+    sessionId: string,
+    reads: { left: number },
+  ): { lastAssistantText?: string } {
+    if (this.opts?.allowTranscript !== true) return {};
+    const projector = this.deps.projector?.() ?? null;
+    if (!projector) return {};
+    // ONE resolve, not two. `status()` and `transcriptPath()` both walk the
+    // resume binding and both re-run the containment check, and calling them
+    // together on every row of every poll doubles that for a size and an mtime
+    // this can stat for itself.
+    const transcriptPath = projector.transcriptPath(sessionId);
+    if (!transcriptPath) return {};
+    // lstat ONLY — no open, no read. A stat is a constant-time metadata call
+    // (the same one the projector's own watch fallback polls with); it is the
+    // 256 KB read that may not happen on this thread. lstat and a regular-file
+    // check for the same reason the reader does it: a FIFO must never be
+    // opened here.
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(transcriptPath);
+    } catch {
+      return {}; // purged, rotated away, unmounted — the pane simply has no preview
+    }
+    if (!stat.isFile()) return {};
+    // NUL-delimited: a path may contain anything a filename may contain, and
+    // concatenating without a separator lets two different (path, size) pairs
+    // collide into one key.
+    const key = `${transcriptPath}\u0000${stat.size}\u0000${stat.mtimeMs}`;
+    const cached = this.lastAssistantCache.get(sessionId);
+    if (cached?.key === key) {
+      return cached.text === null ? {} : { lastAssistantText: cached.text };
+    }
+    // Miss: answer WITHOUT the field and read in the background. The previous
+    // text is deliberately not served — it belongs to a transcript that has
+    // since changed, and a stale last message is exactly the lie this field
+    // exists to remove. The next poll carries the fresh one.
+    if (reads.left > 0 && !this.lastAssistantReads.has(sessionId)) {
+      reads.left -= 1;
+      this.startLastAssistantRead(sessionId, transcriptPath, key);
+    }
+    return {};
+  }
+
+  /** Read one pane's transcript tail off the event loop and memoize the result. */
+  private startLastAssistantRead(sessionId: string, transcriptPath: string, key: string): void {
+    this.lastAssistantReads.add(sessionId);
+    // Bounded (256 KB tail) and null on every failure — see
+    // lastAssistantMessage.ts, including why it lstats before it opens.
+    void readLastAssistantMessageAsync(transcriptPath)
+      .then((message) => {
+        // The pane may have closed while the disk was busy. Writing the entry
+        // now would re-create exactly what `evictClosedSessionState` just swept.
+        if (!this.deps.sessionManager.getSession(sessionId)) return;
+        const text = message ? assistantPreview(message.text) : null;
+        this.lastAssistantCache.set(sessionId, { key, text });
+      })
+      .catch(() => {
+        /* best-effort: a pane with no preview is a normal row */
+      })
+      .finally(() => {
+        this.lastAssistantReads.delete(sessionId);
+      });
   }
 
   /**
@@ -1803,11 +3165,15 @@ export class WebTerminalServer {
    * Same provenance as `rejectWorkspaceId` (main force-stamps
    * `WMUX_WORKSPACE_ID` at spawn; the daemon persists the resolved env), so a
    * workspace exists here iff at least one live pane runs in it. The uuid id
-   * IS surfaced — unlike the label-only `/api/sessions` field — because
-   * attach needs an address, and this route sits behind the same bearer auth
-   * that already exposes full scrollback.
+   * IS surfaced (and `/api/sessions` carries it as `workspaceId`, never as
+   * the `workspace` label) because attach needs an address, and this route
+   * sits behind the same bearer auth that already exposes full scrollback.
+   *
+   * While the desktop is attached, each row also carries the sidebar's own
+   * fields (see `desktopSidebar`), merged onto rows this list already holds.
    */
-  private handleWorkspacesList(res: http.ServerResponse): void {
+  private async handleWorkspacesList(res: http.ServerResponse): Promise<void> {
+    const sidebar = await this.desktopSidebar();
     const byId = new Map<string, { id: string; name: string; panes: RemotePaneSummary[] }>();
     for (const s of this.deps.sessionManager.listLiveSessions()) {
       // Same exclusion as /api/sessions: the orchestrator brain pane must be
@@ -1820,7 +3186,46 @@ export class WebTerminalServer {
         const n = s.env?.[ENV_KEYS.WORKSPACE_NAME];
         if (typeof n === 'string' && n.trim()) entry.name = n.trim();
       }
-      entry.panes.push({ sessionId: s.id, ...shellLabelOf(s.cmd), ...(s.cwd ? { cwd: s.cwd } : {}) });
+      entry.panes.push({
+        sessionId: s.id,
+        ...shellLabelOf(s.cmd),
+        ...(s.cwd ? { cwd: s.cwd } : {}),
+        // #1163 — per-session agent metadata, so the attaching desktop's
+        // roster can count remote agents. The name is creation-time role
+        // metadata, then the daemon's CANONICAL answer (the one
+        // daemon.getAgentName gives the desktop). Never the raw detector
+        // (sticky screen truth after exit) nor the persisted slug (outlives
+        // the agent and every reboot): a remote row must vanish when its agent
+        // exits, exactly as a local one does. Both fields stay absent when
+        // nothing is known — additive-optional.
+        // #1342 — the resume half of local/remote parity. The host decides the
+        // cwd question (the desktop cannot compare a path on another machine)
+        // and the transcript path NEVER leaves this process: it is a host-local
+        // filesystem path with no meaning to the attaching desktop, and the
+        // binding's existence probe has already used it here.
+        ...(() => {
+          const resume = this.deps.resumeState?.(s.id);
+          if (!resume) return {};
+          return {
+            ...(resume.binding ? { resume: resumeInfoOf(resume.binding, s.cwd) } : {}),
+            ...(typeof resume.commandRunning === 'boolean'
+              ? { commandRunning: resume.commandRunning }
+              : {}),
+            ...(typeof resume.agentProcessAlive === 'boolean'
+              ? { agentProcessAlive: resume.agentProcessAlive }
+              : {}),
+          };
+        })(),
+        ...(() => {
+          const state = this.deps.agentState?.(s.id);
+          const agentName = s.agent?.displayName ?? state?.agentName ?? null;
+          if (!agentName) return {};
+          return {
+            agentName,
+            ...(state && isRemoteAgentStatus(state.agentStatus) ? { agentStatus: state.agentStatus } : {}),
+          };
+        })(),
+      });
       byId.set(id, entry);
     }
     const workspaces = [...byId.values()]
@@ -1835,7 +3240,370 @@ export class WebTerminalServer {
         if (aUnnamed !== bUnnamed) return aUnnamed ? 1 : -1;
         return a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
       });
-    return this.json(res, 200, { workspaces });
+    if (!sidebar) return this.json(res, 200, { workspaces });
+    // Merged onto the daemon's own rows only: a workspace still exists here iff
+    // a live, non-brain pane runs in it, and the desktop cannot add one.
+    const fields = new Map(sidebar.workspaces.map((w) => [w.id, w]));
+    // Desktop pane ids of the sessions this reply lists, each under the
+    // workspace both sides agree it runs in: the only panes a task may be
+    // filed under.
+    const sidebarPanes = new Map(sidebar.panes.map((p) => [p.ptyId, p]));
+    const listedPanes = new Map<string, string>();
+    for (const w of workspaces) {
+      for (const pane of w.panes) {
+        const label = sidebarPanes.get(pane.sessionId);
+        if (label?.paneId !== undefined && label.workspaceId === w.id) listedPanes.set(label.paneId, w.id);
+      }
+    }
+    const nesting = phoneTaskNesting(sidebar.workspaces, new Set(byId.keys()), listedPanes);
+    const merged = workspaces.map((w) => {
+      const extra = fields.get(w.id);
+      const panes = w.panes.map((pane) => {
+        const label = sidebarPanes.get(pane.sessionId);
+        return label?.paneId !== undefined && label.workspaceId === w.id ? { ...pane, paneId: label.paneId } : pane;
+      });
+      return extra
+        ? {
+            ...w,
+            panes,
+            ...sidebarWorkspaceFields(extra, nesting.nested.get(w.id), nesting.summaries.get(w.id), nesting.placement.get(w.id)),
+            // The tree may name only this row's own sessions (see phoneWorkspaceLayout).
+            ...(extra.layout ? { layout: phoneWorkspaceLayout(extra.layout, w.panes.map((pane) => pane.sessionId)) } : {}),
+            ...hqRole(sidebar, w.id),
+          }
+        : { ...w, panes, ...hqRole(sidebar, w.id) };
+    });
+    // Only an id this reply lists, so the active workspace cannot name one the
+    // phone is not allowed to see (a brain-only workspace, for one).
+    const active = sidebar.activeWorkspaceId;
+    return this.json(res, 200, {
+      workspaces: merged,
+      ...(active && byId.has(active) ? { activeWorkspaceId: active } : {}),
+      // Not limited to the listed rows: a finished job's workspace is often
+      // closed by then, and its id names nothing the phone may not see.
+      ...(sidebar.moaDelegations !== undefined ? { moaDelegations: sidebar.moaDelegations } : {}),
+    });
+  }
+
+  /**
+   * `GET /api/sessions` — the pane list, with the desktop sidebar's per-pane
+   * labels merged by ptyId when the desktop answers in time. Brain panes are
+   * already gone from `listSessions`, and nothing is added for a ptyId the
+   * list does not hold.
+   */
+  private async handleSessionsList(res: http.ServerResponse, principal?: WebPrincipal): Promise<void> {
+    const sidebar = await this.desktopSidebar();
+    const sessions = this.listSessions(principal);
+    if (!sidebar) return this.json(res, 200, { sessions });
+    const labels = new Map(sidebar.panes.map((p) => [p.ptyId, p]));
+    return this.json(res, 200, {
+      sessions: sessions.map((s) => {
+        const pane = labels.get(s.id);
+        // By the daemon's own record of the session's workspace, label or not.
+        const role = hqRole(sidebar, s.workspaceId);
+        if (!pane) return { ...s, ...role };
+        return {
+          ...s,
+          // Same rule as /api/workspaces: a pane id only where the desktop and
+          // this daemon agree which workspace the session runs in.
+          ...(pane.paneId !== undefined && pane.workspaceId === s.workspaceId ? { paneId: pane.paneId } : {}),
+          ...(pane.surfaceTitle !== undefined ? { surfaceTitle: pane.surfaceTitle } : {}),
+          ...(pane.paneName !== undefined ? { paneName: pane.paneName } : {}),
+          ...role,
+        };
+      }),
+    });
+  }
+
+  /**
+   * The desktop sidebar snapshot for the two polled list routes, or null.
+   * Stale-while-revalidate (see DESKTOP_SIDEBAR_TTL_MS): answers from the
+   * current snapshot at once and refreshes it in the background; only a poll
+   * with no snapshot at all may wait, and only until the shared first-paint
+   * deadline. Never rejects: a list route must not fail because the desktop did.
+   */
+  private async desktopSidebar(): Promise<PhoneSidebarSnapshot | null> {
+    const desktop = this.availableDesktop();
+    if (!desktop) {
+      // Gone, not slow: its fields go with it.
+      this.desktopSidebarCache = null;
+      return null;
+    }
+    const now = this.now();
+    const cached = this.desktopSidebarCache;
+    if ((!cached || now - cached.at >= DESKTOP_SIDEBAR_TTL_MS) && now - this.desktopSidebarFailedAt >= DESKTOP_SIDEBAR_RETRY_MS) {
+      this.refreshDesktopSidebar(desktop);
+    }
+    if (cached && now - cached.at <= DESKTOP_SIDEBAR_MAX_STALE_MS) return cached.value;
+    // No servable snapshot: none yet, or one too old to serve as-is. "Too old"
+    // is usually NOT a failing desktop — it is a quiet spell with nobody
+    // polling, so nothing refreshed it (a phone in the background, a client
+    // polling every 15 s). That case must paint like a first poll: the refresh
+    // just started above, so wait for it until the shared first-paint
+    // deadline. A desktop that is actually failing is in back-off with no
+    // refresh running, and answers at once without the fields.
+    const inFlight = this.desktopSidebarInFlight;
+    if (!inFlight) return null;
+    const firstPaintMs = this.deps.desktopSidebarFirstPaintMs ?? DESKTOP_SIDEBAR_FIRST_PAINT_MS;
+    const remaining = inFlight.startedAt + firstPaintMs - now;
+    if (remaining <= 0) return null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([inFlight.promise, new Promise<void>((resolve) => { timer = setTimeout(resolve, remaining); })]);
+    clearTimeout(timer);
+    const fresh = this.desktopSidebarCache;
+    return fresh && this.now() - fresh.at <= DESKTOP_SIDEBAR_MAX_STALE_MS ? fresh.value : null;
+  }
+
+  /**
+   * Log what the sidebar parse dropped — reason tags only, never values —
+   * when the set of reasons changes, not on every refresh (one a second while
+   * a phone polls).
+   */
+  private warnDesktopSidebar(summary: string): void {
+    if (summary === this.desktopSidebarLastWarning) return;
+    this.desktopSidebarLastWarning = summary;
+    if (summary) this.deps.log('warn', `[web] desktop sidebar fields left out: ${summary}`);
+  }
+
+  /** Start the single background refresh, unless one is already running. */
+  private refreshDesktopSidebar(desktop: DesktopPhoneBridge): void {
+    if (this.desktopSidebarInFlight) return;
+    const generation = this.desktopSidebarGeneration;
+    const entry: { promise: Promise<void>; startedAt: number } = { promise: Promise.resolve(), startedAt: this.now() };
+    entry.promise = desktop.request('workspaces.list', {})
+      .then(
+        (reply) => {
+          if (generation !== this.desktopSidebarGeneration) return;
+          const raw = (reply as { sidebar?: unknown } | null)?.sidebar;
+          const drops = createSidebarDropLog();
+          const value = parsePhoneSidebarSnapshot(raw, drops.report);
+          if (!value && raw !== undefined) drops.report('sidebar.notSnapshot');
+          this.warnDesktopSidebar(drops.summary());
+          if (value) {
+            this.desktopSidebarCache = { at: this.now(), value };
+            this.desktopSidebarFailedAt = 0;
+          } else {
+            // The desktop answered and has no sidebar to give (an older build,
+            // or a renderer still starting): nothing to keep serving.
+            this.desktopSidebarCache = null;
+            this.desktopSidebarFailedAt = this.now();
+          }
+        },
+        (error: unknown) => {
+          if (generation !== this.desktopSidebarGeneration) return;
+          this.desktopSidebarFailedAt = this.now();
+          // A desktop that is gone drops its fields now. Anything else — the
+          // bridge's slots full, a timeout, a failed renderer call — is
+          // transient: the last good snapshot keeps serving until MAX_STALE.
+          if (error instanceof DesktopPhoneError && (error.tag === 'desktop-unavailable' || error.tag === 'desktop-disconnected')) {
+            this.desktopSidebarCache = null;
+          }
+        },
+      )
+      .finally(() => {
+        if (this.desktopSidebarInFlight === entry) this.desktopSidebarInFlight = null;
+      });
+    this.desktopSidebarInFlight = entry;
+  }
+
+  // --- host search -----------------------------------------------------------
+
+  /**
+   * The scopes `GET /api/search` can answer for any caller. Transcript scopes
+   * ride `--allow-transcript`, exactly as `/turns` and `/api/history` do.
+   * Scrollback is the `/api/stream` grant — every authenticated caller holds
+   * it — plus the daemon's text reader. A read, so input is never asked for.
+   */
+  private searchConfig(): { search?: true; searchScopes?: SearchScope[] } {
+    const scopes: SearchScope[] = [
+      ...(this.opts?.allowTranscript === true ? ['turns', 'sessions'] as const : []),
+      ...(this.deps.sessionText ? ['scrollback'] as const : []),
+    ];
+    return scopes.length > 0 ? { search: true, searchScopes: scopes } : {};
+  }
+
+  /**
+   * `GET /api/search?q=&scope=&limit=&cursor=` — see hostSearch.ts for the
+   * matching, the ordering and every bound. Each pane is read through the
+   * predicate its own route uses: turns and pane metadata through
+   * `readableSession` (as `/turns`: no brain pane for anyone), scrollback
+   * through `attachableSession` (as `/api/stream`). Both reach dead-session
+   * tombstones, which come back `alive: false`.
+   *
+   * Only the transcript grant can refuse the whole request, and only when
+   * every requested scope needs it; otherwise a gated scope reports its panes
+   * as `transcript-disabled` and the rest still answers.
+   */
+  private handleSearch(res: http.ServerResponse, url: URL, principal: WebPrincipal): void {
+    const noStore = { 'Cache-Control': 'no-store' };
+    let request: SearchRequest;
+    let after: SearchAfter | null;
+    try {
+      request = parseSearchRequest(url.searchParams);
+      after = request.cursor === null ? null : this.searchCursors.decode(request, request.cursor);
+    } catch (error) {
+      if (error instanceof SearchError) return this.json(res, error.status, { error: error.tag }, noStore);
+      throw error;
+    }
+    const allowTranscript = this.opts?.allowTranscript === true;
+    if (searchForbidden(request.scopes, allowTranscript)) return this.json(res, 403, { error: 'transcript-disabled' }, noStore);
+    if (this.searchesInFlight >= MAX_CONCURRENT_SEARCHES) {
+      return this.json(res, 429, { error: 'search-busy' }, { ...noStore, 'Retry-After': '1' });
+    }
+    // Take the slots only after the synchronous pane listing: a throw there
+    // must not leak a slot that only the promise's finally gives back.
+    const { readable, attachable } = this.searchPanes(principal);
+    // One caller runs one search at a time within a small burst, so a single
+    // device cannot hold both daemon-wide slots.
+    const caller = principal.kind === 'operator' ? 'operator' : `device:${principal.deviceId}`;
+    const admitted = this.searchAdmission.admit(caller);
+    if (!admitted.ok) {
+      return this.json(res, 429, { error: 'search-busy' }, { ...noStore, 'Retry-After': String(admitted.retryAfterSec) });
+    }
+    this.searchesInFlight += 1;
+    // Before the answer, a close means the phone gave up: stop reading.
+    let gone = false;
+    res.on('close', () => { gone = true; });
+    const runHistory = this.deps.runHistory;
+    const sessionText = this.deps.sessionText;
+    void runSearch(request, after, {
+      panes: readable,
+      scrollbackPanes: attachable,
+      allowTranscript,
+      ...(runHistory ? { history: () => runHistory().list(0, 1000).entries } : {}),
+      turns: (id) => this.searchTurnSource(id),
+      ...(sessionText ? {
+        scrollback: {
+          cached: (id: string) => {
+            const managed = this.attachableSession(principal, id);
+            return managed ? this.scrollbackText.get(id, scrollbackKey(managed)) : undefined;
+          },
+          read: async (id: string) => {
+            const managed = this.attachableSession(principal, id);
+            if (!managed) return null;
+            // One extraction per pane at a time, and a daemon-wide cap that
+            // counts the ones a timed-out search left behind.
+            const job = this.scrollbackExtractions.run(id, async () => {
+              // Keyed BEFORE the read: bytes that land meanwhile make the entry
+              // stale on the next search rather than silently current.
+              const key = scrollbackKey(managed);
+              const rows = await sessionText(id);
+              // The queued job looks the pane up again when it runs: text from
+              // an incarnation that replaced this one under the same id is not
+              // this pane's, so it is neither cached nor returned.
+              if (!rows || this.deps.sessionManager.getSession(id) !== managed) return null;
+              const lines = joinWrappedRows(rows);
+              this.scrollbackText.set(id, key, lines);
+              return lines;
+            });
+            return job ?? 'busy';
+          },
+        },
+      } : {}),
+      now: () => this.now(),
+      stopped: () => gone,
+    }, this.searchCursors)
+      .then((body) => { if (!gone) this.json(res, 200, body, noStore); })
+      .catch((err: unknown) => this.failRequest(res, err))
+      .finally(() => {
+        this.searchesInFlight -= 1;
+        this.searchAdmission.release(caller);
+      });
+  }
+
+  /**
+   * Every pane the session manager still holds — live ones and dead-session
+   * tombstones — split by the two read predicates, most recently active first.
+   * `surfaceTitle` comes from the sidebar snapshot already cached, never a
+   * fresh desktop request: a search must not add a round trip to the desktop.
+   */
+  private searchPanes(principal: WebPrincipal): { readable: SearchPane[]; attachable: SearchPane[] } {
+    const sidebar = this.cachedDesktopSidebar();
+    const titles = new Map((sidebar?.panes ?? []).map((pane) => [pane.ptyId, pane.surfaceTitle]));
+    const readable: SearchPane[] = [];
+    const attachable: SearchPane[] = [];
+    const held = new Set<string>();
+    for (const managed of this.deps.sessionManager.listManagedSessions()) {
+      const meta = managed.meta;
+      held.add(meta.id);
+      const agent = meta.agent?.displayName ?? meta.lastDetectedAgent;
+      const surfaceTitle = titles.get(meta.id);
+      const recency = Date.parse(meta.lastActivity);
+      const createdAt = Date.parse(meta.createdAt);
+      const pane: SearchPane = {
+        sessionId: meta.id,
+        ...workspaceIdOf(meta.env),
+        ...workspaceLabelOf(meta.env),
+        ...(agent ? { agent } : {}),
+        ...(meta.cwd ? { cwd: meta.cwd } : {}),
+        ...cwdLeafOf(meta.cwd),
+        ...(surfaceTitle ? { surfaceTitle } : {}),
+        alive: meta.state === 'attached' || meta.state === 'detached',
+        recency: Number.isFinite(recency) ? recency : 0,
+        createdAt: Number.isFinite(createdAt) ? createdAt : 0,
+      };
+      if (this.readableSession(meta.id) === managed) readable.push(pane);
+      if (this.attachableSession(principal, meta.id) === managed) attachable.push(pane);
+    }
+    this.scrollbackText.retain(held);
+    const newestFirst = (a: SearchPane, b: SearchPane) => b.recency - a.recency || (a.sessionId < b.sessionId ? -1 : 1);
+    return { readable: readable.sort(newestFirst), attachable: attachable.sort(newestFirst) };
+  }
+
+  /** The sidebar snapshot already held, or null. Never starts a refresh. */
+  private cachedDesktopSidebar(): PhoneSidebarSnapshot | null {
+    const cached = this.desktopSidebarCache;
+    if (!cached || this.availableDesktop() === null) return null;
+    return this.now() - cached.at <= DESKTOP_SIDEBAR_MAX_STALE_MS ? cached.value : null;
+  }
+
+  /**
+   * Where the `turns` scope reads a pane's conversation: the reader `/turns`
+   * would pick. With the chat bridge wired, its resolution decides — an
+   * OpenCode or managed page it already holds is searched as is, a transcript
+   * file is paged backward through the projector. The page a hit opens on is
+   * named by `turnCursor`, in the cursor format `/turns` reads right now.
+   */
+  private async searchTurnSource(sessionId: string): Promise<TurnSource> {
+    const chat = this.deps.chat?.() ?? null;
+    let cursorFor: (head: number, fileSize: number) => string;
+    if (chat) {
+      const resolution = await chat.resolve(sessionId);
+      if (resolution.source === 'none') return { kind: 'skip', reason: resolution.status.reason || 'unavailable' };
+      if (resolution.source === 'tui') return { kind: 'page', events: resolution.page.events };
+      if (resolution.source === 'managed') {
+        const page = chat.managedSnapshot(sessionId);
+        return page ? { kind: 'page', events: page.events } : { kind: 'skip', reason: 'unreadable' };
+      }
+      const a = resolutionAgentSessionId(resolution) ?? '';
+      const e = resolutionEpoch(resolution) ?? '';
+      cursorFor = (head, fileSize) => encodeChatCursor({ v: 2, src: 'file', a, e, head, fileSize });
+    } else {
+      cursorFor = (head, fileSize) => encodeTurnCursor({ headOffset: head, tailOffset: head, fileSize });
+    }
+    const projector = this.deps.projector?.() ?? null;
+    if (!projector) return { kind: 'skip', reason: 'unavailable' };
+    // The first page is read here so an unresolvable pane is skipped with the
+    // resolver's own reason, not a generic one.
+    const first = projector.searchPage(sessionId);
+    if (!first.ok) return { kind: 'skip', reason: first.reason };
+    const fileSize = first.page.cursor.fileSize;
+    let pending: typeof first | null = first;
+    let before = fileSize;
+    return {
+      kind: 'file',
+      next: (): TurnPage | null => {
+        const read = pending ?? projector.searchPage(sessionId, before);
+        pending = null;
+        if (!read.ok) return null;
+        const { page, lineEnds } = read;
+        const bytes = Math.max(0, before - page.cursor.headOffset);
+        before = page.cursor.headOffset;
+        return { events: page.events, lineEnds, bytes, done: page.cursor.headOffset <= 0 };
+      },
+      // `dir=back` from here answers the window ending just past the hit's line.
+      cursorFor: (lineEnd) => cursorFor(lineEnd, fileSize),
+    };
   }
 
   // --- pane diff (read-only git) -------------------------------------------
@@ -1870,10 +3638,378 @@ export class WebTerminalServer {
    * `not-a-git-repo` is a 409, not a 500: a pane running in `~` is completely
    * normal and the phone should say "no repository here", not "something broke".
    */
-  private async handleSessionDiff(res: http.ServerResponse, rawId: string): Promise<void> {
+  private async handleSessionFiles(res: http.ServerResponse, rawId: string, url: URL, principal: WebPrincipal): Promise<void> {
+    // Two grants, not one. The root is `meta.spawnCwd`, which for a plain shell
+    // pane is the operator's home directory — a read-only device's transcript
+    // consent is consent to see what the agent said, not a file browser over
+    // $HOME. `--allow-input` is the grant that already means "this device acts
+    // on this machine", so the route lives behind both.
+    if (this.opts?.allowTranscript !== true) return this.json(res, 403, { error: 'files-disabled' });
+    if (!this.mayInput(principal)) return this.refuseInput(res, principal, 'Workspace files require input permission');
+    const id = decodePathSegment(rawId);
+    const managed = id === null ? null : this.attachableSession(principal, id);
+    if (!managed?.meta.spawnCwd) return this.json(res, 404, { error: 'session not found' });
+    const offset = Number(url.searchParams.get('offset') ?? 0);
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100000) return this.json(res, 400, { error: 'invalid-offset' });
+    try {
+      const query = url.searchParams.get('query');
+      const result = query !== null
+        ? await searchSessionFiles(managed.meta.spawnCwd, url.searchParams.get('path') ?? '', query)
+        : await sessionFiles(managed.meta.spawnCwd, url.searchParams.get('path') ?? '', offset, url.searchParams.get('preview') === '1');
+      return this.json(res, 200, result, { 'Cache-Control': 'no-store' });
+    } catch (error) {
+      if (error instanceof SessionFileError) return this.json(res, error.status, { error: error.tag });
+      return this.json(res, 404, { error: 'file-unavailable' });
+    }
+  }
+
+  private async handleWorkspaceBrowser(req: http.IncomingMessage, res: http.ServerResponse, rawId: string, url: URL, principal: WebPrincipal): Promise<void> {
+    if (!this.mayInput(principal) || this.opts?.allowTranscript !== true) return this.json(res,403,{error:'workspace-browser-disabled'});
+    const workspaceId = decodePathSegment(rawId);
+    if (!workspaceId || !/^[A-Za-z0-9_-]{1,128}$/.test(workspaceId) || ['__proto__','constructor','prototype'].includes(workspaceId)) return this.json(res,400,{error:'invalid-workspace'});
+    const desktop = this.availableDesktop();
+    if (!desktop) return this.json(res,503,{error:'desktop-unavailable'});
+    try {
+      const registry = await desktop.request('workspaces.list',{}) as {workspaces?:unknown};
+      if (!Array.isArray(registry?.workspaces) || !registry.workspaces.some(row => row && typeof row === 'object' && row.id === workspaceId)) return this.json(res,404,{error:'workspace-not-found'});
+      const fresh = await this.authenticate(req,url,false);
+      if (!fresh.ok) return this.json(res,401,{error:'authorization-expired'});
+      if (!this.mayInput(fresh.principal)) return this.refuseInput(res,fresh.principal,'Input permission changed');
+      return this.handlePhoneBrowser(req,res,rawId,url,fresh.principal,workspaceId);
+    } catch { return this.json(res,503,{error:'workspace-browser-unavailable'}); }
+  }
+
+  private handlePhoneBrowser(req: http.IncomingMessage, res: http.ServerResponse, rawId: string, url: URL, principal: WebPrincipal, knownWorkspace?: string): void {
+    if (this.opts?.allowTranscript !== true) return this.json(res,403,{error:'browser-preview-disabled'});
+    if (req.method === 'POST' && !this.mayInput(principal)) return this.refuseInput(res,principal,'Browser changes require input permission');
+    const id = decodePathSegment(rawId);
+    const session = knownWorkspace !== undefined || id === null ? null : this.attachableSession(principal,id);
+    if (!knownWorkspace && !session) return this.json(res,404,{error:'session not found'});
+    const workspaceId = knownWorkspace ?? session?.meta.env?.[ENV_KEYS.WORKSPACE_ID];
+    if (!workspaceId) return this.json(res,409,{error:'workspace-required'});
+    const desktop = this.availableDesktop();
+    if (!desktop) return this.json(res,503,{error:'desktop-unavailable'});
+    const send = (command: 'browser.list' | 'browser.capture' | 'browser.viewport' | 'browser.navigate' | 'browser.type' | 'browser.key' | 'browser.tap' | 'browser.open' | 'browser.scroll', payload: Record<string,unknown>) => {
+      void desktop.request(command,{...payload,workspaceId}).then(result => this.json(res,200,result,{'Cache-Control':'no-store'}))
+        .catch(() => this.json(res,503,{error:'browser-preview-unavailable'}));
+    };
+    if (req.method === 'GET') {
+      const surfaceId = url.searchParams.get('surfaceId');
+      if (surfaceId !== null && (!surfaceId || surfaceId.length > 128)) return this.json(res,400,{error:'invalid-browser-surface'});
+      return surfaceId ? send('browser.capture',{surfaceId}) : send('browser.list',{});
+    }
+    this.readJsonBody(req,res,async body => {
+      const fresh = await this.authenticate(req,url,false).catch(() => ({ok:false as const}));
+      if (!fresh.ok) return this.json(res,401,{error:'authorization-expired'});
+      if (!this.mayInput(fresh.principal)) return this.refuseInput(res,fresh.principal,'Input permission changed');
+      if (session && (this.attachableSession(fresh.principal,id!) !== session || session.meta.env?.[ENV_KEYS.WORKSPACE_ID] !== workspaceId)) return this.json(res,404,{error:'session not found'});
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return this.json(res,400,{error:'invalid-browser-request'});
+      const value = body as Record<string,unknown>;
+      if (value.action === 'open' && typeof value.url === 'string' && value.url.length <= 4096) return send('browser.open',{url:value.url});
+      if (typeof value.surfaceId !== 'string' || !value.surfaceId || value.surfaceId.length > 128) return this.json(res,400,{error:'invalid-browser-surface'});
+      if (value.action === 'viewport' && (value.mode === 'mobile' || value.mode === 'desktop')) return send('browser.viewport',{surfaceId:value.surfaceId,mode:value.mode});
+      if (value.action === 'navigate' && typeof value.url === 'string' && value.url.length <= 4096) return send('browser.navigate',{surfaceId:value.surfaceId,url:value.url});
+      if ((value.action === 'type' || value.action === 'key' || value.action === 'tap' || value.action === 'scroll') && typeof value.expectedURL === 'string' && value.expectedURL.length <= 4096) {
+        const scope = {surfaceId:value.surfaceId,expectedURL:value.expectedURL};
+        if ((value.action === 'tap' || value.action === 'scroll') && typeof value.x === 'number' && value.x >= 0 && value.x < 1 && typeof value.y === 'number' && value.y >= 0 && value.y < 1 && value.geometry && typeof value.geometry === 'object') {
+          if (value.action === 'tap') return send('browser.tap',{...scope,x:value.x,y:value.y,geometry:value.geometry});
+          if (typeof value.deltaX === 'number' && Math.abs(value.deltaX) <= 1 && typeof value.deltaY === 'number' && Math.abs(value.deltaY) <= 1) return send('browser.scroll',{...scope,x:value.x,y:value.y,geometry:value.geometry,deltaX:value.deltaX,deltaY:value.deltaY});
+        }
+        if (value.action === 'type' && typeof value.text === 'string' && value.text.length > 0 && value.text.length <= 4096) return send('browser.type',{...scope,text:value.text});
+        if (value.action === 'key' && ['Tab','Shift+Tab','Enter','Backspace','Escape','PageUp','PageDown'].includes(value.key as string)) return send('browser.key',{...scope,key:value.key});
+      }
+      return this.json(res,400,{error:'invalid-browser-request'});
+    });
+  }
+
+  private handlePhoneWorkspaces(req: http.IncomingMessage, res: http.ServerResponse, url: URL, principal: WebPrincipal): void {
+    if (!this.mayInput(principal)) return this.refuseInput(res,principal,'Workspace management requires input permission');
+    const desktop = this.availableDesktop();
+    if (!desktop) return this.json(res,503,{error:'desktop-unavailable'});
+    const send = (command: 'workspaces.list' | 'workspaces.create', payload: Record<string,unknown>) => {
+      void desktop.request(command,payload).then(result => {
+        if (command === 'workspaces.create' && result && typeof result === 'object' && 'error' in result &&
+            ['workspace-request-closed','workspace-request-history-full'].includes(String(result.error))) return this.json(res,409,{error:result.error});
+        if (command === 'workspaces.list' && result && typeof result === 'object') {
+          const rows = (result as {workspaces?: unknown}).workspaces;
+          if (!Array.isArray(rows)) throw new Error('invalid workspaces');
+          // The HQ id rides in the sidebar projection; the projection itself
+          // is not part of this reply.
+          const sidebar = parsePhoneSidebarSnapshot((result as {sidebar?: unknown}).sidebar);
+          result = {workspaces: rows.map(row => ({id:row.id,name:row.name,
+            sessionId: typeof row.sessionId === 'string' && this.attachableSession(principal,row.sessionId) ? row.sessionId : null,
+            // Additive settle state (visibility only, desktop-owned).
+            ...(row.settled === true ? {settled:true} : {}),
+            ...(typeof row.snoozedUntil === 'number' && Number.isFinite(row.snoozedUntil) ? {snoozedUntil:row.snoozedUntil} : {}),
+            ...hqRole(sidebar,row.id)}))};
+        }
+        this.json(res,200,result,{'Cache-Control':'no-store'});
+      }).catch(() => this.json(res,503,{error:'workspace-request-unconfirmed'}));
+    };
+    if (req.method === 'GET') return send('workspaces.list',{});
+    this.readJsonBody(req,res,async body => {
+      // The snapshot above was taken when the HEADERS arrived. A device revoked
+      // (or narrowed to read-only) while the body was still on the wire must not
+      // reach the desktop — re-resolve the credential before forwarding.
+      const fresh = await this.authenticate(req,url,false).catch(() => ({ok:false as const}));
+      if (!fresh.ok) return this.json(res,401,{error:'authorization-expired'});
+      if (!this.mayInput(fresh.principal)) return this.refuseInput(res,fresh.principal,'Input permission changed');
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return this.json(res,400,{error:'invalid-workspace-request'});
+      const value = body as Record<string,unknown>;
+      if (typeof value.requestId !== 'string' || !/^[0-9a-f-]{36}$/i.test(value.requestId) ||
+          typeof value.name !== 'string' || !value.name.trim() || value.name.length > 100 ||
+          (value.cwd !== undefined && typeof value.cwd !== 'string')) return this.json(res,400,{error:'invalid-workspace-request'});
+      send('workspaces.create',{requestId:value.requestId,name:value.name,...(value.cwd !== undefined ? {cwd:value.cwd} : {})});
+    });
+  }
+
+  private handleQuickCommands(req: http.IncomingMessage, res: http.ServerResponse, url: URL, principal: WebPrincipal): void {
+    if (this.opts?.allowTranscript !== true) return this.json(res,403,{error:'quick-commands-disabled'});
+    if (req.method === 'POST' && !this.mayInput(principal)) return this.refuseInput(res,principal,'Quick command edits require input permission');
+    const desktop = this.availableDesktop();
+    if (!desktop) return this.json(res,503,{error:'desktop-unavailable'});
+    const send = (command: 'prompts.list' | 'prompts.replace', payload: Record<string,unknown>) => {
+      void desktop.request(command,payload).then(result => this.json(res,200,result,{'Cache-Control':'no-store'})).catch(() => {
+        this.json(res,503,{error:'quick-command-request-unconfirmed'});
+      });
+    };
+    if (req.method === 'GET') return send('prompts.list',{});
+    this.readJsonBody(req,res,async body => {
+      // Re-authorized after the body, exactly as the input and browser routes
+      // are: the entry snapshot is only as fresh as the request headers.
+      const fresh = await this.authenticate(req,url,false).catch(() => ({ok:false as const}));
+      if (!fresh.ok) return this.json(res,401,{error:'authorization-expired'});
+      if (!this.mayInput(fresh.principal)) return this.refuseInput(res,fresh.principal,'Input permission changed');
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return this.json(res,400,{error:'invalid-quick-commands'});
+      const value = body as Record<string,unknown>;
+      if (typeof value.revision !== 'string' || !Array.isArray(value.commands)) return this.json(res,400,{error:'invalid-quick-commands'});
+      send('prompts.replace',{revision:value.revision,commands:value.commands});
+    }, 96 * 1024);
+  }
+
+  private handleSessionAccounts(req: http.IncomingMessage, res: http.ServerResponse, rawId: string, url: URL, principal: WebPrincipal): void {
+    if (this.opts?.allowTranscript !== true) return this.json(res,403,{error:'accounts-disabled'});
+    if (req.method === 'POST' && !this.mayInput(principal)) return this.refuseInput(res,principal,'Account changes require input permission');
+    const id = decodePathSegment(rawId);
+    const session = id === null ? null : this.attachableSession(principal,id);
+    if (!session) return this.json(res,404,{error:'session not found'});
+    const workspaceId = session.meta.env?.[ENV_KEYS.WORKSPACE_ID];
+    if (!workspaceId) return this.json(res,409,{error:'workspace-required'});
+    const desktop = this.availableDesktop();
+    if (!desktop) return this.json(res,503,{error:'desktop-unavailable'});
+    const send = (command: 'accounts.list' | 'accounts.bind' | 'accounts.usage', payload: Record<string,unknown>) => {
+      void desktop.request(command,{...payload,workspaceId}).then(result => this.json(res,200,result,{'Cache-Control':'no-store'})).catch(error => {
+        this.json(res,error instanceof DesktopPhoneError && error.tag === 'desktop-busy' ? 429 : 503,
+          {error:error instanceof DesktopPhoneError ? error.tag : 'desktop-request-failed'});
+      });
+    };
+    if (req.method === 'GET') return send('accounts.list',{});
+    this.readJsonBody(req,res,async body => {
+      // Re-resolve the credential and the pane it may reach: the entry snapshot
+      // predates the body, and this write rebinds a workspace's agent account.
+      const fresh = await this.authenticate(req,url,false).catch(() => ({ok:false as const}));
+      if (!fresh.ok) return this.json(res,401,{error:'authorization-expired'});
+      if (!this.mayInput(fresh.principal)) return this.refuseInput(res,fresh.principal,'Input permission changed');
+      if (this.attachableSession(fresh.principal,id!) !== session ||
+          session.meta.env?.[ENV_KEYS.WORKSPACE_ID] !== workspaceId) return this.json(res,404,{error:'session not found'});
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return this.json(res,400,{error:'invalid-account-request'});
+      const value = body as Record<string,unknown>;
+      if (value.action === 'bind' && (value.vendor === 'claude' || value.vendor === 'codex') &&
+          (value.accountId === null || (typeof value.accountId === 'string' && value.accountId.length <= 128))) {
+        return send('accounts.bind',{vendor:value.vendor,accountId:value.accountId});
+      }
+      if (value.action === 'usage' && typeof value.accountId === 'string' && value.accountId.length <= 128) {
+        return send('accounts.usage',{accountId:value.accountId});
+      }
+      return this.json(res,400,{error:'invalid-account-request'});
+    });
+  }
+
+  /** Whether any pane this caller may read has a live Codex relay (the `codexAccountStatus` key). */
+  private codexAccountStatusVisible(): boolean {
+    const source = this.deps.codexAccountStatus;
+    if (this.opts?.allowTranscript !== true || !source || process.platform === 'win32') return false;
+    return source.liveIds().some((id) => !!this.readableSession(id) && source.accountHome(id) !== undefined);
+  }
+
+  /**
+   * `GET /api/sessions/<id>/codex/account-status` (contract v-next item 2):
+   * the auth state and plan limits of the account this pane's Codex runs on,
+   * read from its already-running account server. Never tokens, e-mails or
+   * account ids; never starts a server.
+   */
+  private handleCodexAccountStatus(res: http.ServerResponse, rawId: string): void {
+    if (this.opts?.allowTranscript !== true) return this.refuseTranscript(res);
+    const id = decodePathSegment(rawId);
+    const pane = id === null ? undefined : this.readableSession(id);
+    if (!pane || id === null) return this.json(res, 404, { error: 'pane-not-found' });
+    const unavailable = (reason: string) => this.json(res, 503, { error: 'unavailable', reason }, { 'Cache-Control': 'no-store' });
+    if (process.platform === 'win32' || pane.meta.wslTarget) return unavailable('unsupported-platform');
+    const source = this.deps.codexAccountStatus;
+    const codeHome = source?.accountHome(id);
+    if (!source || codeHome === undefined) return unavailable('no-account-server');
+    void source.read(codeHome).then(
+      (status) => {
+        if (res.destroyed || res.writableEnded) return;
+        this.json(res, 200, status, { 'Cache-Control': 'no-store' });
+      },
+      () => {
+        if (res.destroyed || res.writableEnded) return;
+        unavailable('upstream-failed');
+      });
+  }
+
+  private handleAgentSettings(req:http.IncomingMessage,res:http.ServerResponse,rawId:string,url:URL,principal:WebPrincipal):void {
+    if (!this.mayInput(principal)) return this.refuseInput(res,principal,'Agent settings require input permission');
+    if (this.opts?.allowTranscript !== true) return this.json(res,403,{error:'transcript-disabled'});
+    const id = decodePathSegment(rawId);
+    const owned = id === null ? undefined : this.attachableSession(principal,id);
+    if (!owned || !id) return this.json(res,404,{error:'session not found'});
+    const control = this.deps.agentSettings;
+    if (!control) return this.json(res,503,{error:'unavailable'});
+    const authorized = async () => {
+      if (res.destroyed || res.writableEnded || this.opts?.allowTranscript !== true) return false;
+      const fresh = await this.authenticate(req,url,false);
+      return fresh.ok && this.mayInput(fresh.principal) &&
+        fresh.principal.kind === principal.kind &&
+        (principal.kind !== 'device' || fresh.principal.kind === 'device' && fresh.principal.deviceId === principal.deviceId) &&
+        this.attachableSession(fresh.principal,id) === owned;
+    };
+    const run = (choice?:PaneSettingsChoice) => {
+      if (this.agentSettingsRequests.has(id) || this.agentSettingsRequests.size >= 4) return this.json(res,409,{error:'busy'});
+      this.agentSettingsRequests.add(id);
+      void (async()=>{
+        if (!await authorized()) return this.json(res,401,{error:'authorization-expired'});
+        const result = await control(id,authorized,choice);
+        if (!await authorized()) return this.json(res,401,{error:'authorization-expired'});
+        this.json(res,200,result,{'Cache-Control':'no-store'});
+      })().catch(error=>{
+        const reason = error instanceof LiveSettingsError ? error.reason : 'unavailable';
+        this.json(res,reason === 'unavailable' ? 503 : 409,{error:reason});
+      }).finally(()=>this.agentSettingsRequests.delete(id));
+    };
+    if (req.method === 'GET') return run();
+    this.readJsonBody(req,res,body=>{
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return this.json(res,400,{error:'invalid-settings-choice'});
+      const value = body as Record<string,unknown>;
+      if (Object.keys(value).length !== 3 || typeof value.model !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/.test(value.model) ||
+          typeof value.effort !== 'string' || !/^[a-z]{1,16}$/.test(value.effort) ||
+          typeof value.expectedRevision !== 'string' || !/^[0-9a-f]{64}\.[0-9a-f]{64}$/.test(value.expectedRevision)) {
+        return this.json(res,400,{error:'invalid-settings-choice'});
+      }
+      run({model:value.model,effort:value.effort,expectedRevision:value.expectedRevision});
+    });
+  }
+
+  private handleSessionGit(req: http.IncomingMessage, res: http.ServerResponse, rawId: string, url: URL, principal: WebPrincipal, pullRequests = false): void {
+    if (!this.mayInput(principal)) return this.refuseInput(res, principal, 'Git control requires input permission');
+    const id = decodePathSegment(rawId);
+    const managed = id === null ? null : this.attachableSession(principal, id);
+    if (!managed) return this.json(res, 404, { error: 'session not found' });
+    const cwd = managed.meta.spawnCwd;
+    if (!cwd) return this.json(res, 409, { error: 'not-a-git-repo' });
+    // Same shape as the agent-settings route: one predicate the handler re-runs
+    // after the body, and the controller re-runs immediately before it moves a
+    // ref — the preflight snapshot is async, and a revoke can land inside it.
+    const authorized = async () => {
+      if (res.destroyed || res.writableEnded) return false;
+      const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+      return fresh.ok && this.mayInput(fresh.principal) &&
+        fresh.principal.kind === principal.kind &&
+        (principal.kind !== 'device' || fresh.principal.kind === 'device' && fresh.principal.deviceId === principal.deviceId) &&
+        this.attachableSession(fresh.principal, id!) === managed;
+    };
+    const respond = (work: () => Promise<unknown>) => {
+      if (this.phoneGitRequests >= 4) return this.json(res, 429, { error: 'git-busy' });
+      this.phoneGitRequests += 1;
+      void work().then(result => this.json(res, 200, result, { 'Cache-Control': 'no-store' })).catch(error => {
+        if (error instanceof SessionGitError) return this.json(res, error.status, { error: error.tag });
+        return this.json(res, 500, { error: 'git-operation-failed' });
+      }).finally(() => { this.phoneGitRequests -= 1; });
+    };
+    if (pullRequests) respond(() => sessionPullRequests(cwd));
+    else if (req.method === 'GET') respond(() => this.phoneGit.read(cwd));
+    else this.readJsonBody(req, res, async body => {
+      const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+      if (!fresh.ok) return this.json(res, 401, { error: 'authorization-expired' });
+      if (!this.mayInput(fresh.principal)) return this.refuseInput(res, fresh.principal, 'Input permission changed');
+      if (this.attachableSession(fresh.principal, id!) !== managed) return this.json(res, 404, { error: 'session not found' });
+      respond(() => this.phoneGit.mutate(cwd, body, authorized));
+    });
+  }
+
+  /** The live sessions this caller may attach, for the phone Git reads (never the brain pane). */
+  private phoneGitSessions(principal: WebPrincipal): PhoneGitSessionRef[] {
+    return this.deps.sessionManager.listLiveSessions().flatMap((s) => {
+      if (isBrainPty({ id: s.id, env: s.env })) return [];
+      const spawnCwd = this.attachableSession(principal, s.id)?.meta.spawnCwd;
+      return spawnCwd ? [{ id: s.id, spawnCwd, lastActivity: s.lastActivity }] : [];
+    });
+  }
+
+  /** Phone Git v1 reads (contract item 5): same grant, pane rule and budget as `/git`. */
+  private handlePhoneGitRead(res: http.ServerResponse, rawId: string | null, principal: WebPrincipal, kind: 'projects' | 'branches' | 'checks'): void {
+    if (!this.mayInput(principal)) return this.refuseInput(res, principal, 'Git control requires input permission');
+    const reads = this.phoneGitReads ??= new PhoneGitReads(this.deps.git ?? createGitRunner());
+    let work = () => reads.projects(this.phoneGitSessions(principal), { aborted: () => res.destroyed || res.writableEnded }) as Promise<unknown>;
+    if (rawId !== null) {
+      const id = decodePathSegment(rawId);
+      const managed = id === null ? null : this.attachableSession(principal, id);
+      if (!managed) return this.json(res, 404, { error: 'session not found' });
+      const cwd = managed.meta.spawnCwd;
+      if (!cwd) return this.json(res, 409, { error: 'not-a-git-repo' });
+      work = kind === 'branches' ? () => reads.branches(cwd, this.phoneGitSessions(principal)) : () => reads.checks(cwd);
+    }
+    if (this.phoneGitRequests >= 4) return this.json(res, 429, { error: 'git-busy' });
+    this.phoneGitRequests += 1;
+    void work().then(result => this.json(res, 200, result, { 'Cache-Control': 'no-store' })).catch(error => {
+      if (error instanceof SessionGitError) return this.json(res, error.status, { error: error.tag });
+      return this.json(res, 500, { error: 'git-operation-failed' });
+    }).finally(() => { this.phoneGitRequests -= 1; });
+  }
+
+  /** The worktree service, or undefined when it is not wired or could not be built. */
+  private phoneWorktreeService(): PhoneWorktreeService | undefined {
+    try { return this.deps.phoneWorktrees?.(); } catch { return undefined; }
+  }
+
+  /** `POST …/git/worktree` and `GET …/git/worktree/<requestId>` (contract item 5). */
+  private handlePhoneWorktree(req: http.IncomingMessage, res: http.ServerResponse, rawId: string, rawReceipt: string | undefined, url: URL, principal: WebPrincipal): void {
+    if (!this.mayInput(principal)) return this.refuseInput(res, principal, 'Git control requires input permission');
+    const id = decodePathSegment(rawId);
+    const managed = id === null ? null : this.attachableSession(principal, id);
+    if (!managed || id === null) return this.json(res, 404, { error: 'session not found' });
+    const service = this.phoneWorktreeService();
+    if (!service?.available) return this.json(res, 503, { error: 'git-receipts-unavailable' });
+    const owner = principal.kind === 'device' ? `device:${principal.deviceId}` : 'operator';
+    if (rawReceipt !== undefined) {
+      const requestId = decodePathSegment(rawReceipt);
+      if (requestId === null || !PHONE_WORKTREE_REQUEST_ID.test(requestId)) return this.json(res, 400, { error: 'invalid-git-request' });
+      return this.json(res, 200, service.receipt(owner, id, requestId), { 'Cache-Control': 'no-store' });
+    }
+    const cwd = managed.meta.spawnCwd;
+    if (!cwd) return this.json(res, 409, { error: 'not-a-git-repo' });
+    this.readJsonBody(req, res, async body => {
+      // Re-authorized after the body, as `/git` writes are: the same credential
+      // must still hold the grant and still reach this pane.
+      const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+      if (!fresh.ok || fresh.principal.kind !== principal.kind ||
+          (principal.kind === 'device' && (fresh.principal.kind !== 'device' || fresh.principal.deviceId !== principal.deviceId))) {
+        return this.json(res, 401, { error: 'authorization-expired' });
+      }
+      if (!this.mayInput(fresh.principal)) return this.refuseInput(res, fresh.principal, 'Input permission changed');
+      if (this.attachableSession(fresh.principal, id) !== managed) return this.json(res, 404, { error: 'session not found' });
+      // Creations have their own budget in the service (one per caller, two
+      // overall), so a queued checkout never holds one of the read slots.
+      const result = service.submit({ owner, deviceId: principal.kind === 'device' ? principal.deviceId : '', sessionId: id, cwd, body });
+      this.json(res, result.status, result.body, { 'Cache-Control': 'no-store' });
+    });
+  }
+
+  private async handleSessionDiff(res: http.ServerResponse, rawId: string, principal: WebPrincipal): Promise<void> {
     const id = decodePathSegment(rawId);
     if (id === null) return this.json(res, 404, { error: 'session not found' });
-    const managed = this.deps.sessionManager.getSession(id);
+    const managed = this.attachableSession(principal, id);
     if (!managed) return this.json(res, 404, { error: 'session not found' });
 
     // Absent only for a session record written before spawnCwd existed. Every
@@ -1928,6 +4064,62 @@ export class WebTerminalServer {
     // patch under today's prompt is the exact failure this route exists to
     // prevent.
     return this.json(res, 200, result.diff, { 'Cache-Control': 'no-store' });
+  }
+
+  // --- pane slash commands + skills ----------------------------------------
+
+  /**
+   * `GET /api/sessions/:id/commands` — what can this pane's agent be asked to
+   * run? The phone shows this the moment someone types `/` in the composer.
+   *
+   * The catalog is the CLI's own on-disk convention, read by
+   * `scanSkillCatalog`: `.claude/skills/<name>/SKILL.md` and
+   * `.claude/commands/<name>.md`, project entries shadowing user-global ones by
+   * name. Only a NAME and a description leave the machine — no file contents,
+   * no paths — which is why this takes the same Bearer gate as `/api/sessions`
+   * and no new grant: the credential that reads this already reads the pane's
+   * whole scrollback, so a list of filenames is strictly less than it has.
+   *
+   * IT IS `meta.spawnCwd`, NOT `meta.cwd`, for the reason spelled out on
+   * handleSessionDiff: `meta.cwd` follows OSC 7, so any process inside a pane
+   * could aim this scan at a directory an operator never chose. A session
+   * record with no `spawnCwd` (written before the field existed) answers with
+   * an empty list rather than a refusal — "this pane has no commands" is a
+   * usable answer for a composer, "409" is not.
+   */
+  private handleSessionCommands(res: http.ServerResponse, rawId: string, url: URL, principal: WebPrincipal): void {
+    const id = decodePathSegment(rawId);
+    if (id === null) return this.json(res, 404, { error: 'session not found' });
+    const agent = url.searchParams.get('agent');
+    // The composer's skill list is part of the Moa pane's chat; the legacy
+    // command list (a directory read) is not.
+    const managed = this.attachableSession(principal, id) ?? (agent !== null ? this.moaSession(id) : undefined);
+    if (!managed) return this.json(res, 404, { error: 'session not found' });
+    if (agent !== null) {
+      // Same pane rule as the other chat routes: the brain pane is nobody's
+      // chat, whatever the credential, the Moa pane aside. The legacy list
+      // keeps its old rule.
+      if (!this.conversableSession(id)) return this.json(res, 404, { error: 'session not found' });
+      void this.handleChatSkills(res, id, agent).catch((err: unknown) => this.failRequest(res, err));
+      return;
+    }
+
+    const cwd = managed.meta.spawnCwd;
+    if (!cwd) return this.json(res, 200, { commands: [] });
+
+    const hit = this.skillCatalogCache.get(cwd);
+    const now = Date.now();
+    if (hit && now - hit.at < SKILL_CATALOG_TTL_MS) {
+      return this.json(res, 200, { commands: hit.entries });
+    }
+    // `scanSkillCatalog` is SYNCHRONOUS, so this readdir walk runs on the event
+    // loop — which is why it may only happen on a cache miss. It is bounded
+    // (200 entries, 4 KB read per file, a 12-level walk up for the project
+    // root) and fail-soft, so a miss costs a small fixed number of stats rather
+    // than a directory tree of unknown size.
+    const entries = scanSkillCatalog(cwd);
+    this.skillCatalogCache.set(cwd, { at: now, entries });
+    return this.json(res, 200, { commands: entries });
   }
 
   // --- pane geometry -------------------------------------------------------
@@ -2008,8 +4200,23 @@ export class WebTerminalServer {
     // routes: a phone that fetched a pane id the daemon no longer owns learns the
     // pane is gone, not that its conversation is unavailable. A brain pty answers
     // the same way — see readableSession.
-    if (!this.readableSession(sessionId)) {
+    if (!this.conversableSession(sessionId)) {
       this.json(res, 404, { error: 'session not found' });
+      return;
+    }
+    // A chat-v2 record owns the pane: read it from the host, ahead of the bridge.
+    const v2 = this.chatV2For(sessionId);
+    if (v2) {
+      this.noteTranscriptWatcher(sessionId, principal);
+      this.handleChatV2Turns(req, res, sessionId, v2.binding, v2.host);
+      return;
+    }
+    // Native chat (contract §5): the same three-way dispatch the desktop uses.
+    // Without the bridge the route stays byte-for-byte what it was.
+    const chat = this.deps.chat?.() ?? null;
+    if (chat) {
+      this.noteTranscriptWatcher(sessionId, principal);
+      void this.handleChatTurns(req, res, sessionId, principal, chat).catch((err: unknown) => this.failRequest(res, err));
       return;
     }
     const projector = this.deps.projector?.() ?? null;
@@ -2068,6 +4275,1013 @@ export class WebTerminalServer {
     });
   }
 
+  // --- native chat bridge (contract v0.3.1) ---------------------------------
+
+  /**
+   * `/turns` with the bridge wired (N1, N2, N11). The binding is resolved
+   * fresh on every read — `tui` (OpenCode plugin), `managed`, `file` (Claude
+   * JSONL / Codex rollout) or `none` — and every 200 carries `chat`, so the
+   * phone never has to infer what the pane is from the rows it holds.
+   *
+   * `reset` appears exactly when the request carried a cursor. Old clients
+   * tell a snapshot from a delta by that key alone, and treat a delta as
+   * upsert-plus-append, so a full `tui`/`managed` page answered without
+   * `reset:true` would make them keep rows the page no longer has.
+   */
+  private async handleChatTurns(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    sessionId: string,
+    principal: WebPrincipal,
+    chat: ChatBridge,
+  ): Promise<void> {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const dir = (url.searchParams.get('dir') ?? 'forward') === 'back' ? 'back' : 'forward';
+    const rawCursor = url.searchParams.get('cursor');
+    const carried = !!rawCursor;
+    const cursor = decodeChatCursor(rawCursor);
+    // Admitted as the Moa pane: Moa can be switched off (or the HQ change)
+    // during either await below, and the page must not go out after that.
+    const viaMoa = !this.readableSession(sessionId);
+    const moaWithdrawn = (): boolean => {
+      if (!viaMoa || this.moaSession(sessionId)) return false;
+      this.json(res, 404, { error: 'session not found' });
+      return true;
+    };
+
+    const resolution = await chat.resolve(sessionId);
+    if (moaWithdrawn()) return;
+    // The page is read before the blocked await (a screen render): a binding
+    // that moved meanwhile must not have its rows served under this identity.
+    const body = this.readChatTurnsPage(res, sessionId, principal, chat, resolution, dir, carried, cursor);
+    if (!body) return;
+    const blocked = await this.readChatBlocked(chat, sessionId, resolution);
+    if (res.destroyed || res.writableEnded) return;
+    if (moaWithdrawn()) return;
+    this.noteChatBlocked(sessionId, resolution.status.terminal?.agent, blocked);
+    const caps = clientCaps(req);
+    // A file binding's episode is daemon-tracked; an OpenCode one comes from
+    // its plugin's read. Only a caller that declared a cap that uses it is shown one.
+    const wantsTurn = caps.chatCancel === true || caps.chatQueue === true;
+    const turn = !wantsTurn ? undefined : resolution.source === 'file' ? chat.turn(sessionId)
+      : resolution.source === 'tui' ? resolution.turn : undefined;
+    const owner = chatOwner(principal);
+    const queue = caps.chatQueue === true && chat.queueEnabled?.() === true ? chat.queue?.(owner, sessionId) ?? [] : undefined;
+    const events = queue !== undefined ? this.tagDeliveredRows(chat, sessionId, owner, body.events) : body.events;
+    // Only a terminal binding whose agent is not alive can be resumable; skip the lookup otherwise.
+    const resumable = resolution.source === 'file' && resolution.status.agentAlive !== true
+      ? await chat.resumable?.(sessionId).catch(() => false) ?? false : false;
+    if (res.destroyed || res.writableEnded) return;
+    if (moaWithdrawn()) return;
+    this.json(res, 200, { ...body, ...(events !== undefined ? { events } : {}), chat: buildChatObject(resolution, projectChatBlocked(blocked, caps),
+      { ...(turn ? { turn } : {}), resumable, chatCancel: caps.chatCancel === true, ...(queue ? { queue } : {}),
+        accountStatus: this.opts?.allowTranscript === true && process.platform !== 'win32' &&
+          this.deps.codexAccountStatus?.accountHome(sessionId) !== undefined }) });
+  }
+
+  /**
+   * The pane's live chat-v2 record and its host, or null. A `handed-off` record
+   * is skipped: its conversation now runs in the pane's TUI, which the bridge
+   * reads as a terminal binding. The first call subscribes to the host's pushes
+   * so a change nudges the pane's phone watchers.
+   */
+  private chatV2For(sessionId: string): { host: ChatV2PhoneHost; binding: ChatV2Binding } | null {
+    const host = this.deps.chatV2?.() ?? null;
+    if (!host) return null;
+    if (this.chatV2PushHost !== host) {
+      this.chatV2PushOff?.();
+      this.chatV2PushHost = host;
+      this.chatV2PushOff = host.onPush((push) => {
+        if (this.chatV2PushHost !== host) return;
+        this.chatV2Cancels.observe(push.paneId, host);
+        this.emitTranscriptNudge(push.paneId);
+      });
+    }
+    const binding = host.bindingForPane(sessionId);
+    return binding && binding.status !== 'handed-off' ? { host, binding } : null;
+  }
+
+  /**
+   * A pending decision of this record's driver, answerable through
+   * `/api/approvals`: the pane's, made in this load of this conversation
+   * (`threadId` = chatSessionId, `relayId` = epoch).
+   */
+  private chatV2Blocked(sessionId: string, binding: ChatV2Binding): ChatBlocked | undefined {
+    if (this.isBrainApproval(sessionId)) return undefined;
+    const pending = this.deps.approvals?.list().pending
+      .find((record) => record.sessionId === sessionId && record.native?.adapter === 'claude'
+        && record.native.threadId === binding.chatSessionId && record.native.relayId === binding.epoch);
+    return pending ? { by: 'approval', approvalId: pending.id } : undefined;
+  }
+
+  /**
+   * `/turns` for a chat-v2 record. Like a managed record it is a full bounded
+   * page on every read with no back paging, under a `managed` cursor bound to
+   * the record's identity and `c2:` epoch, so a new epoch (a daemon restart)
+   * resets the phone's rows.
+   */
+  private handleChatV2Turns(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    sessionId: string,
+    binding: ChatV2Binding,
+    host: ChatV2PhoneHost,
+  ): void {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const dir = (url.searchParams.get('dir') ?? 'forward') === 'back' ? 'back' : 'forward';
+    const rawCursor = url.searchParams.get('cursor');
+    const carried = !!rawCursor;
+    const session = host.sessionForPane(sessionId);
+    const identity = chatV2Identity(binding);
+    const blocked = this.chatV2Blocked(sessionId, binding);
+    // The first observation is recorded without an event, as on the bridge path.
+    this.noteChatBlocked(sessionId, binding.agent, blocked);
+    const page = session ? chatV2Page(session) : null;
+    const caps = clientCaps(req);
+    const chat = buildChatV2Object(binding, session, blocked,
+      { chatCancel: caps.chatCancel === true, chatQueue: caps.chatQueue === true, historyTruncated: page?.truncatedHead === true });
+    if (!session || !page) {
+      this.json(res, 200, { available: false, reason: 'unreadable', ...(carried ? { reset: true, events: [] } : {}), chat });
+      return;
+    }
+    const current = { src: 'managed' as const, agentSessionId: identity.agentSessionId, epoch: identity.historyEpoch };
+    const cursor = encodeChatCursor({ v: 2, src: 'managed', a: identity.agentSessionId, e: identity.historyEpoch, head: 0 });
+    if (carried && dir === 'back' && cursorMatches(decodeChatCursor(rawCursor), current)) {
+      this.json(res, 200, { available: true, mode: 'older', reset: false, events: [], cursor, hasMore: false, chat });
+      return;
+    }
+    this.json(res, 200, {
+      available: true,
+      mode: 'snapshot',
+      ...(carried ? { reset: true } : {}),
+      events: page.events,
+      cursor,
+      hasMore: false,
+      ...(page.truncatedHead ? { truncatedHead: true } : {}),
+      chat,
+    });
+  }
+
+  /**
+   * Best effort: a user row whose text is a message the daemon typed for this
+   * caller carries its `clientMessageId`. Each delivery tags at most one row,
+   * the first matching one at or after it was typed. Rows are copied, never
+   * mutated (the projector may hand out shared objects).
+   */
+  private tagDeliveredRows(chat: ChatBridge, sessionId: string, owner: ChatOwner, events: unknown): unknown {
+    const delivered = chat.delivered?.(owner, sessionId) ?? [];
+    if (!Array.isArray(events) || delivered.length === 0) return events;
+    const unused = [...delivered];
+    return events.map((event: Record<string, unknown>) => {
+      if (event?.kind !== 'user_text' || typeof event.text !== 'string') return event;
+      const text = event.text.trim();
+      const ts = typeof event.ts === 'number' ? event.ts : undefined;
+      const index = unused.findIndex((m) => m.text.trim() === text && (ts === undefined || ts >= m.at - CHAT_DELIVERY_SKEW_MS));
+      if (index < 0) return event;
+      const [match] = unused.splice(index, 1);
+      return { ...event, clientMessageId: match.clientMessageId };
+    });
+  }
+
+  /** The `/turns` page for a resolved binding, read synchronously; undefined once answered (503). */
+  private readChatTurnsPage(
+    res: http.ServerResponse,
+    sessionId: string,
+    principal: WebPrincipal,
+    chat: ChatBridge,
+    resolution: ChatResolution,
+    dir: 'back' | 'forward',
+    carried: boolean,
+    cursor: ReturnType<typeof decodeChatCursor>,
+  ): Record<string, unknown> | undefined {
+    const reply = (body: Record<string, unknown>) => body;
+    // No `cursor` on purpose: a client that had a conversation drops its rows
+    // and reads again from nothing.
+    const unavailable = (reason: string, cause?: ChatUnavailableCause) =>
+      reply({ available: false, reason, ...(cause ? { cause } : {}), ...(carried ? { reset: true, events: [] } : {}) });
+
+    if (resolution.source === 'none' || !hasConversation(resolution)) {
+      return unavailable(resolution.status.reason, resolution.source === 'none' ? resolution.cause : undefined);
+    }
+    const src: ReadSource = resolution.source;
+    const agentSessionId = resolutionAgentSessionId(resolution) ?? '';
+    const epoch = resolutionEpoch(resolution) ?? '';
+    const valid = cursorMatches(cursor, { src, agentSessionId, epoch }) ? cursor : null;
+    const bound = { v: 2 as const, src, a: agentSessionId, e: epoch };
+
+    if (resolution.source === 'file') {
+      const projector = this.deps.projector?.() ?? null;
+      if (!projector) {
+        this.json(res, 503, { error: 'transcript projector unavailable' });
+        return undefined;
+      }
+      const fileCursor = (c: TranscriptCursor) =>
+        encodeChatCursor({ ...bound, head: c.headOffset, tail: c.tailOffset, fileSize: c.fileSize });
+      // The tail of the CURRENT conversation, replacing whatever the client holds.
+      const tail = () => {
+        const page = projector.snapshot(sessionId);
+        if (!page) return unavailable('unreadable');
+        return reply({
+          available: true,
+          mode: 'snapshot',
+          ...(carried ? { reset: true } : {}),
+          events: page.events,
+          cursor: fileCursor(page.cursor),
+          hasMore: page.hasMore,
+          ...(page.truncatedHead ? { truncatedHead: true } : {}),
+        });
+      };
+      // Rules 1–4 failed (or a v1 cursor, or none at all).
+      if (!valid || (dir === 'forward' && valid.tail === undefined)) return tail();
+      if (dir === 'back') {
+        // Same conversation, but the file may have been rewritten under the
+        // cursor: the forward path's shrink and line-boundary checks apply.
+        if (projector.staleCursor(sessionId, valid.head, valid.fileSize)) return tail();
+        const page = projector.snapshot(sessionId, { before: valid.head });
+        if (!page) return unavailable('unreadable');
+        return reply({
+          available: true,
+          mode: 'older',
+          reset: false,
+          events: page.events,
+          cursor: fileCursor(page.cursor),
+          hasMore: page.hasMore,
+          ...(page.truncatedHead ? { truncatedHead: true } : {}),
+        });
+      }
+      const result = projector.delta(sessionId, valid.tail as number, { cursorFileSize: valid.fileSize });
+      if (!result) return unavailable('unreadable');
+      return reply({
+        available: true,
+        mode: result.reset ? 'snapshot' : 'delta',
+        reset: result.reset,
+        events: result.events,
+        cursor: fileCursor(result.cursor),
+        ...(result.budgetDropped ? { budgetDropped: true } : {}),
+      });
+    }
+
+    // `tui` and `managed` are snapshot-only: a full bounded page on every
+    // read, no back paging (managed eviction shifts positions, N9).
+    const page = resolution.source === 'tui' ? resolution.page : chat.managedSnapshot(sessionId);
+    if (!page) return unavailable('unreadable');
+    const next = encodeChatCursor({ ...bound, head: page.cursor.headOffset });
+    if (resolution.source === 'tui') this.noteChatWatch(chat, sessionId, principal);
+    if (carried && dir === 'back' && valid) {
+      return reply({ available: true, mode: 'older', reset: false, events: [], cursor: next, hasMore: false });
+    }
+    return reply({
+      available: true,
+      mode: 'snapshot',
+      ...(carried ? { reset: true } : {}),
+      events: page.events,
+      cursor: next,
+      hasMore: false,
+      ...(page.truncatedHead ? { truncatedHead: true } : {}),
+    });
+  }
+
+  /**
+   * The read-time blocked state, or undefined. A bridge failure reads as "not
+   * blocked" rather than failing the page: the send path re-checks every gate
+   * itself, so a missed badge costs a refused send, not a wrong one.
+   */
+  private async readChatBlocked(chat: ChatBridge, sessionId: string, resolution: ChatResolution): Promise<ChatBlocked | undefined> {
+    // The Moa pane's permission dialog: the bridge computes nothing for a
+    // brain pane, so its record (#1772) is read here, shaped like any other
+    // pane's — a capable caller sees `{by:'approval', approvalId}`. Main's
+    // dialog flag alone, with no record yet, is the bare terminal block.
+    if (this.moaSession(sessionId)) {
+      const pending = this.deps.approvals?.list().pending
+        .find((r) => r.sessionId === sessionId && r.kind === 'terminal_prompt' && !isNativeDecision(r));
+      if (pending) {
+        this.rememberMoaCard(pending.id);
+        // Never answerable here: this also feeds the chat.blocked broadcast
+        // every device hears, and a device never presses a Moa-pane record
+        // (#1786); the desktop answers through its own RPC.
+        return { by: 'terminal', terminalPrompt: { approvalId: pending.id, answerable: false } };
+      }
+      if (this.moaDialogUp(sessionId)) return { by: 'terminal' };
+    }
+    // Producer-side brain gate (#1397/#1402): computed for no brain pane but
+    // the Moa pane, whichever path asks.
+    if (this.isBrainApproval(sessionId) && !this.moaSession(sessionId)) return undefined;
+    try {
+      return await chat.blocked(sessionId, resolution);
+    } catch (err) {
+      this.deps.log('warn', `[web] chat.blocked failed for ${sessionId}: ${errMsg(err)}`);
+      return undefined;
+    }
+  }
+
+  /**
+   * N3 — turn a changed read-time `chat.blocked` into a live event for the
+   * pane's `/turns` watchers. The FIRST observation of a pane is recorded
+   * without an event: whoever made it just read the value in `/turns`.
+   */
+  private noteChatBlocked(sessionId: string, agent: string | undefined, blocked: ChatBlocked | undefined): void {
+    if (this.isBrainApproval(sessionId) && !this.moaSession(sessionId)) return;
+    // Two views of one state: a capable client may see a `terminal_prompt` as
+    // an approval, an older one sees the terminal. A transition in either view
+    // is an event; each watcher gets its own view.
+    const views = {
+      legacy: projectChatBlocked(blocked, { terminalPromptAnswer: false }),
+      capable: projectChatBlocked(blocked, { terminalPromptAnswer: true }),
+    };
+    const keyOf = (b: ChatBlocked | undefined): string => (b ? JSON.stringify([b.by, b.approvalId ?? null]) : '');
+    const key = blocked ? JSON.stringify([keyOf(views.legacy), keyOf(views.capable)]) : '';
+    const previous = this.chatBlockedState.get(sessionId);
+    this.chatBlockedState.set(sessionId, key);
+    if (previous === undefined || previous === key) return;
+    const bodyOf = (view: ChatBlocked | undefined): { event: 'chat.blocked' | 'chat.unblocked'; body: string } => ({
+      event: view ? 'chat.blocked' : 'chat.unblocked',
+      body: JSON.stringify(view
+        ? {
+            sessionId,
+            by: view.by,
+            ...(view.approvalId ? { approvalId: view.approvalId } : {}),
+            ...(agent ? { agent } : {}),
+            at: this.now(),
+          }
+        : { sessionId, at: this.now() }),
+    });
+    const legacy = bodyOf(views.legacy);
+    const capable = bodyOf(views.capable);
+    this.deliverChatEvent(sessionId, (caps) => (caps.terminalPromptAnswer ? capable : legacy));
+  }
+
+  /** #1772 — a card a phone was shown as the Moa pane's (see `moaCardIds`). */
+  private rememberMoaCard(id: string): void {
+    if (this.moaCardIds.has(id)) return;
+    this.moaCardIds.add(id);
+    while (this.moaCardIds.size > MOA_CARD_IDS_MAX) {
+      const oldest = this.moaCardIds.values().next();
+      if (oldest.done) break;
+      this.moaCardIds.delete(oldest.value);
+    }
+  }
+
+  /**
+   * #1772 — a Moa card settled after Moa was switched off: the recompute no
+   * longer runs for the pane (it is a brain pane like any other now), so a
+   * watcher that was told it is blocked hears `chat.unblocked` from here, once.
+   */
+  private releaseMoaChatBlocked(sessionId: string): void {
+    if (!this.chatBlockedState.get(sessionId)) return;
+    this.chatBlockedState.delete(sessionId);
+    const body = JSON.stringify({ sessionId, at: this.now() });
+    this.deliverChatEvent(sessionId, () => ({ event: 'chat.unblocked', body }));
+  }
+
+  /**
+   * LIVE-ONLY, like `transcript.nudge`: no `id:`, never in `attentionLog`,
+   * never replayed. A pane flapping between blocked and unblocked would
+   * otherwise evict a pending approval from the 100-entry replay window, and a
+   * phone replaying after a reconnect would clear a badge while a human is
+   * still being waited on. `/turns` is the authoritative state.
+   */
+  private deliverChatEvent(
+    sessionId: string,
+    viewFor: (caps: ClientCaps) => { event: 'chat.blocked' | 'chat.unblocked' | 'chat.queue' | 'chat.cancel'; body: string },
+    only?: (principal: WebPrincipal) => boolean,
+  ): void {
+    const watchers = this.transcriptWatchers.get(sessionId);
+    if (!watchers || watchers.size === 0) return;
+    for (const client of this.eventClients) {
+      if (!watchers.has(this.watcherKey(client.principal))) continue;
+      if (only && !only(client.principal)) continue;
+      try {
+        const { event, body } = viewFor(client.caps);
+        writeSse(client.res, event, body);
+      } catch {
+        /* client stream broken — its own 'close' handler cleans up */
+      }
+    }
+  }
+
+  /** Whether some principal that read this pane's `/turns` holds `/api/events` open. */
+  private hasLiveChatWatcher(sessionId: string): boolean {
+    const watchers = this.transcriptWatchers.get(sessionId);
+    if (!watchers || watchers.size === 0) return false;
+    for (const client of this.eventClients) {
+      if (watchers.has(this.watcherKey(client.principal))) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Something that can change a pane's blocked state happened (an approval
+   * event, a liveness change, a transcript nudge). Recompute it once per
+   * second at most, and only for a pane somebody is actually watching —
+   * resolving a binding is a plugin read for OpenCode, not a map lookup.
+   */
+  private scheduleChatBlockedCheck(sessionId: string): void {
+    if (this.opts?.allowTranscript !== true || this.chatBlockedTimers.has(sessionId)) return;
+    if (!this.conversableSession(sessionId)) return;
+    if ((!(this.deps.chat?.() ?? null) && !this.chatV2For(sessionId)) || !this.hasLiveChatWatcher(sessionId)) return;
+    const timer = setTimeout(() => {
+      this.chatBlockedTimers.delete(sessionId);
+      void this.recomputeChatBlocked(sessionId).catch((err: unknown) =>
+        this.deps.log('warn', `[web] chat blocked recompute failed for ${sessionId}: ${errMsg(err)}`),
+      );
+    }, CHAT_BLOCKED_COALESCE_MS);
+    timer.unref?.();
+    this.chatBlockedTimers.set(sessionId, timer);
+  }
+
+  private async recomputeChatBlocked(sessionId: string): Promise<void> {
+    if (this.opts?.allowTranscript !== true) return;
+    if (!this.conversableSession(sessionId)) {
+      this.chatBlockedState.delete(sessionId);
+      return;
+    }
+    if (!this.hasLiveChatWatcher(sessionId)) return;
+    // A chat-v2 pane's `blocked` is the host's; the bridge's view would be another binding's.
+    const v2 = this.chatV2For(sessionId);
+    if (v2) {
+      this.noteChatBlocked(sessionId, v2.binding.agent, this.chatV2Blocked(sessionId, v2.binding));
+      return;
+    }
+    const chat = this.deps.chat?.() ?? null;
+    if (!chat) return;
+    const resolution = await chat.resolve(sessionId);
+    const blocked = await this.readChatBlocked(chat, sessionId, resolution);
+    if (!this.server) return;
+    this.noteChatBlocked(sessionId, resolution.status.terminal?.agent, blocked);
+  }
+
+  /**
+   * N7 — record a successful OpenCode read and (re)arm the bridge watch that
+   * nudges this pane's phone watchers on TUI changes. `watch` is called on
+   * every such read; the bridge keeps one watch per pane.
+   */
+  private noteChatWatch(chat: ChatBridge, sessionId: string, principal: WebPrincipal): void {
+    let reads = this.chatWatchReads.get(sessionId);
+    if (!reads) {
+      reads = new Map();
+      this.chatWatchReads.set(sessionId, reads);
+    }
+    reads.set(this.watcherKey(principal), this.now());
+    try {
+      chat.watch(sessionId);
+    } catch (err) {
+      this.deps.log('warn', `[web] chat watch failed for ${sessionId}: ${errMsg(err)}`);
+    }
+  }
+
+  /**
+   * End every bridge watch no reader holds any more: a watch survives only
+   * while some principal that read the pane within `CHAT_WATCH_IDLE_MS` has
+   * an `/api/events` connection open. `transcriptWatchers` is deliberately
+   * never pruned; this map is the one with a lifetime.
+   */
+  private sweepChatWatches(): void {
+    if (this.chatWatchReads.size === 0) return;
+    const now = this.now();
+    const connected = new Set<string>();
+    for (const client of this.eventClients) connected.add(this.watcherKey(client.principal));
+    const chat = this.deps.chat?.() ?? null;
+    for (const [sessionId, reads] of this.chatWatchReads) {
+      for (const [key, at] of reads) {
+        if (now - at > CHAT_WATCH_IDLE_MS) reads.delete(key);
+      }
+      if ([...reads.keys()].some((key) => connected.has(key))) continue;
+      this.chatWatchReads.delete(sessionId);
+      try {
+        chat?.unwatch(sessionId);
+      } catch (err) {
+        this.deps.log('warn', `[web] chat unwatch failed for ${sessionId}: ${errMsg(err)}`);
+      }
+    }
+  }
+
+  /** The `/api/config` chat keys (contract §4), or none without the bridge. */
+  private chatConfig(principal: WebPrincipal): Record<string, unknown> {
+    if (!(this.deps.chat?.() ?? null)) return {};
+    const chatBinding = this.opts?.allowTranscript === true;
+    const writable = this.chatWritable(principal);
+    const dangerous = this.opts?.allowDangerousLaunch === true;
+    return {
+      chatBinding,
+      chatSend: writable,
+      chatLaunch: writable,
+      ...(writable
+        ? {
+            chatLaunchModes: {
+              claude: dangerous ? ['default', 'bypass'] : ['default'],
+              codex: dangerous ? ['default', 'yolo'] : ['default'],
+            },
+          }
+        : {}),
+      chatSkills: true,
+      // Launch body capabilities: `prompt` may be omitted, and `resume: true` is accepted.
+      chatLaunchBare: true,
+      chatLaunchResume: true,
+      // `resume: true` also continues a pane's own binding once its agent exited (`chat.resumable`).
+      chatResumeBound: true,
+      chatVersion: 1,
+    };
+  }
+
+  private refuseTranscript(res: http.ServerResponse): void {
+    return this.json(res, 403, {
+      error: 'transcript-disabled: server started without --allow-transcript',
+      detail: 'restart with: wmux web --allow-transcript <your other flags>',
+    });
+  }
+
+  /**
+   * §3.3 steps 3–5, after the body: the credential that sent the headers must
+   * still be the same caller, still hold input, and the pane must still be the
+   * SAME incarnation. Answers the request itself and returns null on refusal.
+   * Every chat route resolves its pane with `conversableSession`, whatever
+   * the principal: `/turns` 404s a brain pane for the operator too (the Moa
+   * pane aside), so a chat write or receipt must not reach one either.
+   */
+  private async reauthorizeChatWrite(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    url: URL,
+    principal: WebPrincipal,
+    id: string,
+    pane: ManagedSession,
+    incarnation: string | undefined,
+  ): Promise<WebPrincipal | null> {
+    const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+    if (!fresh.ok || !sameCaller(principal, fresh.principal)) {
+      this.json(res, 401, { error: 'authorization-expired' });
+      return null;
+    }
+    if (!this.mayInput(fresh.principal)) {
+      this.refuseInput(res, fresh.principal, 'Input permission changed');
+      return null;
+    }
+    if (this.conversableSession(id) !== pane || pane.meta.incarnationId !== incarnation) {
+      this.json(res, 409, { error: 'pane-incarnation-changed' });
+      return null;
+    }
+    return fresh.principal;
+  }
+
+  /**
+   * The predicate the daemon runs immediately before its first PTY/plugin
+   * write and again before Enter (§3.3 steps 6–7): the same checks as above,
+   * plus, before the first write only, a caller that is still waiting for the
+   * answer — a phone that hung up has nobody to tell what was typed. Before
+   * Enter a hang-up no longer stops the send: that would leave a half-typed
+   * paste in the agent's composer, and the receipt GET recovers the outcome.
+   */
+  private chatWriteAuthorizer(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    url: URL,
+    principal: WebPrincipal,
+    id: string,
+    pane: ManagedSession,
+    incarnation: string | undefined,
+    extra?: () => boolean,
+    kind: MoaWriteKind = 'send',
+  ): (stage?: 'first-write' | 'submit') => Promise<boolean> {
+    return async (stage) => {
+      if (stage !== 'submit' && (res.destroyed || res.writableEnded)) return false;
+      if (this.opts?.allowTranscript !== true) return false;
+      if (extra && !extra()) return false;
+      const now = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+      const ok = now.ok && sameCaller(principal, now.principal) && this.mayInput(now.principal) &&
+        this.conversableSession(id) === pane && pane.meta.incarnationId === incarnation;
+      return this.moaWriteCleared(ok, principal, id, pane, stage, kind);
+    };
+  }
+
+  /**
+   * The Moa pane's part of a chat write check, after the caller's own: a send
+   * is refused while Moa's permission dialog is up (Enter would answer it; a
+   * cancel is ESC, which only declines it), and a cleared write to the Moa
+   * pane is audited at its write boundary — a send at `submit`, after its text
+   * is in the composer and nothing but Enter follows; a cancel at
+   * `first-write`, immediately before the ESC. A queue drain's pre-check and a
+   * write refused before anything was typed log nothing.
+   */
+  private moaWriteCleared(
+    ok: boolean, principal: WebPrincipal, id: string, pane: ManagedSession,
+    stage: 'first-write' | 'submit' | undefined, kind: MoaWriteKind,
+  ): boolean {
+    if (!ok || this.readableSession(id) === pane) return ok;
+    // Captured with the check, so a withdrawal after it cannot drop the line.
+    const viaMoa = this.moaSession(id) === pane;
+    if (!viaMoa) return false;
+    if (kind === 'send' && this.moaDialogUp(id)) return false;
+    if (stage === (kind === 'send' ? 'submit' : 'first-write')) this.auditMoaSend(principal, id, 'chat');
+    return true;
+  }
+
+  /**
+   * The same predicate for a message the daemon queue delivers later, when
+   * the request that queued it is long gone: nothing to re-authenticate, so
+   * the owner is checked against the live roster instead. The server must
+   * still run with the same policy object, the device must still be paired
+   * and hold input, and the pane must be the same incarnation.
+   */
+  private queuedChatAuthorizer(
+    principal: WebPrincipal,
+    id: string,
+    pane: ManagedSession,
+    incarnation: string | undefined,
+  ): (stage?: 'first-write' | 'submit') => Promise<boolean> {
+    const opts = this.opts;
+    return async (stage) => {
+      if (!this.server || !opts || this.opts !== opts || opts.allowTranscript !== true || opts.allowInput !== true) return false;
+      if (principal.kind === 'device') {
+        let row: WebDeviceSummary | undefined;
+        try { row = this.deps.devices?.list?.().find((d) => d.deviceId === principal.deviceId); } catch { return false; }
+        if (!row || row.revokedAt !== undefined || !row.allowInput) return false;
+      }
+      const ok = this.conversableSession(id) === pane && pane.meta.incarnationId === incarnation;
+      return this.moaWriteCleared(ok, principal, id, pane, stage, 'send');
+    };
+  }
+
+  /**
+   * `DELETE /api/sessions/:id/chat/queue/:clientMessageId`: take back a
+   * queued message. Needs input, like the send that queued it; the owner is
+   * the caller, so another device's item reads as not found.
+   */
+  private handleChatDequeue(res: http.ServerResponse, rawId: string, rawMessageId: string, principal: WebPrincipal): void {
+    res.setHeader('Cache-Control', 'no-store');
+    const refusal = this.chatWriteRefusal(principal);
+    if (refusal === 'transcript') return this.refuseTranscript(res);
+    if (refusal === 'input') return this.refuseInput(res, principal, 'Canceling a queued message changes what is typed into this pane');
+    const id = decodePathSegment(rawId);
+    if (id === null || !this.conversableSession(id)) return this.json(res, 404, { error: 'pane-not-found' });
+    const chat = this.deps.chat?.() ?? null;
+    if (!chat?.dequeue) return this.json(res, 503, { error: 'chat-unavailable' });
+    const clientMessageId = decodePathSegment(rawMessageId) ?? '';
+    const wire = dequeueResponse(chat.dequeue(chatOwner(principal), id, clientMessageId), clientMessageId);
+    return this.json(res, wire.status, wire.body);
+  }
+
+  /**
+   * `POST /api/sessions/:id/chat/messages` (N4). The route adds the principal
+   * gates and the wire mapping; binding, identity, receipts and the guarded
+   * write are the daemon's shared send path, the same one the desktop uses.
+   */
+  private handleChatSend(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    rawId: string,
+    url: URL,
+    principal: WebPrincipal,
+  ): void {
+    res.setHeader('Cache-Control', 'no-store');
+    const refusal = this.chatWriteRefusal(principal);
+    if (refusal === 'transcript') return this.refuseTranscript(res);
+    if (refusal === 'input') return this.refuseInput(res, principal, 'Sending to a chat types into this pane');
+    const id = decodePathSegment(rawId);
+    const pane = id === null ? undefined : this.conversableSession(id);
+    if (!pane || id === null) return this.json(res, 404, { error: 'session not found' });
+    const chat = this.deps.chat?.() ?? null;
+    if (!chat && !this.chatV2For(id)) return this.json(res, 503, { error: 'chat-unavailable' });
+    const incarnation = pane.meta.incarnationId;
+
+    this.readJsonBody(req, res, (body) => {
+      void (async () => {
+        const fresh = await this.reauthorizeChatWrite(req, res, url, principal, id, pane, incarnation);
+        if (!fresh) return;
+        const parsed = parseSendBody(body);
+        if (!parsed.ok) {
+          return this.json(res, 400, {
+            error: 'invalid-chat-request',
+            detail: parsed.detail,
+            effect: 'none',
+            ...(parsed.clientMessageId !== undefined ? { clientMessageId: parsed.clientMessageId } : {}),
+          });
+        }
+        const { clientMessageId } = parsed.value;
+        // A chat-v2 record is read + approve only on the phone, like a managed one.
+        if (this.chatV2For(id)) {
+          const refused = chatV2SendResponse(clientMessageId);
+          return this.json(res, refused.status, refused.body);
+        }
+        if (!chat) return this.json(res, 503, { error: 'chat-unavailable' });
+        // Moa's own permission dialog is up: Enter would answer it, and its only
+        // answer path is the desktop. Same refusal as a dialog the screen shows.
+        if (this.moaDialogUp(id)) {
+          const blocked = sendResponse({ clientMessageId, replayed: false, result: 'blocked', effect: 'none', error: 'chat-blocked', blockedBy: 'terminal' }, clientMessageId);
+          return this.json(res, blocked.status, blocked.body);
+        }
+        let outcome;
+        try {
+          // The cap on THIS request opts it into the daemon queue.
+          const queue = clientCaps(req).chatQueue === true && chat.queueEnabled?.() === true
+            ? { authorized: this.queuedChatAuthorizer(fresh, id, pane, incarnation) } : undefined;
+          outcome = await chat.send({
+            owner: chatOwner(fresh),
+            id,
+            ...parsed.value,
+            managedReadOnly: true,
+            authorized: this.chatWriteAuthorizer(req, res, url, principal, id, pane, incarnation),
+            ...(queue ? { queue } : {}),
+          });
+        } catch (err) {
+          // No `effect`: the write stage is unknown, and the client's rule for a
+          // 5xx without one is "unknown — ask the receipt", never "nothing sent".
+          this.deps.log('warn', `[web] chat send threw for ${id}: ${errMsg(err)}`);
+          return this.json(res, 500, { error: 'chat-send-failed', clientMessageId });
+        }
+        const wire = sendResponse(outcome, clientMessageId);
+        this.json(res, wire.status, wire.body);
+      })().catch((err: unknown) => this.failRequest(res, err));
+    }, CHAT_SEND_MAX_BODY_BYTES);
+  }
+
+  /**
+   * `POST /api/sessions/:id/chat/cancel`: one ESC into the pane's running
+   * Claude/Codex turn. Same gate order as send; the 404 names `pane-not-found`
+   * so a client can tell a missing pane from a daemon without the route. The
+   * `chat-cancel` cap is not required here: the route existing is the opt-in.
+   */
+  private handleChatCancel(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    rawId: string,
+    url: URL,
+    principal: WebPrincipal,
+  ): void {
+    res.setHeader('Cache-Control', 'no-store');
+    const refusal = this.chatWriteRefusal(principal);
+    if (refusal === 'transcript') return this.refuseTranscript(res);
+    if (refusal === 'input') return this.refuseInput(res, principal, 'Stopping a turn types into this pane');
+    const id = decodePathSegment(rawId);
+    const pane = id === null ? undefined : this.conversableSession(id);
+    if (!pane || id === null) return this.json(res, 404, { error: 'pane-not-found' });
+    const chat = this.deps.chat?.() ?? null;
+    if (!chat && !this.chatV2For(id)) return this.json(res, 503, { error: 'chat-unavailable' });
+    const incarnation = pane.meta.incarnationId;
+
+    this.readJsonBody(req, res, (body) => {
+      void (async () => {
+        const fresh = await this.reauthorizeChatWrite(req, res, url, principal, id, pane, incarnation);
+        if (!fresh) return;
+        const parsed = parseCancelBody(body);
+        if (!parsed.ok) {
+          return this.json(res, 400, {
+            error: 'invalid-chat-request',
+            detail: parsed.detail,
+            effect: 'none',
+            ...(parsed.clientCancelId !== undefined ? { clientCancelId: parsed.clientCancelId } : {}),
+          });
+        }
+        const { clientCancelId } = parsed.value;
+        const authorize = this.chatWriteAuthorizer(req, res, url, principal, id, pane, incarnation, undefined, 'cancel');
+        const v2 = this.chatV2For(id);
+        if (v2) {
+          const v2Outcome = await this.chatV2Cancels.cancel({
+            owner: chatOwner(fresh), paneId: id, body: parsed.value, host: v2.host, authorized: () => authorize('first-write'),
+          });
+          const v2Wire = cancelResponse(v2Outcome);
+          return this.json(res, v2Wire.status, v2Wire.body);
+        }
+        if (!chat) return this.json(res, 503, { error: 'chat-unavailable' });
+        let outcome;
+        try {
+          outcome = await chat.cancel({ owner: chatOwner(fresh), id, ...parsed.value, authorized: () => authorize('first-write') });
+        } catch (err) {
+          // No `effect`: whether the ESC was written is unknown.
+          this.deps.log('warn', `[web] chat cancel threw for ${id}: ${errMsg(err)}`);
+          return this.json(res, 500, { error: 'cancel-failed', clientCancelId });
+        }
+        const wire = cancelResponse(outcome);
+        this.json(res, wire.status, wire.body);
+      })().catch((err: unknown) => this.failRequest(res, err));
+    }, CHAT_CANCEL_MAX_BODY_BYTES);
+  }
+
+  /**
+   * The caller gates every chat write route checks first, in their order:
+   * send, launch, cancel and dequeue. The first refusal, or null.
+   * `/api/config` advertises `chatSend`, `chatLaunch`, `chatQueue`,
+   * `chatCancel` and `chatCancelOutcome` from this same answer
+   * (`chatWritable`), so a key is never shown to a caller the route refuses.
+   */
+  private chatWriteRefusal(principal: WebPrincipal): 'transcript' | 'input' | null {
+    if (this.opts?.allowTranscript !== true) return 'transcript';
+    if (!this.mayInput(principal)) return 'input';
+    return null;
+  }
+
+  /** Whether a chat write gets past every gate that does not depend on the pane (the caller's, and a bridge). */
+  private chatWritable(principal: WebPrincipal): boolean {
+    return this.chatWriteRefusal(principal) === null && (this.deps.chat?.() ?? null) !== null;
+  }
+
+  /** `GET /api/sessions/:id/chat/cancel/:clientCancelId`: transcript, not input; owner- and pane-bound (chatCancelOutcome.ts). */
+  private handleChatCancelReceipt(res: http.ServerResponse, rawId: string, rawCancelId: string, principal: WebPrincipal): void {
+    res.setHeader('Cache-Control', 'no-store');
+    if (this.opts?.allowTranscript !== true) return this.refuseTranscript(res);
+    const id = decodePathSegment(rawId);
+    if (id === null || !this.conversableSession(id)) return this.json(res, 404, { error: 'pane-not-found' });
+    const clientCancelId = decodePathSegment(rawCancelId) ?? '';
+    const v2Progress = this.chatV2Cancels.progress(chatOwner(principal), id, clientCancelId);
+    if (v2Progress) return this.json(res, 200, { clientCancelId, ...v2Progress });
+    const wire = cancelReceiptResponse(this.deps.chat?.() ?? null, chatOwner(principal), id, clientCancelId);
+    return this.json(res, wire.status, wire.body);
+  }
+
+  /**
+   * `GET /api/sessions/:id/chat/messages/:clientMessageId` (§6.3). No
+   * `mayInput` on purpose: a device whose grant was withdrawn after a send
+   * must still learn whether that send landed. Owner binding keeps one device
+   * from reading another's receipts.
+   */
+  private handleChatSendReceipt(res: http.ServerResponse, rawId: string, rawMessageId: string, principal: WebPrincipal): void {
+    res.setHeader('Cache-Control', 'no-store');
+    if (this.opts?.allowTranscript !== true) return this.refuseTranscript(res);
+    const id = decodePathSegment(rawId);
+    if (id === null || !this.conversableSession(id)) return this.json(res, 404, { error: 'session not found' });
+    const chat = this.deps.chat?.() ?? null;
+    if (!chat) return this.json(res, 503, { error: 'chat-unavailable' });
+    const clientMessageId = decodePathSegment(rawMessageId) ?? '';
+    const view = chat.receipt(chatOwner(principal), id, clientMessageId);
+    return this.json(res, 200, {
+      clientMessageId,
+      state: view.state,
+      ...(view.result ? { result: view.result } : {}),
+      ...(view.error ? { error: view.error } : {}),
+      ...(view.queued ? { queued: true } : {}),
+      ...(view.queue ? { queue: { ...view.queue } } : {}),
+      ...(view.agentSessionId ? { agentSessionId: view.agentSessionId } : {}),
+      ...(view.historyEpoch ? { historyEpoch: view.historyEpoch } : {}),
+      ...(typeof view.at === 'number' ? { at: view.at } : {}),
+    });
+  }
+
+  /**
+   * `POST /api/sessions/:id/chat/launch` (N8). Types a fixed launcher into
+   * the pane's own empty shell; the daemon owns every readiness check. The
+   * dangerous modes need the operator's server ceiling AND a per-request
+   * `confirm` naming the exact combination (§3.4), and the ceiling is read
+   * again inside the predicate that runs just before the launcher is typed.
+   */
+  private handleChatLaunch(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    rawId: string,
+    url: URL,
+    principal: WebPrincipal,
+  ): void {
+    res.setHeader('Cache-Control', 'no-store');
+    const refusal = this.chatWriteRefusal(principal);
+    if (refusal === 'transcript') return this.refuseTranscript(res);
+    if (refusal === 'input') return this.refuseInput(res, principal, 'Starting an agent runs a command on this machine');
+    const id = decodePathSegment(rawId);
+    const pane = id === null ? undefined : this.readableSession(id);
+    if (!pane || id === null) return this.json(res, 404, { error: 'session not found' });
+    const chat = this.deps.chat?.() ?? null;
+    if (!chat && !this.chatV2For(id)) return this.json(res, 503, { error: 'chat-unavailable' });
+    const incarnation = pane.meta.incarnationId;
+
+    this.readJsonBody(req, res, (body) => {
+      void (async () => {
+        const fresh = await this.reauthorizeChatWrite(req, res, url, principal, id, pane, incarnation);
+        if (!fresh) return;
+        const parsed = parseLaunchBody(body);
+        if (!parsed.ok) {
+          return this.json(res, 400, {
+            error: 'invalid-chat-request',
+            detail: parsed.detail,
+            effect: 'none',
+            ...(parsed.clientLaunchId !== undefined ? { clientLaunchId: parsed.clientLaunchId } : {}),
+          });
+        }
+        const { agent, mode, prompt, resume, clientLaunchId } = parsed.value;
+        const age = checkChatId(clientLaunchId, this.now(), CHAT_LAUNCH_RETENTION_MS);
+        if (age === 'invalid') {
+          return this.json(res, 400, {
+            error: 'invalid-chat-request',
+            detail: 'clientLaunchId must be <13-digit ms>-<lowercase uuid>',
+            effect: 'none',
+            clientLaunchId,
+          });
+        }
+        // Past the receipt lifetime `unknown` no longer proves "never typed",
+        // so the id is refused rather than risking a second launcher.
+        if (age === 'expired') return this.json(res, 400, { error: 'launch-id-expired', effect: 'none', clientLaunchId });
+        // The anchor shell of a chat-v2 pane is idle, but the pane has a writer: the driver.
+        if (this.chatV2For(id)) {
+          const refused = chatV2LaunchResponse(clientLaunchId);
+          return this.json(res, refused.status, refused.body);
+        }
+        if (!chat) return this.json(res, 503, { error: 'chat-unavailable' });
+
+        const owner = chatOwner(fresh);
+        const dangerous = mode !== 'default';
+        const trace = (outcome: string): void => {
+          if (!dangerous) return;
+          try {
+            chat.traceDangerousLaunch({ at: this.now(), owner, paneId: id, agent, mode, clientLaunchId, outcome });
+          } catch (err) {
+            this.deps.log('warn', `[web] dangerous launch trace failed: ${errMsg(err)}`);
+          }
+        };
+        if (dangerous && this.opts?.allowDangerousLaunch !== true) {
+          trace('dangerous-launch-disabled');
+          return this.json(res, 403, {
+            error: 'dangerous-launch-disabled: server started without --allow-dangerous-launch',
+            detail: 'restart with: wmux web --allow-dangerous-launch <your other flags>',
+            effect: 'none',
+            clientLaunchId,
+          });
+        }
+        if (dangerous && parsed.value.confirm !== `${agent}:${mode}`) {
+          trace('dangerous-mode-unconfirmed');
+          return this.json(res, 428, { error: 'dangerous-mode-unconfirmed', effect: 'none', clientLaunchId });
+        }
+
+        const fingerprint = JSON.stringify([id, incarnation ?? null, agent, mode, prompt ?? null, resume]);
+        const begun = this.chatLaunchReceipts.begin(owner, clientLaunchId, id, fingerprint, this.now());
+        if (begun.kind === 'conflict') return this.json(res, 409, { error: 'launch-id-conflict', effect: 'none', clientLaunchId });
+        if (begun.kind === 'pending') return this.json(res, 202, { state: 'pending', replayed: true, clientLaunchId });
+        if (begun.kind === 'replay') return this.json(res, 200, { ...begun.body, replayed: true });
+        if (begun.kind === 'full') return this.json(res, 429, { error: 'launch-busy', effect: 'none', clientLaunchId });
+
+        const authorize = this.chatWriteAuthorizer(req, res, url, principal, id, pane, incarnation,
+          () => !dangerous || this.opts?.allowDangerousLaunch === true);
+        // A chat-v2 record created while the launch ran (the desktop reserves the
+        // pane before its first await) refuses it. Checked after the last await:
+        // the bridge types right after this resolves, with no await between.
+        let claimedByChatV2 = false;
+        const authorized = async (stage?: 'first-write' | 'submit'): Promise<boolean> => {
+          const ok = await authorize(stage);
+          if (ok && this.chatV2For(id)) claimedByChatV2 = true;
+          return ok && !claimedByChatV2;
+        };
+        let wire: WireResponse;
+        let effect: 'none' | 'uncertain' | 'submitted';
+        try {
+          const outcome = await chat.launch({ id, agent, ...(prompt !== undefined ? { prompt } : {}), resume, mode, refuseConversation: true, authorized });
+          wire = claimedByChatV2 && !outcome.ok ? chatV2LaunchResponse(clientLaunchId) : launchResponse(outcome, clientLaunchId);
+          effect = outcome.ok ? 'submitted' : outcome.effect;
+          if (outcome.ok) trace('submitted');
+          else if (outcome.error === 'launch-unconfirmed') trace('launch-unconfirmed');
+        } catch (err) {
+          // The daemon passed its checks and then failed: whether the launcher
+          // reached the shell is unknown, which is exactly `launch-unconfirmed`.
+          this.deps.log('warn', `[web] chat launch threw for ${id}: ${errMsg(err)}`);
+          wire = { status: 502, body: { error: 'launch-unconfirmed', effect: 'uncertain', clientLaunchId } };
+          effect = 'uncertain';
+          trace('launch-unconfirmed');
+        }
+        this.chatLaunchReceipts.finish(owner, clientLaunchId, effect, wire.status, wire.body);
+        this.json(res, wire.status, wire.body);
+      })().catch((err: unknown) => this.failRequest(res, err));
+    }, CHAT_LAUNCH_MAX_BODY_BYTES);
+  }
+
+  /** `GET /api/sessions/:id/chat/launch/:clientLaunchId` — owner-bound, memory only. */
+  private handleChatLaunchReceipt(res: http.ServerResponse, rawId: string, rawLaunchId: string, principal: WebPrincipal): void {
+    res.setHeader('Cache-Control', 'no-store');
+    if (this.opts?.allowTranscript !== true) return this.refuseTranscript(res);
+    const id = decodePathSegment(rawId);
+    if (id === null || !this.readableSession(id)) return this.json(res, 404, { error: 'session not found' });
+    const clientLaunchId = decodePathSegment(rawLaunchId) ?? '';
+    const state: LaunchReceiptState = this.chatLaunchReceipts.state(chatOwner(principal), id, clientLaunchId, this.now());
+    return this.json(res, 200, { clientLaunchId, state });
+  }
+
+  /**
+   * `GET /api/sessions/:id/commands?agent=` (N6): the native catalogue the
+   * composer offers after `/` (Claude) or `$` (Codex). Names, descriptions
+   * and the verbatim invocation only — the same no-new-grant reasoning as the
+   * legacy list. Every refusal is a 200 `unavailable`, as the desktop RPC
+   * answers, so a composer never has to tell "none" from "not now".
+   */
+  private async handleChatSkills(res: http.ServerResponse, id: string, agent: string): Promise<void> {
+    if (agent !== 'claude' && agent !== 'codex') {
+      return this.json(res, 400, { error: 'invalid-chat-request', detail: 'agent must be claude or codex' });
+    }
+    const unavailable = { state: 'unavailable', commands: [] };
+    const chat = this.deps.chat?.() ?? null;
+    if (!chat) return this.json(res, 200, unavailable);
+    let catalog;
+    try {
+      catalog = await chat.skills(id, agent);
+    } catch (err) {
+      this.deps.log('warn', `[web] chat skills failed for ${id}: ${errMsg(err)}`);
+      return this.json(res, 200, unavailable);
+    }
+    return this.json(res, 200, {
+      state: catalog.state,
+      ...(catalog.reason ? { reason: catalog.reason } : {}),
+      commands: catalog.skills.map((skill) => ({
+        name: skill.name,
+        description: skill.description,
+        source: skill.source,
+        kind: 'skill',
+        invocation: skill.invocation,
+      })),
+    });
+  }
+
   /**
    * The pane a phone is allowed to READ, or null.
    *
@@ -2084,6 +5298,79 @@ export class WebTerminalServer {
     const managed = this.deps.sessionManager.getSession(sessionId);
     if (!managed) return undefined;
     return isBrainPty({ id: sessionId, env: managed.meta.env }) ? undefined : managed;
+  }
+
+  /**
+   * The pane THIS caller may attach to (stream bytes from, type into), or null.
+   *
+   * #1388 — the byte routes resolved their pane with a bare `getSession`, so
+   * a paired device that learned a brain id could open `/api/stream?session=`
+   * on it and read the orchestrator's raw terminal, while `/api/sessions` and
+   * the transcript routes had long refused the same id. The exclusion could
+   * not simply be added to `handleStream`: the operator token legitimately
+   * streams every pane, brain included (the desktop's own remote mirror rides
+   * this route). So the gate follows the credential class — a device gets
+   * `readableSession`'s answer, the operator keeps `getSession`'s. Every
+   * per-pane route a device can reach (stream, input, resize, delete, diff,
+   * commands) resolves through here, so the 404 is the same on all of them.
+   */
+  private attachableSession(
+    principal: WebPrincipal,
+    sessionId: string,
+  ): ReturnType<DaemonSessionManager['getSession']> {
+    return principal.kind === 'operator'
+      ? this.deps.sessionManager.getSession(sessionId)
+      : this.readableSession(sessionId);
+  }
+
+  /**
+   * The Moa (HQ brain) pane, when `sessionId` names it and main still vouches
+   * for it: Moa on, its HQ present, and this live session that HQ's brain
+   * (see moaPane.ts). Undefined otherwise, including for every other brain.
+   *
+   * The ONE brain pane a paired device may reach, and only through the routes
+   * that resolve with `conversableSession` / `inputSession`: turns, chat and
+   * raw input. Every other per-pane route keeps `readableSession` /
+   * `attachableSession`, so stream, resize, delete, files, git, diff and the
+   * rest still 404 it. Re-read on every check, so the in-flight re-checks see
+   * a withdrawal the moment main pushes it.
+   */
+  private moaSession(sessionId: string): ManagedSession | undefined {
+    const fact = this.deps.moaPane?.() ?? null;
+    if (fact?.sessionId !== sessionId) return undefined;
+    return resolveMoaPane(fact, (id) => this.deps.sessionManager.getSession(id));
+  }
+
+  /** `{moaSessionId}` while the Moa pane resolves, else nothing. */
+  private moaSessionIdField(): { moaSessionId?: string } {
+    const sessionId = this.deps.moaPane?.()?.sessionId;
+    return sessionId !== undefined && this.moaSession(sessionId) ? { moaSessionId: sessionId } : {};
+  }
+
+  /** The Moa pane's own permission dialog is on screen (main's flag, see moaPane.ts). */
+  private moaDialogUp(sessionId: string): boolean {
+    return this.deps.moaPane?.()?.dialog !== undefined && !!this.moaSession(sessionId);
+  }
+
+  /** `readableSession`, plus the Moa pane: the turn and chat routes only. */
+  private conversableSession(sessionId: string): ManagedSession | undefined {
+    return this.readableSession(sessionId) ?? this.moaSession(sessionId);
+  }
+
+  /** `attachableSession`, plus the Moa pane: `POST /api/input` only. */
+  private inputSession(principal: WebPrincipal, sessionId: string): ManagedSession | undefined {
+    return this.attachableSession(principal, sessionId) ?? this.moaSession(sessionId);
+  }
+
+  /** One device-audit line for a phone send that reached the Moa pane. */
+  private auditMoaSend(principal: WebPrincipal, sessionId: string, route: 'chat' | 'input'): void {
+    // The caller decided the write went to the Moa pane, before the write.
+    if (principal.kind !== 'device') return;
+    try {
+      this.deps.auditMoaSend?.({ deviceId: principal.deviceId, sessionId, route });
+    } catch {
+      // Best-effort, like every other audit line.
+    }
   }
 
   /**
@@ -2112,7 +5399,7 @@ export class WebTerminalServer {
       });
       return;
     }
-    if (!this.readableSession(sessionId)) {
+    if (!this.conversableSession(sessionId)) {
       this.json(res, 404, { error: 'session not found' });
       return;
     }
@@ -2176,14 +5463,473 @@ export class WebTerminalServer {
     this.json(res, 200, { body: found.body, bytes });
   }
 
+  /**
+   * `GET /api/sessions/:id/turns/image?path=<absolute>` — the BYTES behind an
+   * image path the transcript named (a Read/Write tool input, or a photo the
+   * phone itself uploaded), so a turn view can render a thumbnail instead of a
+   * filename.
+   *
+   * Same gate, same tag as `/turns` and `/turns/block`: `--allow-transcript`
+   * already grants "file contents the agent read", and a separate flag would
+   * make the operator arm the same reading twice.
+   *
+   * The boundary is `meta.spawnCwd` ∪ `deps.uploadsDir`, and IT IS
+   * `meta.spawnCwd`, NOT `meta.cwd`, for the reason spelled out on
+   * handleSessionDiff: `meta.cwd` follows OSC 7, so any process inside the pane
+   * can move it with three bytes of terminal output and aim this route at the
+   * whole home directory. A record with no `spawnCwd` leaves the uploads
+   * directory as the only root; with neither there is nothing to serve.
+   * Outside the roots, the one path served is a file the pane's agent sent
+   * with `SendUserFile` — see `sentFileTarget`.
+   *
+   * Everything a caller could use to map the disk answers 404 `image not
+   * found` — outside the boundary, missing, a directory, unreadable. A 403 for
+   * "outside" would confirm the path exists.
+   */
+  private async handleSessionTurnImage(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    sessionId: string,
+    principal: WebPrincipal,
+  ): Promise<void> {
+    res.setHeader('Cache-Control', 'no-store');
+    if (this.opts?.allowTranscript !== true) {
+      this.json(res, 403, {
+        error: 'transcript-disabled: server started without --allow-transcript',
+        detail: 'restart with: wmux web --allow-transcript <your other flags>',
+      });
+      return;
+    }
+    const managed = this.readableSession(sessionId);
+    if (!managed) {
+      this.json(res, 404, { error: 'session not found' });
+      return;
+    }
+
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const raw = url.searchParams.get('path');
+    // Absolute only, and a NUL is refused rather than truncated: Node throws on
+    // one anyway, and refusing here keeps "what this route accepts" readable.
+    if (raw === null || raw.trim() === '' || raw.includes('\0') || !path.isAbsolute(raw)) {
+      this.json(res, 400, {
+        error: 'bad-image-ref',
+        detail: 'path must be an absolute filesystem path',
+      });
+      return;
+    }
+
+    const roots = [managed.meta.spawnCwd, this.deps.uploadsDir].filter(
+      (dir): dir is string => typeof dir === 'string' && dir.length > 0,
+    );
+
+    // Set only when the path resolves inside a root.
+    let real: string | null = null;
+    if (roots.length > 0) {
+      let resolved: string | null;
+      try {
+        resolved = await fs.promises.realpath(raw);
+      } catch {
+        // Missing, or a link that does not resolve — indistinguishable from
+        // "outside the boundary" on purpose.
+        resolved = null;
+      }
+      // BOTH sides resolved: `/tmp` is a symlink to `/private/tmp` on macOS, so a
+      // raw root would reject every file under it. And the containment test is
+      // `path.relative`, never a string prefix — `/a/b` is not a prefix test away
+      // from swallowing `/a/bc`.
+      for (const root of resolved === null ? [] : roots) {
+        let realRoot: string;
+        try {
+          realRoot = await fs.promises.realpath(root);
+        } catch {
+          continue;
+        }
+        const rel = path.relative(realRoot, resolved as string);
+        if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) continue;
+        real = resolved;
+        break;
+      }
+    }
+    // Outside the roots, a file the pane's agent sent with SendUserFile is the
+    // one other path served. Unlisted, expired and missing all get the same 404.
+    const sent = real === null ? await this.sentFileTarget(sessionId, raw) : null;
+    if (sent) real = sent.real;
+    if (real === null) {
+      this.json(res, 404, { error: 'image not found' });
+      return;
+    }
+
+    // Past the boundary check, everything else reads through ONE handle. A
+    // second path lookup here is a window in which the file under an allowed
+    // path becomes a symlink to somewhere else, or a small file becomes a large
+    // one after the size gate has passed.
+    // `openResolvedFile` re-checks what it opened instead of trusting
+    // O_NOFOLLOW/O_NONBLOCK, which Node does not have on win32 (#1434); its
+    // doc says what that covers and what it does not. Every refusal is the
+    // same 404.
+    const handle = await openResolvedFile(real);
+    if (!handle) {
+      this.json(res, 404, { error: 'image not found' });
+      return;
+    }
+    try {
+      const stat = await handle.stat();
+      // A sent file must not have been written after the call that sent it.
+      if (!stat.isFile() || (sent && stat.mtimeMs > sent.sentAt + SENT_FILE_CLOCK_SKEW_MS)) {
+        this.json(res, 404, { error: 'image not found' });
+        return;
+      }
+      if (stat.size > MAX_TURN_IMAGE_BYTES) {
+        // No exact size in the answer: the cap is the only number a caller
+        // learns, never how big the thing behind the path really is.
+        this.json(res, 413, {
+          error: 'image-too-large',
+          detail: `the cap is ${MAX_TURN_IMAGE_BYTES} bytes`,
+        });
+        return;
+      }
+      const head = Buffer.alloc(IMAGE_MAGIC_BYTES);
+      const { bytesRead } = await handle.read(head, 0, IMAGE_MAGIC_BYTES, 0);
+      // The BYTES decide, never the extension: a phone asked to render a text
+      // file named `.png` shows a broken thumbnail, and `nosniff` plus a wrong
+      // Content-Type is how a non-image gets a chance to be something else.
+      const contentType = sniffImageContentType(head.subarray(0, bytesRead));
+      if (!contentType) {
+        this.json(res, 415, {
+          error: 'not-an-image',
+          detail: 'leading bytes are not PNG, JPEG, GIF or WebP',
+        });
+        return;
+      }
+      // Bounded by the size the gate saw, never "to EOF": holding the handle
+      // does not freeze the file, and a pane process appending to it between
+      // the stat and here would otherwise be buffered whole. One extra byte
+      // probed past that size says whether it grew — then it is over the cap
+      // by definition of what the gate approved.
+      const body = Buffer.allocUnsafe(stat.size);
+      let filled = 0;
+      while (filled < body.length) {
+        const { bytesRead } = await handle.read(body, filled, body.length - filled, filled);
+        if (bytesRead === 0) break;
+        filled += bytesRead;
+      }
+      const probe = await handle.read(Buffer.alloc(1), 0, 1, body.length);
+      if (probe.bytesRead > 0) {
+        this.json(res, 413, {
+          error: 'image-too-large',
+          detail: `the cap is ${MAX_TURN_IMAGE_BYTES} bytes`,
+        });
+        return;
+      }
+      if (filled < body.length) {
+        // Shrank under us — what the gate approved is not what is there.
+        this.json(res, 404, { error: 'image not found' });
+        return;
+      }
+      if (sent) this.auditSentFile(principal, sessionId, sent.name, stat.size);
+      res.writeHead(200, {
+        'Content-Type': contentType,
+        ...this.securityHeaders(),
+        'Content-Length': String(body.length),
+      });
+      // Respect response backpressure instead of ending with an 8 MB chunk.
+      const source = Readable.from((function* () {
+        for (let offset = 0; offset < body.length; offset += 64 * 1024) yield body.subarray(offset, offset + 64 * 1024);
+      })());
+      res.once('close', () => source.destroy());
+      source.pipe(res);
+    } catch {
+      // A read that fails after the handle opened (permissions, a device that
+      // went away) is the same answer as a file that was never there. Unless
+      // the 200 was already on the wire — then a JSON body would throw
+      // ERR_HTTP_HEADERS_SENT on top, and the honest end is to cut the socket.
+      if (res.headersSent) {
+        res.destroy();
+      } else {
+        this.json(res, 404, { error: 'image not found' });
+      }
+    } finally {
+      await handle.close().catch(() => { /* already gone — nothing to release */ });
+    }
+  }
+
+  /**
+   * `GET /api/sessions/:id/turns/file?path=<absolute>` — the bytes behind a
+   * path the transcript named, for the files a phone can play as well as the
+   * ones it can render: everything `/turns/image` serves, plus the ISO BMFF
+   * video containers an agent produces.
+   *
+   * A deliberate COPY of `handleSessionTurnImage`'s gate, not a shared helper
+   * it was rewired to call. Shipped phone builds depend on that route, and the
+   * contract this one was written to (wmux-ios, 2026-09-20) asks in as many
+   * words that it not be touched; refactoring it to reach a new abstraction is
+   * a change to it, whatever the diff says about behaviour. The one shared
+   * piece is the open itself, `openResolvedFile`: #1434 asked for both routes
+   * to change together, and two copies of that check could drift apart.
+   *
+   * Every piece of the boundary is load-bearing here for the reasons spelled
+   * out on that handler: the roots are `meta.spawnCwd` ∪ `deps.uploadsDir` and
+   * NOT `meta.cwd` (OSC 7 lets any process in the pane move that one), both
+   * sides are realpath'd, containment is `path.relative` and never a string
+   * prefix, and ONE handle carries the request from the gate to the last byte.
+   * The `SendUserFile` addition (`sentFileTarget`) applies here as there.
+   *
+   * Two things differ from the image route, both forced by the size this one
+   * accepts:
+   *
+   * - The bytes are STREAMED. A 128 MB cap with `Buffer.allocUnsafe(size)`
+   *   behind it is a single request that can hold 128 MB.
+   * - The type is sniffed BEFORE the cap is applied, because the cap depends on
+   *   it. A consequence worth naming: a 200 MB text file is refused as
+   *   `unsupported-type`, not `file-too-large`.
+   */
+  private async handleSessionTurnFile(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    sessionId: string,
+    principal: WebPrincipal,
+  ): Promise<void> {
+    res.setHeader('Cache-Control', 'no-store');
+    if (this.opts?.allowTranscript !== true) {
+      this.json(res, 403, {
+        error: 'transcript-disabled: server started without --allow-transcript',
+        detail: 'restart with: wmux web --allow-transcript <your other flags>',
+      });
+      return;
+    }
+    const managed = this.readableSession(sessionId);
+    if (!managed) {
+      this.json(res, 404, { error: 'session not found' });
+      return;
+    }
+
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const raw = url.searchParams.get('path');
+    if (raw === null || raw.trim() === '' || raw.includes('\0') || !path.isAbsolute(raw)) {
+      this.json(res, 400, {
+        error: 'bad-file-ref',
+        detail: 'path must be an absolute filesystem path',
+      });
+      return;
+    }
+
+    const roots = [managed.meta.spawnCwd, this.deps.uploadsDir].filter(
+      (dir): dir is string => typeof dir === 'string' && dir.length > 0,
+    );
+
+    let real: string | null = null;
+    if (roots.length > 0) {
+      let resolved: string | null;
+      try {
+        resolved = await fs.promises.realpath(raw);
+      } catch {
+        resolved = null;
+      }
+      for (const root of resolved === null ? [] : roots) {
+        let realRoot: string;
+        try {
+          realRoot = await fs.promises.realpath(root);
+        } catch {
+          continue;
+        }
+        const rel = path.relative(realRoot, resolved as string);
+        if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) continue;
+        real = resolved;
+        break;
+      }
+    }
+    // The SendUserFile addition, exactly as on the image route.
+    const sent = real === null ? await this.sentFileTarget(sessionId, raw) : null;
+    if (sent) real = sent.real;
+    if (real === null) {
+      this.json(res, 404, { error: 'file not found' });
+      return;
+    }
+
+    const handle = await openResolvedFile(real);
+    if (!handle) {
+      this.json(res, 404, { error: 'file not found' });
+      return;
+    }
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || (sent && stat.mtimeMs > sent.sentAt + SENT_FILE_CLOCK_SKEW_MS)) {
+        this.json(res, 404, { error: 'file not found' });
+        return;
+      }
+      // A sent file may also be WebM, whose DocType sits past the first 16 bytes.
+      const headBytes = sent ? SENT_FILE_MAGIC_BYTES : IMAGE_MAGIC_BYTES;
+      const head = Buffer.alloc(headBytes);
+      const { bytesRead } = await handle.read(head, 0, headBytes, 0);
+      // The BYTES decide, never the extension — and before the cap, because
+      // which cap applies is a fact about the type.
+      const contentType = sent
+        ? sniffSentFileContentType(head.subarray(0, bytesRead))
+        : sniffTurnFileContentType(head.subarray(0, bytesRead));
+      if (!contentType) {
+        this.json(res, 415, {
+          error: 'unsupported-type',
+          detail: sent
+            ? 'leading bytes are not PNG, JPEG, GIF, WebP, MP4, QuickTime or WebM'
+            : 'leading bytes are not PNG, JPEG, GIF, WebP, MP4 or QuickTime',
+        });
+        return;
+      }
+      const cap = contentType.startsWith('video/') ? MAX_TURN_VIDEO_BYTES : MAX_TURN_IMAGE_BYTES;
+      if (stat.size > cap) {
+        // The cap is the only number a caller learns, never how big the thing
+        // behind the path really is.
+        this.json(res, 413, {
+          error: 'file-too-large',
+          detail: `the cap is ${cap} bytes`,
+        });
+        return;
+      }
+
+      // Content-Length before the first byte: the phone's progress bar reads
+      // it, and it is the size the gate approved rather than whatever the file
+      // turns out to be — the two checks after the stream are what reconcile
+      // them.
+      res.writeHead(200, {
+        'Content-Type': contentType,
+        ...this.securityHeaders(),
+        'Content-Length': String(stat.size),
+      });
+      // `autoClose: false` or the stream closes the handle at 'end', and the
+      // probe below — which is the whole point of holding one handle — would
+      // read from a closed descriptor on every SUCCESSFUL transfer.
+      const stream = handle.createReadStream({
+        start: 0,
+        end: stat.size - 1,
+        autoClose: false,
+      });
+      // `pipe` unpipes when the response closes but never destroys its source,
+      // so a phone that leaves mid-download would otherwise leave the wait
+      // below pending for ever with the handle still held. Destroying turns the
+      // walk-out into a rejection the catch already answers.
+      const abort = (): void => {
+        stream.destroy();
+      };
+      res.once('close', abort);
+      // And 'close' may ALREADY have fired: every step of the gate above is an
+      // await, and a phone on a slow link can be gone before the first byte.
+      // A listener registered after the event never runs, and `res.write` on a
+      // destroyed response does not throw — it returns false, so `pipe` parks
+      // the source waiting for a 'drain' that is never coming and the wait
+      // below never settles. The handle would be held for the life of the
+      // daemon. Checking once, here, is what closes that window.
+      if (res.destroyed) {
+        stream.destroy();
+        return;
+      }
+      try {
+        // `{ end: false }`: whether this response gets a clean end or a cut
+        // socket is decided by the probe, and pipe's default would have ended
+        // it before the question was asked.
+        stream.pipe(res, { end: false });
+        await finished(stream);
+      } finally {
+        res.off('close', abort);
+      }
+      if (res.destroyed) return;
+      // A file that SHRANK sends fewer bytes than the Content-Length already
+      // promised, and a client holding that promise waits for a remainder that
+      // is never coming. The header is long gone, so there is no JSON left to
+      // answer with: cutting the socket is the honest end, and the buffered
+      // route says the same thing with its 404 on `filled < body.length`.
+      if (stream.bytesRead !== stat.size) {
+        res.destroy();
+        return;
+      }
+      // GROWTH needs nothing, and this is the one place the shape of this route
+      // differs from what the contract sketched. The stream is bounded by
+      // `end: stat.size - 1`, so bytes the gate never approved cannot ride out
+      // behind the ones it did — the prefix that went out IS the whole response
+      // its Content-Length promised. Cutting the socket on a grown file, as the
+      // sketch had it, cannot reach the client as a failure (it already has
+      // every byte the header announced) and lands instead on whatever is still
+      // in the userland buffer: the same good response, truncated or not,
+      // depending on timing. A probe whose only possible action is to corrupt a
+      // correct answer is not a guard, so there is no probe.
+      // A sent file is audited once every byte promised has gone out.
+      if (sent) this.auditSentFile(principal, sessionId, sent.name, stat.size);
+      res.end();
+    } catch {
+      if (res.headersSent) {
+        res.destroy();
+      } else {
+        this.json(res, 404, { error: 'file not found' });
+      }
+    } finally {
+      await handle.close().catch(() => { /* already gone — nothing to release */ });
+    }
+  }
+
+  /**
+   * Where to open `raw` when the transcript bound to this pane says its agent
+   * sent that exact path to the user with `SendUserFile` (successfully, under
+   * 24 hours ago), with the call's time — or null.
+   *
+   * The match is on `raw` as the request spelled it, byte for byte against the
+   * transcript's `input.files[]`; `sentFileParts` separately refuses `.`/`..`
+   * segments and doubled separators. Only the PARENT is resolved: the last
+   * component is opened as named, so `openResolvedFile` refuses it when it is a
+   * symlink and checks the handle is the regular file it looked up.
+   *
+   * The binding is read again after the scan: a `session_start` (or a rebind)
+   * that landed while it ran means the list read belongs to a session the
+   * pane no longer shows, and nothing is served.
+   */
+  private async sentFileTarget(
+    sessionId: string,
+    raw: string,
+  ): Promise<{ real: string; name: string; sentAt: number } | null> {
+    const parts = sentFileParts(raw);
+    if (!parts) return null;
+    const projector = this.deps.projector?.() ?? null;
+    const before = projector?.sentFileBinding(sessionId) ?? null;
+    if (!projector || !before) return null;
+    const sentAt = await this.sentFiles.sentAt(before.transcriptPath, raw, this.now());
+    if (sentAt === null) return null;
+    const after = projector.sentFileBinding(sessionId);
+    if (
+      !after ||
+      after.transcriptPath !== before.transcriptPath ||
+      after.agentSessionId !== before.agentSessionId ||
+      after.generation !== before.generation
+    ) {
+      return null;
+    }
+    try {
+      return { real: path.join(await fs.promises.realpath(parts.dir), parts.name), name: parts.name, sentAt };
+    } catch {
+      return null;
+    }
+  }
+
+  /** One device-audit line for a served sent file: never the full path. */
+  private auditSentFile(principal: WebPrincipal, sessionId: string, name: string, bytes: number): void {
+    try {
+      this.deps.auditSentFile?.({
+        deviceId: principal.kind === 'device' ? principal.deviceId : '',
+        sessionId,
+        file: name,
+        bytes,
+      });
+    } catch {
+      // Best-effort, like every other audit line.
+    }
+  }
+
   private handleSessionResize(
     req: http.IncomingMessage,
     res: http.ServerResponse,
     rawId: string,
+    principal: WebPrincipal,
   ): void {
     const id = decodePathSegment(rawId);
     if (id === null) return this.json(res, 404, { error: 'session not found' });
-    const managed = this.deps.sessionManager.getSession(id);
+    const managed = this.attachableSession(principal, id);
     if (!managed) return this.json(res, 404, { error: 'session not found' });
 
     this.readJsonBody(req, res, (body) => {
@@ -2203,7 +5949,7 @@ export class WebTerminalServer {
       // Re-read rather than trusting the lookup above: the body arrives over
       // however many TCP segments it takes, and a pane can die or be attached
       // by the desk in between.
-      const current = this.deps.sessionManager.getSession(id);
+      const current = this.attachableSession(principal, id);
       if (!current) return this.json(res, 404, { error: 'session not found' });
       if (current.meta.state === 'attached' && current.viewerVisible) {
         return this.json(res, 409, {
@@ -2221,6 +5967,8 @@ export class WebTerminalServer {
       // interleaved with output painted for a different width — permanently,
       // because scrollback is not re-flowable. The route's claim that it only
       // changes two numbers is only true once that handshake has happened.
+      // Opening the pane's stream (or typing into it) activates it at the saved
+      // geometry, so this only answers a resize sent before either.
       if (current.deferred) {
         return this.json(res, 409, {
           error: 'resize-failed',
@@ -2316,10 +6064,24 @@ export class WebTerminalServer {
    * only differently revocable, so gating on the credential FORM rather than on
    * the server's input policy would be a boundary that is not one.
    */
+  private async agentOptionsForWorkspace(workspaceId: string, account?: ResolvedPaneAccount): Promise<AgentLaunchOptions[]> {
+    if (!this.deps.agentLaunchOptions) throw new Error('Agent launch unavailable');
+    if (!workspaceId) return this.deps.agentLaunchOptions();
+    // Bridge failures surface as DesktopPhoneError / PaneAccountRefusalError
+    // (see paneAccountFailure). A chosen account's vendor binding is skipped.
+    const resolved = await resolveWorkspaceAccountKeys(workspaceId, this.availableDesktop(), account?.vendor);
+    const env = {...process.env};
+    delete env.CODEX_HOME;
+    if (resolved.CODEX_HOME !== undefined) env.CODEX_HOME = resolved.CODEX_HOME;
+    // A per-pane account replaces its own vendor's key only; the catalog is that account's.
+    return this.deps.agentLaunchOptions(account ? applyPaneAccount(env, account) : env);
+  }
+
   private handleSessionCreate(
     req: http.IncomingMessage,
     res: http.ServerResponse,
     principal: WebPrincipal,
+    url: URL,
   ): void {
     if (!this.mayInput(principal)) {
       return this.refuseInput(
@@ -2332,25 +6094,112 @@ export class WebTerminalServer {
     if (!lifecycle) return this.json(res, 503, { error: 'lifecycle unavailable' });
 
     this.readJsonBody(req, res, (body) => {
-      const b = (body ?? {}) as { workspaceId?: unknown; cwd?: unknown };
+      void (async () => {
+      // The entry check saw the credential as it was when the HEADERS arrived.
+      // Re-check it now that the body is in, BEFORE anything is looked up for
+      // this caller: a device revoked while its body trickled in must not learn
+      // whether an account id exists.
+      const stillAuthorized = async () => {
+        const now = await this.authenticate(req,url,false).catch(() => ({ok:false as const}));
+        return now.ok && this.mayInput(now.principal);
+      };
+      const fresh = await this.authenticate(req,url,false).catch(() => ({ok:false as const}));
+      if (!fresh.ok) return this.json(res,401,{error:'authorization-expired'});
+      if (!this.mayInput(fresh.principal)) return this.refuseInput(res,fresh.principal,'Input permission changed');
+      const caller = fresh.principal;
+      const b = (body ?? {}) as { workspaceId?: unknown; cwd?: unknown; agentLaunch?: unknown; accountId?: unknown; handoffFrom?: unknown };
       const workspaceId = typeof b.workspaceId === 'string' ? b.workspaceId.trim() : '';
       const cwd = typeof b.cwd === 'string' ? b.cwd.trim() : '';
+      // Contract v-next item 4. The account list needs transcript access, so
+      // naming one does too; checked before the shape so a caller without the
+      // grant learns nothing about accounts.
+      if (b.accountId !== undefined && this.opts?.allowTranscript !== true) return this.refuseTranscript(res);
+      const lineage = parsePaneAccountFields({ ...(b as Record<string, unknown>), workspaceId });
+      if (!lineage.ok) return this.json(res, 400, { error: lineage.error, effect: 'none' });
       if (workspaceId) {
-        const bad = this.rejectWorkspaceId(workspaceId, principal);
+        const bad = this.rejectWorkspaceId(workspaceId, caller);
         if (bad) return this.json(res, 400, bad);
       }
+      let account: ResolvedPaneAccount | undefined;
+      if (lineage.value.accountId) {
+        const chosen = await resolvePaneAccount(this.availableDesktop(), workspaceId, lineage.value.accountId);
+        // The lookup was a round trip: answer only a caller that still holds the grant.
+        if (!await stillAuthorized()) return this.json(res,401,{error:'authorization-expired'});
+        if (!chosen.ok) return this.json(res, chosen.refusal.status, chosen.refusal.body);
+        account = chosen.account;
+      }
+      let agentLaunch: AgentLaunchChoice | undefined;
+      if (b.agentLaunch !== undefined) {
+        if (!this.deps.agentLaunchOptions) return this.json(res,400,{error:'agent-launch-unavailable'});
+        if (!b.agentLaunch || typeof b.agentLaunch !== 'object' || Array.isArray(b.agentLaunch)) return this.json(res,400,{error:'invalid-agent-launch'});
+        // Any agent other than the account's vendor, not only the other known
+        // one. The vendor is not echoed: the phone already knows which account it picked.
+        if (account && (b.agentLaunch as { agent?: unknown }).agent !== account.vendor) {
+          return this.json(res, 400, { error: 'account-vendor-mismatch', effect: 'none' });
+        }
+        let options: AgentLaunchOptions[];
+        try { options = await this.agentOptionsForWorkspace(workspaceId, account); }
+        catch (error) {
+          const failure = paneAccountFailure(error);
+          if (!await stillAuthorized()) return this.json(res,401,{error:'authorization-expired'});
+          return failure ? this.json(res, failure.status, failure.body) : this.json(res,503,{error:'agent-launch-unavailable'});
+        }
+        try {
+          buildAgentLaunch(b.agentLaunch, options);
+          const requested = b.agentLaunch as AgentLaunchChoice;
+          agentLaunch = {agent:requested.agent,...(requested.model !== undefined ? {model:requested.model} : {}),...(requested.effort !== undefined ? {effort:requested.effort} : {})};
+        } catch { return this.json(res,400,{error:'invalid-agent-launch'}); }
+      }
+      // The desktop agent-options round trip came after the check above.
+      if (!await stillAuthorized()) return this.json(res,401,{error:'authorization-expired'});
+      // A cwd the shell cannot enter does not fail the spawn: the child exits
+      // at once and the caller got a 201 for a dead pane. Refuse it up front
+      // (the phone offers "open in home" instead). After the re-check above,
+      // so a caller that just lost its grant learns nothing about the disk.
+      if (cwd && await cwdUnusable(cwd)) return this.json(res, 400, { error: 'cwd-not-found', effect: 'none' });
+      const handoffFrom = lineage.value.handoffFrom ? await verifyHandoff(lineage.value.handoffFrom, {
+        readable: (id) => {
+          const source = this.attachableSession(caller, id);
+          return !!source && source.meta.state !== 'dead' && source.meta.state !== 'suspended';
+        },
+        allowTranscript: this.opts?.allowTranscript === true,
+        currentConversation: async (id) => {
+          const chat = this.deps.chat?.() ?? null;
+          return chat ? resolutionAgentSessionId(await chat.resolve(id)) : undefined;
+        },
+        now: () => this.now(),
+      }) : undefined;
       lifecycle
-        .create({ ...(workspaceId ? { workspaceId } : {}), ...(cwd ? { cwd } : {}) })
+        // The same question again at the spawn itself: `create` has its own
+        // awaits after this point, and this check is the last one before a PTY.
+        .create({
+          ...(workspaceId ? { workspaceId } : {}), ...(cwd ? { cwd } : {}), ...(agentLaunch ? {agentLaunch} : {}),
+          ...(account ? { account } : {}), ...(handoffFrom ? { handoffFrom } : {}),
+          authorized: stillAuthorized,
+        })
         .then(({ id }) => {
           // One serializer: the new pane is described by the SAME projection
           // `GET /api/sessions` uses, so a client can append the response to
           // its list without a second shape to keep in step. A create that
           // somehow left nothing live is reported rather than faked.
-          const row = this.listSessions().find((s) => s.id === id);
+          const row = this.listSessions(caller).find((s) => s.id === id);
           if (!row) return this.json(res, 500, { error: 'created session is not live' });
-          return this.json(res, 201, row);
+          return this.json(res, 201, {
+            ...row,
+            ...(handoffFrom ? this.handoffRow(handoffFrom, caller) : {}),
+            // Echoed so the phone can confirm the account was honoured.
+            ...(lineage.value.accountId ? { accountId: lineage.value.accountId } : {}),
+          });
         })
         .catch((err: unknown) => {
+          // The grant went away while the create was preparing. Not the
+          // operator's situation — the caller's — so it answers like the
+          // pre-spawn re-check above, not like a refused create.
+          if (err instanceof SessionAuthorizationExpiredError) return this.json(res,401,{error:'authorization-expired'});
+          // The desktop went away or failed mid-create, or an account check
+          // refused at the spawn: typed, and nothing was created.
+          const failure = paneAccountFailure(err);
+          if (failure) return this.json(res, failure.status, failure.body);
           // The daemon refuses a create for reasons that are the operator's
           // situation, not a bug: the session cap, memory pressure, a shutdown
           // in flight. 409 says "not now" and carries the daemon's own wording,
@@ -2358,7 +6207,14 @@ export class WebTerminalServer {
           this.deps.log('warn', `[web] session create failed: ${errMsg(err)}`);
           return this.json(res, 409, { error: 'create-failed', detail: errMsg(err) });
         });
+      })().catch(() => this.json(res,503,{error:'agent-launch-unavailable'}));
     });
+  }
+
+  /** A lineage as this caller may see it on a row (see `handoffRowOf`). */
+  private handoffRow(value: unknown, principal: WebPrincipal | undefined) {
+    return handoffRowOf(value, this.opts?.allowTranscript === true,
+      (id) => principal !== undefined && this.attachableSession(principal, id) !== undefined);
   }
 
   /**
@@ -2447,7 +6303,7 @@ export class WebTerminalServer {
 
     const id = decodePathSegment(rawId);
     if (id === null) return this.json(res, 404, { error: 'session not found' });
-    if (!this.deps.sessionManager.getSession(id)) {
+    if (!this.attachableSession(principal, id)) {
       return this.json(res, 404, { error: 'session not found' });
     }
     lifecycle
@@ -2467,6 +6323,13 @@ export class WebTerminalServer {
           this.livenessTimers.delete(id);
         }
         this.pendingLiveness.delete(id);
+        // ...and the `/api/sessions` snapshot state for the same pane, so a
+        // closed pane's liveness and preview are gone by the time the next
+        // list is served rather than on the poll after it. A pane that dies on
+        // its own (no DELETE) is swept by `evictClosedSessionState`.
+        this.latestLiveness.delete(id);
+        this.lastAssistantCache.delete(id);
+        this.lastAssistantReads.delete(id);
         res.writeHead(204, this.securityHeaders());
         res.end();
       })
@@ -2485,7 +6348,7 @@ export class WebTerminalServer {
     principal: WebPrincipal,
   ): void {
     const sessionId = url.searchParams.get('session') ?? '';
-    const managed = this.deps.sessionManager.getSession(sessionId);
+    const managed = this.attachableSession(principal, sessionId);
     if (!managed) {
       return this.json(res, 404, { error: 'session not found' });
     }
@@ -2497,6 +6360,9 @@ export class WebTerminalServer {
       'X-Accel-Buffering': 'no',
       ...this.securityHeaders(),
     });
+    // Headers out at once, like /api/events: a 200 is the client's "stream is
+    // live" signal, and it must not wait on the snapshot work below.
+    res.flushHeaders();
 
     // The headers are already out, so there is no status code left to send on
     // failure — but `readAll()` + `Buffer.concat` on a ring of up to 64 MB can
@@ -2564,6 +6430,13 @@ export class WebTerminalServer {
     bridge.on('exit', onExit);
     bridge.on('resize', onResize);
 
+    // A pane recovered after a daemon restart holds its output until a viewer
+    // attaches. The desk's first resize used to be the only trigger, so a pane
+    // no desktop mounts stayed silent forever. Activating here keeps the saved
+    // geometry; the held output (after the snapshot above) arrives through
+    // `onData`.
+    if (managed.deferred) this.deps.sessionManager.activateDeferred(sessionId);
+
     const stopHeartbeat = startSseHeartbeat(res);
 
     const detach = (): void => {
@@ -2615,9 +6488,27 @@ export class WebTerminalServer {
     // would pull each time. The truncation rides `meta` rather than a new event
     // name, so a cached frontend that predates it is unaffected.
     const snapshot = capSnapshot(managed.ringBuffer.readAll());
+    // The shared staleReplayResetLevel gate's inputs (src/shared/terminal),
+    // read at the same instant as the ring so they describe THIS snapshot, and
+    // from the same sources `pty.list` gives the desktop:
+    //  - commandRunning: OSC 133. `false` = the shell sits at its prompt, so
+    //    mouse/focus reporting the snapshot re-arms is a dead TUI's leftover.
+    //    Absent when the shell emits no prompt markers.
+    //  - resumeAgent: recovered this daemon boot, agent not re-detected — the
+    //    arming process is known dead (its prompt log is empty after the
+    //    restart, so commandRunning alone would say nothing). Grounds for the
+    //    mouse/focus reset only: the recovered shell is alive and owns ?2004.
+    const resume = this.deps.resumeState?.(managed.meta.id);
     const meta = this.streamMeta(managed, {
       truncated: snapshot.truncated,
       omittedBytes: snapshot.omittedBytes,
+      // The server's image switch, on the frame the client paints from: a
+      // reconnect after `wmux web --[no-]inline-images` must load or drop the
+      // image addon BEFORE it replays this snapshot, which an /api/config
+      // round trip started on open cannot guarantee (#1641).
+      inlineImages: this.opts?.inlineImages !== false,
+      ...(typeof resume?.commandRunning === 'boolean' ? { commandRunning: resume.commandRunning } : {}),
+      ...(resume?.resumeAgent ? { resumeAgent: resume.resumeAgent } : {}),
     });
     // Absolute stream offset of the window's FIRST byte. The tracker needs it
     // to decide whether the alt-screen entry is something the window already
@@ -2637,6 +6528,36 @@ export class WebTerminalServer {
 
   // --- input (opt-in) -----------------------------------------------------
 
+  /**
+   * Whether raw input must be refused because the pane shows the agent's own
+   * permission dialog (a pending `terminal_prompt` record, answered or not).
+   *
+   * A digit and Enter typed here would answer that dialog while skipping every
+   * fence `POST /api/approvals/:id` applies (capability, fingerprint, the
+   * reflex delay, one write per record, the re-read before the write), and
+   * would let a phone that cannot show the dialog approve it. So the dialog is
+   * answered through the approvals route or at the desk, never through raw
+   * input. The one carve-out is the cancel direction: a lone Esc or a lone
+   * Ctrl-C only abandons what the pane is doing, the same two keys the MCP
+   * approval block exempts.
+   *
+   * Scoped to web principals by construction: the desktop types through the
+   * pipe, never through this server.
+   */
+  private terminalPromptBlocksInput(sessionId: string, body: string): boolean {
+    if (body === '\x1b' || body === '\x03') return false;
+    // The Moa pane's own permission dialog has no approval record, so typed
+    // keys could answer it; only cancelling it (ESC / ^C above) gets through.
+    if (this.moaDialogUp(sessionId)) return true;
+    const approvals = this.deps.approvals;
+    if (!approvals) return false;
+    // A native decision is not a dialog typed keys can answer behind the
+    // fences: the agent's server judges its own input, as it does today.
+    return approvals.list().pending.some(
+      (r) => r.kind === 'terminal_prompt' && r.sessionId === sessionId && !isNativeDecision(r),
+    );
+  }
+
   private handleInput(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -2647,9 +6568,24 @@ export class WebTerminalServer {
       return this.refuseInput(res, principal, 'typing runs commands on this machine');
     }
     const sessionId = url.searchParams.get('session') ?? '';
-    const managed = this.deps.sessionManager.getSession(sessionId);
+    // Same class gate as the stream (#1388): a device must not be able to
+    // type into the orchestrator's pane either — except the Moa pane, while
+    // main vouches for it (see moaSession).
+    const managed = this.inputSession(principal, sessionId);
     if (!managed) {
       return this.json(res, 404, { error: 'session not found' });
+    }
+    const incarnation = managed.meta.incarnationId;
+    const requestID = req.headers['x-wmux-input-request-id'];
+    const afterInput = req.headers['x-wmux-input-after'];
+    if (afterInput !== undefined && (typeof afterInput !== 'string' || afterInput.length > 160 || requestID === undefined)) {
+      return this.json(res,400,{error:'invalid-input-precondition'});
+    }
+    if (requestID !== undefined && (typeof requestID !== 'string' || requestID.length > 64)) {
+      return this.json(res,400,{error:'invalid-input-request-id'});
+    }
+    if (requestID !== undefined && (!incarnation || req.headers['x-wmux-pane-incarnation'] !== incarnation)) {
+      return this.json(res,409,{error:'pane-incarnation-changed'});
     }
 
     const chunks: Buffer[] = [];
@@ -2666,14 +6602,54 @@ export class WebTerminalServer {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => {
+    req.on('end', async () => {
       if (aborted) return;
       const body = Buffer.concat(chunks).toString('utf8');
       try {
-        managed.ptyProcess.write(body);
+        const fresh = await this.authenticate(req, url, false);
+        if (!fresh.ok) return this.json(res,401,{error:'authorization-expired'});
+        if (!this.mayInput(fresh.principal)) return this.refuseInput(res,fresh.principal,'Input permission changed');
+        if (this.inputSession(fresh.principal,sessionId) !== managed || managed.meta.incarnationId !== incarnation) {
+          return this.json(res,409,{error:'pane-incarnation-changed'});
+        }
+        // Decided with the check above, before the write, so the audit line
+        // cannot be lost to a withdrawal between the write and the log.
+        const viaMoa = this.attachableSession(fresh.principal,sessionId) !== managed;
+        // Decided in the same synchronous run as the write, never earlier: the
+        // dialog can appear while the body is on the wire.
+        const promptActive = () => this.terminalPromptBlocksInput(sessionId, body);
+        const refusePrompt = () => this.json(res,409,{error:'terminal-prompt-active',effect:'none'});
+        const write = () => {
+          // Same activation as opening the stream: the reply to this input
+          // must not be held behind a recovery mute nobody will lift.
+          if (managed.deferred) this.deps.sessionManager.activateDeferred(sessionId);
+          managed.ptyProcess.write(body);
+          if (viaMoa) this.auditMoaSend(fresh.principal, sessionId, 'input');
         // A phone can paste drafts containing newlines; bridge.noteInput keeps
         // bracketed-paste bodies inert and only re-arms on a submitted CR/LF.
-        managed.bridge.noteInput?.(body);
+          managed.bridge.noteInput?.(body);
+          const revision = managed.bridge.getInputRevision?.();
+          return typeof revision === 'number' ? `${this.inputEpoch}:${revision}` : undefined;
+        };
+        if (typeof requestID === 'string') {
+          if (!this.deps.inputReceipts) return this.json(res,503,{error:'input-receipts-unavailable'});
+          const owner = fresh.principal.kind === 'device' ? `device:${fresh.principal.deviceId}` : 'operator';
+          let receipt;
+          // In the precondition, not in `write`: a refusal there journals
+          // nothing, so a retry with the same id is checked again rather than
+          // replayed as uncertain or written later without the check.
+          let promptRefused = false;
+          try {
+            receipt = this.deps.inputReceipts().execute(owner,requestID,JSON.stringify([sessionId,incarnation,afterInput ?? null]),body,write,
+              () => {
+                if (promptActive()) { promptRefused = true; return false; }
+                return afterInput === undefined || afterInput === `${this.inputEpoch}:${managed.bridge.getInputRevision?.()}`;
+              });
+          } catch { return promptRefused ? refusePrompt() : this.json(res,409,{error:'input-request-rejected'}); }
+          return this.json(res,receipt.status === 'written' ? 200 : 409,receipt);
+        }
+        if (promptActive()) return refusePrompt();
+        write();
       } catch (err) {
         return this.json(res, 500, { error: `write failed: ${errMsg(err)}` });
       }
@@ -2705,7 +6681,7 @@ export class WebTerminalServer {
    * No multipart. The daemon has no parser and is not getting one for a body
    * that is a single blob.
    */
-  private handleUpload(req: http.IncomingMessage, res: http.ServerResponse): void {
+  private handleUpload(req: http.IncomingMessage, res: http.ServerResponse, fileExtension?: string): void {
     if (this.opts?.allowUpload !== true) {
       return this.json(res, 403, {
         error: 'uploads-disabled: server started without --allow-upload',
@@ -2753,7 +6729,7 @@ export class WebTerminalServer {
     req.on('end', () => {
       if (aborted) return;
       const body = Buffer.concat(chunks);
-      const ext = sniffImageExt(body);
+      const ext = fileExtension ?? sniffImageExt(body);
       if (!ext) {
         release();
         return this.json(res, 415, {
@@ -2778,7 +6754,7 @@ export class WebTerminalServer {
         // will free space on its own.
         return this.json(res, 507, { error: 'uploads-full: quota exceeded, try again later' });
       }
-      const name = `photo-${new Date(now).toISOString().replace(/[:.]/g, '-')}-${crypto
+      const name = `${fileExtension ? 'file' : 'photo'}-${new Date(now).toISOString().replace(/[:.]/g, '-')}-${crypto
         .randomBytes(4)
         .toString('hex')}.${ext}`;
       const full = path.join(dir, name);
@@ -2877,6 +6853,261 @@ export class WebTerminalServer {
   }
 
   /**
+   * `POST /api/live-activity-registration` — where to reach this device's Live
+   * Activity, so the lock screen keeps following the daemon after iOS has
+   * stopped running the app.
+   *
+   * DEVICE ONLY, same as push registration: the operator token names no device.
+   *
+   * MERGES rather than replaces, which is the one thing a client has to know.
+   * iOS issues a push-to-start token at launch and an activity token only once
+   * an activity exists, so the two arrive in separate calls; a replace would
+   * mean each one erased the other. An omitted field is left alone. An explicit
+   * `null` removes that token — which is how the app says "the activity is
+   * over" rather than leaving the daemon pushing at a handle Apple will
+   * eventually 410.
+   *
+   * `apnsEnvironment` is registered HERE and not borrowed from the push
+   * registration: Live Activities are a separate permission, so a phone that
+   * refused notifications has no push registration to borrow from.
+   */
+  private handleLiveActivityRegistration(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    principal: WebPrincipal,
+  ): void {
+    if (principal.kind !== 'device') {
+      return this.json(res, 403, {
+        error: 'push-is-for-devices',
+        detail: 'register with the credential of the device whose activity this is',
+      });
+    }
+    const devices = this.deps.devices;
+    if (!devices?.registerLiveActivity) {
+      return this.json(res, 503, { error: 'push-unavailable' });
+    }
+    this.readJsonBody(req, res, (body) => {
+      const b = (body ?? {}) as {
+        hostID?: unknown;
+        pushToStartToken?: unknown;
+        activityToken?: unknown;
+        apnsEnvironment?: unknown;
+      };
+      // PRESENCE, not type — the same rule the push route follows and for a
+      // sharper reason here: `undefined` and `null` mean OPPOSITE things on this
+      // route ("leave it" vs "remove it"), so a field that is merely absent must
+      // never reach the store looking like an explicit null. Values are handed
+      // over raw; the store owns every allowlist.
+      let result: { ok: boolean; reason?: string };
+      try {
+        result = devices.registerLiveActivity!(principal.deviceId, {
+          ...(statesField(body, "hostID") ? { hostID: b.hostID } : {}),
+          ...(statesField(body, 'pushToStartToken')
+            ? { pushToStartToken: b.pushToStartToken }
+            : {}),
+          ...(statesField(body, 'activityToken') ? { activityToken: b.activityToken } : {}),
+          ...(statesField(body, 'apnsEnvironment')
+            ? { apnsEnvironment: b.apnsEnvironment }
+            : {}),
+        });
+      } catch (err) {
+        this.deps.log('warn', `[web] live activity registration threw: ${errMsg(err)}`);
+        return this.json(res, 500, { error: 'live-activity-registration-failed' });
+      }
+      if (result.ok) {
+        // Only a token that ADDS a way to reach the activity. A removal
+        // (`activityToken: null`) is the app saying the activity is over; re-running
+        // the decision then would start a fresh one the moment it was dismissed.
+        if (typeof b.activityToken === 'string') this.deps.liveActivityRegistered?.();
+        return this.json(res, 200, { ok: true });
+      }
+      // `bad-token` / `bad-apns-environment` are the caller's fault; the rest
+      // are ours or the operator's, and a device revoked mid-flight should hear
+      // that rather than a generic 400.
+      const status =
+        result.reason === 'bad-token' || result.reason === 'bad-apns-environment' ? 400 : 409;
+      return this.json(res, status, {
+        error: result.reason ?? 'live-activity-registration-failed',
+      });
+    });
+  }
+
+  /**
+   * The device store's management verbs, or null when any is missing. One
+   * capability, not three: see `WebDeviceResolver.list`.
+   */
+  private deviceManagement(): (WebDeviceResolver & Required<Pick<WebDeviceResolver, 'list' | 'revoke' | 'setInput'>>) | null {
+    const devices = this.deps.devices;
+    if (!devices?.list || !devices.revoke || !devices.setInput) return null;
+    return devices as WebDeviceResolver & Required<Pick<WebDeviceResolver, 'list' | 'revoke' | 'setInput'>>;
+  }
+
+  /**
+   * How much of the roster this caller sees: `all` for the operator and for a
+   * device that may type, `self` for a read-only device.
+   *
+   * A device that may type already has a shell on this machine and can read
+   * `devices.json` from it, so showing it the roster exposes nothing new. The
+   * roster is for SEEING which devices exist and when each was last seen, so
+   * the owner can revoke a lost one from the desktop (or with the operator
+   * token); a device can revoke only itself. A read-only device has no such
+   * reach, so it sees its own row and nothing about the others, not even their
+   * names.
+   */
+  private deviceScope(principal: WebPrincipal): 'all' | 'self' {
+    return principal.kind === 'operator' || this.mayInput(principal) ? 'all' : 'self';
+  }
+
+  /**
+   * `GET /api/devices` — the paired-device roster, filtered by `deviceScope`.
+   *
+   * The operator also sees revoked tombstones (the desk's history); a device
+   * with `all` scope sees only active devices, because a tombstone is nothing
+   * it can act on. Rows are built from an explicit field list, never a spread
+   * of the store's row, so nothing the store grows later (hashes, salts, push
+   * tokens) can ride along by accident.
+   */
+  private handleDeviceList(res: http.ServerResponse, principal: WebPrincipal): void {
+    const devices = this.deviceManagement();
+    if (!devices) return this.json(res, 503, { error: 'device-management-unavailable' });
+    const scope = this.deviceScope(principal);
+    let rows: WebDeviceSummary[];
+    try {
+      rows = devices.list();
+    } catch (err) {
+      this.deps.log('warn', `[web] device list failed: ${errMsg(err)}`);
+      return this.json(res, 500, { error: 'device-list-failed' });
+    }
+    const self = principal.kind === 'device' ? principal.deviceId : null;
+    const visible = rows.filter((d) => {
+      if (principal.kind === 'operator') return true;
+      if (scope === 'all') return d.revokedAt === undefined;
+      return d.deviceId === self;
+    });
+    return this.json(
+      res,
+      200,
+      {
+        devices: visible.map((d) => ({
+          deviceId: d.deviceId,
+          name: d.name,
+          pairedAt: d.createdAt,
+          lastSeenAt: d.lastSeenAt,
+          // The device's OWN stored grant. The server ceiling is reported once,
+          // in `serverGrants`, so the phone can say which of the two said no.
+          grants: { input: d.allowInput === true },
+          revoked: d.revokedAt !== undefined,
+          ...(d.revokedAt !== undefined ? { revokedAt: d.revokedAt } : {}),
+          current: d.deviceId === self,
+        })),
+        serverGrants: {
+          input: this.opts?.allowInput === true,
+          upload: this.opts?.allowUpload === true,
+          transcript: this.opts?.allowTranscript === true,
+        },
+        scope,
+      },
+      { 'Cache-Control': 'no-store' },
+    );
+  }
+
+  /**
+   * `POST /api/devices/:id/revoke` — remove a device.
+   *
+   * A device may revoke only ITSELF, and needs no input grant for it: giving
+   * up your own access is never an escalation. Any other id is refused before
+   * the roster is consulted, with one fixed body, so a device cannot learn
+   * which ids exist by probing. The operator may revoke anyone.
+   *
+   * Same ordering as the desktop RPC (persist, then cut the device's streams
+   * and tickets, then answer). On a self-revoke the response still arrives:
+   * this request is a plain HTTP exchange, not one of the SSE streams
+   * `disconnectDevice` ends.
+   */
+  private handleDeviceRevoke(res: http.ServerResponse, rawId: string, principal: WebPrincipal): void {
+    const devices = this.deviceManagement();
+    if (!devices) return this.json(res, 503, { error: 'device-management-unavailable' });
+    const deviceId = decodePathSegment(rawId) ?? '';
+    if (principal.kind === 'device' && deviceId !== principal.deviceId) {
+      return this.json(res, 403, { error: 'not-permitted' });
+    }
+    const actor: DeviceActor = principal.kind === 'operator' ? 'operator-web' : 'device-self';
+    let result: ReturnType<typeof revokeDeviceAndDisconnect>;
+    try {
+      result = revokeDeviceAndDisconnect(deviceId, devices, this, actor);
+    } catch (err) {
+      this.deps.log('warn', `[web] device revoke failed: ${errMsg(err)}`);
+      return this.json(res, 500, { error: 'device-revoke-failed' });
+    }
+    if (result.reason === 'not-found') return this.json(res, 404, { error: 'device-not-found' });
+    const closed = result.closed ?? 0;
+    return this.json(res, 200, result.ok ? { ok: true, closed } : { ok: false, reason: 'persist-failed', closed });
+  }
+
+  /**
+   * `PATCH /api/devices/:id/grants` — LOWER a device's input grant.
+   *
+   * Same caller rule as revoke (a device only on itself, refused before any
+   * lookup), and likewise no input grant needed to give one up.
+   *
+   * The answer comes from what `setInput` returns, never from the principal
+   * authenticated at the top: the body arrives over later macrotasks, and the
+   * desktop can revoke the device in between.
+   */
+  private handleDeviceGrants(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    rawId: string,
+    principal: WebPrincipal,
+  ): void {
+    const devices = this.deviceManagement();
+    if (!devices) return this.json(res, 503, { error: 'device-management-unavailable' });
+    const deviceId = decodePathSegment(rawId) ?? '';
+    if (principal.kind === 'device' && deviceId !== principal.deviceId) {
+      return this.json(res, 403, { error: 'not-permitted' });
+    }
+    const actor: DeviceActor = principal.kind === 'operator' ? 'operator-web' : 'device-self';
+    this.readJsonBody(req, res, (body) => {
+      const b = body as Record<string, unknown> | null;
+      if (
+        typeof body !== 'object' ||
+        body === null ||
+        Array.isArray(body) ||
+        Object.keys(body).length !== 1 ||
+        typeof b?.['input'] !== 'boolean'
+      ) {
+        return this.json(res, 400, { error: 'invalid-grants' });
+      }
+      // RAISING a grant is desktop-only, for the operator token too. Pairing
+      // codes are desktop-only for the same reason: the operator token travels
+      // in URLs and QR codes, a far wider leak surface than the daemon pipe the
+      // desktop uses. On a server started without --allow-input this is a real
+      // boundary; with it, it is policy — either way nothing is written.
+      if (b['input'] === true) return this.json(res, 403, { error: 'grant-escalation-desktop-only' });
+      let result: WebDeviceSetInputResult;
+      try {
+        result = devices.setInput(deviceId, false, actor);
+      } catch (err) {
+        this.deps.log('warn', `[web] device grant change failed: ${errMsg(err)}`);
+        return this.json(res, 500, { error: 'device-grant-failed' });
+      }
+      if (result.reason === 'not-found') return this.json(res, 404, { error: 'device-not-found' });
+      if (result.reason === 'revoked') return this.json(res, 409, { error: 'device-revoked' });
+      // Cut the device's streams only when its grant actually changed (whether
+      // or not the write landed — it is read-only in memory either way), or
+      // when this call retried a change that had not reached disk. A no-op
+      // PATCH must not be a way to cut a device's streams over and over
+      // without leaving an audit line.
+      if (result.changed || result.retried) this.disconnectDevice(deviceId);
+      return this.json(
+        res,
+        200,
+        result.ok ? { ok: true, grants: { input: false } } : { ok: false, reason: 'persist-failed', grants: { input: false } },
+      );
+    });
+  }
+
+  /**
    * `GET /api/approvals` — what a client needs the moment it connects: the
    * requests still waiting on a human, plus the recently settled tail.
    *
@@ -2884,9 +7115,16 @@ export class WebTerminalServer {
    * pending approval on two devices; the loser of that race gets a 409, and
    * without the settled record there is nothing to render but an error code.
    */
-  private handleApprovalsList(res: http.ServerResponse): void {
+  private handleApprovalsList(res: http.ServerResponse, principal: WebPrincipal, caps: ClientCaps): void {
     const approvals = this.deps.approvals;
     if (!approvals) return this.json(res, 503, { error: 'approvals unavailable' });
+    // What an agent's own server raised or settled with no signal shows up on
+    // a later list (its records arrive over SSE); this list is not held for it.
+    try {
+      this.deps.reconcileDecisions?.();
+    } catch (err) {
+      this.deps.log('warn', `[web] decision reconcile failed: ${errMsg(err)}`);
+    }
     let listed: { pending: ApprovalRequest[]; recentlyResolved: ApprovalRequest[] };
     try {
       listed = approvals.list();
@@ -2902,10 +7140,105 @@ export class WebTerminalServer {
     // daemon-internal, but it means adding a field to ApprovalRequest puts it
     // on the pipe and not here — deliberately, since the allowlist exists so
     // registry internals cannot reach the network by default.
+    // #1397 — the brain pane is excluded for a device, exactly as it is from
+    // `/api/sessions` and the per-pane routes. A record is refused at the
+    // producer today (`HookIngest`), so this filter should never have anything
+    // to drop; it is here because the producer is one path and this route is
+    // what a device actually reads. Same credential split as
+    // `attachableSession`: the operator's own surfaces keep the full list.
+    // #1772 — the Moa pane's own prompt is the one brain record a device sees,
+    // while main vouches for the Moa pane (see deviceBarredApproval).
+    const visible = (r: ApprovalRequest): boolean =>
+      principal.kind === 'operator' || !this.deviceBarredApproval(r.sessionId);
+    // A settled `terminal_prompt` is history only when a phone ANSWERED it
+    // (`pressedAt`: approved or declined remotely), decided from the record
+    // alone — whatever this caller is shown of it (an older client sees no
+    // question; it renders `toolName — summary`). A record the daemon
+    // replaced before anyone pressed (every key in the pane and every late
+    // parse mints one) and a card that expired when its dialog closed are not
+    // answers anyone gave from here, and filled the list with empty rows.
+    // A native decision is answered through the agent's server, with no
+    // `pressedAt`: resolved is the answer.
+    const answeredHere = (r: ApprovalRequest): boolean => r.kind !== 'terminal_prompt' || r.pressedAt !== undefined
+      || (r.channel === 'native-rpc' && r.state === 'resolved')
+      // A plan answered with feedback (stepwise keys, no `pressedAt`).
+      || (r.step?.status === 'done' && r.state === 'resolved');
+    // A Claude question form's "Other" width, from the pane's width now (the
+    // answer re-checks it against the width then).
+    const otherMaxCells = (r: ApprovalRequest): number | undefined => {
+      if (r.kind !== 'awaiting_input' || r.form?.kind !== 'questions' || r.channel !== 'fenced-keys') return undefined;
+      const managed = this.deps.sessionManager.getSession(r.sessionId);
+      return askOtherMaxWidth(managed?.ptyProcess.cols ?? managed?.meta.cols);
+    };
+    // #1772 — a Moa card first seen here (raised before this server subscribed
+    // to the registry) must still hear its close once Moa is off.
+    for (const r of listed.pending) {
+      if (this.isBrainApproval(r.sessionId) && this.moaSession(r.sessionId)) this.rememberMoaCard(r.id);
+    }
     return this.json(res, 200, {
-      pending: listed.pending.map(approvalWire),
-      recentlyResolved: listed.recentlyResolved.map(approvalWire),
+      pending: listed.pending.filter(visible).map((r) => approvalWire(this.deviceView(principal, r), caps, otherMaxCells(r))),
+      recentlyResolved: listed.recentlyResolved.filter(visible).filter(answeredHere).map((r) => approvalWire(this.deviceView(principal, r), caps)),
     });
+  }
+
+  /**
+   * Does this approval name the orchestrator brain's own pane?
+   *
+   * A BRAIN filter, not `readableSession`'s brain-or-unknown one, and for the
+   * same reason `broadcastEvent` takes the flat one (#1402): an id the manager
+   * no longer knows is a pane that closed while its record was still listed,
+   * and treating that as "brain" would hide real approvals from a device.
+   * `isBrainPty` falls back to the id prefix, so a brain pane that has already
+   * gone is still recognised without its env.
+   */
+  private isBrainApproval(sessionId: string): boolean {
+    const managed = this.deps.sessionManager.getSession(sessionId);
+    return isBrainPty({ id: sessionId, env: managed?.meta.env });
+  }
+
+  /**
+   * May a DEVICE not see or answer this pane's approvals? Every brain pane's,
+   * except the Moa pane's while main vouches for it (#1772: its own
+   * permission prompt is a `terminal_prompt` record a phone may answer). The
+   * one check for the device list, every device route and their `authorize`
+   * re-checks, so Moa switched off mid-request refuses there too.
+   */
+  private deviceBarredApproval(sessionId: string): boolean {
+    return this.isBrainApproval(sessionId) && !this.moaSession(sessionId);
+  }
+
+  /**
+   * #1772 — the record as this caller may see it. A device never presses a
+   * Moa-pane record (devicePressBarred), so it gets the informational card
+   * only — no choices, fingerprint, question, reason or decision-v2 form,
+   * plan mode included — rather than buttons that always fail.
+   */
+  private deviceView(principal: WebPrincipal, r: ApprovalRequest): ApprovalRequest {
+    if (!this.devicePressBarred(principal, r)) return r;
+    const view: Partial<ApprovalRequest> = { ...r };
+    delete view.choices;
+    delete view.promptFingerprint;
+    delete view.question;
+    delete view.reason;
+    delete view.form;
+    delete view.formFingerprint;
+    return view as ApprovalRequest;
+  }
+
+  /** A device's `authorize` verdict on the record's pane, re-read at call time. */
+  private moaAuthorizeVerdict(principal: WebPrincipal, record: ApprovalRequest): 'ok' | 'expired' {
+    return principal.kind === 'device' && this.deviceBarredApproval(record.sessionId) ? 'expired' : 'ok';
+  }
+
+  /**
+   * #1772 — may this caller not PRESS the record (answer or decline it)? A
+   * device sees the Moa pane's own prompt but never presses it until the
+   * parser binds Moa's dialog shapes (#1786); the desktop's Moa chat answers
+   * it. Asked after `deviceBarredApproval`, so a brain record a device still
+   * reaches is the Moa pane's.
+   */
+  private devicePressBarred(principal: WebPrincipal, record: ApprovalRequest): boolean {
+    return principal.kind === 'device' && this.isBrainApproval(record.sessionId);
   }
 
   /**
@@ -2939,6 +7272,7 @@ export class WebTerminalServer {
     res: http.ServerResponse,
     rawId: string,
     principal: WebPrincipal,
+    url: URL,
   ): void {
     const approvals = this.deps.approvals;
     if (!approvals) return this.json(res, 503, { error: 'approvals unavailable' });
@@ -2958,15 +7292,51 @@ export class WebTerminalServer {
     // runs the tool (arbitrary Bash, a write, a subagent), which is exactly
     // what --allow-input governs. Gate it accordingly (review: Claude).
     const record = approvals.list().pending.find((r) => r.id === id);
-    if (record?.kind === 'awaiting_permission' && !this.mayInput(principal)) {
+    // #1397 — a device may not answer the orchestrator brain's own prompt. The
+    // same 404 as an unknown id, and BEFORE the gate check below: a 403 here
+    // would confirm the record exists, which is half of what the exclusion is
+    // for. The operator path is untouched.
+    if (record && principal.kind === 'device' && this.deviceBarredApproval(record.sessionId)) {
+      return this.json(res, 404, { error: 'not-found' });
+    }
+    // Moa's own prompt: the same 501 as a record nobody can answer remotely.
+    if (record && this.devicePressBarred(principal, record)) {
+      return this.json(res, 501, { error: 'answer-in-terminal', reason: 'unsupported-shape' });
+    }
+    // The agent's own terminal dialog is answerable only by a client that
+    // declared it understands one. An older client (the shipped iOS app among
+    // them) maps 501 to "open the pane on the computer".
+    const caps = clientCaps(req);
+    // Not answerable remotely for THIS caller: no capability, or a record that
+    // was never bound and parsed whole (no fingerprint to answer against). Said
+    // before any body validation, so a capable client learns it is 501 rather
+    // than being told its (necessarily absent) fingerprint is malformed.
+    if (
+      record?.kind === 'terminal_prompt'
+      && (!caps.terminalPromptAnswer || !record.promptFingerprint || !record.choices?.length)
+    ) {
+      return this.json(res, 501, {
+        error: 'answer-in-terminal',
+        reason: caps.terminalPromptAnswer ? 'unsupported-shape' : 'no-capability',
+      });
+    }
+    // A gate approval runs the tool; a terminal-prompt answer types a key into
+    // the pane. Both need the same grant as typing.
+    // A native decision is acted on by the agent's own server: same grant.
+    if (record && needsInputGrant(record) && !this.mayInput(principal)) {
       return this.refuseInput(
         res,
         principal,
-        'approving a tool permission runs the tool — it needs the same grant as typing',
+        isNativeDecision(record)
+          ? 'answering an agent\'s own prompt acts on the agent — it needs the same grant as typing'
+          : record.kind === 'terminal_prompt'
+            ? 'answering a terminal prompt types into the pane — it needs the same grant as typing'
+            : 'approving a tool permission runs the tool — it needs the same grant as typing',
       );
     }
 
     this.readJsonBody(req, res, (body) => {
+      void (async () => {
       const decision = (body as { decision?: unknown } | null)?.decision;
       if (decision !== 'approve' && decision !== 'deny') {
         return this.json(res, 400, { error: "decision must be 'approve' or 'deny'" });
@@ -2979,29 +7349,94 @@ export class WebTerminalServer {
         && !Array.isArray(parsedBody)
         && Object.prototype.hasOwnProperty.call(parsedBody, 'choiceKey');
       const rawChoiceKey = hasChoiceKey ? parsedBody?.['choiceKey'] : undefined;
+      const terminalPrompt = record?.kind === 'terminal_prompt';
       if (hasChoiceKey && (
-        decision !== 'approve'
+        // A terminal prompt names its option with either decision; the check
+        // that the two agree is below.
+        (decision !== 'approve' && !terminalPrompt)
         || typeof rawChoiceKey !== 'string'
         || !/^\d{1,2}$/.test(rawChoiceKey)
       )) {
         return this.json(res, 400, { error: 'invalid-choice-key' });
       }
       const choiceKey = hasChoiceKey ? rawChoiceKey as string : undefined;
+      // A terminal prompt answer: `choiceKey` is authoritative, `decision` must
+      // agree with the option it names (approve ↔ plain Yes, deny ↔ plain No),
+      // and the dialog fingerprint the client was shown must ride along. The
+      // registry re-checks all of it inside its mutation link.
+      const rawFingerprint = parsedBody?.['promptFingerprint'];
+      let promptFingerprint: string | undefined;
+      if (terminalPrompt) {
+        if (typeof rawFingerprint !== 'string' || !/^[0-9a-f]{32}$/.test(rawFingerprint)) {
+          return this.json(res, 400, { error: 'invalid-prompt-fingerprint' });
+        }
+        promptFingerprint = rawFingerprint;
+        const option = record.choices?.find((c) => c.key === choiceKey);
+        if (!option || decisionForChoiceLabel(option.label) !== decision) {
+          return this.json(res, 400, { error: 'invalid-choice' });
+        }
+      }
+      // The brain exclusion and the permission-gate check before the body saw
+      // the credential as it was when the HEADERS arrived. A device revoked or
+      // narrowed while the body was on the wire must not answer, so both are
+      // applied again to a freshly resolved principal.
+      const sameCaller = (now: WebPrincipal): boolean =>
+        now.kind === 'operator'
+          ? principal.kind === 'operator'
+          : principal.kind === 'device' && now.deviceId === principal.deviceId;
+      const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+      if (!fresh.ok || !sameCaller(fresh.principal)) return this.json(res, 401, { error: 'authorization-expired' });
+      const current = approvals.list().pending.find((r) => r.id === id);
+      if (current && fresh.principal.kind === 'device' && this.deviceBarredApproval(current.sessionId)) {
+        return this.json(res, 404, { error: 'not-found' });
+      }
+      if (current && needsInputGrant(current) && !this.mayInput(fresh.principal)) {
+        return this.refuseInput(res, fresh.principal, 'Input permission changed');
+      }
+      // And once more from inside the registry's mutation link, which can queue
+      // behind other resolves and re-read the screen before it writes. The
+      // input grant matters only for a permission gate: a screen prompt stays
+      // answerable read-only (see above).
+      const authorize = async (record: ApprovalRequest): Promise<'ok' | 'expired' | 'read-only'> => {
+        const now = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+        if (!now.ok || !sameCaller(now.principal)) return 'expired';
+        if (this.moaAuthorizeVerdict(now.principal, record) === 'expired') return 'expired';
+        if (needsInputGrant(record) && !this.mayInput(now.principal)) {
+          return 'read-only';
+        }
+        return 'ok';
+      };
       approvals
         .resolve({
           id,
           decision,
-          resolvedBy: describePrincipal(principal),
+          resolvedBy: describePrincipal(fresh.principal),
           ...(choiceKey !== undefined ? { choiceKey } : {}),
+          ...(promptFingerprint !== undefined ? { promptFingerprint } : {}),
+          // Set HERE, for a capable caller only — never read from the body. A
+          // native decision takes it from any web client: a native question
+          // is answered like an AskUserQuestion, which needs no capability (a
+          // native permission without one was refused 501 above).
+          ...(caps.terminalPromptAnswer || (current && isNativeDecision(current))
+            ? { terminalPromptAnswer: TERMINAL_PROMPT_WEB_ANSWER }
+            : {}),
+          authorize,
         })
         .then((result) => {
+          if (!result.ok && result.reason === 'prompt-changed' && current) this.deps.moaPromptRefused?.(current.sessionId);
           if (result.ok) {
             // 200 with `durable:false` rather than an error: the keystroke IS in
             // the terminal, so the answer landed and the caller must not retry.
             // What did not land is the record of it — after a restart the
             // history will not show this decision or who made it. The client
             // says so instead of the daemon knowing it privately.
-            return this.json(res, 200, { state: result.request.state, durable: result.durable });
+            return this.json(res, 200, {
+              state: result.request.state,
+              // A terminal prompt answer: the key is in the pane, and the record
+              // stays pending until the dialog is seen gone.
+              ...(typeof result.request.pressedAt === 'number' ? { pressedAt: result.request.pressedAt } : {}),
+              durable: result.durable,
+            });
           }
           switch (result.reason) {
             // Someone else got there first — hand back WHO, so the loser's UI
@@ -3023,7 +7458,38 @@ export class WebTerminalServer {
             // The daemon has no keystroke map for this agent, so it refuses to
             // guess bytes. Not the caller's fault: 501, not 4xx.
             case 'unsupported-agent':
-              return this.json(res, 501, { error: 'unsupported-agent' });
+              return this.json(res, 501, { error: 'unsupported-agent', reason: 'unsupported-agent' });
+            // A terminal prompt this caller may not answer (see the registry).
+            case 'answer-in-terminal':
+              return this.json(res, 501, {
+                error: 'answer-in-terminal',
+                reason: result.answerRefusal,
+              });
+            // A multi-select or multi-question AskUserQuestion: one key cannot
+            // answer it, so nothing was typed. Same `error` a v1 client already
+            // maps to "answer on the computer"; `reason` says why.
+            case 'needs-v2':
+              return this.json(res, 501, { error: 'answer-in-terminal', reason: 'needs-v2' });
+            // The one remote answer to this terminal prompt was already typed.
+            case 'already-answered':
+              return this.json(res, 409, { error: 'already-answered' });
+            // The dialog on screen is not the one the client answered. The
+            // record may have been superseded by a fresh parse (an SSE
+            // `approval` event follows); nothing was typed.
+            case 'prompt-changed':
+              return this.json(res, 409, { error: 'prompt-changed' });
+            case 'answer-too-soon':
+              return this.json(res, 425, { error: 'answer-too-soon' });
+            case 'prompt-unverified':
+              return this.json(res, 409, { error: 'prompt-unverified', effect: 'none' });
+            // A native decision's agent server: unreachable (nothing sent,
+            // retry) or silent past the timeout (may have landed).
+            case 'agent-unavailable':
+              return this.json(res, 503, { error: 'agent-unavailable', effect: 'none' });
+            case 'answer-uncertain':
+              return this.json(res, 409, { error: 'answer-uncertain', effect: 'uncertain' });
+            case 'invalid-choice':
+              return this.json(res, 400, { error: 'invalid-choice' });
             // The choiceKey does not belong to this request or the option is not
             // visible on screen. The request is still pending — the caller can
             // retry with a valid key or use the default approve/deny.
@@ -3031,6 +7497,16 @@ export class WebTerminalServer {
               return this.json(res, 422, { error: 'invalid-choice-key' });
             case 'not-found':
               return this.json(res, 404, { error: 'not-found' });
+            // The registry's own re-check refused: same answers as the
+            // post-body check above.
+            case 'unauthorized':
+              return this.json(res, 401, { error: 'authorization-expired' });
+            case 'input-revoked':
+              return this.refuseInput(res, fresh.principal, 'Input permission changed');
+            // 503, not 401: the check could not finish, which says nothing
+            // about the credential — a 401 would send the phone to re-pair.
+            case 'authorization-unconfirmed':
+              return this.json(res, 503, { error: 'authorization-unconfirmed' });
             default: {
               // A reason this surface does not know how to map. Never silently
               // report success — say the server does not understand its own
@@ -3049,7 +7525,560 @@ export class WebTerminalServer {
             /* socket already gone */
           }
         });
+      })().catch((err: unknown) => {
+        this.deps.log('warn', `[web] approval resolve failed: ${errMsg(err)}`);
+        try {
+          this.json(res, 500, { error: 'approvals unavailable' });
+        } catch {
+          /* socket already gone */
+        }
+      });
     });
+  }
+
+  /**
+   * `GET /api/approvals/:id/detail` — the FULL command of a pending
+   * `terminal_prompt` bound to its tool call. The record carries a 200-char
+   * `summary` only: it is replicated to SSE, the push payload and
+   * approvals.json, and a command can be arbitrarily long. The phone fetches
+   * the rest here, when the user opens the card.
+   *
+   * The full command is transcript content, so it needs what reading the
+   * transcript needs — the server's `--allow-transcript` — AND what seeing
+   * the dialog's question needs — the `terminal-prompt-answer` capability.
+   * No input grant: this reads, it types nothing. The orchestrator brain's
+   * pane is a 404 for a device, like an unknown id. 404 too for a record that
+   * is settled, another kind, or was never bound (informational).
+   */
+  private handleApprovalDetail(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    rawId: string,
+    principal: WebPrincipal,
+  ): void {
+    const approvals = this.deps.approvals;
+    if (!approvals?.terminalPromptDetail) return this.json(res, 503, { error: 'approvals unavailable' });
+    if (this.opts?.allowTranscript !== true) return this.json(res, 403, { error: 'transcript-disabled' });
+    const caps = clientCaps(req);
+    if (!caps.terminalPromptAnswer && !caps.decisionV2) return this.json(res, 501, { error: 'answer-in-terminal' });
+    let id: string;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      return this.json(res, 404, { error: 'not-found' });
+    }
+    if (!id || id.includes('/')) return this.json(res, 404, { error: 'not-found' });
+    const record = approvals.list().pending.find((r) => r.id === id);
+    if (!record || record.kind !== 'terminal_prompt' || isNativeDecision(record)) {
+      return this.json(res, 404, { error: 'not-found' });
+    }
+    if (principal.kind === 'device' && this.deviceBarredApproval(record.sessionId)) {
+      return this.json(res, 404, { error: 'not-found' });
+    }
+    // `decision-v2` alone opens the plan dialog's detail (its record says `hasDetail`).
+    if (!caps.terminalPromptAnswer && record.form?.kind !== 'plan') {
+      return this.json(res, 501, { error: 'answer-in-terminal' });
+    }
+    const detail = approvals.terminalPromptDetail(id);
+    if (!detail) return this.json(res, 404, { error: 'not-found' });
+    return this.json(res, 200, detail, { 'Cache-Control': 'no-store' });
+  }
+
+  /**
+   * `POST /api/approvals/:id/decline` — cancel a `terminal_prompt` dialog with
+   * ONE Esc. Declining is the safe direction, so it is open for an
+   * informational record too (one the phone cannot answer Yes/No), but it is
+   * as atomic as an answer: the registry writes the Esc only while the record
+   * is still pending and a dialog is still active on the pane at write time,
+   * and writes nothing otherwise (409/410).
+   *
+   * Only for a client that declared `terminal-prompt-decline`, and only with
+   * the device's input grant (it types into the pane), re-checked after the
+   * body and again from inside the registry right before the write. The
+   * orchestrator brain's pane is a 404 for a device. Body: `{}` or
+   * `{"promptFingerprint":"<hex>"}` (when present it must be the record's);
+   * `decision` / `via`, if sent, must be `"deny"` / `"escape"`.
+   */
+  private handleApprovalDecline(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    rawId: string,
+    principal: WebPrincipal,
+    url: URL,
+  ): void {
+    const approvals = this.deps.approvals;
+    if (!approvals) return this.json(res, 503, { error: 'approvals unavailable' });
+    let id: string;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      return this.json(res, 404, { error: 'not-found' });
+    }
+    if (!id || id.includes('/')) return this.json(res, 404, { error: 'not-found' });
+    const find = (): ApprovalRequest | undefined => {
+      const listed = approvals.list();
+      return listed.pending.find((r) => r.id === id) ?? listed.recentlyResolved.find((r) => r.id === id);
+    };
+    const record = find();
+    if (!record || (principal.kind === 'device' && this.deviceBarredApproval(record.sessionId))) {
+      return this.json(res, 404, { error: 'not-found' });
+    }
+    // A native decision (a permission or a question) is declined by the
+    // agent's own server — never an Esc — so a decision-v2 client may too.
+    const native = isNativeDecision(record);
+    if (record.kind !== 'terminal_prompt' && !native) return this.json(res, 400, { error: 'not-a-terminal-prompt' });
+    const declineCaps = clientCaps(req);
+    if (!declineCaps.terminalPromptDecline && !(native && declineCaps.decisionV2)) {
+      return this.json(res, 501, { error: 'answer-in-terminal', reason: 'no-capability' });
+    }
+    if (!this.mayInput(principal)) {
+      return this.refuseInput(res, principal, 'declining a terminal prompt types into the pane — it needs the same grant as typing');
+    }
+    this.readJsonBody(req, res, (body) => {
+      void (async () => {
+        const parsedBody = (body ?? {}) as Record<string, unknown>;
+        if (typeof parsedBody !== 'object' || Array.isArray(parsedBody)) {
+          return this.json(res, 400, { error: 'invalid-body' });
+        }
+        if (parsedBody['decision'] !== undefined && parsedBody['decision'] !== 'deny') {
+          return this.json(res, 400, { error: "decision must be 'deny'" });
+        }
+        if (parsedBody['via'] !== undefined && parsedBody['via'] !== 'escape') {
+          return this.json(res, 400, { error: "via must be 'escape'" });
+        }
+        const rawFingerprint = parsedBody['promptFingerprint'];
+        if (rawFingerprint !== undefined && (typeof rawFingerprint !== 'string' || !/^[0-9a-f]{32}$/.test(rawFingerprint))) {
+          return this.json(res, 400, { error: 'invalid-prompt-fingerprint' });
+        }
+        const sameCaller = (now: WebPrincipal): boolean =>
+          now.kind === 'operator'
+            ? principal.kind === 'operator'
+            : principal.kind === 'device' && now.deviceId === principal.deviceId;
+        const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+        if (!fresh.ok || !sameCaller(fresh.principal)) return this.json(res, 401, { error: 'authorization-expired' });
+        const current = find();
+        if (!current || (fresh.principal.kind === 'device' && this.deviceBarredApproval(current.sessionId))) {
+          return this.json(res, 404, { error: 'not-found' });
+        }
+        if (!this.mayInput(fresh.principal)) return this.refuseInput(res, fresh.principal, 'Input permission changed');
+        // Moa's own prompt: no Esc from a device either. Refused with what the
+        // registry answers a card it cannot prove, in its order; nothing typed.
+        // A settled record goes on to the registry, which refuses it as such.
+        if (current.state === 'pending' && this.devicePressBarred(fresh.principal, current)) {
+          if (current.pressedAt !== undefined || current.step) return this.json(res, 409, { error: 'already-answered', effect: 'none' });
+          if (this.now() - current.createdAt < TERMINAL_PROMPT_MIN_ANSWER_AGE_MS) {
+            return this.json(res, 425, { error: 'answer-too-soon', effect: 'none' });
+          }
+          return this.json(res, 409, { error: 'prompt-unverified', effect: 'none' });
+        }
+        const authorize = async (r: ApprovalRequest): Promise<'ok' | 'expired' | 'read-only'> => {
+          const now = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+          if (!now.ok || !sameCaller(now.principal)) return 'expired';
+          if (this.moaAuthorizeVerdict(now.principal, r) === 'expired') return 'expired';
+          return this.mayInput(now.principal) ? 'ok' : 'read-only';
+        };
+        const result = await approvals.resolve({
+          id,
+          decision: 'deny',
+          resolvedBy: describePrincipal(fresh.principal),
+          ...(typeof rawFingerprint === 'string' ? { promptFingerprint: rawFingerprint } : {}),
+          // Set HERE, for a client that declared the capability — never read from the body.
+          terminalPromptDecline: TERMINAL_PROMPT_WEB_DECLINE,
+          authorize,
+        });
+        if (!result.ok && result.reason === 'prompt-changed') this.deps.moaPromptRefused?.(current.sessionId);
+        if (result.ok) {
+          return this.json(res, 200, {
+            state: result.request.state,
+            ...(typeof result.request.pressedAt === 'number' ? { pressedAt: result.request.pressedAt } : {}),
+            via: isNativeDecision(result.request) ? 'native' : 'escape',
+            durable: result.durable,
+          });
+        }
+        // Every refusal wrote nothing.
+        switch (result.reason) {
+          case 'already-resolved':
+            return this.json(res, 409, { error: 'already-resolved', resolvedBy: result.resolvedBy, effect: 'none' });
+          case 'already-answered':
+            return this.json(res, 409, { error: 'already-answered', effect: 'none' });
+          case 'prompt-changed':
+            return this.json(res, 409, { error: 'prompt-changed', effect: 'none' });
+          case 'prompt-unverified':
+            return this.json(res, 409, { error: 'prompt-unverified', effect: 'none' });
+          case 'answer-too-soon':
+            return this.json(res, 425, { error: 'answer-too-soon', effect: 'none' });
+          case 'expired':
+          case 'prompt-gone':
+            return this.json(res, 410, {
+              error: result.reason,
+              ...(result.request ? { state: result.request.state } : {}),
+              effect: 'none',
+            });
+          case 'answer-in-terminal':
+            return this.json(res, 501, { error: 'answer-in-terminal', reason: result.answerRefusal });
+          case 'agent-unavailable':
+            return this.json(res, 503, { error: 'agent-unavailable', effect: 'none' });
+          case 'answer-uncertain':
+            return this.json(res, 409, { error: 'answer-uncertain', effect: 'uncertain' });
+          case 'invalid-choice':
+            return this.json(res, 400, { error: 'invalid-choice' });
+          case 'not-found':
+            return this.json(res, 404, { error: 'not-found' });
+          case 'unauthorized':
+            return this.json(res, 401, { error: 'authorization-expired' });
+          case 'input-revoked':
+            return this.refuseInput(res, fresh.principal, 'Input permission changed');
+          case 'authorization-unconfirmed':
+            return this.json(res, 503, { error: 'authorization-unconfirmed' });
+          default: {
+            const reason = String(result.reason);
+            this.deps.log('warn', `[web] approval decline returned unknown reason: ${reason}`);
+            return this.json(res, 500, { error: reason });
+          }
+        }
+      })().catch((err: unknown) => {
+        this.deps.log('warn', `[web] approval decline failed: ${errMsg(err)}`);
+        try {
+          this.json(res, 500, { error: 'approvals unavailable' });
+        } catch {
+          /* socket already gone */
+        }
+      });
+    });
+  }
+
+  /** The `decision-v2` form kinds this daemon produces now; none when unknown. */
+  private decisionForms(): DecisionFormKind[] {
+    try {
+      return [...(this.deps.decisionForms?.() ?? [])];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * `POST /api/approvals/:id/answer` — a `decision-v2` answer: the form's
+   * fingerprint, the client's own `clientAnswerId`, and an action, answers or
+   * text (see decisionAnswer.ts; unknown fields are 400).
+   *
+   * Only for a client that declared `decision-v2`, always with the input
+   * grant (a v2 answer can type several keys or text), re-checked after the
+   * body and from inside the registry. The orchestrator brain's pane is a 404
+   * for a device. Every answer is journaled under `(caller, clientAnswerId)`:
+   * a retry while it runs is 202, after it the same final response again, a
+   * different body under the same id 409 `answer-id-reused`, and one that was
+   * running when the daemon stopped 409 `answer-uncertain` — never re-run.
+   *
+   * Only the forms `decisionForms` lists are answered (agent-native ones
+   * through the agent's own server); the registry refuses every other
+   * record with 501 `answer-in-terminal` / `unsupported-shape`.
+   */
+  private handleApprovalAnswer(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    rawId: string,
+    principal: WebPrincipal,
+    url: URL,
+  ): void {
+    const approvals = this.deps.approvals;
+    if (!approvals) return this.json(res, 503, { error: 'approvals unavailable' });
+    let id: string;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      return this.json(res, 404, { error: 'not-found' });
+    }
+    if (!id || id.includes('/')) return this.json(res, 404, { error: 'not-found' });
+    const find = (): ApprovalRequest | undefined => {
+      const listed = approvals.list();
+      return listed.pending.find((r) => r.id === id) ?? listed.recentlyResolved.find((r) => r.id === id);
+    };
+    // A record that is gone is NOT refused yet: its receipt may still replay
+    // (the history keeps a few records, a receipt keeps a day).
+    const record = find();
+    if (record && principal.kind === 'device' && this.deviceBarredApproval(record.sessionId)) {
+      return this.json(res, 404, { error: 'not-found' });
+    }
+    // Moa's own prompt (an ExitPlanMode form included): never from a device.
+    if (record && this.devicePressBarred(principal, record)) {
+      return this.json(res, 501, { error: 'answer-in-terminal', reason: 'unsupported-shape' });
+    }
+    if (!clientCaps(req).decisionV2) {
+      return this.json(res, 501, { error: 'answer-in-terminal', reason: 'no-capability' });
+    }
+    // Every v2 answer needs the grant (see needsInputGrant), record or not.
+    if (!this.mayInput(principal)) {
+      return this.refuseInput(res, principal, 'answering a decision acts on the agent — it needs the same grant as typing');
+    }
+    this.readJsonBody(req, res, (body) => {
+      void (async () => {
+        const parsed = parseDecisionAnswerBody(body);
+        if (!parsed.ok) return this.json(res, 400, { error: parsed.error, ...(parsed.textRefusal ? { reason: parsed.textRefusal } : {}) });
+        const answer = parsed.answer;
+        const sameCaller = (now: WebPrincipal): boolean =>
+          now.kind === 'operator'
+            ? principal.kind === 'operator'
+            : principal.kind === 'device' && now.deviceId === principal.deviceId;
+        const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+        if (!fresh.ok || !sameCaller(fresh.principal)) return this.json(res, 401, { error: 'authorization-expired' });
+        if (!this.mayInput(fresh.principal)) return this.refuseInput(res, fresh.principal, 'Input permission changed');
+        let receipts: AnswerReceiptStore;
+        try {
+          if (!this.deps.answerReceipts) return this.json(res, 503, { error: 'answer-receipts-unavailable' });
+          receipts = this.deps.answerReceipts();
+        } catch (err) {
+          this.deps.log('warn', `[web] answer receipts unavailable: ${errMsg(err)}`);
+          return this.json(res, 503, { error: 'answer-receipts-unavailable' });
+        }
+        const owner = answerOwner(fresh.principal);
+        const bodyHash = receiptHash([id, answer]);
+        const replyTo = (seen: AnswerReceiptBegin): void => {
+          switch (seen.kind) {
+            case 'in-flight':
+              return this.json(res, 202, { state: 'pending', replayed: true });
+            case 'replay':
+              return this.json(res, seen.response.status, { ...seen.response.body, replayed: true });
+            case 'reused':
+              return this.json(res, 409, { error: 'answer-id-reused', effect: 'none' });
+            case 'uncertain':
+              return this.json(res, 409, { error: 'answer-uncertain', effect: 'uncertain' });
+            case 'full':
+              return this.json(res, 429, { error: 'answer-receipts-full', effect: 'none' });
+            case 'new':
+              return undefined;
+          }
+        };
+        // The caller's own receipt first: a retry replays even after the
+        // approval itself has left the list.
+        const seen = receipts.peek(owner, answer.clientAnswerId, id, bodyHash);
+        if (seen) return replyTo(seen);
+        // A new execution needs a live record.
+        const current = find();
+        if (!current || (fresh.principal.kind === 'device' && this.deviceBarredApproval(current.sessionId))) {
+          return this.json(res, 404, { error: 'not-found' });
+        }
+        let begun: AnswerReceiptBegin;
+        try {
+          begun = await receipts.begin(owner, answer.clientAnswerId, id, bodyHash);
+        } catch (err) {
+          this.deps.log('warn', `[web] answer receipt write failed: ${errMsg(err)}`);
+          return this.json(res, 503, { error: 'answer-receipts-unavailable' });
+        }
+        if (begun.kind !== 'new') return replyTo(begun);
+        const authorize = async (r: ApprovalRequest): Promise<'ok' | 'expired' | 'read-only'> => {
+          const now = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+          if (!now.ok || !sameCaller(now.principal)) return 'expired';
+          if (this.moaAuthorizeVerdict(now.principal, r) === 'expired') return 'expired';
+          return needsInputGrant(r, 'answer') && !this.mayInput(now.principal) ? 'read-only' : 'ok';
+        };
+        let response: AnswerReceiptResponse;
+        try {
+          const result = await approvals.resolve({
+            id,
+            // Not read on the v2 path: the answer's action decides.
+            decision: 'approve',
+            resolvedBy: describePrincipal(fresh.principal),
+            // Set HERE, for a client that declared the capability — never read from the body.
+            decisionV2Answer: DECISION_V2_WEB_ANSWER,
+            decisionAnswer: answer,
+            authorize,
+          });
+          response = decisionAnswerResponse(result);
+        } catch (err) {
+          this.deps.log('warn', `[web] decision answer threw: ${errMsg(err)}`);
+          response = { status: 500, body: { error: 'internal-error' } };
+        }
+        // Only a final outcome is kept; one the caller may retry past is released.
+        const partial = response.body['effect'] === 'partial';
+        if (answerIsRetryable(response) && !partial) {
+          await receipts.release(owner, answer.clientAnswerId);
+        } else {
+          await receipts.finish(
+            owner,
+            answer.clientAnswerId,
+            response.status === 200 ? 'done' : partial ? 'partial' : response.body['effect'] === 'uncertain' ? 'uncertain' : 'refused',
+            response,
+          );
+        }
+        if (response.status === 403 && !partial) return this.refuseInput(res, fresh.principal, 'Input permission changed');
+        return this.json(res, response.status, response.body);
+      })().catch((err: unknown) => {
+        this.deps.log('warn', `[web] decision answer failed: ${errMsg(err)}`);
+        try {
+          this.json(res, 500, { error: 'approvals unavailable' });
+        } catch {
+          /* socket already gone */
+        }
+      });
+    });
+  }
+
+  // --- phone channels (contract §9) -----------------------------------------
+
+  /** `GET /api/channels` — the human workspace' observable channel list. */
+  private handleChannelsList(res: http.ServerResponse): void {
+    const channels = this.deps.channels;
+    if (!channels) return this.json(res, 503, { error: 'channels-unavailable' });
+    // Unread counts and cursors are live state: never let a cache answer for them.
+    return this.json(res, 200, channels.list(), { 'Cache-Control': 'no-store' });
+  }
+
+  /** `GET /api/channels/:id/messages?since=&limit=` — cursor-paged messages. */
+  private handleChannelsMessages(
+    res: http.ServerResponse,
+    url: URL,
+    rawId: string,
+  ): void {
+    const channels = this.deps.channels;
+    if (!channels) return this.json(res, 503, { error: 'channels-unavailable' });
+    const id = decodePathSegment(rawId);
+    if (!id) return this.json(res, 404, { error: 'not-found' });
+    const result = channels.messages(
+      id,
+      url.searchParams.get('since'),
+      url.searchParams.get('limit'),
+    );
+    if (!result.ok) {
+      return this.json(res, result.error.status, {
+        error: result.error.error,
+        ...(result.error.detail ? { detail: result.error.detail } : {}),
+      });
+    }
+    return this.json(
+      res,
+      200,
+      {
+        messages: result.messages,
+        nextSince: result.nextSince,
+        oldestRetainedSeq: result.oldestRetainedSeq,
+        ...(result.gap ? { gap: true } : {}),
+      },
+      { 'Cache-Control': 'no-store' },
+    );
+  }
+
+  /**
+   * `POST /api/channels/:id/ack` — advance the human seat's read cursor.
+   * Allowed without the input grant: marking what you read is part of reading.
+   * The body arrives after header auth, so the caller is re-authenticated in
+   * the body callback, right before the cursor moves — a device revoked while
+   * its body was in flight gets 401, not an ack.
+   */
+  private handleChannelsAck(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    url: URL,
+    principal: WebPrincipal,
+    rawId: string,
+  ): void {
+    const channels = this.deps.channels;
+    if (!channels) return this.json(res, 503, { error: 'channels-unavailable' });
+    const id = decodePathSegment(rawId);
+    if (!id) return this.json(res, 404, { error: 'not-found' });
+    // readJsonBody never calls back for a request it already answered, and it
+    // does not await the callback — so a rejection is caught here, or the
+    // request would hang with no answer.
+    this.readJsonBody(req, res, (body) => {
+      void this.ackChannel(req, res, url, principal, channels, id, body)
+        .catch((err: unknown) => this.failRequest(res, err));
+    });
+  }
+
+  private async ackChannel(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    url: URL,
+    principal: WebPrincipal,
+    channels: ChannelPhoneApi,
+    id: string,
+    body: unknown,
+  ): Promise<void> {
+    const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+    if (!fresh.ok || !sameCaller(principal, fresh.principal)) {
+      return this.json(res, 401, { error: 'authorization-expired' });
+    }
+    const result = await channels.ack(id, body);
+    if (!result.ok) {
+      return this.json(res, result.error.status, {
+        error: result.error.error,
+        ...(result.error.detail ? { detail: result.error.detail } : {}),
+      });
+    }
+    return this.json(res, 200, { lastReadSeq: result.lastReadSeq });
+  }
+
+  /**
+   * `POST /api/channels/:id/join` — take the human seat (idempotent). A write:
+   * it plants a permanent seat and an `operator-join` system message, so it
+   * needs this caller's input grant like every other write route.
+   */
+  private async handleChannelsJoin(
+    res: http.ServerResponse,
+    principal: WebPrincipal,
+    rawId: string,
+  ): Promise<void> {
+    const channels = this.deps.channels;
+    if (!channels) return this.json(res, 503, { error: 'channels-unavailable' });
+    if (!this.mayInput(principal)) {
+      return this.refuseInput(res, principal, 'Joining a channel requires input permission');
+    }
+    const id = decodePathSegment(rawId);
+    if (!id) return this.json(res, 404, { error: 'not-found' });
+    const result = await channels.join(id);
+    if (!result.ok) {
+      return this.json(res, result.error.status, {
+        error: result.error.error,
+        ...(result.error.detail ? { detail: result.error.detail } : {}),
+      });
+    }
+    return this.json(res, 200, {
+      lastReadSeq: result.lastReadSeq,
+      alreadyMember: result.alreadyMember,
+    });
+  }
+
+  /**
+   * `GET /api/approvals/:id/answer/:clientAnswerId` — the caller's OWN receipt
+   * for a v2 answer (another device's is a 404, as is an unknown id). A phone
+   * that lost the POST's response reads the outcome here instead of guessing.
+   */
+  private handleAnswerReceipt(
+    res: http.ServerResponse,
+    rawId: string,
+    rawAnswerId: string,
+    principal: WebPrincipal,
+  ): void {
+    const approvals = this.deps.approvals;
+    if (!approvals || !this.deps.answerReceipts) return this.json(res, 503, { error: 'approvals unavailable' });
+    let id: string;
+    let clientAnswerId: string;
+    try {
+      id = decodeURIComponent(rawId);
+      clientAnswerId = decodeURIComponent(rawAnswerId);
+    } catch {
+      return this.json(res, 404, { error: 'not-found' });
+    }
+    if (!id || !/^[A-Za-z0-9-]{16,128}$/.test(clientAnswerId)) return this.json(res, 404, { error: 'not-found' });
+    const listed = approvals.list();
+    const record = listed.pending.find((r) => r.id === id) ?? listed.recentlyResolved.find((r) => r.id === id);
+    if (record && principal.kind === 'device' && this.deviceBarredApproval(record.sessionId)) {
+      return this.json(res, 404, { error: 'not-found' });
+    }
+    let receipt;
+    try {
+      receipt = this.deps.answerReceipts().lookup(answerOwner(principal), clientAnswerId);
+    } catch (err) {
+      this.deps.log('warn', `[web] answer receipts unavailable: ${errMsg(err)}`);
+      return this.json(res, 503, { error: 'answer-receipts-unavailable' });
+    }
+    if (!receipt || receipt.approvalId !== id) return this.json(res, 404, { error: 'not-found' });
+    return this.json(res, 200, {
+      clientAnswerId,
+      approvalId: id,
+      state: receipt.state,
+      ...(receipt.state === 'uncertain' ? { effect: 'uncertain' } : {}),
+      ...(receipt.result ? { status: receipt.result.status, result: receipt.result.body } : {}),
+    }, { 'Cache-Control': 'no-store' });
   }
 
   /**
@@ -3062,6 +8091,7 @@ export class WebTerminalServer {
     req: http.IncomingMessage,
     res: http.ServerResponse,
     onBody: (body: unknown) => void,
+    maxBytes = MAX_JSON_BODY_BYTES,
   ): void {
     const chunks: Buffer[] = [];
     let total = 0;
@@ -3069,7 +8099,7 @@ export class WebTerminalServer {
     req.on('data', (chunk: Buffer) => {
       if (aborted) return;
       total += chunk.length;
-      if (total > MAX_JSON_BODY_BYTES) {
+      if (total > maxBytes) {
         aborted = true;
         this.json(res, 413, { error: 'payload too large' });
         req.destroy();
@@ -3116,6 +8146,34 @@ export class WebTerminalServer {
   private publishApproval(e: ApprovalEvent): void {
     if (!e || typeof e !== 'object' || !e.request) return;
     const r = e.request;
+    // #1397 — the same producer-side gate `broadcastEvent` takes, for the same
+    // reason. This fan-out is not keyed by pane and is not keyed by principal:
+    // it writes to every open stream and lands in the replayable log that
+    // `/api/events` serves, whose backlog route takes no principal. So a
+    // delivery-side filter would still leave the brain's `toolName` and
+    // `toolInputSummary` — and a brain pane id a device can then try elsewhere
+    // — sitting in the replay window. FLAT, like the liveness gate: the desk
+    // drives the brain over RPC, not this fan-out.
+    //
+    // #1772 — the Moa pane's own prompt is the exception while main vouches for
+    // the Moa pane, and a card published that way keeps its later events
+    // (press, resolve, expire, supersede) after Moa is off, so the phone that
+    // showed it can close it — and its chat badge with it.
+    const settles = e.type === 'resolve' || e.type === 'expire' || e.type === 'supersede';
+    if (this.isBrainApproval(r.sessionId)) {
+      const known = this.moaCardIds.has(r.id);
+      if (!known && !this.moaSession(r.sessionId)) return;
+      if (settles) this.moaCardIds.delete(r.id);
+      else this.rememberMoaCard(r.id);
+      if (!this.moaSession(r.sessionId)) {
+        if (settles) this.releaseMoaChatBlocked(r.sessionId);
+      } else {
+        this.scheduleChatBlockedCheck(r.sessionId);
+      }
+    } else {
+      // N3 — an approval opening or closing moves the pane's blocked state.
+      this.scheduleChatBlockedCheck(r.sessionId);
+    }
     this.publish('approval', {
       sessionId: r.sessionId,
       // NOT `id`: the envelope's own `id` is the replay cursor, and identity
@@ -3138,8 +8196,11 @@ export class WebTerminalServer {
       ...(typeof r.resolvedAt === 'number' ? { resolvedAt: r.resolvedAt } : {}),
       // #783 — gate-card fields so the phone can render what tool and what input.
       ...(r.kind === 'awaiting_permission' ? { kind: r.kind } : {}),
-      ...(r.toolName ? { toolName: r.toolName } : {}),
+      ...(r.kind !== 'terminal_prompt' && r.toolName ? { toolName: r.toolName } : {}),
       ...(r.toolInputSummary ? { toolInputSummary: r.toolInputSummary } : {}),
+      // The agent's own terminal dialog: the kind and nothing else. The nudge
+      // carries no content; the capability-aware list is where the dialog is.
+      ...(r.kind === 'terminal_prompt' ? { kind: r.kind } : {}),
     });
   }
 
@@ -3158,6 +8219,27 @@ export class WebTerminalServer {
    */
   private broadcastEvent(kind: 'critical' | 'notify', payload: { sessionId: string; event?: unknown }): void {
     if (!payload || typeof payload !== 'object') return;
+    // #1402 — the same gate `emitAgentLiveness` takes, and for the same reason.
+    // `DaemonSessionManager` re-emits `session:critical` / `session:notification`
+    // for EVERY pty, the brain included, and this fan-out is not keyed by pane:
+    // it writes to every open stream and records the entry in the replayable
+    // `attentionLog` that `/api/events` serves. So a brain pane's events reached
+    // every paired phone carrying both the pane id AND pane-authored content —
+    // the critical detector's `matchedLine`, an OSC 9/777 title and body. That
+    // is the channel through which a device learns the id the per-pane routes
+    // (#1401) now refuse; refusing it there while handing out fresh ids here
+    // closed the door and left the sign up. It has to be refused at the
+    // producer: the log behind `/api/events` is shared and its backlog route
+    // takes no principal, so a delivery-side filter would still leave brain
+    // content in the replay window.
+    //
+    // FLAT, like the liveness gate: the desk drives the brain over RPC, not this
+    // fan-out, and the pane is absent from `/api/sessions` anyway. A BRAIN
+    // filter, not `readableSession`'s brain-or-unknown one: an id the manager no
+    // longer knows is a pane that closed while its event was in flight, and
+    // dropping those would lose real signals.
+    const named = this.deps.sessionManager.getSession(payload.sessionId);
+    if (isBrainPty({ id: payload.sessionId, env: named?.meta.env })) return;
     const event = payload.event && typeof payload.event === 'object' ? (payload.event as Record<string, unknown>) : {};
     const entry = this.publish(kind, { sessionId: payload.sessionId, ...event });
 
@@ -3187,6 +8269,7 @@ export class WebTerminalServer {
    * that makes a resume ambiguous.
    */
   private publish(kind: EventKind, payload: Record<string, unknown>): AttentionEntry {
+    if (kind === 'channel.mention') this.coalesceChannelMention(payload['channelId']);
     const entry: AttentionEntry = {
       id: ++this.attentionSeq,
       at: this.now(),
@@ -3226,8 +8309,29 @@ export class WebTerminalServer {
    * phone calls `delta()` and lets the cursor checks (fileSize/boundary)
    * decide whether to append or re-snapshot, instead of the server guessing.
    */
+  /**
+   * SSE `chat.queue`: a daemon queue item changed state. Live-only like
+   * `chat.blocked`, and only to the item's owner among the pane's watchers.
+   * `/turns` `chat.queue[]` stays the authoritative state.
+   */
+  emitChatQueue(event: ChatQueueEvent): void {
+    if (!this.server || this.opts?.allowTranscript !== true) return;
+    const body = JSON.stringify({ sessionId: event.sessionId, clientMessageId: event.clientMessageId, state: event.state,
+      ...(event.reason ? { reason: event.reason } : {}), at: event.at });
+    this.deliverChatEvent(event.sessionId, () => ({ event: 'chat.queue', body }), (principal) => chatOwner(principal) === event.owner);
+  }
+
+  /** SSE `chat.cancel`: a cancel's progress changed. Live-only, only to its owner among the pane's watchers. */
+  emitChatCancel(event: ChatCancelEvent): void {
+    if (!this.server || this.opts?.allowTranscript !== true) return;
+    const body = cancelEventBody(event);
+    this.deliverChatEvent(event.sessionId, () => ({ event: 'chat.cancel', body }), (principal) => chatOwner(principal) === event.owner);
+  }
+
   emitTranscriptNudge(sessionId: string): void {
     if (this.eventClients.size === 0) return;
+    // N3 — a new transcript row can open or close an OpenCode dialog.
+    this.scheduleChatBlockedCheck(sessionId);
     // 1s coalescing per pane. The FIRST nudge of a burst arms the timer; later
     // ones in the same window are dropped on purpose (a refetch is already
     // pending, and the cursor checks on that refetch subsume later writes).
@@ -3243,6 +8347,10 @@ export class WebTerminalServer {
   private deliverTranscriptNudge(sessionId: string): void {
     const watchers = this.transcriptWatchers.get(sessionId);
     if (!watchers || watchers.size === 0) return;
+    // A device watching the Moa pane keeps its watcher entry after Moa is
+    // withdrawn; from then on it is a brain pane like any other.
+    const managed = this.deps.sessionManager.getSession(sessionId);
+    if (managed && isBrainPty({ id: sessionId, env: managed.meta.env }) && !this.moaSession(sessionId)) return;
     const body = JSON.stringify({ sessionId });
     for (const client of this.eventClients) {
       if (!watchers.has(this.watcherKey(client.principal))) continue;
@@ -3266,16 +8374,48 @@ export class WebTerminalServer {
    *     Liveness is a live signal by nature: a header state from before the
    *     reconnect is worthless, so there is nothing to replay anyway.
    *   - COALESCED per pane, keeping the newest state (see the constant).
-   *   - WATCHERS ONLY. A device that never opened this pane's turn view has no
-   *     header to feed, and its SSE channel should not carry another pane's
-   *     per-tool-call traffic.
+   *   - WATCHERS ONLY on the FLEET stream (`/api/events`). A device that never
+   *     opened this pane's turn view has no header to feed there, and its
+   *     fleet-wide channel should not carry another pane's per-tool-call
+   *     traffic. The per-pane stream is the other half (#1315): a client of
+   *     `/api/stream?session=<id>` gets this pane's state unconditionally,
+   *     minus `tool`, because it asked for that one pane by name. See
+   *     `deliverPaneLiveness`.
    *
    * Terminal states (`isTerminalLiveness`) flush immediately and cancel any
    * open window, so "waiting for you" never queues behind a stale tool name.
    */
   emitAgentLiveness(body: AgentLivenessBody): void {
-    if (this.eventClients.size === 0) return;
     const { sessionId } = body;
+    // Record BEFORE the no-subscribers bail and before coalescing: the list
+    // snapshot must be right for a phone that polls `/api/sessions` without
+    // ever holding an SSE stream open, and it wants the newest state, not the
+    // one a coalescing window happened to deliver.
+    //
+    // Gated on a session the daemon actually has. `sessionId` arrives from the
+    // hook pipe, which is not a trusted producer — a pane can write anything
+    // into it — and an ungated `set` would let a loop of invented ids grow this
+    // map for the daemon's life. A pane the manager does not know is also a
+    // pane `listSessions` would never render.
+    if (this.deps.sessionManager.getSession(sessionId)) {
+      this.recordLiveness(sessionId, body.state, body.at);
+    }
+    // #1315 — past this line the id arms a per-pane coalescing timer and ends
+    // up on a wire, so it has to name a pane a phone may be told about. It used
+    // to be inert on its own: an invented id could hold no watcher, so delivery
+    // found nobody. With the pane stream as a second sink that is no longer
+    // true, and `this.clients` is not keyed by pane — one open stream for pane A
+    // would otherwise let an id off the untrusted hook pipe reach
+    // `pendingLiveness`/`livenessTimers`, the same growth `recordLiveness` above
+    // is gated against. Same gate as the transcript routes, so the orchestrator
+    // brain's pane is refused here too.
+    if (!this.readableSession(sessionId)) return;
+    // N3 — `awaiting_input` and its end are blocked-state transitions.
+    this.scheduleChatBlockedCheck(sessionId);
+    // Both sinks, not just the fleet one (#1315): a phone on the terminal face
+    // holds a pane stream and no `/api/events` connection at all, and bailing on
+    // `eventClients` alone left it with nothing to render.
+    if (this.eventClients.size === 0 && this.clients.size === 0) return;
     if (isTerminalLiveness(body.state)) {
       const timer = this.livenessTimers.get(sessionId);
       if (timer) {
@@ -3300,6 +8440,34 @@ export class WebTerminalServer {
     }, AGENT_LIVENESS_COALESCE_MS);
     timer.unref?.();
     this.livenessTimers.set(sessionId, timer);
+  }
+
+  /**
+   * Write one pane's liveness into the `/api/sessions` snapshot, if the payload
+   * can be believed.
+   *
+   * `at` is a number off the hook pipe, and the list renders elapsed time from
+   * it, so three cases have to be handled before it is stored — all of them
+   * producing a row that reads as an agent working since a time that never
+   * happened:
+   *
+   *   - NOT A FINITE NUMBER (absent, NaN, a string that slipped the type).
+   *     Refused outright: there is no sensible stand-in, and the previous entry
+   *     is at least true.
+   *   - IN THE FUTURE. Clamped to now, which is the earliest moment the state
+   *     can actually have been observed. A clock skewed an hour forward would
+   *     otherwise pin a row at "0s" forever, and — worse — outlive the staleness
+   *     cutoff no matter how long the agent has been dead.
+   *   - OLDER THAN WHAT IS STORED. Dropped. Hook delivery is not ordered (the
+   *     pipe coalesces, retries, and interleaves panes), so an `idle` that
+   *     arrives after a later `busy` must not resurrect the earlier state.
+   */
+  private recordLiveness(sessionId: string, state: AgentLivenessState, at: number): void {
+    if (!Number.isFinite(at)) return;
+    const stamped = Math.min(at, this.now());
+    const previous = this.latestLiveness.get(sessionId);
+    if (previous && previous.at > stamped) return;
+    this.latestLiveness.set(sessionId, { state, at: stamped });
   }
 
   /**
@@ -3328,10 +8496,62 @@ export class WebTerminalServer {
 
   private deliverLiveness(body: AgentLivenessBody): void {
     const watchers = this.transcriptWatchers.get(body.sessionId);
-    if (!watchers || watchers.size === 0) return;
-    const wire = JSON.stringify(body);
-    for (const client of this.eventClients) {
-      if (!watchers.has(this.watcherKey(client.principal))) continue;
+    if (watchers && watchers.size > 0) {
+      const wire = JSON.stringify(body);
+      for (const client of this.eventClients) {
+        if (!watchers.has(this.watcherKey(client.principal))) continue;
+        try {
+          writeSse(client.res, 'agent.liveness', wire);
+        } catch {
+          /* client stream broken — its own 'close' handler cleans up */
+        }
+      }
+    }
+    this.deliverPaneLiveness(body);
+  }
+
+  /**
+   * #1315 — the same liveness state, on the pane stream the terminal face is
+   * already holding open.
+   *
+   * The fleet copy above reaches a device only after it has read that pane's
+   * `/api/sessions/:id/turns`, which is itself 403 without `--allow-transcript`.
+   * A phone that only ever opens the terminal mirror therefore never saw a
+   * liveness frame and had to infer "is it running" from a 30 s poll plus an
+   * activity window — up to ~150 s of lag on a state the daemon knew exactly.
+   *
+   * No new route, no new ticket, no new registry: the subscription IS the SSE
+   * connection, so it ends when the socket does (`handleStream`'s `close`
+   * handler removes the client from `this.clients`). That is the difference
+   * from `transcriptWatchers`, which is deliberately never undone.
+   *
+   * Scoped to the client's OWN pane, so this reaches nobody who was not already
+   * receiving that pane's raw PTY bytes on the same connection — strictly less
+   * than the stream already carries.
+   *
+   * `tool` is withheld, exactly as `livenessSummary` withholds it from
+   * `/api/sessions`: it is per-call content the pane itself chose, arriving over
+   * a hook pipe that is not a trusted producer, and widening the STATE is the
+   * point here while widening what the pane is typing is not. `agent` stays
+   * because it is the pane's identity, which `/api/sessions` already serves in
+   * its own `agent` field — this is not a second, narrower trust claim about the
+   * pipe, only about which of its fields this wire needs. The body is rebuilt
+   * field by field rather than deleted from, so a future field on
+   * `AgentLivenessBody` is opt-in rather than leaked by default.
+   *
+   * Which pane a frame may name is settled in `emitAgentLiveness`, which refuses
+   * an unknown id and the brain pane before a timer is ever armed.
+   */
+  private deliverPaneLiveness(body: AgentLivenessBody): void {
+    if (this.clients.size === 0) return;
+    const wire = JSON.stringify({
+      sessionId: body.sessionId,
+      state: body.state,
+      agent: body.agent,
+      at: body.at,
+    });
+    for (const client of this.clients) {
+      if (client.sessionId !== body.sessionId) continue;
       try {
         writeSse(client.res, 'agent.liveness', wire);
       } catch {
@@ -3365,13 +8585,38 @@ export class WebTerminalServer {
   /** Drop entries past the cap (oldest first) and anything past the TTL. */
   private evictAttention(): void {
     if (this.attentionLog.length > ATTENTION_CAP) {
-      this.attentionLog.splice(0, this.attentionLog.length - ATTENTION_CAP);
+      this.markAttentionLost(this.attentionLog.splice(0, this.attentionLog.length - ATTENTION_CAP));
     }
     const cutoff = this.now() - ATTENTION_TTL_MS;
     // Entries are appended in time order, so the expired ones are a prefix.
     let drop = 0;
     while (drop < this.attentionLog.length && this.attentionLog[drop].at < cutoff) drop += 1;
-    if (drop > 0) this.attentionLog.splice(0, drop);
+    if (drop > 0) this.markAttentionLost(this.attentionLog.splice(0, drop));
+  }
+
+  private markAttentionLost(dropped: AttentionEntry[]): void {
+    for (const e of dropped) this.attentionLostThrough = Math.max(this.attentionLostThrough, e.id);
+  }
+
+  /**
+   * Phone channel Inbox (§9) — make room for a new `channel.mention`. The
+   * channel's previous mention is superseded, not lost: the new one carries the
+   * same instruction (refetch that channel), so removing it moves no watermark.
+   * Past ATTENTION_MENTION_CAP the oldest other-channel mention is genuinely
+   * dropped, so it does move the watermark — a client behind it gets `reset`
+   * (refetch `/api/channels`, whose seat unread is durable) instead of a silent
+   * hole. Either way approvals are never the entries that make room.
+   */
+  private coalesceChannelMention(channelId: unknown): void {
+    this.attentionLog = this.attentionLog.filter(
+      (e) => e.kind !== 'channel.mention' || e.payload['channelId'] !== channelId,
+    );
+    const mentions = this.attentionLog.filter((e) => e.kind === 'channel.mention');
+    const excess = mentions.length - (ATTENTION_MENTION_CAP - 1);
+    if (excess <= 0) return;
+    const dropped = new Set(mentions.slice(0, excess));
+    this.markAttentionLost([...dropped]);
+    this.attentionLog = this.attentionLog.filter((e) => !dropped.has(e));
   }
 
   private now(): number {
@@ -3445,11 +8690,11 @@ export class WebTerminalServer {
     if (!cursor || cursor.epoch !== this.attentionEpoch) {
       return { reset: true, entries: this.attentionLog.slice() };
     }
-    const oldest = this.attentionLog.length > 0 ? this.attentionLog[0].id : null;
-    // With entries held, continuity survives only if the cursor's NEXT id is one
-    // we still have. With none held, it survives only if nothing was issued
-    // after the cursor — an empty log is "quiet", not "lost", until it isn't.
-    const gap = oldest === null ? cursor.id < this.headId() : cursor.id < oldest - 1;
+    // Continuity survives only if nothing after the cursor was lost. With pure
+    // prefix eviction this is the old "the cursor's NEXT id is still held" test
+    // (lostThrough = oldest - 1, or headId once the log is empty); the explicit
+    // watermark also stays right when a superseded mention left the middle.
+    const gap = cursor.id < this.attentionLostThrough;
     // A cursor above every id we ever issued cannot be positioned either; it did
     // not come from us in this epoch.
     if (gap || cursor.id > this.headId()) {
@@ -3479,6 +8724,12 @@ export class WebTerminalServer {
       'X-Accel-Buffering': 'no',
       ...this.securityHeaders(),
     });
+    // Send the headers and a first byte now. Node holds the headers until the
+    // first body write, and a reconnect with nothing to replay would otherwise
+    // write nothing until the first heartbeat (25 s): the phone treats the
+    // stream as open only once the 200 arrives, so it sat "not connected".
+    res.flushHeaders();
+    res.write(': open\n\n');
 
     // EventSource's own resume header wins; `?since=` covers a page RELOAD,
     // where the browser starts a fresh EventSource with no memory of the id.
@@ -3503,7 +8754,7 @@ export class WebTerminalServer {
     }
 
     const detach = startSseHeartbeat(res);
-    const client: EventClient = { res, detach, principal };
+    const client: EventClient = { res, detach, principal, caps: clientCaps(req) };
     this.eventClients.add(client);
 
     req.on('close', () => {
@@ -3541,6 +8792,7 @@ export class WebTerminalServer {
     this.pairCode = code;
     this.pairExpiresAt = Date.now() + PAIR_TTL_MS;
     this.pairAttempts = PAIR_MAX_ATTEMPTS;
+    this.pairGeneration += 1;
     // Deliberately does NOT clear `pendingDeviceName`. A replacement minted
     // after a burned attempt budget is still the same operator pairing the same
     // device, so the name has to survive it — see the test that burns five
@@ -3563,7 +8815,7 @@ export class WebTerminalServer {
    * store, and the pairing screen keeps working unchanged — but it is now a
    * per-device credential, not the operator's.
    */
-  private async handlePair(res: http.ServerResponse, url: URL): Promise<void> {
+  private async handlePair(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> {
     const supplied = (url.searchParams.get('code') ?? '').trim().toUpperCase();
 
     if (!this.pairCode || Date.now() > this.pairExpiresAt) {
@@ -3614,22 +8866,45 @@ export class WebTerminalServer {
       return this.json(res, 200, { token: this.token });
     }
 
+    // Claim the slot BEFORE the await: the mint is async, and in that window
+    // a second redemption of the same code, or the other card starting a
+    // new pairing, must not see (or burn) this one. Everything the device is
+    // minted with is read now, from the pairing this code belonged to.
+    const claimed = {
+      code: this.pairCode,
+      expiresAt: this.pairExpiresAt,
+      attempts: this.pairAttempts,
+      name: this.pendingDeviceName,
+      allowInput: this.pendingDeviceAllowInput,
+      flow: this.pendingPairFlow,
+      kind: this.redeemingDeviceKind(req),
+    };
+    this.burnPairCode();
+    const claimedGeneration = this.pairGeneration;
+
     let minted: { deviceId: string; deviceSecret: string };
     try {
-      minted = await devices.mint({
-        name: this.pendingDeviceName,
-        allowInput: this.pendingDeviceAllowInput,
-      });
+      minted = await devices.mint({ name: claimed.name, allowInput: claimed.allowInput, kind: claimed.kind });
     } catch (err) {
-      // The roster could not be persisted. Do NOT burn the code and do NOT
-      // fall back to the shared token: a credential the daemon cannot
-      // remember is one the operator can never revoke.
+      // The roster could not be persisted. Do NOT fall back to the shared
+      // token: a credential the daemon cannot remember is one the operator
+      // can never revoke. Give the code back so the operator can retry —
+      // unless the slot has moved on since, in which case the newer pairing
+      // stays exactly as it is.
+      if (this.pairGeneration === claimedGeneration && this.server) {
+        this.pairCode = claimed.code;
+        this.pairExpiresAt = claimed.expiresAt;
+        this.pairAttempts = claimed.attempts;
+        this.pendingDeviceName = claimed.name;
+        this.pendingDeviceAllowInput = claimed.allowInput;
+        this.pendingPairFlow = claimed.flow;
+        this.pairGeneration += 1;
+      }
       this.deps.log('error', `[web] device mint failed: ${errMsg(err)}`);
       return this.json(res, 500, { error: 'pairing failed' });
     }
 
-    // Success: hand the credential over exactly once, then burn the code.
-    this.burnPairCode();
+    // Success: the code was consumed when it was claimed above.
     return this.json(res, 200, {
       deviceId: minted.deviceId,
       deviceSecret: minted.deviceSecret,
@@ -3637,12 +8912,29 @@ export class WebTerminalServer {
     });
   }
 
+  /**
+   * What the redeeming device is, for the roster icon only.
+   *
+   * The desktop client says so in a header. Without one, a code minted by the
+   * phone card was redeemed by what the operator called a phone (the web page
+   * or the phone app, neither of which sends the header); anything else is
+   * `unknown`. Never read by an authorization decision — the header is
+   * caller-written and only picks an icon.
+   */
+  private redeemingDeviceKind(req: http.IncomingMessage): DeviceKind {
+    const claimed = normalizeDeviceKind(req.headers[DEVICE_KIND_HEADER]);
+    if (claimed !== 'unknown') return claimed;
+    return this.pendingPairFlow === 'phone' ? 'phone' : 'unknown';
+  }
+
   /** Consume the active pairing code (single use) and its pending name. */
   private burnPairCode(): void {
     this.pairCode = '';
     this.pairExpiresAt = 0;
     this.pairAttempts = 0;
+    this.pairGeneration += 1;
     this.pendingDeviceName = undefined;
+    this.pendingPairFlow = undefined;
     // Back to the server's default rather than to `false`: a redeemed code
     // must not leave the NEXT device on this host worse off than the first.
     this.pendingDeviceAllowInput = this.defaultPendingGrant();
@@ -3726,6 +9018,16 @@ export class WebTerminalServer {
         allowInput: result.allowInput,
       },
     };
+  }
+
+  /**
+   * The desktop bridge when the first-party desktop process is attached, else
+   * null. The one availability judgment: the desktop routes use it to decide
+   * 503, and `/api/config` uses it to decide what to advertise.
+   */
+  private availableDesktop(): DesktopPhoneBridge | null {
+    const desktop = this.deps.desktop?.();
+    return desktop?.available ? desktop : null;
   }
 
   /**
@@ -3889,6 +9191,18 @@ export class WebTerminalServer {
     this.manifest = readIfExists(path.join(dir, 'manifest.webmanifest'));
     this.serviceWorker = readIfExists(path.join(dir, 'sw.js'));
     this.icon = readIfExists(path.join(dir, 'icon-512.png'));
+    this.appHtml = readIfExists(path.join(dir, 'app.html'));
+    this.appCsp = buildWebCsp(this.appHtml ? this.appHtml.toString('utf8') : null);
+    this.appFonts = new Map();
+    try {
+      for (const name of fs.readdirSync(path.join(dir, 'app-assets'))) {
+        if (!WEB_APP_FONT_FILE.test(name)) continue;
+        const bytes = readIfExists(path.join(dir, 'app-assets', name));
+        if (bytes) this.appFonts.set(name, bytes);
+      }
+    } catch {
+      /* no /app build — `/app` answers 503 like a missing shell */
+    }
     // Derived from the page we just loaded, once per start rather than per
     // request: hashing 583 KB on the way out of every response would be a real
     // cost for a header that cannot change while the process runs.
@@ -3900,7 +9214,7 @@ export class WebTerminalServer {
     // browser would compute, and every inline block was refused: a blank
     // terminal. Verified in a real browser both ways; buildWebCsp normalizes
     // first.
-    this.csp = buildWebCsp(this.terminalHtml ? this.terminalHtml.toString('utf8') : null);
+    this.csp = buildWebCsp(this.terminalHtml ? this.terminalHtml.toString('utf8') : null, { wasm: true });
     if (!this.terminalHtml) {
       this.deps.log('warn', `[web] terminal.html missing under ${dir} — run \`npm run build:daemon-web\``);
     }
@@ -3984,10 +9298,148 @@ function decodePathSegment(raw: string): string | null {
   return id;
 }
 
+/** Receipt owner namespace for an HTTP principal, as `/api/input` keys its receipts. */
+function chatOwner(principal: WebPrincipal): ChatOwner {
+  return principal.kind === 'device' ? `device:${principal.deviceId}` : 'operator';
+}
+
+/** Same credential class and, for a device, the same device (the #1447 rule). */
+function sameCaller(original: WebPrincipal, now: WebPrincipal): boolean {
+  return now.kind === 'operator'
+    ? original.kind === 'operator'
+    : original.kind === 'device' && now.deviceId === original.deviceId;
+}
+
+/**
+ * A sidebar workspace row as `/api/workspaces` carries it: the task link is
+ * flattened onto the row (`ownerWorkspaceId`, `detached`, `createdAt`,
+ * `nested`), present only on a fan-out task workspace; `taskSummary` only on
+ * an owner row with nested tasks. `nested`, the summary and the pane placement
+ * (`nestedUnder`, `requesterPaneId`) are the phone-list view from
+ * `phoneTaskNesting`; the per-task state bits stay internal.
+ */
+function sidebarWorkspaceFields(
+  row: PhoneSidebarWorkspace,
+  nested: boolean | undefined,
+  taskSummary: PhoneSidebarTaskSummary | undefined,
+  placement: { nestedUnder: PhoneTaskNestedUnder; requesterPaneId?: string } | undefined,
+): Record<string, unknown> {
+  const { task } = row;
+  return {
+    order: row.order,
+    pinned: row.pinned,
+    ...(row.color !== undefined ? { color: row.color } : {}),
+    ...(row.gitBranch !== undefined ? { gitBranch: row.gitBranch } : {}),
+    ...(row.gitIsWorktree !== undefined ? { gitIsWorktree: row.gitIsWorktree } : {}),
+    ...(row.gitSync !== undefined ? { gitSync: row.gitSync } : {}),
+    ...(row.moaHandoff !== undefined ? { moaHandoff: row.moaHandoff } : {}),
+    ...(taskSummary !== undefined ? { taskSummary } : {}),
+    ...(task
+      ? {
+          ownerWorkspaceId: task.ownerWorkspaceId,
+          detached: task.detached,
+          ...(task.createdAt !== undefined ? { createdAt: task.createdAt } : {}),
+          nested: nested === true,
+          ...(nested === true && placement
+            ? {
+                nestedUnder: placement.nestedUnder,
+                ...(placement.requesterPaneId !== undefined ? { requesterPaneId: placement.requesterPaneId } : {}),
+              }
+            : {}),
+        }
+      : {}),
+  };
+}
+
+/** Which chat write a Moa pane check is for (see `moaWriteCleared`). */
+type MoaWriteKind = 'send' | 'cancel';
+
+/**
+ * `role: "hq"` for a row of the desktop's Moa HQ workspace, nothing for any
+ * other row or without a snapshot. The phone hides HQ rows by this key alone.
+ */
+function hqRole(sidebar: PhoneSidebarSnapshot | null, workspaceId: unknown): { role?: 'hq' } {
+  return sidebar?.hqWorkspaceId !== undefined && workspaceId === sidebar.hqWorkspaceId ? { role: 'hq' } : {};
+}
+
+/** A pane's extracted scrollback is current while nothing was written and the geometry held. */
+function scrollbackKey(managed: ManagedSession): string {
+  return `${managed.meta.incarnationId ?? ''}\0${managed.ringBuffer.totalBytesWritten}\0${managed.meta.cols}x${managed.meta.rows}`;
+}
+
+/** The pane's workspace id from its spawn env, bounded like every id on the wire. */
+function workspaceIdOf(env: Record<string, string> | undefined): { workspaceId?: string } {
+  const value = env?.[ENV_KEYS.WORKSPACE_ID];
+  return typeof value === 'string' && value.length > 0 && value.length <= 128 ? { workspaceId: value } : {};
+}
+
 function workspaceLabelOf(env: Record<string, string> | undefined): { workspace?: string } {
   const value = env?.[ENV_KEYS.WORKSPACE_NAME];
   const workspace = typeof value === 'string' ? value.trim() : '';
   return workspace ? { workspace } : {};
+}
+
+/** `spawnCwd` for a session row: present only when it is a usable path. */
+function spawnCwdOf(spawnCwd: string | undefined): { spawnCwd?: string } {
+  return typeof spawnCwd === 'string' && spawnCwd ? { spawnCwd } : {};
+}
+
+/**
+ * Whether a requested pane cwd is certainly unusable. Same `~` expansion as
+ * the spawn; a relative path has no anchor a phone could mean. On Windows only
+ * a drive or UNC path is checked here: a `/…` or `~` path may be meant for a
+ * WSL default shell, which the spawn resolves inside the distro, so those keep
+ * the spawn's own handling. Never throws.
+ */
+async function cwdUnusable(requested: string): Promise<boolean> {
+  if (process.platform === 'win32') {
+    if (requested.startsWith('/') || requested.startsWith('~')) return false;
+    if (!path.win32.isAbsolute(requested) || !/^(?:[A-Za-z]:[\\/]|\\\\)/.test(requested)) return true;
+  }
+  const dir = expandTilde(requested);
+  if (!path.isAbsolute(dir)) return true;
+  try {
+    if (!(await fs.promises.stat(dir)).isDirectory()) return true;
+    // A shell must be able to enter it, not only see it.
+    if (process.platform !== 'win32') await fs.promises.access(dir, fs.constants.X_OK);
+    return false;
+  } catch { return true; }
+}
+
+/**
+ * The last segment of a pane's working directory — the label of last resort
+ * (#1319).
+ *
+ * The phone's chip falls back `agent -> shell -> cwd leaf -> "pane"`, and it
+ * used to compute that leaf itself from `cwd`. Doing it here costs one string
+ * split and means every client agrees on what the leaf is instead of each one
+ * re-deriving it from a path whose separator depends on the host.
+ *
+ * Leaks strictly less than the row already carries: `cwd` is served in full
+ * one field over. It is the OSC 7 cwd, so it is whatever the pane's own
+ * process last claimed — a label, never a directory to act on (see
+ * `DaemonSession.cwd`). Both separators are split on because a Windows daemon
+ * can hold a pane whose shell reports a POSIX path (WSL, git-bash), and a
+ * trailing separator must not yield an empty leaf.
+ *
+ * Three inputs have no leaf and get the field withheld rather than a label a
+ * human cannot read:
+ *
+ *   - A ROOT. `/` has always had none; `C:\` — which is exactly what OSC 7
+ *     `/C:/` parses to on the daemon's primary platform — must behave the same,
+ *     or a pane sitting at a drive root renders a chip reading "C:".
+ *   - WHITESPACE. A segment of spaces is an invisible chip. `cwd` is whatever
+ *     the pane's own process claimed, so degenerate values are a thing that
+ *     happens rather than a hypothetical.
+ *   - Nothing at all (absent, empty).
+ */
+function cwdLeafOf(cwd: string | undefined): { cwdLeaf?: string } {
+  if (typeof cwd !== 'string') return {};
+  const segments = cwd.split(/[\\/]/).filter((segment) => segment.trim().length > 0);
+  const leaf = segments[segments.length - 1]?.trim() ?? '';
+  // A bare drive letter is the Windows spelling of `/` — a root, not a folder.
+  if (!leaf || /^[A-Za-z]:$/.test(leaf)) return {};
+  return { cwdLeaf: leaf };
 }
 
 /**
@@ -4006,7 +9458,185 @@ function workspaceLabelOf(env: Record<string, string> | undefined): { workspace?
  * anything security-relevant may key on — the keystroke map, not this list,
  * decides what a decision sends.
  */
-function approvalWire(r: ApprovalRequest): Record<string, unknown> {
+/**
+ * What a client declared it understands, from `X-Wmux-Client-Caps` — a
+ * comma-separated token list. Unknown tokens are ignored; no header means an
+ * older client.
+ */
+export interface ClientCaps {
+  /** Understands (and can answer) a `terminal_prompt` record's dialog. */
+  terminalPromptAnswer: boolean;
+  /** Can decline a `terminal_prompt` dialog (`POST /api/approvals/:id/decline`). */
+  terminalPromptDecline?: boolean;
+  /** Set by the server, not the client: `/detail` is open to this caller (`--allow-transcript`). */
+  terminalPromptDetail?: boolean;
+  /** Understands `form` records and answers them through `POST /api/approvals/:id/answer`. */
+  decisionV2?: boolean;
+  /** Uses `POST /api/sessions/:id/chat/cancel` (no route yet). Today it only adds `chat.turn` to `/turns`. */
+  chatCancel?: boolean;
+  /** Uses the daemon-held chat queue: a send carrying it is queued during a turn; `/turns` adds `chat.turn` and `chat.queue`. */
+  chatQueue?: boolean;
+}
+
+export const CLIENT_CAPS_HEADER = 'x-wmux-client-caps';
+export const CLIENT_CAP_TERMINAL_PROMPT_ANSWER = 'terminal-prompt-answer';
+export const CLIENT_CAP_TERMINAL_PROMPT_DECLINE = 'terminal-prompt-decline';
+export const CLIENT_CAP_DECISION_V2 = 'decision-v2';
+export const CLIENT_CAP_CHAT_CANCEL = 'chat-cancel';
+export const CLIENT_CAP_CHAT_QUEUE = 'chat-queue';
+
+export function clientCaps(req: http.IncomingMessage): ClientCaps {
+  const raw = req.headers[CLIENT_CAPS_HEADER];
+  const joined = Array.isArray(raw) ? raw.join(',') : raw ?? '';
+  const tokens = new Set(joined.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean));
+  return {
+    terminalPromptAnswer: tokens.has(CLIENT_CAP_TERMINAL_PROMPT_ANSWER),
+    terminalPromptDecline: tokens.has(CLIENT_CAP_TERMINAL_PROMPT_DECLINE),
+    decisionV2: tokens.has(CLIENT_CAP_DECISION_V2),
+    chatCancel: tokens.has(CLIENT_CAP_CHAT_CANCEL),
+    chatQueue: tokens.has(CLIENT_CAP_CHAT_QUEUE),
+  };
+}
+
+/** Who a v2 answer receipt belongs to. */
+function answerOwner(principal: WebPrincipal): string {
+  return principal.kind === 'device' ? `device:${principal.deviceId}` : 'operator';
+}
+
+/** Statuses a caller may retry past: their answer receipt is released, not kept. */
+const ANSWER_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([401, 403, 425, 500, 503]);
+
+/**
+ * Whether a v2 answer's outcome is one the caller may retry past (its receipt
+ * is released, so the retry is checked afresh): the retryable statuses, and a
+ * 409 `already-answered` — another answer to the record was in flight.
+ */
+function answerIsRetryable(response: AnswerReceiptResponse): boolean {
+  return ANSWER_RETRYABLE_STATUSES.has(response.status)
+    || (response.status === 409 && response.body['error'] === 'already-answered');
+}
+
+/** A v2 answer's registry result as the HTTP response it is journaled and replayed as. */
+function decisionAnswerResponse(result: ApprovalResolveResult): AnswerReceiptResponse {
+  const response = decisionAnswerOutcome(result);
+  // A stepwise answer that typed some of its keys before it stopped says so,
+  // whatever stopped it.
+  if (!result.ok && result.effect === 'partial' && result.request?.step) {
+    const { index, total, status } = result.request.step;
+    return { status: response.status, body: { ...response.body, effect: 'partial', step: { index, total, status } } };
+  }
+  return response;
+}
+
+function decisionAnswerOutcome(result: ApprovalResolveResult): AnswerReceiptResponse {
+  if (result.ok) {
+    return { status: 200, body: { state: result.request.state, effect: 'complete', durable: result.durable } };
+  }
+  switch (result.reason) {
+    case 'already-resolved':
+      return { status: 409, body: { error: 'already-resolved', ...(result.resolvedBy ? { resolvedBy: result.resolvedBy } : {}), effect: 'none' } };
+    case 'prompt-changed':
+    case 'already-answered':
+    case 'prompt-unverified':
+      return { status: 409, body: { error: result.reason, effect: 'none' } };
+    case 'expired':
+    case 'prompt-gone':
+      return { status: 410, body: { error: result.reason, ...(result.request ? { state: result.request.state } : {}), effect: 'none' } };
+    case 'answer-too-soon':
+      return { status: 425, body: { error: 'answer-too-soon', effect: 'none' } };
+    case 'agent-unavailable':
+      return { status: 503, body: { error: 'agent-unavailable', effect: 'none' } };
+    case 'answer-uncertain':
+      return { status: 409, body: { error: 'answer-uncertain', effect: 'uncertain' } };
+    case 'answer-in-terminal':
+      return { status: 501, body: { error: 'answer-in-terminal', reason: result.answerRefusal } };
+    case 'needs-v2':
+    case 'unsupported-agent':
+      return { status: 501, body: { error: 'answer-in-terminal', reason: result.reason } };
+    case 'invalid-choice':
+    case 'invalid-choice-key':
+      return { status: 400, body: { error: 'invalid-choice' } };
+    case 'invalid-text':
+      return { status: 400, body: { error: 'invalid-text', ...(result.textRefusal ? { reason: result.textRefusal } : {}) } };
+    case 'not-found':
+      return { status: 404, body: { error: 'not-found' } };
+    case 'unauthorized':
+      return { status: 401, body: { error: 'authorization-expired' } };
+    case 'input-revoked':
+      return { status: 403, body: { error: 'input-revoked' } };
+    case 'authorization-unconfirmed':
+      return { status: 503, body: { error: 'authorization-unconfirmed' } };
+    default:
+      // Closed on the wire: an unmapped reason is a server bug, not something
+      // to hand the client verbatim.
+      return { status: 500, body: { error: 'internal-error' } };
+  }
+}
+
+/**
+ * The `decision-v2` projection of a record: its form and fingerprint while it
+ * can still be answered, and a stepwise answer's progress. Nothing for a
+ * client that did not declare `decision-v2`, so every older client's bytes are
+ * unchanged.
+ */
+function decisionV2Wire(r: ApprovalRequest, caps: ClientCaps, otherMaxCells?: number): Record<string, unknown> {
+  if (!caps.decisionV2) return {};
+  // A stepwise answer that started (running, partial or done) leaves nothing to answer.
+  const open = r.state === 'pending' && r.pressedAt === undefined && !r.step && !!r.form && !!r.formFingerprint;
+  // The plan dialog: its question, and the whole plan at `/detail`.
+  const plan = open && r.kind === 'terminal_prompt' && r.form?.kind === 'plan' && !isNativeDecision(r);
+  return {
+    ...(open
+      ? { form: otherMaxCells !== undefined ? { ...r.form, otherMaxCells } : r.form, formFingerprint: r.formFingerprint }
+      : {}),
+    ...(plan && r.question ? { question: r.question } : {}),
+    ...(plan && caps.terminalPromptDetail ? { hasDetail: true } : {}),
+    ...(r.step ? { step: { index: r.step.index, total: r.step.total, status: r.step.status } } : {}),
+  };
+}
+
+function approvalWire(r: ApprovalRequest, caps: ClientCaps = { terminalPromptAnswer: false }, otherMaxCells?: number): Record<string, unknown> {
+  // The agent's own terminal dialog, projected per caller. An older client (no
+  // capability) gets the informational card only — kind, tool, summary — so it
+  // can never render controls for a dialog it cannot answer. A capable client
+  // gets the parsed dialog when the record is answerable.
+  if (r.kind === 'terminal_prompt') {
+    const parsed = caps.terminalPromptAnswer && !!r.promptFingerprint && !!r.choices?.length;
+    // Once the one answer is in (`pressedAt`), or the record is settled, the
+    // dialog stays readable but there is nothing left to press.
+    const answerable = parsed && r.pressedAt === undefined && r.state === 'pending';
+    return {
+      id: r.id,
+      sessionId: r.sessionId,
+      agent: r.agent,
+      kind: r.kind,
+      state: r.state,
+      createdAt: r.createdAt,
+      ...(r.workspaceId ? { workspaceId: r.workspaceId } : {}),
+      ...(r.toolName ? { toolName: r.toolName } : {}),
+      ...(r.summary ? { summary: r.summary } : {}),
+      // A hint for the client's own confirm step — computed at creation from the
+      // call's full command. Never a permission.
+      ...(r.risk ? { risk: r.risk } : {}),
+      ...(parsed
+        ? {
+            ...(r.question ? { question: r.question } : {}),
+            ...(r.reason ? { reason: r.reason } : {}),
+          }
+        : {}),
+      ...(answerable ? { choices: r.choices, promptFingerprint: r.promptFingerprint } : {}),
+      // The full command is at `GET /api/approvals/:id/detail` (an answerable
+      // record is always bound to its call, so it always has one). A native
+      // decision has no screen dialog and so no detail.
+      ...(answerable && caps.terminalPromptDetail && !isNativeDecision(r) ? { hasDetail: true } : {}),
+      ...decisionV2Wire(r, caps, otherMaxCells),
+      ...(typeof r.pressedAt === 'number' ? { pressedAt: r.pressedAt } : {}),
+      ...(r.decision ? { decision: r.decision } : {}),
+      ...(r.selectedChoiceKey ? { selectedChoiceKey: r.selectedChoiceKey } : {}),
+      ...(r.resolvedBy ? { resolvedBy: r.resolvedBy } : {}),
+      ...(typeof r.resolvedAt === 'number' ? { resolvedAt: r.resolvedAt } : {}),
+    };
+  }
   return {
     id: r.id,
     sessionId: r.sessionId,
@@ -4038,6 +9668,7 @@ function approvalWire(r: ApprovalRequest): Record<string, unknown> {
     // shell command with nothing on screen saying which one.
     ...(r.toolName ? { toolName: r.toolName } : {}),
     ...(r.toolInputSummary ? { toolInputSummary: r.toolInputSummary } : {}),
+    ...decisionV2Wire(r, caps, otherMaxCells),
   };
 }
 
@@ -4065,6 +9696,27 @@ function createTransportServer(
   } catch (error) {
     throw new Error(`TLS certificate/key could not be loaded: ${errMsg(error)}`);
   }
+}
+
+/**
+ * #1342 — project a host-local {@link ResumeBinding} onto the wire.
+ *
+ * Two fields are deliberately transformed rather than copied:
+ *   - `transcriptPath` is DROPPED. It is an absolute path on this machine; the
+ *     attaching desktop can do nothing with it but display or leak it, and the
+ *     staleness probe it exists for has already run host-side.
+ *   - `cwd` becomes the boolean `cwdMatches`. `--resume` is cwd-scoped, and
+ *     only this host can compare its own paths, so it answers the question
+ *     instead of shipping the path for the desktop to guess with.
+ */
+function resumeInfoOf(binding: ResumeBinding, paneCwd: string | undefined): RemoteResumeInfo {
+  return {
+    agent: binding.agent,
+    sessionId: binding.sessionId,
+    cwdMatches:
+      !!paneCwd && !!binding.cwd && normalizeResumeCwd(binding.cwd) === normalizeResumeCwd(paneCwd),
+    ...(binding.permissionMode ? { permissionMode: binding.permissionMode } : {}),
+  };
 }
 
 function readTlsPem(kind: 'certificate' | 'private key', filePath: string): Buffer {
@@ -4126,10 +9778,119 @@ function sniffImageExt(body: Buffer): 'jpg' | 'png' | null {
   return null;
 }
 
+/** How many leading bytes `sniffImageContentType` needs — WebP's marker ends at 12. */
+const IMAGE_MAGIC_BYTES = 16;
+
+/**
+ * The `Content-Type` for a blob `/turns/image` is about to serve, by its
+ * leading bytes — or null for anything that is not one of the four formats a
+ * phone can render.
+ *
+ * Separate from `sniffImageExt`, which answers a different question (what
+ * extension do we WRITE for an upload) over a deliberately narrower set. Widening
+ * that one to GIF and WebP would start writing extensions the upload route's
+ * deletion predicate does not recognise.
+ */
+function sniffImageContentType(head: Buffer): string | null {
+  if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (head.length >= PNG_SIGNATURE.length && head.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
+    return 'image/png';
+  }
+  if (head.length >= 6) {
+    const gif = head.subarray(0, 6).toString('latin1');
+    if (gif === 'GIF87a' || gif === 'GIF89a') return 'image/gif';
+  }
+  // RIFF containers carry the real format at byte 8; only the WEBP one is an image.
+  if (
+    head.length >= 12 &&
+    head.subarray(0, 4).toString('latin1') === 'RIFF' &&
+    head.subarray(8, 12).toString('latin1') === 'WEBP'
+  ) {
+    return 'image/webp';
+  }
+  return null;
+}
+
+/**
+ * The ISO BMFF major brands `/turns/file` hands back as `video/mp4`.
+ *
+ * `iso4`/`iso5`/`iso6`/`dash` are here because a FRAGMENTED mp4 carries one of
+ * them as its major brand — `ffmpeg -movflags frag_keyframe+empty_moov` writes
+ * `iso5` — and an agent rendering a clip for streaming is the exact use this
+ * route exists for. Without them a perfectly ordinary mp4 is refused with a
+ * status the client treats as permanent.
+ *
+ * `M4A ` stays OUT: it is audio, and this route's contract is what a phone can
+ * show in a turn view.
+ */
+const MP4_BRANDS = new Set([
+  'isom', 'iso2', 'iso4', 'iso5', 'iso6', 'dash', 'mp41', 'mp42', 'avc1', 'mp4v', 'M4V ',
+]);
+
+/**
+ * The `Content-Type` for a blob `/turns/file` is about to serve: everything
+ * `/turns/image` accepts, plus the ISO BMFF containers an agent writes (a
+ * screen recording, an ffmpeg render) — or null for anything else.
+ *
+ * Delegates rather than duplicates, and leaves `sniffImageContentType` exactly
+ * as narrow as it was. That one backs a route already in shipped phone builds
+ * whose promise is "what comes back renders as an image"; widening it to video
+ * would break that promise for every client that never asked for it.
+ */
+function sniffTurnFileContentType(head: Buffer): string | null {
+  const image = sniffImageContentType(head);
+  if (image) return image;
+  // ISO BMFF puts a `ftyp` box at byte 4 and its major brand at byte 8. Unlike
+  // every other entry here the marker is not at offset 0 — the first four bytes
+  // are the box's own length.
+  //
+  // And that length is CHECKED, because the marker alone is twelve bytes of
+  // ASCII that a text file can hold by accident or by design: `<!--ftypisom`
+  // would otherwise be served as `video/mp4`. A `ftyp` box is 4 (size) + 4
+  // ('ftyp') + 4 (major brand) + 4 (minor version) + four per compatible brand,
+  // so its length is always 16 or more and always a multiple of four. Prose
+  // that happens to carry the marker does not also carry a plausible length
+  // in front of it.
+  if (head.length >= 12 && head.subarray(4, 8).toString('latin1') === 'ftyp') {
+    const boxBytes = head.readUInt32BE(0);
+    if (boxBytes >= 16 && boxBytes % 4 === 0) {
+      const brand = head.subarray(8, 12).toString('latin1');
+      if (brand === 'qt  ') return 'video/quicktime';
+      if (MP4_BRANDS.has(brand)) return 'video/mp4';
+    }
+  }
+  return null;
+}
+
+/** Leading bytes read for a sent file: enough to reach a WebM DocType. */
+const SENT_FILE_MAGIC_BYTES = 64;
+
+/** EBML magic, and the DocType element ID that names the Matroska flavour. */
+const EBML_MAGIC = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]);
+const EBML_DOCTYPE = Buffer.from([0x42, 0x82]);
+
+/**
+ * The `Content-Type` for a file served because the agent sent it with
+ * `SendUserFile`: what `/turns/file` serves, plus WebM. Kept apart so the
+ * spawn-cwd and uploads paths keep the exact set they always had.
+ */
+function sniffSentFileContentType(head: Buffer): string | null {
+  const known = sniffTurnFileContentType(head.subarray(0, IMAGE_MAGIC_BYTES));
+  if (known) return known;
+  // An EBML header whose DocType is `webm` (a one-byte size, 0x84, in front).
+  if (head.length < 12 || !head.subarray(0, 4).equals(EBML_MAGIC)) return null;
+  const at = head.indexOf(EBML_DOCTYPE, 4);
+  if (at < 0 || head[at + 2] !== 0x84) return null;
+  return head.subarray(at + 3, at + 7).toString('latin1') === 'webm' ? 'video/webm' : null;
+}
+
 /**
  * Exactly the names `handleUpload` generates, every segment anchored:
  * `photo-` + an ISO 8601 instant with `:` and `.` rewritten to `-` + `-` +
- * eight lowercase hex + `.jpg` or `.png`.
+ * eight lowercase hex + `.jpg` or `.png`. General attachments use the same
+ * timestamp/random structure with `file-` and a bounded alphanumeric extension.
  *
  * This is a DELETION predicate, so it is written to be over-strict rather than
  * convenient. `~/.wmux/uploads` is also where an operator stages files for
@@ -4137,7 +9898,7 @@ function sniffImageExt(body: Buffer): 'jpg' | 'png' | null {
  * unlink `photo-vacation.jpg` a day after they put it there. Nothing this route
  * did not write is ever removed.
  */
-const UPLOAD_NAME_RE = /^photo-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{8}\.(jpg|png)$/;
+const UPLOAD_NAME_RE = /^(?:photo-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{8}\.(?:jpg|png)|file-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{8}\.[a-z0-9]{1,12})$/;
 
 /**
  * Delete uploads older than the TTL. Modelled on `pruneOldLogs`, including the

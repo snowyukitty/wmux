@@ -1,17 +1,29 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { LiveSettingsError } from '../codexLiveSettings';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { DesktopPhoneBridge, DesktopPhoneError } from '../../phone/DesktopPhoneBridge';
+import { RunHistoryStore } from '../../history/RunHistoryStore';
+import { InputReceiptStore } from '../InputReceiptStore';
+import { AnswerReceiptStore } from '../../approvals/AnswerReceiptStore';
 import { EventEmitter } from 'node:events';
 import { request as httpReq } from 'node:http';
-import { WebTerminalServer, type WebDeviceResolver } from '../WebTerminalServer';
+import { WebTerminalServer, SessionAuthorizationExpiredError, type WebDeviceResolver } from '../WebTerminalServer';
+import { StreamResponseLimits } from '../StreamResponseLimits';
+import * as heartbeat from '../sseHeartbeat';
 import type { TranscriptProjector } from '../../transcript/TranscriptProjector';
+import type { ResumeBinding } from '../../../shared/agentResume';
 import type { TranscriptStatus } from '../../../shared/transcript/turnEvents';
 import { GIT_HARDENING_CONFIG, type GitRunner } from '../sessionDiff';
 import { MIN_PHONE_PROTOCOL_VERSION, PHONE_PROTOCOL_VERSION } from '../protocolVersion';
 import { OutputModeTracker } from '../../util/outputModeTracker';
 import { capSnapshot } from '../snapshotWindow';
+
+/** A directory that exists on every CI platform: `POST /api/sessions` refuses a cwd that doesn't. */
+const EXISTING_DIR = fs.realpathSync(os.tmpdir());
 
 /** Drop the fixed `-c key=value` hardening prefix, leaving the command itself. */
 const gitBody = (args: readonly string[]): string[] => args.slice(GIT_HARDENING_CONFIG.length);
@@ -23,6 +35,7 @@ import type {
   ApprovalRequest,
   ApprovalResolveResult,
 } from '../../approvals/types';
+import { DECISION_V2_WEB_ANSWER, TERMINAL_PROMPT_WEB_ANSWER, TERMINAL_PROMPT_WEB_DECLINE, type DecisionFormKind, type TerminalPromptDetail } from '../../approvals/types';
 import type { DaemonSessionManager } from '../../DaemonSessionManager';
 
 // A minimal fake of exactly what WebTerminalServer touches: getSession() (for
@@ -30,12 +43,14 @@ import type { DaemonSessionManager } from '../../DaemonSessionManager';
 function makeDeps() {
   const bridge = new EventEmitter();
   const write = vi.fn();
+  // How many stream listeners the bridge had at each activation.
+  const activateListenerCounts: number[] = [];
   const managed = {
     // `cwd` and `spawnCwd` DIFFER on purpose: `cwd` is what the pane's own
     // process last claimed via OSC 7 (i.e. attacker-controlled), `spawnCwd` is
     // where the daemon actually spawned it. Every diff assertion below expects
     // '/x', which is the whole point.
-    meta: { id: 's1', cols: 80, rows: 24, state: 'detached', cwd: '/tmp/osc7-said-so', spawnCwd: '/x' },
+    meta: { id: 's1', incarnationId: 'incarnation-1', cols: 80, rows: 24, state: 'detached', cwd: '/tmp/osc7-said-so', spawnCwd: '/x' },
     // A session recovered from a reboot that has not had its first resize yet.
     // The resize route refuses it — that first resize is the desk's unmute.
     deferred: false,
@@ -58,11 +73,12 @@ function makeDeps() {
   // and no wmux identity at all.
   type LiveRow = {
     id: string; cwd: string; cols: number; rows: number; state: string;
-    agent: undefined; lastDetectedAgent: undefined; lastActivity: string;
+    agent: { role: string; teamId: string; displayName: string } | undefined;
+    lastDetectedAgent: string | undefined;
+    lastActivity: string;
     env: Record<string, string>; cmd: string;
   };
-  const live: LiveRow[] = [
-    {
+  const live: LiveRow[] = [    {
       id: 's1', cwd: '/x', cols: 80, rows: 24, state: 'detached',
       agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
       env: { WMUX_WORKSPACE_ID: 'ws-1', WMUX_WORKSPACE_NAME: 'Workspace 1', ANTHROPIC_API_KEY: 'sk-secret' },
@@ -128,6 +144,12 @@ function makeDeps() {
         : undefined;
     },
     listLiveSessions: () => live,
+    // The manager's own unmute. Flips the flag like the real one so a second
+    // stream or input can be shown NOT to activate again.
+    activateDeferred: vi.fn((id: string) => {
+      activateListenerCounts.push(bridge.listenerCount('data'));
+      if (id === 's1') managed.deferred = false;
+    }),
     resizeSession: (id: string, cols: number, rows: number) => {
       resizeCalls.push({ id, cols, rows });
       if (resizeBox.throws) throw new Error(resizeBox.throws);
@@ -149,11 +171,25 @@ function makeDeps() {
   // functions. It mutates `live` so the route's "describe the new pane with the
   // SAME projection /api/sessions uses" claim is actually exercised.
   const lifecycleCalls: Array<{ op: 'create' | 'destroy'; arg: unknown }> = [];
-  const lifecycleBox = { createThrows: '', destroyThrows: '', createGoesMissing: false };
+  // `createGate` stands in for the daemon's own awaits inside create (workspace
+  // account env, CLI lookup, Codex relay reservation): the route has already
+  // re-authorized before create is called, so the window this fake opens is
+  // exactly the one the daemon's pre-spawn check has to cover.
+  const lifecycleBox = {
+    createThrows: '', destroyThrows: '', createGoesMissing: false,
+    createGate: null as Promise<void> | null, gatePassed: false,
+    authorizedAfterGate: null as boolean | null, spawned: false,
+  };
   let created = 0;
   const lifecycle = {
-    async create(params: { workspaceId?: string; cwd?: string }) {
+    async create({ authorized, ...params }: { workspaceId?: string; cwd?: string; authorized?: () => Promise<boolean> }) {
       lifecycleCalls.push({ op: 'create', arg: { ...params } });
+      if (lifecycleBox.createGate) { await lifecycleBox.createGate; lifecycleBox.gatePassed = true; }
+      if (authorized && !(await authorized())) {
+        lifecycleBox.authorizedAfterGate = lifecycleBox.gatePassed;
+        throw new SessionAuthorizationExpiredError();
+      }
+      lifecycleBox.spawned = true;
       if (lifecycleBox.createThrows) throw new Error(lifecycleBox.createThrows);
       created += 1;
       const id = `web-${created}`;
@@ -205,13 +241,18 @@ function makeDeps() {
   // mockReturnValue on the same object.
   const projectorMock = {
     status: vi.fn<(id: string) => TranscriptStatus>(() => ({ available: false, reason: 'no-hook' })),
+    // `/api/sessions`'s lastAssistantText reads the file itself, so it needs the
+    // full path status() deliberately withholds from the wire.
+    transcriptPath: vi.fn<(id: string) => string | null>(() => null),
+    // The binding SendUserFile lookups read; null while a new session has not bound.
+    sentFileBinding: vi.fn<(id: string) => { transcriptPath: string; agentSessionId: string; generation: number } | null>(() => null),
     snapshot: vi.fn((): unknown => null),
     delta: vi.fn((): unknown => null),
     codeBlock: vi.fn((): unknown => null),
   };
 
   return {
-    sessionManager, bridge, write, live, managed,
+    sessionManager, bridge, write, live, managed, activateListenerCounts,
     resizeCalls, resizeBox,
     lifecycle, lifecycleCalls, lifecycleBox,
     git, gitCalls, gitScript, gitGate, uploadsDir,
@@ -236,11 +277,15 @@ function makeDevices() {
   const mintCalls: Array<{ name?: string; allowInput?: boolean }> = [];
   const touchCalls: string[] = [];
   const pushRegistrations: Array<{ deviceId: string; apnsToken: string; publicKey: string }> = [];
-  const box = { mintThrows: false };
+  const liveActivityRegistrations: Array<{ deviceId: string } & Record<string, unknown>> = [];
+  /** Forces the store's answer, so the route's status mapping can be exercised. */
+  const liveActivityBox: { reason: string } = { reason: '' };
+  const box: { mintThrows: boolean; mintGate: Promise<void> | null } = { mintThrows: false, mintGate: null };
   let seq = 0;
   const devices: WebDeviceResolver = {
     async mint(params) {
       mintCalls.push({ ...params });
+      if (box.mintGate) await box.mintGate;
       if (box.mintThrows) throw new Error('roster write failed');
       seq += 1;
       const deviceId = `dev-${seq}`;
@@ -286,9 +331,35 @@ function makeDevices() {
       }
       return { ok: true };
     },
+    // Mirrors the real store closely enough that the route's own mapping is
+    // exercised: MERGE semantics, `null` removes, and the same two refusals.
+    registerLiveActivity(deviceId, input) {
+      liveActivityRegistrations.push({ deviceId, ...input });
+      if (liveActivityBox.reason) return { ok: false, reason: liveActivityBox.reason };
+      const rec = roster.get(deviceId);
+      if (!rec) return { ok: false, reason: 'not-found' };
+      if (rec.revoked) return { ok: false, reason: 'revoked' };
+      for (const key of ['pushToStartToken', 'activityToken'] as const) {
+        const raw = input[key];
+        if (raw === undefined || raw === null) continue;
+        if (typeof raw !== 'string' || !/^[0-9a-f]{64,200}$/.test(raw)) {
+          return { ok: false, reason: 'bad-token' };
+        }
+      }
+      if (
+        input.apnsEnvironment !== undefined &&
+        input.apnsEnvironment !== 'development' &&
+        input.apnsEnvironment !== 'production'
+      ) {
+        return { ok: false, reason: 'bad-apns-environment' };
+      }
+      return { ok: true };
+    },
   };
   return {
     devices,
+    liveActivityRegistrations,
+    liveActivityBox,
     deviceRoster: roster,
     deviceResolveCalls: resolveCalls,
     deviceMintCalls: mintCalls,
@@ -314,9 +385,17 @@ function makeApprovals() {
   const listeners = new Set<(e: ApprovalEvent) => void>();
   const records: ApprovalRequest[] = [];
   const resolveCalls: Array<{ id: string; decision: string; resolvedBy: string }> = [];
-  const box: { result: ApprovalResolveResult; listThrows: boolean } = {
+  const box: {
+    result: ApprovalResolveResult;
+    listThrows: boolean;
+    beforeAuthorize?: () => void;
+    /** Held open by a test to keep a resolve in flight. */
+    hold?: Promise<void>;
+    details: Map<string, TerminalPromptDetail>;
+  } = {
     result: { ok: true, durable: true, request: mkApproval({ state: 'resolved', decision: 'approve', resolvedBy: 'web' }) },
     listThrows: false,
+    details: new Map(),
   };
   const approvals: ApprovalRegistryApi = {
     list: () => {
@@ -328,12 +407,28 @@ function makeApprovals() {
     },
     pendingCount: () => records.filter((r) => r.state === 'pending').length,
     resolve: async (params) => {
-      resolveCalls.push({ ...params });
+      // Recorded without the `authorize` closure, so call assertions stay plain
+      // data. The closure is still exercised the way the real registry does:
+      // against the pending record, with the same two refusals.
+      const { authorize, ...recorded } = params;
+      resolveCalls.push(recorded);
+      if (box.hold) await box.hold;
+      const pending = records.find((r) => r.id === params.id && r.state === 'pending');
+      if (authorize && pending) {
+        box.beforeAuthorize?.();
+        const verdict = await authorize(pending);
+        if (verdict === 'expired') return { ok: false, reason: 'unauthorized' };
+        if (verdict === 'read-only') return { ok: false, reason: 'input-revoked' };
+      }
       return box.result;
     },
     onEvent: (listener) => {
       listeners.add(listener);
       return () => listeners.delete(listener);
+    },
+    terminalPromptDetail: (id) => {
+      const pending = records.find((r) => r.id === id && r.state === 'pending');
+      return pending ? box.details.get(id) ?? null : null;
     },
   };
   const emitApproval = (type: ApprovalEvent['type'], request: ApprovalRequest) => {
@@ -355,6 +450,17 @@ function mkApproval(over: Partial<ApprovalRequest> = {}): ApprovalRequest {
   };
 }
 
+// The phone Git controller refuses repositories with content filters, and the
+// macOS CI image declares git-lfs filters in the runner's global gitconfig.
+// Point HOME at an empty directory for this file so git sees no global config.
+const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-web-home-'));
+const savedHome = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+beforeAll(() => { process.env.HOME = isolatedHome; process.env.USERPROFILE = isolatedHome; });
+afterAll(() => {
+  process.env.HOME = savedHome.HOME; process.env.USERPROFILE = savedHome.USERPROFILE;
+  fs.rmSync(isolatedHome, { recursive: true, force: true });
+});
+
 describe('WebTerminalServer', () => {
   let server: WebTerminalServer;
   let bridge: EventEmitter;
@@ -364,19 +470,26 @@ describe('WebTerminalServer', () => {
   let resolveCalls: Array<{ id: string; decision: string; resolvedBy: string }>;
   let emitApproval: (type: ApprovalEvent['type'], request: ApprovalRequest) => void;
   let approvalListeners: Set<(e: ApprovalEvent) => void>;
-  let approvalBox: { result: ApprovalResolveResult; listThrows: boolean };
+  let approvalBox: ReturnType<typeof makeApprovals>['approvalBox'];
   let deviceRoster: Map<string, { secret: string; name?: string; revoked: boolean }>;
+  let answerReceiptStore: AnswerReceiptStore;
+  let reconcileCalls: number;
   let deviceMintCalls: Array<{ name?: string }>;
   let pushRegistrations: Array<{ deviceId: string; apnsToken: string; publicKey: string }>;
+  let liveActivityRegistrations: Array<{ deviceId: string } & Record<string, unknown>>;
+  let liveActivityBox: { reason: string };
+  let liveActivityRegisteredCalls: number;
   let deviceTouchCalls: string[];
-  let deviceBox: { mintThrows: boolean };
+  let deviceBox: { mintThrows: boolean; mintGate: Promise<void> | null };
   let resizeCalls: Array<{ id: string; cols: number; rows: number }>;
   let resizeBox: ReturnType<typeof makeDeps>['resizeBox'];
   let lifecycleCalls: Array<{ op: 'create' | 'destroy'; arg: unknown }>;
-  let lifecycleBox: { createThrows: string; destroyThrows: string; createGoesMissing: boolean };
+  let lifecycleBox: { createThrows: string; destroyThrows: string; createGoesMissing: boolean;
+    createGate: Promise<void> | null; gatePassed: boolean; authorizedAfterGate: boolean | null; spawned: boolean };
   let gitCalls: Array<{ args: readonly string[]; cwd: string }>;
   let gitScript: Record<string, { ok: boolean; stdout: string; stderr: string; ran?: boolean }>;
   let gitGate: { hold: Promise<void> | null };
+  let activateListenerCounts: number[];
   let managed: {
     meta: Record<string, unknown>;
     deferred: boolean;
@@ -390,9 +503,39 @@ describe('WebTerminalServer', () => {
   let projectorMock: ReturnType<typeof makeDeps>['projectorMock'];
   /** #783 — the daemon's runtime gate flag, which the server only reads/writes. */
   let gateArmed: boolean;
+  /** The decision-v2 form kinds the daemon reports producing. */
+  let decisionFormKinds: DecisionFormKind[];
+  /** Whether the daemon's Live Activity pusher reports itself enabled. */
+  let liveActivityPushEnabled: boolean;
+  let desktopBridge: DesktopPhoneBridge | null;
+  /** Added to the server's clock: the sidebar-cache tests age snapshots with it instead of sleeping. */
+  let clockOffsetMs: number;
+  let agentLaunchEnv: NodeJS.ProcessEnv | undefined;
+  let settingsCalls: Array<{id:string;choice:unknown}>;
+  /** What the server handed its sent-file audit hook. */
+  let sentFileAudits: Array<{ deviceId: string; sessionId: string; file: string; bytes: number }>;
+  /** The Moa pane main last pushed (`daemon.moa.set`). */
+  let moaFact: { sessionId: string; workspaceId: string } | null;
+  let settingsHook: ((authorized:()=>Promise<boolean>)=>Promise<void>) | undefined;
+  const settingsRevision = 'a'.repeat(64)+'.'+'b'.repeat(64);
+
+  /** #1163 — the daemon's canonical agent state per session, as the server reads it. */
+  let agentStates: Record<string, { agentName: string | null; agentStatus: 'idle' | 'running' | 'awaiting_input' }>;
+  /** #1342 — the daemon's resume state per session, as the server reads it. */
+  let resumeStates: Record<string, { binding?: ResumeBinding; commandRunning?: boolean; agentProcessAlive?: boolean; resumeAgent?: string }>;
 
   beforeEach(() => {
+    desktopBridge = null;
+    clockOffsetMs = 0;
+    agentLaunchEnv = undefined;
+    settingsCalls = []; settingsHook = undefined;
+    sentFileAudits = [];
+    moaFact = null;
     gateArmed = true;
+    decisionFormKinds = [];
+    liveActivityPushEnabled = true;
+    agentStates = {};
+    resumeStates = {};
     const deps = makeDeps();
     bridge = deps.bridge;
     write = deps.write;
@@ -405,6 +548,9 @@ describe('WebTerminalServer', () => {
     deviceRoster = deps.deviceRoster;
     deviceMintCalls = deps.deviceMintCalls;
     pushRegistrations = deps.pushRegistrations;
+    liveActivityRegistrations = deps.liveActivityRegistrations;
+    liveActivityBox = deps.liveActivityBox;
+    liveActivityRegisteredCalls = 0;
     deviceTouchCalls = deps.deviceTouchCalls;
     deviceBox = deps.deviceBox;
     resizeCalls = deps.resizeCalls;
@@ -415,9 +561,12 @@ describe('WebTerminalServer', () => {
     gitScript = deps.gitScript;
     gitGate = deps.gitGate;
     managed = deps.managed;
+    activateListenerCounts = deps.activateListenerCounts;
     live = deps.live;
     uploadsDir = deps.uploadsDir;
     projectorMock = deps.projectorMock;
+    answerReceiptStore = new AnswerReceiptStore(deps.uploadsDir);
+    reconcileCalls = 0;
     server = new WebTerminalServer({
       sessionManager: deps.sessionManager,
       approvals: deps.approvals,
@@ -425,10 +574,31 @@ describe('WebTerminalServer', () => {
       lifecycle: deps.lifecycle,
       git: deps.git,
       uploadsDir: deps.uploadsDir,
+      auditSentFile: (entry) => { sentFileAudits.push(entry); },
+      moaPane: () => moaFact,
+      runHistory: () => new RunHistoryStore(deps.uploadsDir),
+      inputReceipts: () => new InputReceiptStore(deps.uploadsDir),
+      answerReceipts: () => answerReceiptStore,
+      decisionForms: () => decisionFormKinds,
+      reconcileDecisions: () => { reconcileCalls += 1; },
+      desktop: () => desktopBridge,
+      agentLaunchOptions: async env => { agentLaunchEnv = env; return [{agent:'claude',models:['opus','sonnet'],efforts:['low','high']}]; },
+      agentSettings: async (id,authorized,choice)=>{
+        settingsCalls.push({id,choice});
+        await settingsHook?.(authorized);
+        return {agent:'codex',model:'model-a',effort:'low',busy:false,revision:settingsRevision,models:[]};
+      },
       projector: () => projectorMock as unknown as TranscriptProjector,
       gateConfig: () => ({ gatedTools: ['Bash'] }),
       gateEnabled: () => gateArmed,
+      liveActivityPush: () => liveActivityPushEnabled,
+      liveActivityRegistered: () => { liveActivityRegisteredCalls += 1; },
       setGateEnabled: (enabled) => { gateArmed = enabled; },
+      agentState: (id) => agentStates[id],
+      resumeState: (id) => resumeStates[id],
+      // The first-paint wait, short so a "desktop does not answer" case costs little.
+      desktopSidebarFirstPaintMs: 150,
+      now: () => Date.now() + clockOffsetMs,
       log: () => { /* silent in tests */ },
       assetsDir: os.tmpdir(), // no terminal.html needed for the /api/* tests
     });
@@ -436,7 +606,9 @@ describe('WebTerminalServer', () => {
 
   afterEach(async () => {
     if (server.isRunning) await server.stop();
-    fs.rmSync(uploadsDir, { recursive: true, force: true });
+    // A timed-out Git request can still hold the repo as its process cwd.
+    // Async retries let its completion callbacks run before removing the tree.
+    await fs.promises.rm(uploadsDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   // Port 0 → ephemeral bind; status() reports the actual port.
@@ -469,6 +641,33 @@ describe('WebTerminalServer', () => {
     const ok = await fetch(`${base()}/api/config`, { headers: bearer(token) });
     expect(ok.status).toBe(200);
     expect(await ok.json()).toMatchObject({ allowInput: false, allowUpload: false });
+  });
+
+  // #1316 — the phone's half of the daemon's idle clock. The daemon folds this
+  // timestamp into the same anchor as the pipe's lastDisconnectAt, so a phone
+  // that is being used is no longer indistinguishable from an abandoned daemon.
+  it('stamps idle-clock activity for authenticated /api/* calls, and only those', async () => {
+    const info = await startRO();
+    const token = info.token as string;
+
+    expect(server.getLastActivityAt()).toBeNull();
+
+    // A refused credential is not somebody using the daemon.
+    const noAuth = await fetch(`${base()}/api/config`);
+    expect(noAuth.status).toBe(401);
+    expect(server.getLastActivityAt()).toBeNull();
+
+    // Neither is the one unauthenticated API route: anything that can open the
+    // port can call it, and a stranger must not be able to keep the daemon up.
+    await fetch(`${base()}/api/pair?code=ZZZZZZZZ`);
+    expect(server.getLastActivityAt()).toBeNull();
+
+    const before = Date.now();
+    const ok = await fetch(`${base()}/api/sessions`, { headers: bearer(token) });
+    expect(ok.status).toBe(200);
+    const stamped = server.getLastActivityAt();
+    expect(stamped).not.toBeNull();
+    expect(stamped as number).toBeGreaterThanOrEqual(before);
   });
 
   it('★ /api/config carries the phone protocol handshake', async () => {
@@ -565,7 +764,181 @@ describe('WebTerminalServer', () => {
     expect(wire).not.toContain('sk-secret');
     expect(wire).not.toContain('ANTHROPIC_API_KEY');
     expect(wire).not.toContain('/usr/bin');
-    expect(wire).not.toContain('ws-legacy');
+    // The workspace id is an ADDRESS, carried as `workspaceId` (the same id
+    // `/api/workspaces` already serves to this bearer) — never as the label.
+    expect(sessions[1].workspaceId).toBe('ws-legacy');
+    expect(sessions[0].workspaceId).toBe('ws-1');
+    expect('workspaceId' in sessions[2]).toBe(false);
+  });
+
+  it('★ #1319 a pane row names the detected agent and the cwd leaf, or carries neither key', async () => {
+    // s1 runs an agent the detector recognised; s2 and s3 are plain shells.
+    // Before this the phone had only `agent`, whose value is a role display
+    // name for some panes and this same slug for others — so every shell pane's
+    // chip collapsed to the generic word.
+    live[0].lastDetectedAgent = 'claude';
+    const info = await startRO();
+    const res = await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) });
+    expect(res.status).toBe(200);
+    const { sessions } = (await res.json()) as { sessions: Array<Record<string, unknown>> };
+
+    expect(sessions[0].lastDetectedAgent).toBe('claude');
+    // `agent` keeps the shape it always had — the new field is additive, not a
+    // replacement, so a client that ignores it behaves exactly as before.
+    expect(sessions[0].agent).toBe('claude');
+    // Absent means "no agent was ever detected here", never null-the-value: a
+    // client must be able to tell "not known" from "known to be nothing".
+    expect('lastDetectedAgent' in sessions[1]).toBe(false);
+    expect('lastDetectedAgent' in sessions[2]).toBe(false);
+
+    // The leaf of the pane's own cwd — the label of last resort, computed once
+    // by the daemon instead of separately by every client.
+    expect(sessions[0].cwdLeaf).toBe('x');
+    expect(sessions[1].cwdLeaf).toBe('y');
+  });
+
+  it('★ #1319 the cwd leaf survives both separators and a trailing one', async () => {
+    // A Windows daemon can hold a pane whose shell reports a POSIX path (WSL,
+    // git-bash), so neither separator can be the only one split on, and a
+    // trailing separator must not swallow the leaf.
+    live[0].cwd = 'C:\\Users\\dev\\wmux\\';
+    live[1].cwd = '/home/dev/projects/relay';
+    live[2].cwd = '\\\\build-01\\share\\out';
+    const info = await startRO();
+    const { sessions } = (await (
+      await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) })
+    ).json()) as { sessions: Array<Record<string, unknown>> };
+
+    expect(sessions[0].cwdLeaf).toBe('wmux');
+    expect(sessions[1].cwdLeaf).toBe('relay');
+    expect(sessions[2].cwdLeaf).toBe('out');
+  });
+
+  it('★ #1319 a cwd with no readable leaf carries no key — including a DRIVE root', async () => {
+    // `cwd` is whatever the pane's own process last claimed over OSC 7, so the
+    // degenerate values are real. The key is withheld rather than filled with
+    // something a human cannot read: absent is a label the client can fall back
+    // from, "C:" and " " are labels it would print.
+    live[0].cwd = '/';
+    // What OSC 7 `/C:/` parses to on the daemon's primary platform. Before the
+    // drive-letter check this rendered a pane chip reading "C:".
+    live[1].cwd = 'C:\\';
+    live[2].cwd = '   ';
+    const info = await startRO();
+    const { sessions } = (await (
+      await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) })
+    ).json()) as { sessions: Array<Record<string, unknown>> };
+
+    expect('cwdLeaf' in sessions[0]).toBe(false);
+    expect('cwdLeaf' in sessions[1]).toBe(false);
+    expect('cwdLeaf' in sessions[2]).toBe(false);
+  });
+
+  it('deduplicates authenticated input IDs and refuses changed bodies or pane incarnations', async () => {
+    const info = await startRW();
+    const requestID = `${Date.now()}.${crypto.randomUUID()}`;
+    const headers = {...bearer(info.token as string),'X-Wmux-Input-Request-ID':requestID,'X-Wmux-Pane-Incarnation':'incarnation-1'};
+    const post = (body: string) => fetch(`${base()}/api/input?session=s1`,{method:'POST',headers,body});
+    expect((await post('hello')).status).toBe(200);
+    expect(await (await post('hello')).json()).toEqual({status:'written',replayed:true});
+    expect(write).toHaveBeenCalledTimes(1);
+    expect((await post('changed')).status).toBe(409);
+    managed.meta.incarnationId = 'incarnation-2';
+    expect((await post('hello')).status).toBe(409);
+    expect(write).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry a possibly partial write through the HTTP receipt path', async () => {
+    const info = await startRW();
+    write.mockImplementationOnce(() => { throw new Error('partial'); });
+    const headers = {...bearer(info.token as string),'X-Wmux-Input-Request-ID':`${Date.now()}.${crypto.randomUUID()}`,'X-Wmux-Pane-Incarnation':'incarnation-1'};
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await fetch(`${base()}/api/input?session=s1`,{method:'POST',headers,body:'hello'});
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({status:'uncertain',replayed:attempt === 1});
+    }
+    expect(write).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false,true])('guards Return against intervening input (changed=%s)', async changed => {
+    const info = await startRW();
+    let revision = 0;
+    Object.assign(bridge,{getInputRevision:() => revision,noteInput:() => { revision++; }});
+    const textID = `${Date.now()}.${crypto.randomUUID()}`;
+    const returnID = `${Date.now()}.${crypto.randomUUID()}`;
+    const post = (id: string, body: string, after?: string) => fetch(`${base()}/api/input?session=s1`, {
+      method:'POST',headers:{...bearer(info.token as string),'X-Wmux-Input-Request-ID':id,
+        'X-Wmux-Pane-Incarnation':'incarnation-1',...(after ? {'X-Wmux-Input-After':after} : {})},body,
+    });
+    const receipt = await (await post(textID,'hello')).json() as {inputToken:string};
+    expect(receipt.inputToken).toEqual(expect.any(String));
+    if (changed) revision++; // Another phone/desktop write observed by the bridge.
+    const submission = await post(returnID,'\r',receipt.inputToken);
+    expect(submission.status).toBe(changed ? 409 : 200);
+    expect(write).toHaveBeenCalledTimes(changed ? 1 : 2);
+    if (!changed) {
+      revision++;
+      const replay = await post(returnID,'\r',receipt.inputToken);
+      expect(replay.status).toBe(200);
+      expect(await replay.json()).toMatchObject({status:'written',replayed:true});
+      expect(write).toHaveBeenCalledTimes(2);
+    }
+  });
+
+  it('reconciles a dropped response after HTTP server restart without repeating input', async () => {
+    const info = await startRW();
+    const requestID = `${Date.now()}.${crypto.randomUUID()}`;
+    let receivedResponse = false;
+    await new Promise<void>((resolve, reject) => {
+      const request = httpReq(`${base()}/api/input?session=s1`, {
+        method:'POST', headers:{...bearer(info.token as string),
+          'X-Wmux-Input-Request-ID':requestID,'X-Wmux-Pane-Incarnation':'incarnation-1'},
+      }, response => { receivedResponse = true; response.resume(); reject(new Error('Expected dropped response')); });
+      // Drop the client socket exactly when the server writes, before its
+      // receipt response. No timing sleeps or live user PTYs are involved.
+      write.mockImplementationOnce(() => request.destroy(new Error('simulated response loss')));
+      request.once('error', () => resolve());
+      request.end('hello');
+    });
+    expect(receivedResponse).toBe(false);
+    expect(write).toHaveBeenCalledTimes(1);
+    await server.stop();
+    const restarted = await startRW();
+    const response = await fetch(`${base()}/api/input?session=s1`, {
+      method:'POST',headers:{...bearer(restarted.token as string),
+        'X-Wmux-Input-Request-ID':requestID,'X-Wmux-Pane-Incarnation':'incarnation-1'},body:'hello',
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({status:'written',replayed:true});
+    expect(write).toHaveBeenCalledTimes(1);
+  });
+
+  it('rechecks device revocation after a slow input body completes', async () => {
+    await startRW();
+    const phone = await pairDevice('Slow sender',true);
+    let observed!: () => void;
+    const authorized = new Promise<void>(resolve => { observed = resolve; });
+    const original = sessionManager.getSession.bind(sessionManager);
+    const spy = vi.spyOn(sessionManager,'getSession').mockImplementation(id => {
+      const result = original(id);
+      if (id === 's1') observed();
+      return result;
+    });
+    let request: ReturnType<typeof httpReq>;
+    const response = new Promise<number | undefined>((resolve,reject) => {
+      request = httpReq(`${base()}/api/input?session=s1`,{method:'POST',headers:bearer(phone.token)},res => {
+        res.resume(); res.on('end',() => resolve(res.statusCode));
+      });
+      request.on('error',reject);
+      request.write('partial body');
+    });
+    try {
+      await authorized;
+      deviceRoster.get(phone.deviceId)!.revoked = true;
+      request!.end(' remaining body');
+      expect(await response).toBe(401);
+      expect(write).not.toHaveBeenCalled();
+    } finally { spy.mockRestore(); request!.destroy(); }
   });
 
   it('rejects input when started read-only (403), accepts and writes when --allow-input (204)', async () => {
@@ -745,6 +1118,104 @@ describe('WebTerminalServer', () => {
   });
 
   // ── critical / notify SSE tee ──────────────────────────────────────────────
+  it('★ #1402 withholds the brain pane\'s critical/notify events from the fan-out and the replay log', async () => {
+    // Both brain marks, on separate panes: the env marker, and the id prefix
+    // for a listing that omits env. A pane the manager no longer knows must
+    // still get through — that is a closed pane's in-flight event, not a
+    // brain pane.
+    live.push({
+      id: 'pty-orchestrator', cwd: '/x', cols: 80, rows: 24, state: 'detached',
+      agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+      env: { WMUX_BRAIN_PTY: '1' }, cmd: '/usr/bin/claude',
+    });
+    const info = await startRO();
+    const token = info.token as string;
+    const ac = new AbortController();
+    const sse = await fetch(
+      `${base()}/api/stream?session=s1&token=${encodeURIComponent(token)}`,
+      { signal: ac.signal },
+    );
+    expect(sse.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const em = sessionManager as unknown as EventEmitter;
+    em.emit('session:critical', {
+      sessionId: 'pty-orchestrator',
+      event: { action: 'delete files', riskLevel: 'critical', matchedLine: '$ rm -rf orchestrator-secrets' },
+    });
+    em.emit('session:notification', {
+      sessionId: 'brain-ws-9',
+      event: { source: 'osc9', title: null, body: 'orchestrator notification', ts: 1 },
+    });
+    em.emit('session:notification', {
+      sessionId: 'gone-worker',
+      event: { source: 'osc9', title: null, body: 'closed pane still speaks', ts: 2 },
+    });
+
+    const reader = (sse.body as ReadableStream<Uint8Array>).getReader();
+    let text = '';
+    const deadline = Date.now() + 500;
+    while (Date.now() < deadline && !text.includes('closed pane still speaks')) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) text += Buffer.from(value).toString('utf8');
+    }
+    ac.abort();
+
+    expect(text).toContain('"sessionId":"gone-worker"');
+    expect(text).not.toContain('pty-orchestrator');
+    expect(text).not.toContain('orchestrator-secrets');
+    expect(text).not.toContain('brain-ws-9');
+    expect(text).not.toContain('orchestrator notification');
+
+    // The replayable backlog behind /api/events never held them either.
+    const backlog = await fetch(`${base()}/api/events`, { headers: bearer(token) });
+    expect(backlog.status).toBe(200);
+    const body = await backlog.text();
+    expect(body).toContain('gone-worker');
+    expect(body).not.toContain('pty-orchestrator');
+    expect(body).not.toContain('brain-ws-9');
+  });
+
+  it('★ #1397 withholds the brain pane\'s approval events from the fan-out and the replay log', async () => {
+    // The same producer-side gate as #1402 above, on the other producer. An
+    // `approval` event carries the pane id AND the gate's tool name and input
+    // summary, so a brain record here would hand a device the orchestrator's
+    // tool input plus the very id the per-pane routes (#1388) refuse.
+    live.push({
+      id: 'pty-orchestrator', cwd: '/x', cols: 80, rows: 24, state: 'detached',
+      agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+      env: { WMUX_BRAIN_PTY: '1' }, cmd: '/usr/bin/claude',
+    });
+    const info = await startRO();
+    const token = info.token as string;
+
+    // Injected at the registry's own event edge, not produced through the hook
+    // path: whether the brain can raise a record today is a property of how
+    // `ClaudePtyBrainAdapter` spawns it, which is exactly what this gate is
+    // here not to depend on.
+    emitApproval('create', mkApproval({
+      id: 'ap-brain',
+      sessionId: 'pty-orchestrator',
+      kind: 'awaiting_permission',
+      toolName: 'Bash',
+      toolInputSummary: 'rm -rf orchestrator-secrets',
+    }));
+    // A pane the manager no longer knows still gets through — a closed pane's
+    // in-flight approval is not a brain pane.
+    emitApproval('create', mkApproval({ id: 'ap-gone', sessionId: 'gone-worker' }));
+    emitApproval('create', mkApproval({ id: 'ap-worker', sessionId: 's1' }));
+
+    const backlog = await fetch(`${base()}/api/events`, { headers: bearer(token) });
+    expect(backlog.status).toBe(200);
+    const body = await backlog.text();
+    expect(body).toContain('ap-worker');
+    expect(body).toContain('ap-gone');
+    expect(body).not.toContain('ap-brain');
+    expect(body).not.toContain('pty-orchestrator');
+    expect(body).not.toContain('orchestrator-secrets');
+  });
+
   it('tees session:critical and session:notification to every SSE client', async () => {
     const info = await startRO();
     const token = info.token as string;
@@ -855,6 +1326,59 @@ describe('WebTerminalServer', () => {
       expect(api.headers.get('content-security-policy')).toBe("frame-ancestors 'none'");
     } finally {
       if (csps.isRunning) await csps.stop();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The browser app page (/ and /app) has its own inline scripts, so its own
+  // policy, and serves only the exact font files the build emitted.
+  it('serves GET /app under its own CSP and its fonts same-origin', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-web-app-'));
+    fs.writeFileSync(path.join(dir, 'terminal.html'), '<html><body><script>var a=1;</script></body></html>');
+    fs.writeFileSync(path.join(dir, 'app.html'), '<html><body><script>var boot=1;</script><script>var app=2;</script></body></html>');
+    fs.mkdirSync(path.join(dir, 'app-assets'));
+    fs.writeFileSync(path.join(dir, 'app-assets', 'Inter-abc123.woff2'), 'FONT');
+    // Build-emitted names may carry dots; the route must serve every name the build gate accepts.
+    fs.writeFileSync(path.join(dir, 'app-assets', 'Inter.latin-B_x.1.woff2'), 'DOTTED');
+    fs.writeFileSync(path.join(dir, 'app-assets', 'notes.txt'), 'nope');
+    const deps = makeDeps();
+    const srv = new WebTerminalServer({ sessionManager: deps.sessionManager, log: () => { /* silent */ }, assetsDir: dir });
+    try {
+      const info = await srv.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: false });
+      const base = `http://127.0.0.1:${info.port}`;
+      const page = await fetch(`${base}/app`);
+      expect(page.status).toBe(200);
+      expect(await page.text()).toContain('var app=2;');
+      const csp = page.headers.get('content-security-policy') ?? '';
+      expect(csp.match(/'sha256-[A-Za-z0-9+/=]+'/g)).toHaveLength(2);
+      expect(csp).toContain("font-src 'self'");
+      // The app compiles no WebAssembly; only the classic page's image
+      // decoders need it (#1641).
+      expect(csp).not.toContain('wasm-unsafe-eval');
+      // `/` is the app page too, now that it has terminals.
+      const root = await fetch(`${base}/`);
+      expect(await root.text()).toContain('var app=2;');
+      expect(root.headers.get('content-security-policy')).toBe(csp);
+      // The classic page lives at /classic (fallback) and /pair (pairing), and
+      // its policy names only its own block.
+      for (const classicPath of ['/classic', '/pair']) {
+        const classic = await fetch(`${base}${classicPath}`);
+        expect(await classic.text()).toContain('var a=1;');
+        const classicCsp = classic.headers.get('content-security-policy') ?? '';
+        expect(classicCsp.match(/'sha256-/g)).toHaveLength(1);
+        expect(classicCsp).toContain("'wasm-unsafe-eval'");
+        expect(classicCsp).not.toContain("'unsafe-eval'");
+      }
+
+      const font = await fetch(`${base}/app/assets/Inter-abc123.woff2`);
+      expect(font.status).toBe(200);
+      expect(font.headers.get('content-type')).toBe('font/woff2');
+      expect(await font.text()).toBe('FONT');
+      expect(await (await fetch(`${base}/app/assets/Inter.latin-B_x.1.woff2`)).text()).toBe('DOTTED');
+      expect((await fetch(`${base}/app/assets/notes.txt`)).status).toBe(404);
+      expect((await fetch(`${base}/app/assets/..%2Fterminal.html`)).status).toBe(404);
+    } finally {
+      if (srv.isRunning) await srv.stop();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -1334,6 +1858,26 @@ describe('WebTerminalServer', () => {
     expect(out.text).toContain('"body":"missed-it"');
   });
 
+  it('answers at once when a reconnect has nothing to replay, without waiting for the heartbeat', async () => {
+    const info = await startRO();
+    const token = info.token as string;
+    emitNotify('s2', 'already-seen');
+    const epoch = (await backlog(token)).epoch;
+
+    // Cursor at the head: nothing to replay, so before the fix no byte (and
+    // no headers) left the daemon until the first 25 s heartbeat — fetch
+    // itself would not resolve and this test would time out.
+    const out = await readEventStream(
+      `${base()}/api/events?token=${encodeURIComponent(token)}`,
+      /: open\n\n/,
+      { 'Last-Event-ID': `${epoch}:1` },
+    );
+    expect(out.status).toBe(200);
+    expect(out.text).toContain(': open\n\n');
+    expect(out.text).not.toContain('event: reset');
+    expect(out.text).not.toContain('already-seen');
+  });
+
   it('resumes from Last-Event-ID, which the browser resends on reconnect', async () => {
     const info = await startRO();
     const token = info.token as string;
@@ -1673,7 +2217,10 @@ describe('WebTerminalServer', () => {
       // A well-formed key that is not valid for this live request stays pending.
       { result: { ok: false, reason: 'invalid-choice-key' }, status: 422, body: { error: 'invalid-choice-key' } },
       // No keystroke map for this agent — the daemon refuses to guess bytes.
-      { result: { ok: false, reason: 'unsupported-agent' }, status: 501, body: { error: 'unsupported-agent' } },
+      { result: { ok: false, reason: 'unsupported-agent' }, status: 501, body: { error: 'unsupported-agent', reason: 'unsupported-agent' } },
+      // A multi-select / multi-question AskUserQuestion: one key cannot answer
+      // it. The error a v1 client already understands, plus why.
+      { result: { ok: false, reason: 'needs-v2' }, status: 501, body: { error: 'answer-in-terminal', reason: 'needs-v2' } },
       { result: { ok: false, reason: 'not-found' }, status: 404, body: { error: 'not-found' } },
     ];
 
@@ -2204,7 +2751,7 @@ describe('WebTerminalServer', () => {
     // UUIDs cannot be operated, so the name has to reach the store.
     // The grant rides with the name for the same reason: both are decided at
     // the desk, and the phone types only a code.
-    expect(deviceMintCalls).toEqual([{ name: 'Wife phone', allowInput: true }]);
+    expect(deviceMintCalls).toEqual([{ name: 'Wife phone', allowInput: true, kind: 'phone' }]);
 
     // A second pairing is a DIFFERENT device — that is the whole point.
     const second = await pairDevice('Tablet');
@@ -2322,6 +2869,117 @@ describe('WebTerminalServer', () => {
     expect((await badKey.json()).error).toBe('bad-key');
   });
 
+  it('★ a device registers its Live Activity tokens; the operator token cannot', async () => {
+    const info = await startRO();
+    const { token } = await pairDevice('Phone');
+    const pushToStartToken = 'a'.repeat(64);
+    const activityToken = 'b'.repeat(64);
+    const post = (auth: string, body: unknown) =>
+      fetch(`${base()}/api/live-activity-registration`, {
+        method: 'POST',
+        headers: { ...bearer(auth), 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    const ok = await post(token, { pushToStartToken, apnsEnvironment: 'development' });
+    expect(ok.status).toBe(200);
+    expect(liveActivityRegistrations.at(-1)).toEqual({
+      deviceId: 'dev-1',
+      pushToStartToken,
+      apnsEnvironment: 'development',
+    });
+
+    // ★ The activity token arrives LATER, in its own call. What reaches the
+    // store must carry only that field — an omitted one means "leave it", and
+    // the store is the thing that merges.
+    const before = liveActivityRegisteredCalls;
+    expect((await post(token, { activityToken })).status).toBe(200);
+    expect(liveActivityRegistrations.at(-1)).toEqual({ deviceId: 'dev-1', activityToken });
+    // ★ …and the daemon hears about it, so numbers that moved while the token
+    // was in flight reach the lock screen now rather than at the next approval.
+    expect(liveActivityRegisteredCalls).toBe(before + 1);
+
+    // ★ `null` is NOT absence on this route: it is "the activity is over".
+    expect((await post(token, { activityToken: null })).status).toBe(200);
+    expect(liveActivityRegistrations.at(-1)).toEqual({ deviceId: 'dev-1', activityToken: null });
+    // ★ …and it must not re-run the decision, which would start a new activity
+    // the moment the old one was dismissed.
+    expect(liveActivityRegisteredCalls).toBe(before + 1);
+
+    // The operator token names no device, so there is no activity to register.
+    const asOperator = await post(info.token as string, { pushToStartToken });
+    expect(asOperator.status).toBe(403);
+    expect((await asOperator.json()).error).toBe('push-is-for-devices');
+  });
+
+  it('refuses a malformed activity token and an unknown APNs stage with 400', async () => {
+    await startRO();
+    const { token } = await pairDevice('Phone');
+    const post = (body: unknown) =>
+      fetch(`${base()}/api/live-activity-registration`, {
+        method: 'POST',
+        headers: { ...bearer(token), 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    const badToken = await post({ activityToken: 'nope' });
+    expect(badToken.status).toBe(400);
+    expect((await badToken.json()).error).toBe('bad-token');
+
+    const badStage = await post({ pushToStartToken: 'a'.repeat(64), apnsEnvironment: 'staging' });
+    expect(badStage.status).toBe(400);
+    expect((await badStage.json()).error).toBe('bad-apns-environment');
+  });
+
+  it('★ the store refusals that are not the caller fault come back as 409', async () => {
+    await startRO();
+    const { token } = await pairDevice('Phone');
+    const post = () =>
+      fetch(`${base()}/api/live-activity-registration`, {
+        method: 'POST',
+        headers: { ...bearer(token), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pushToStartToken: 'a'.repeat(64) }),
+      });
+
+    // A device revoked between the auth check and the write, a record that
+    // vanished, and a roster that could not be written are all 409: the request
+    // was fine, the daemon could not honour it.
+    for (const reason of ['revoked', 'not-found', 'persist-failed']) {
+      liveActivityBox.reason = reason;
+      const res = await post();
+      expect(res.status, reason).toBe(409);
+      expect((await res.json()).error).toBe(reason);
+    }
+    // Nothing was stored, so there is nothing to catch up on.
+    expect(liveActivityRegisteredCalls).toBe(0);
+    liveActivityBox.reason = '';
+    expect((await post()).status).toBe(200);
+  });
+
+  it('★ /api/config says this daemon can drive a Live Activity', async () => {
+    await startRO();
+    const { token } = await pairDevice('Phone');
+    const cfg = await (await fetch(`${base()}/api/config`, { headers: bearer(token) })).json();
+    // The phone hands the daemon the start decision only on this flag; a
+    // daemon that omits it keeps the app starting the activity locally.
+    expect(cfg.liveActivityPush).toBe(true);
+  });
+
+  it('★ …and OMITS the key when the pusher is inert, exactly as an old daemon does', async () => {
+    // No relay configured → the pusher can send nothing. Reporting `true` here
+    // would tell the phone to stop starting the activity itself and wait for a
+    // push that is never coming — a lock screen that simply goes quiet.
+    liveActivityPushEnabled = false;
+    await startRO();
+    const { token } = await pairDevice('Phone');
+    const res = await fetch(`${base()}/api/config`, { headers: bearer(token) });
+    const wire = await res.text();
+    // The KEY is gone, not set to false: a daemon that predates the feature
+    // answers the same shape, and the phone must read the two identically.
+    expect(wire).not.toContain('liveActivityPush');
+    expect('liveActivityPush' in JSON.parse(wire)).toBe(false);
+  });
+
   it('★ authenticates the routes a phone actually uses with a device credential', async () => {
     await startRO();
     const { token } = await pairDevice('Phone');
@@ -2385,6 +3043,62 @@ describe('WebTerminalServer', () => {
     // …and the daemon-side control surface is untouched by M3.
     expect(server.status().token).toBe(token);
     expect(server.refreshPairCode().pairCode).toMatch(pairCodePattern);
+  });
+
+  it('admits more than eight operator remote pane streams plus host events', async () => {
+    const info = await startWithTranscript();
+    const abort = new AbortController();
+    try {
+      const panes = await Promise.all(Array.from({ length: 10 }, () => fetch(`${base()}/api/stream?session=s1`, {
+        headers: bearer(info.token as string), signal: abort.signal,
+      })));
+      expect(panes.every((response) => response.status === 200)).toBe(true);
+      const events = await fetch(`${base()}/api/events`, { headers: { ...bearer(info.token as string), Accept: 'text/event-stream' }, signal: abort.signal });
+      expect(events.status).toBe(200);
+    } finally { abort.abort(); }
+  });
+
+  it('shares the stream ceiling across SSE and media, releases slots, and keeps quiet SSE alive', async () => {
+    const limits = new StreamResponseLimits(300, 2);
+    const acquire = StreamResponseLimits.prototype.acquire;
+    const admission = vi.spyOn(StreamResponseLimits.prototype, 'acquire')
+      .mockImplementation((key, response, options) => acquire.call(limits, key, response, options));
+    const startHeartbeat = heartbeat.startSseHeartbeat;
+    const pings = vi.spyOn(heartbeat, 'startSseHeartbeat')
+      .mockImplementation((response) => startHeartbeat(response, 25));
+    const abort = new AbortController();
+    try {
+      const info = await startWithTranscript();
+      const device = await pairDevice('Limited viewer');
+      const headers = bearer(device.token);
+      const pane = await fetch(`${base()}/api/stream?session=s1`, { headers, signal: abort.signal });
+      const events = await fetch(`${base()}/api/events`, {
+        headers: { ...headers, Accept: 'text/event-stream' }, signal: abort.signal,
+      });
+      expect(pane.status).toBe(200);
+      expect(events.status).toBe(200);
+      const media = await fetch(`${base()}/api/sessions/s1/turns/file?path=/missing`, { headers });
+      expect(media.status).toBe(429);
+      expect(await media.json()).toMatchObject({ error: 'too-many-streams' });
+      // Reading heartbeat comments keeps a quiet stream healthy past its idle limit.
+      const reader = events.body!.getReader();
+      const until = Date.now() + 400;
+      while (Date.now() < until) expect((await reader.read()).done).toBe(false);
+      const phone = await pairDevice('Other principal');
+      const other = await fetch(`${base()}/api/stream?session=s1`, {
+        headers: bearer(phone.token), signal: abort.signal,
+      });
+      expect(other.status).toBe(200);
+      await pane.body!.cancel();
+      await vi.waitFor(async () => {
+        const freed = await fetch(`${base()}/api/sessions/s1/turns/file?path=/missing`, { headers });
+        expect(freed.status).toBe(404);
+      });
+    } finally {
+      abort.abort();
+      pings.mockRestore();
+      admission.mockRestore();
+    }
   });
 
   it('★ 401s a revoked device with reason `revoked` AND kills its live streams at once', async () => {
@@ -2701,7 +3415,7 @@ describe('WebTerminalServer', () => {
     expect(paired.status).toBe(200);
     // `startPairing` was called with a name and no grant, so the device
     // registers read-only — an unstated grant is never read as "yes".
-    expect(deviceMintCalls).toEqual([{ name: 'Named phone', allowInput: false }]);
+    expect(deviceMintCalls).toEqual([{ name: 'Named phone', allowInput: false, kind: 'phone' }]);
 
     // Redeeming consumes the name AND the grant: the next device inherits
     // neither. A code minted without a fresh decision registers a read-only
@@ -2709,7 +3423,222 @@ describe('WebTerminalServer', () => {
     server.refreshPairCode();
     const next = server.status().pairCode as string;
     expect((await fetch(`${base()}/api/pair?code=${next}`)).status).toBe(200);
-    expect(deviceMintCalls[1]).toEqual({ name: undefined, allowInput: false });
+    expect(deviceMintCalls[1]).toEqual({ name: undefined, allowInput: false, kind: 'unknown' });
+  });
+
+  // ── phone / computer pairing flows (one code slot) ─────────────────────────
+
+  describe('phone and computer pairing share one code slot without mixing', () => {
+    /** Burn the attempt budget and let the server re-mint lazily (the expiry path). */
+    const burnAndReMint = async (): Promise<string> => {
+      for (let i = 0; i < 5; i++) await fetch(`${base()}/api/pair?code=ZZZZZZZZ`);
+      const realNow = Date.now();
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(realNow + 31_000);
+      try {
+        await fetch(`${base()}/api/pair?code=ZZZZZZZZ`);
+        return server.status().pairCode as string;
+      } finally {
+        nowSpy.mockRestore();
+      }
+    };
+
+    it('refuses a computer start while a phone pairing is live, before touching the code', async () => {
+      await startRO();
+      const phone = server.startPairing({ name: 'Wife phone', allowInput: true, flow: 'phone' });
+      if (!phone.ok) throw new Error(phone.error);
+
+      const computer = server.startPairing({ name: 'Computer', allowInput: false, flow: 'computer' });
+      expect(computer).toMatchObject({ ok: false, reason: 'busy' });
+
+      // The phone's QR still encodes the same code, name and grant.
+      const status = server.status();
+      expect(status.pairCode).toBe(phone.code);
+      expect(status.pendingDeviceName).toBe('Wife phone');
+      expect(status.pendingDeviceAllowInput).toBe(true);
+      expect(status.pendingPairFlow).toBe('phone');
+
+      expect((await fetch(`${base()}/api/pair?code=${phone.code}`)).status).toBe(200);
+      expect(deviceMintCalls).toEqual([{ name: 'Wife phone', allowInput: true, kind: 'phone' }]);
+    });
+
+    it('keeps the computer name, grant and flow across the re-mint path, and never lends them to the phone', async () => {
+      await startRO();
+      const computer = server.startPairing({ name: 'Computer', allowInput: true, flow: 'computer' });
+      if (!computer.ok) throw new Error(computer.error);
+
+      const replacement = await burnAndReMint();
+      expect(replacement).toHaveLength(8);
+      expect(replacement).not.toBe(computer.code);
+      const status = server.status();
+      expect(status.pendingDeviceName).toBe('Computer');
+      expect(status.pendingDeviceAllowInput).toBe(true);
+      expect(status.pendingPairFlow).toBe('computer');
+
+      // The phone card cannot start over the live computer pairing…
+      expect(server.startPairing({ name: 'Phone', allowInput: false, flow: 'phone' })).toMatchObject({
+        ok: false,
+        reason: 'busy',
+      });
+      // …until the operator cancels it. Then the phone gets ITS name and grant.
+      const cancelled = server.cancelPairing();
+      expect(cancelled.pendingDeviceName).toBeUndefined();
+      expect(cancelled.pendingPairFlow).toBeUndefined();
+      expect(cancelled.pairCode).not.toBe(replacement);
+
+      const phone = server.startPairing({ name: 'Phone', allowInput: false, flow: 'phone' });
+      if (!phone.ok) throw new Error(phone.error);
+      expect(server.status()).toMatchObject({
+        pendingDeviceName: 'Phone',
+        pendingDeviceAllowInput: false,
+        pendingPairFlow: 'phone',
+      });
+      // The cancelled computer code no longer redeems anything.
+      expect((await fetch(`${base()}/api/pair?code=${replacement}`)).status).toBe(403);
+      expect((await fetch(`${base()}/api/pair?code=${phone.code}`)).status).toBe(200);
+      expect(deviceMintCalls).toEqual([{ name: 'Phone', allowInput: false, kind: 'phone' }]);
+    });
+
+    it('lets the other card start once the pending code has expired, replacing the whole triple', async () => {
+      await startRO();
+      const phone = server.startPairing({ name: 'Phone', allowInput: true, flow: 'phone' });
+      if (!phone.ok) throw new Error(phone.error);
+      const realNow = Date.now();
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(realNow + 11 * 60_000);
+      try {
+        const computer = server.startPairing({ name: 'Computer', allowInput: false, flow: 'computer' });
+        expect(computer.ok).toBe(true);
+        expect(server.status()).toMatchObject({
+          pendingDeviceName: 'Computer',
+          pendingDeviceAllowInput: false,
+          pendingPairFlow: 'computer',
+        });
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it('re-minting the same flow ("New code") is allowed and keeps that flow', async () => {
+      await startRO();
+      const first = server.startPairing({ name: 'Computer', allowInput: false, flow: 'computer' });
+      const again = server.startPairing({ name: 'Computer', allowInput: false, flow: 'computer' });
+      expect(first.ok && again.ok).toBe(true);
+      if (first.ok && again.ok) expect(again.code).not.toBe(first.code);
+      expect(server.status().pendingPairFlow).toBe('computer');
+    });
+
+    it('records the kind the desktop client states, allowlisted; flow decides only when it says nothing', async () => {
+      await startRO();
+      const computer = server.startPairing({ name: 'Computer', flow: 'computer' });
+      if (!computer.ok) throw new Error(computer.error);
+      const res = await fetch(`${base()}/api/pair?code=${computer.code}`, {
+        headers: { 'X-Wmux-Device-Kind': ' Computer ' },
+      });
+      expect(res.status).toBe(200);
+
+      const phone = server.startPairing({ name: 'Phone', flow: 'phone' });
+      if (!phone.ok) throw new Error(phone.error);
+      // Not on the allowlist: never trusted, falls back to what the card said.
+      await fetch(`${base()}/api/pair?code=${phone.code}`, { headers: { 'X-Wmux-Device-Kind': 'admin' } });
+
+      const unlabelled = server.startPairing({ name: 'Typed by hand', flow: 'computer' });
+      if (!unlabelled.ok) throw new Error(unlabelled.error);
+      await fetch(`${base()}/api/pair?code=${unlabelled.code}`);
+
+      expect(deviceMintCalls.map((c) => (c as { kind?: string }).kind)).toEqual(['computer', 'phone', 'unknown']);
+    });
+
+    it('lists a device holding a live stream in liveDeviceIds, and drops it on disconnect', async () => {
+      await startRO();
+      const phone = await pairDevice('Watching phone');
+      expect(server.liveDeviceIds().size).toBe(0);
+      const ticket = await ticketFor(phone.token);
+      const ac = new AbortController();
+      const pane = await fetch(`${base()}/api/stream?session=s1&ticket=${encodeURIComponent(ticket)}`, {
+        signal: ac.signal,
+      });
+      expect(pane.status).toBe(200);
+      await new Promise((r) => setTimeout(r, 30));
+      expect([...server.liveDeviceIds()]).toEqual([phone.deviceId]);
+      server.disconnectDevice(phone.deviceId);
+      expect(server.liveDeviceIds().size).toBe(0);
+      ac.abort();
+    });
+
+    it('a pairing started for the other card during a slow mint is never burned by it', async () => {
+      await startRO();
+      const phone = server.startPairing({ name: 'Phone', allowInput: true, flow: 'phone' });
+      if (!phone.ok) throw new Error(phone.error);
+      let release: () => void = () => undefined;
+      deviceBox.mintGate = new Promise<void>((r) => { release = r; });
+      const redeeming = fetch(`${base()}/api/pair?code=${phone.code}`);
+      await new Promise((r) => setTimeout(r, 30));
+      // The phone code is already claimed: a second redemption loses, and the
+      // computer card may start while the mint is still in flight.
+      expect((await fetch(`${base()}/api/pair?code=${phone.code}`)).status).toBe(403);
+      const computer = server.startPairing({ name: 'Computer', allowInput: false, flow: 'computer' });
+      if (!computer.ok) throw new Error(computer.error);
+      release();
+      expect((await redeeming).status).toBe(200);
+      deviceBox.mintGate = null;
+      // The computer pairing survived the phone's redemption untouched.
+      expect(server.status()).toMatchObject({
+        pairCode: computer.code,
+        pendingDeviceName: 'Computer',
+        pendingDeviceAllowInput: false,
+        pendingPairFlow: 'computer',
+      });
+      expect(deviceMintCalls[0]).toEqual({ name: 'Phone', allowInput: true, kind: 'phone' });
+    });
+
+    it('a failed mint gives the code back only if the slot has not moved on', async () => {
+      await startRO();
+      const phone = server.startPairing({ name: 'Phone', flow: 'phone' });
+      if (!phone.ok) throw new Error(phone.error);
+      let release: () => void = () => undefined;
+      deviceBox.mintGate = new Promise<void>((r) => { release = r; });
+      deviceBox.mintThrows = true;
+      const redeeming = fetch(`${base()}/api/pair?code=${phone.code}`);
+      await new Promise((r) => setTimeout(r, 30));
+      const computer = server.startPairing({ name: 'Computer', flow: 'computer' });
+      if (!computer.ok) throw new Error(computer.error);
+      release();
+      expect((await redeeming).status).toBe(500);
+      deviceBox.mintGate = null;
+      deviceBox.mintThrows = false;
+      expect(server.status()).toMatchObject({ pairCode: computer.code, pendingPairFlow: 'computer' });
+    });
+
+    it('never writes a pairing code into the daemon log', async () => {
+      const lines: string[] = [];
+      const fresh = makeDeps();
+      const logged = new WebTerminalServer({
+        sessionManager: fresh.sessionManager,
+        devices: fresh.devices,
+        log: (_level, msg) => { lines.push(msg); },
+        assetsDir: os.tmpdir(),
+      });
+      const info = await logged.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: false });
+      const at = `http://127.0.0.1:${info.port}`;
+      const codes = new Set<string>([info.pairCode as string]);
+      try {
+        const phone = logged.startPairing({ name: 'Phone', flow: 'phone' });
+        if (!phone.ok) throw new Error(phone.error);
+        codes.add(phone.code);
+        logged.status();
+        await fetch(`${at}/api/pair?code=ZZZZZZZZ`);
+        expect((await fetch(`${at}/api/pair?code=${phone.code}`)).status).toBe(200);
+        const computer = logged.startPairing({ name: 'Computer', flow: 'computer' });
+        if (!computer.ok) throw new Error(computer.error);
+        codes.add(computer.code);
+        const refused = logged.startPairing({ name: 'Phone', flow: 'phone' });
+        expect(refused.ok).toBe(false);
+        codes.add(logged.cancelPairing().pairCode as string);
+      } finally {
+        await logged.stop();
+      }
+      const joined = lines.join('\n');
+      for (const code of codes) expect(joined).not.toContain(code);
+    });
   });
 
   // ── stream tickets (B3) ────────────────────────────────────────────────────
@@ -3004,6 +3933,76 @@ describe('WebTerminalServer', () => {
     }
   });
 
+  it('★ opening the stream of a recovering pane activates it once, at its saved size', async () => {
+    // A pane the daemon recovered after its own restart holds its output until
+    // a viewer attaches. The web client never resizes, so the stream itself is
+    // the attach; otherwise the pane stays silent forever.
+    const activate = (sessionManager as unknown as { activateDeferred: ReturnType<typeof vi.fn> }).activateDeferred;
+    const token = (await startRO()).token as string;
+    managed.deferred = true;
+    const rows = async () => (await (await fetch(`${base()}/api/sessions`, { headers: bearer(token) })).json()).sessions;
+    expect((await rows()).find((r: { id: string }) => r.id === 's1').deferred).toBe(true);
+
+    const ac = new AbortController();
+    try {
+      const sse = await fetch(`${base()}/api/stream?session=s1&token=${encodeURIComponent(token)}`, { signal: ac.signal });
+      expect(sse.status).toBe(200);
+      await new Promise((r) => setTimeout(r, 30));
+      expect(activate).toHaveBeenCalledTimes(1);
+      expect(activate).toHaveBeenCalledWith('s1');
+      // Listening BEFORE the activation, so the held output it releases
+      // reaches this viewer.
+      expect(activateListenerCounts).toEqual([1]);
+      expect(resizeCalls).toEqual([]);
+      expect((await rows()).find((r: { id: string }) => r.id === 's1').deferred).toBe(false);
+
+      // An active pane is not activated again.
+      const again = await fetch(`${base()}/api/stream?session=s1&token=${encodeURIComponent(token)}`, { signal: ac.signal });
+      expect(again.status).toBe(200);
+      await new Promise((r) => setTimeout(r, 30));
+      expect(activate).toHaveBeenCalledTimes(1);
+    } finally {
+      ac.abort();
+    }
+  });
+
+  it('★ typing into a recovering pane activates it; a read-only refusal does not', async () => {
+    const activate = (sessionManager as unknown as { activateDeferred: ReturnType<typeof vi.fn> }).activateDeferred;
+    managed.deferred = true;
+    let info = await startRO();
+    const refused = await fetch(`${base()}/api/input?session=s1`, {
+      method: 'POST', headers: bearer(info.token as string), body: 'nope',
+    });
+    expect(refused.status).toBe(403);
+    expect(activate).not.toHaveBeenCalled();
+    await server.stop();
+
+    info = await startRW();
+    const res = await fetch(`${base()}/api/input?session=s1`, {
+      method: 'POST', headers: bearer(info.token as string), body: 'echo after\r',
+    });
+    expect(res.status).toBe(204);
+    expect(activate).toHaveBeenCalledWith('s1');
+    expect(write).toHaveBeenCalledWith('echo after\r');
+    expect(managed.deferred).toBe(false);
+  });
+
+  it('★ a recovering pane takes a phone resize once its stream activated it', async () => {
+    const token = (await startRO()).token as string;
+    managed.deferred = true;
+    const ac = new AbortController();
+    try {
+      const sse = await fetch(`${base()}/api/stream?session=s1&token=${encodeURIComponent(token)}`, { signal: ac.signal });
+      expect(sse.status).toBe(200);
+      await new Promise((r) => setTimeout(r, 30));
+      const res = await postResize('s1', token, { cols: 65, rows: 50 });
+      expect(res.status).toBe(200);
+      expect(resizeCalls).toEqual([{ id: 's1', cols: 65, rows: 50 }]);
+    } finally {
+      ac.abort();
+    }
+  });
+
   it('★ refuses a pane that is still recovering', async () => {
     // The first resize of a deferred session is the desk's unmute handshake.
     // Taking it here starts capture at the phone's geometry and interleaves
@@ -3036,6 +4035,1929 @@ describe('WebTerminalServer', () => {
     expect((await postResize('s1', 'nonsense', { cols: 60, rows: 30 })).status).toBe(401);
     const { token } = await pairDevice('Phone');
     expect((await postResize('s1', token, { cols: 60, rows: 30 })).status).toBe(200);
+  });
+
+  it('serves durable history only with auth and transcript consent, including closed panes', async () => {
+    const ro = await startRO();
+    expect((await fetch(`${base()}/api/history`)).status).toBe(401);
+    expect((await fetch(`${base()}/api/history`, {headers:bearer(ro.token as string)})).status).toBe(403);
+    await server.stop();
+    const info = await startWithTranscript();
+    const headers = bearer(info.token as string);
+    const history = new RunHistoryStore(uploadsDir);
+    history.ingest('closed-pane', {}, {source:'hook',decision:'emit',hookKind:'agent.stop',agent:'Claude Code',status:'complete',message:'Done',
+      signal:{kind:'agent.stop',agent:'claude',cwd:'/repo',ts:100,payload:{last_assistant_message:'Implemented the fix'}}});
+    const response = await fetch(`${base()}/api/history`, {headers});
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(await response.json()).toMatchObject({entries:[{sessionId:'closed-pane',summary:'Implemented the fix',outcome:'completed'}],nextOffset:null});
+    expect((await fetch(`${base()}/api/history?offset=-1`, {headers})).status).toBe(400);
+  });
+
+  // Stage and commit stay separate, but each starts 32-36 sequential real Git
+  // processes across snapshots, writes and assertions. Their Windows startup
+  // cost can exceed Vitest's 5s default on a busy runner. Give only these two
+  // integration cases a finite 20s budget. Test-side spawns stay minimal too:
+  // identity is appended to the config `init` wrote instead of `git config` calls.
+  const gitHttpTimeoutMs = 20_000;
+  const gitRepo = (name: string) => {
+    const root = path.join(uploadsDir, name);
+    fs.mkdirSync(root);
+    const git = (...args: string[]) => execFileSync('git', args, {cwd:root,encoding:'utf8'}).trim();
+    git('init', '-b', 'main');
+    fs.appendFileSync(path.join(root, '.git', 'config'), '[user]\n\tname = HTTP Test\n\temail = http@example.invalid\n');
+    fs.writeFileSync(path.join(root, 'phone.txt'), 'reviewed');
+    managed.meta.spawnCwd = root;
+    managed.meta.cwd = '/untrusted-osc-path';
+    return git;
+  };
+
+  it('stages through the authenticated Git API using spawnCwd', async () => {
+    const info = await startRW();
+    const auth = bearer(info.token as string);
+    const git = gitRepo('repo');
+    const endpoint = `${base()}/api/sessions/s1/git`;
+    const beforeResponse = await fetch(endpoint, {headers:auth});
+    expect(beforeResponse.headers.get('cache-control')).toBe('no-store');
+    const before = await beforeResponse.json();
+    expect(before).toMatchObject({branch:'main',ref:'refs/heads/main',head:null,files:[{path:'phone.txt',status:'??'}]});
+    const stage = await fetch(endpoint, {method:'POST',headers:auth,body:JSON.stringify({requestId:crypto.randomUUID(),action:'stage',paths:['phone.txt'],expectedHead:before.head,expectedTree:before.tree,expectedRef:before.ref})});
+    expect(await stage.json()).toEqual({applied:true});
+    expect(git('ls-files')).toBe('phone.txt');
+  }, gitHttpTimeoutMs);
+
+  it('commits through the authenticated Git API using spawnCwd', async () => {
+    const info = await startRW();
+    const auth = bearer(info.token as string);
+    const git = gitRepo('repo');
+    // A base commit, then a staged edit on top of it: the phone's real flow is
+    // snapshot GET → commit with the head/tree/ref that snapshot reported.
+    git('add', 'phone.txt');
+    git('commit', '-q', '-m', 'base');
+    fs.writeFileSync(path.join(uploadsDir, 'repo', 'phone.txt'), 'reviewed again');
+    git('add', 'phone.txt');
+    const endpoint = `${base()}/api/sessions/s1/git`;
+    const staged = await (await fetch(endpoint, {headers:auth})).json();
+    expect(staged).toMatchObject({branch:'main',ref:'refs/heads/main',head:expect.stringMatching(/^[0-9a-f]{40}$/)});
+    const mutation = {requestId:crypto.randomUUID(),action:'commit',message:'From phone',expectedHead:staged.head,expectedTree:staged.tree,expectedRef:staged.ref};
+    const send = () => fetch(endpoint, {method:'POST',headers:auth,body:JSON.stringify(mutation)});
+    const result = await (await send()).json();
+    expect(result).toMatchObject({applied:true});
+    expect(await (await send()).json()).toEqual(result);
+    // One `rev-list` pins it all: HEAD is the returned commit, its parent is
+    // the head the snapshot reported, and the replay did not commit twice.
+    expect(git('rev-list','HEAD')).toBe(`${result.commit}\n${staged.head}`);
+  }, gitHttpTimeoutMs);
+
+  it('gates Git control on authentication, input grants and session visibility', async () => {
+    const info = await startRO();
+    const headers = bearer(info.token as string);
+    expect((await fetch(`${base()}/api/sessions/s1/git`)).status).toBe(401);
+    expect((await fetch(`${base()}/api/sessions/s1/git`, {headers})).status).toBe(403);
+    expect((await fetch(`${base()}/api/sessions/s1/git`, {method:'POST',headers,body:'{}'})).status).toBe(403);
+    expect(await (await fetch(`${base()}/api/config`, {headers})).json()).toMatchObject({gitControl:false});
+    await server.stop();
+    const enabled = await startRW();
+    const auth = bearer(enabled.token as string);
+    expect(await (await fetch(`${base()}/api/config`, {headers:auth})).json()).toMatchObject({gitControl:true});
+    expect((await fetch(`${base()}/api/sessions/missing/git`, {headers:auth})).status).toBe(404);
+    expect((await fetch(`${base()}/api/sessions/s1/git`, {method:'POST',headers:auth,body:'{}'})).status).toBe(400);
+  });
+
+  it('gates settings on both input and transcript grants', async()=>{
+    let info=await startWithTranscript();
+    expect((await fetch(`${base()}/api/sessions/s1/agent-settings`,{headers:bearer(info.token as string)})).status).toBe(403);
+    await server.stop();info=await startRW();
+    expect((await fetch(`${base()}/api/sessions/s1/agent-settings`,{headers:bearer(info.token as string)})).status).toBe(403);
+    expect(await (await fetch(`${base()}/api/config`,{headers:bearer(info.token as string)})).json()).toMatchObject({agentSettings:false});
+    expect(settingsCalls).toHaveLength(0);
+  });
+  it('serves scoped settings without cache and refuses extra mutation fields', async()=>{
+    const info=await server.start({port:0,host:'127.0.0.1',allowInput:true,allowTranscript:true,allowUpload:false});
+    const headers=bearer(info.token as string);
+    const endpoint=`${base()}/api/sessions/s1/agent-settings`;
+    expect((await fetch(endpoint)).status).toBe(401);
+    expect(await (await fetch(`${base()}/api/config`,{headers})).json()).toMatchObject({agentSettings:true});
+    const result=await fetch(endpoint,{headers});
+    expect(result.status).toBe(200);expect(result.headers.get('cache-control')).toBe('no-store');
+    const choice={model:'model-a',effort:'low',expectedRevision:settingsRevision};
+    expect((await fetch(endpoint,{method:'POST',headers,body:JSON.stringify({...choice,threadId:'forged'})})).status).toBe(400);
+    expect((await fetch(endpoint,{method:'POST',headers,body:JSON.stringify(choice)})).status).toBe(200);
+    expect(settingsCalls).toEqual([{id:'s1',choice:undefined},{id:'s1',choice}]);
+  });
+  it('serializes settings operations and reauthenticates after an in-flight credential revocation', async()=>{
+    await server.start({port:0,host:'127.0.0.1',allowInput:true,allowTranscript:true,allowUpload:false});
+    const phone=await pairDevice('Settings phone');const headers=bearer(phone.token);
+    let enter!:()=>void;const entered=new Promise<void>(resolve=>{enter=resolve;});
+    let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
+    let permitted=true;
+    settingsHook=async authorized=>{enter();await gate;permitted=await authorized();};
+    const endpoint=`${base()}/api/sessions/s1/agent-settings`;
+    const first=fetch(endpoint,{headers});await entered;
+    const second=await fetch(endpoint,{headers});
+    expect(second.status).toBe(409);expect(await second.json()).toEqual({error:'busy'});
+    deviceRoster.get(phone.deviceId)!.revoked=true;release();
+    expect((await first).status).toBe(401);expect(permitted).toBe(false);
+    expect(settingsCalls).toHaveLength(1);
+  });
+  it('preserves an unconfirmed write outcome without retrying the controller', async()=>{
+    const info=await server.start({port:0,host:'127.0.0.1',allowInput:true,allowTranscript:true,allowUpload:false});
+    settingsHook=async()=>{throw new LiveSettingsError('unconfirmed');};
+    const result=await fetch(`${base()}/api/sessions/s1/agent-settings`,{method:'POST',headers:bearer(info.token as string),body:JSON.stringify({model:'model-a',effort:'low',expectedRevision:settingsRevision})});
+    expect(result.status).toBe(409);expect(await result.json()).toEqual({error:'unconfirmed'});
+    expect(settingsCalls).toHaveLength(1);
+  });
+
+  it('reads the selected workspace account catalog without returning its config path', async () => {
+    const calls: unknown[] = [];
+    desktopBridge = new DesktopPhoneBridge((_owner,raw) => {
+      const data = (raw as {data:{requestId:string;command:string;payload:unknown}}).data;
+      calls.push({command:data.command,payload:data.payload});
+      desktopBridge!.complete('main',{requestId:data.requestId,ok:true,result:{CODEX_HOME:'/private/account'}});
+      return true;
+    });
+    desktopBridge.register('main');
+    await startRW();
+    const device = await pairDevice('Catalog phone');
+    const headers = bearer(device.token);
+    const response = await fetch(`${base()}/api/agent-launch-options?workspaceId=ws-1`,{headers});
+    expect(response.status).toBe(200);
+    expect(agentLaunchEnv?.CODEX_HOME).toBe('/private/account');
+    expect(await response.text()).not.toContain('/private/account');
+    expect(calls).toEqual([{command:'accounts.env',payload:{workspaceId:'ws-1'}}]);
+    expect((await fetch(`${base()}/api/agent-launch-options?workspaceId=forged`,{headers})).status).toBe(400);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('validates agent launch against advertised options before creating a pane', async () => {
+    const ro = await startRO();
+    expect((await fetch(`${base()}/api/agent-launch-options`,{headers:bearer(ro.token as string)})).status).toBe(403);
+    await server.stop();
+    const rw = await startRW();
+    const headers = bearer(rw.token as string);
+    expect((await fetch(`${base()}/api/agent-launch-options`)).status).toBe(401);
+    expect(await (await fetch(`${base()}/api/agent-launch-options`,{headers})).json()).toEqual({agents:[{agent:'claude',models:['opus','sonnet'],efforts:['low','high']}]});
+    const before = lifecycleCalls.length;
+    expect((await fetch(`${base()}/api/sessions`,{method:'POST',headers,body:JSON.stringify({agentLaunch:{agent:'claude',model:'opus; bad'}})})).status).toBe(400);
+    expect(lifecycleCalls).toHaveLength(before);
+    expect((await fetch(`${base()}/api/sessions`,{method:'POST',headers,body:JSON.stringify({agentLaunch:{agent:'claude',model:'opus',effort:'high'}})})).status).toBe(201);
+    expect(lifecycleCalls.at(-1)).toMatchObject({op:'create',arg:{agentLaunch:{agent:'claude',model:'opus',effort:'high'}}});
+  });
+
+  describe('per-pane account and handoff lineage (contract v-next item 4)', () => {
+    /** A desktop that answers `accounts.envForAccount` from `accounts`; `announce` is what it registered with. */
+    const accountDesktop = (announce: string[] | undefined, accounts: Record<string, unknown>, calls: unknown[] = []) => {
+      desktopBridge = new DesktopPhoneBridge((_owner,raw) => {
+        const data = (raw as {data:{requestId:string;command:string;payload:Record<string,unknown>}}).data;
+        calls.push({command:data.command,payload:data.payload});
+        const workspaceEnv = {CLAUDE_CONFIG_DIR:'/ws/claude',CODEX_HOME:'/ws/codex'};
+        const reply = data.command === 'accounts.env'
+          ? {ok:true,result:data.payload.typed === true ? {ok:true,env:workspaceEnv} : workspaceEnv}
+          : data.command === 'accounts.envForAccount' && announce
+            ? {ok:true,result:accounts[data.payload.accountId as string] ?? {ok:false,error:'unknown-account'}}
+            // An old desktop throws on a command it does not know; the envelope says only "failed".
+            : {ok:false};
+        queueMicrotask(() => desktopBridge!.complete('main',{requestId:data.requestId,...reply}));
+        return true;
+      });
+      desktopBridge.register('main',announce);
+      return calls;
+    };
+    const second = {ok:true,vendor:'codex',env:{CODEX_HOME:'/acct/second'}};
+    const startBoth = () => server.start({port:0,host:'127.0.0.1',allowInput:true,allowTranscript:true,allowUpload:false});
+    const post = (headers: Record<string,string>, body: unknown) => fetch(`${base()}/api/sessions`,{method:'POST',headers,body:JSON.stringify(body)});
+
+    it('an old desktop (command unknown) refuses the create and never spawns on the workspace env', async () => {
+      accountDesktop(undefined,{c2:second});
+      const headers = bearer((await startBoth()).token as string);
+      expect(await (await fetch(`${base()}/api/config`,{headers})).json()).not.toHaveProperty('paneAccount');
+      const before = lifecycleCalls.length;
+      const refused = await post(headers,{workspaceId:'ws-1',accountId:'c2'});
+      expect(refused.status).toBe(503);
+      expect(await refused.json()).toEqual({error:'desktop-unavailable',effect:'none'});
+      // A desktop that announced the command but fails it is refused the same way.
+      accountDesktop(['accounts.envForAccount'],{c2:{ok:false,error:'boom'}});
+      expect((await post(headers,{workspaceId:'ws-1',accountId:'c2'})).status).toBe(503);
+      desktopBridge = null;
+      expect((await post(headers,{workspaceId:'ws-1',accountId:'c2'})).status).toBe(503);
+      expect(lifecycleCalls).toHaveLength(before);
+    });
+
+    it('refuses unknown and foreign ids alike, a missing workspace, a missing grant, and a vendor mismatch', async () => {
+      accountDesktop(['accounts.envForAccount'],{c2:second});
+      const headers = bearer((await startBoth()).token as string);
+      const before = lifecycleCalls.length;
+      const unknown = await (await post(headers,{workspaceId:'ws-1',accountId:'nope'})).json();
+      const foreign = await (await post(headers,{workspaceId:'ws-1',accountId:'3f1c2e4a-0b6d-4c1e-9a7f-2d8e5b6c7a90'})).json();
+      expect(unknown).toEqual({error:'unknown-account',effect:'none'});
+      expect(foreign).toEqual(unknown);
+      const noWorkspace = await post(headers,{accountId:'c2'});
+      expect(noWorkspace.status).toBe(400);
+      expect(await noWorkspace.json()).toEqual({error:'workspace-required',effect:'none'});
+      expect(await (await post(headers,{workspaceId:'ws-1',accountId:'../x'})).json()).toEqual({error:'invalid-account-id',effect:'none'});
+      const mismatch = await post(headers,{workspaceId:'ws-1',accountId:'c2',agentLaunch:{agent:'claude'}});
+      expect(mismatch.status).toBe(400);
+      expect(await mismatch.text()).toBe(JSON.stringify({error:'account-vendor-mismatch',effect:'none'}));
+      // Any other agent is a mismatch too, not only the other known vendor.
+      expect(await (await post(headers,{workspaceId:'ws-1',accountId:'c2',agentLaunch:{agent:'opencode'}})).json()).toEqual({error:'account-vendor-mismatch',effect:'none'});
+      expect(lifecycleCalls).toHaveLength(before);
+      await server.stop();
+      const rw = await startRW();
+      const noTranscript = await post(bearer(rw.token as string),{workspaceId:'ws-1',accountId:'c2'});
+      expect(noTranscript.status).toBe(403);
+      expect(lifecycleCalls).toHaveLength(before);
+    });
+
+    it('spawns with the chosen account, echoes the id, and never returns the path', async () => {
+      const calls = accountDesktop(['accounts.envForAccount'],{c2:second});
+      const headers = bearer((await startBoth()).token as string);
+      expect(await (await fetch(`${base()}/api/config`,{headers})).json()).toMatchObject({paneAccount:true,paneHandoff:true});
+      const created = await post(headers,{workspaceId:'ws-1',accountId:'c2'});
+      expect(created.status).toBe(201);
+      const text = await created.text();
+      expect(JSON.parse(text)).toMatchObject({accountId:'c2'});
+      expect(text).not.toContain('/acct/second');
+      expect(lifecycleCalls.at(-1)).toMatchObject({op:'create',arg:{workspaceId:'ws-1',account:{vendor:'codex',dir:'/acct/second'}}});
+      // `/api/config` also reads the sidebar snapshot (`workspaces.list`) for `moa`.
+      expect(calls.filter((c) => (c as {command:string}).command !== 'workspaces.list'))
+        .toEqual([{command:'accounts.envForAccount',payload:{workspaceId:'ws-1',accountId:'c2'}}]);
+    });
+
+    it('validates the launch catalog against the chosen account', async () => {
+      const claude = {ok:true,vendor:'claude',env:{CLAUDE_CONFIG_DIR:'/acct/claude-2'}};
+      accountDesktop(['accounts.envForAccount'],{c2:second,k2:claude});
+      const headers = bearer((await startBoth()).token as string);
+      expect((await fetch(`${base()}/api/agent-launch-options?workspaceId=ws-1&accountId=c2`,{headers})).status).toBe(200);
+      expect(agentLaunchEnv?.CODEX_HOME).toBe('/acct/second');
+      expect((await fetch(`${base()}/api/agent-launch-options?workspaceId=ws-1&accountId=k2`,{headers})).status).toBe(200);
+      expect(agentLaunchEnv?.CODEX_HOME).toBe('/ws/codex');
+      expect(agentLaunchEnv?.CLAUDE_CONFIG_DIR).toBe('/acct/claude-2');
+      const unknown = await fetch(`${base()}/api/agent-launch-options?workspaceId=ws-1&accountId=nope`,{headers});
+      expect(unknown.status).toBe(400);
+      expect(await unknown.json()).toEqual({error:'unknown-account',effect:'none'});
+      expect(await (await fetch(`${base()}/api/agent-launch-options?accountId=c2`,{headers})).json()).toEqual({error:'workspace-required',effect:'none'});
+      expect((await post(headers,{workspaceId:'ws-1',accountId:'k2',agentLaunch:{agent:'claude',model:'opus'}})).status).toBe(201);
+      expect(agentLaunchEnv?.CLAUDE_CONFIG_DIR).toBe('/acct/claude-2');
+    });
+
+    it('stores handoff lineage with verified, and refuses a malformed one', async () => {
+      const headers = bearer((await startBoth()).token as string);
+      const before = lifecycleCalls.length;
+      for (const handoffFrom of [{sessionId:'s1',extra:1},{sessionId:'a b'},'s1',{sessionId:'s1',agentSessionId:''}]) {
+        const bad = await post(headers,{handoffFrom});
+        expect(bad.status).toBe(400);
+        expect(await bad.json()).toEqual({error:'invalid-handoff',effect:'none'});
+      }
+      expect(lifecycleCalls).toHaveLength(before);
+      const live = await post(headers,{handoffFrom:{sessionId:'s1'}});
+      expect(live.status).toBe(201);
+      expect(await live.json()).toMatchObject({handoffFrom:{sessionId:'s1',verified:true}});
+      expect(lifecycleCalls.at(-1)).toMatchObject({arg:{handoffFrom:{sessionId:'s1',verified:true}}});
+      const gone = await post(headers,{handoffFrom:{sessionId:'gone-pane',agentSessionId:'conv-1'}});
+      expect(lifecycleCalls.at(-1)).toMatchObject({arg:{handoffFrom:{sessionId:'gone-pane',agentSessionId:'conv-1',verified:false}}});
+      // The row names a source only when this reader may attach it.
+      const goneRow = (await gone.json()) as {handoffFrom:Record<string,unknown>};
+      expect(goneRow.handoffFrom).toEqual({verified:false,at:expect.any(Number)});
+    });
+
+    it('re-checks the credential after a slow body, before answering anything about accounts', async () => {
+      accountDesktop(['accounts.envForAccount'],{c2:second});
+      await startBoth();
+      const phone = await pairDevice('Slow phone');
+      const before = lifecycleCalls.length;
+      const status = await new Promise<{status:number;text:string}>((resolve,reject) => {
+        const req = httpReq({host:'127.0.0.1',port:server.status().port,path:'/api/sessions',method:'POST',
+          headers:{Authorization:`Bearer ${phone.token}`,'Content-Type':'application/json'}},(res) => {
+          let text = ''; res.on('data',(c) => { text += c; }); res.on('end',() => resolve({status:res.statusCode ?? 0,text}));
+        });
+        req.on('error',reject);
+        const body = JSON.stringify({workspaceId:'ws-1',accountId:'nope'});
+        req.write(body.slice(0,10));
+        setTimeout(() => { deviceRoster.get(phone.deviceId)!.revoked = true; req.end(body.slice(10)); },50);
+      });
+      expect(status.status).toBe(401);
+      expect(status.text).not.toContain('unknown-account');
+      expect(lifecycleCalls).toHaveLength(before);
+    });
+
+    it('a broken binding for the chosen vendor does not block the pane; one for the other vendor is named', async () => {
+      const calls: unknown[] = [];
+      desktopBridge = new DesktopPhoneBridge((_owner,raw) => {
+        const data = (raw as {data:{requestId:string;command:string;payload:Record<string,unknown>}}).data;
+        calls.push({command:data.command,payload:data.payload});
+        // The workspace's claude binding points at a directory that is gone.
+        const result = data.command === 'accounts.envForAccount' ? {ok:true,vendor:'claude',env:{CLAUDE_CONFIG_DIR:'/acct/claude-2'}}
+          : data.payload.omitVendor === 'claude' ? {ok:true,env:{CODEX_HOME:'/ws/codex'}}
+          : {ok:false,error:'workspace-account-missing'};
+        queueMicrotask(() => desktopBridge!.complete('main',{requestId:data.requestId,ok:true,result}));
+        return true;
+      });
+      desktopBridge.register('main',['accounts.envForAccount']);
+      const headers = bearer((await startBoth()).token as string);
+      const created = await post(headers,{workspaceId:'ws-1',accountId:'k2',agentLaunch:{agent:'claude'}});
+      expect(created.status).toBe(201);
+      expect(calls).toContainEqual({command:'accounts.env',payload:{workspaceId:'ws-1',typed:true,omitVendor:'claude'}});
+      const missing = await post(headers,{workspaceId:'ws-1',agentLaunch:{agent:'claude'}});
+      expect(missing.status).toBe(409);
+      expect(await missing.json()).toEqual({error:'workspace-account-missing',effect:'none'});
+    });
+
+    it('a desktop that detaches mid-lookup answers desktop-unavailable, never invalid-agent-launch', async () => {
+      desktopBridge = new DesktopPhoneBridge((_owner,raw) => {
+        const data = (raw as {data:{requestId:string;command:string}}).data;
+        if (data.command === 'accounts.envForAccount') queueMicrotask(() => desktopBridge!.complete('main',{requestId:data.requestId,ok:true,result:second}));
+        else queueMicrotask(() => desktopBridge!.disconnect('main'));
+        return true;
+      });
+      desktopBridge.register('main',['accounts.envForAccount']);
+      const headers = bearer((await startBoth()).token as string);
+      const before = lifecycleCalls.length;
+      const detached = await post(headers,{workspaceId:'ws-1',accountId:'c2',agentLaunch:{agent:'codex'}});
+      // (codex is not in this fixture's catalog: a 400 here would mean the bridge failure became invalid-agent-launch.)
+      expect(detached.status).toBe(503);
+      expect(await detached.json()).toEqual({error:'desktop-unavailable',effect:'none'});
+      expect(lifecycleCalls).toHaveLength(before);
+    });
+  });
+
+  it('serves workspace-scoped browser captures and restricts browser writes', async () => {
+    managed.meta.env = { WMUX_WORKSPACE_ID: 'ws-1' };
+    const calls: unknown[] = [];
+    desktopBridge = new DesktopPhoneBridge((_owner, raw) => {
+      const data = (raw as {data: {requestId: string; command: string; payload: unknown}}).data;
+      calls.push({command:data.command,payload:data.payload});
+      desktopBridge!.complete('main',{requestId:data.requestId,ok:true,result:data.command === 'browser.capture'
+        ? {data:'x'.repeat(160000),mimeType:'image/jpeg',capturedAt:1} : {pages:[]}});
+      return true;
+    });
+    desktopBridge.register('main');
+    const off = await startRO();
+    expect((await fetch(`${base()}/api/sessions/s1/browser`,{headers:bearer(off.token as string)})).status).toBe(403);
+    await server.stop();
+    const ro = await startWithTranscript();
+    const headers = bearer(ro.token as string);
+    expect((await fetch(`${base()}/api/sessions/s1/browser`)).status).toBe(401);
+    const capture = await fetch(`${base()}/api/sessions/s1/browser?surfaceId=own`,{headers});
+    expect(capture.status).toBe(200);
+    expect(capture.headers.get('cache-control')).toBe('no-store');
+    expect((await capture.json()).data).toHaveLength(160000);
+    expect((await fetch(`${base()}/api/sessions/s1/browser`,{method:'POST',headers,body:'{}'})).status).toBe(403);
+    await server.stop();
+    const rw = await server.start({port:0,host:'127.0.0.1',allowInput:true,allowUpload:false,allowTranscript:true});
+    const auth = bearer(rw.token as string);
+    expect((await fetch(`${base()}/api/sessions/s1/browser`,{method:'POST',headers:auth,body:JSON.stringify({action:'viewport',surfaceId:'own',mode:'mobile',workspaceId:'forged',expression:'bad'})})).status).toBe(200);
+    expect(calls).toEqual([
+      {command:'browser.capture',payload:{surfaceId:'own',workspaceId:'ws-1'}},
+      {command:'browser.viewport',payload:{surfaceId:'own',mode:'mobile',workspaceId:'ws-1'}},
+    ]);
+    expect((await fetch(`${base()}/api/sessions/s1/browser`,{method:'POST',headers:auth,body:'{"action":"evaluate","surfaceId":"own","expression":"bad"}'})).status).toBe(400);
+    const post = (value: unknown) => fetch(`${base()}/api/sessions/s1/browser`,{method:'POST',headers:auth,body:JSON.stringify(value)});
+    expect((await post({action:'type',surfaceId:'own',expectedURL:'https://example.com/',text:'hello',expression:'bad',workspaceId:'other'})).status).toBe(200);
+    expect(calls.at(-1)).toEqual({command:'browser.type',payload:{surfaceId:'own',expectedURL:'https://example.com/',text:'hello',workspaceId:'ws-1'}});
+    expect((await post({action:'key',surfaceId:'own',expectedURL:'https://example.com/',key:'Tab'})).status).toBe(200);
+    expect((await post({action:'open',url:'https://example.com/',workspaceId:'forged',partition:'forged'})).status).toBe(200);
+    expect(calls.at(-1)).toEqual({command:'browser.open',payload:{url:'https://example.com/',workspaceId:'ws-1'}});
+    const geometry = {width:1000,height:728,scrollX:0,scrollY:0};
+    expect((await post({action:'tap',surfaceId:'own',expectedURL:'https://example.com/',x:0.5,y:0.25,geometry,workspaceId:'forged'})).status).toBe(200);
+    expect(calls.at(-1)).toEqual({command:'browser.tap',payload:{surfaceId:'own',expectedURL:'https://example.com/',x:0.5,y:0.25,geometry,workspaceId:'ws-1'}});
+    expect((await post({action:'scroll',surfaceId:'own',expectedURL:'https://example.com/',x:0.5,y:0.5,geometry,deltaX:0,deltaY:0.5,expression:'bad'})).status).toBe(200);
+    expect(calls.at(-1)).toEqual({command:'browser.scroll',payload:{surfaceId:'own',expectedURL:'https://example.com/',x:0.5,y:0.5,geometry,deltaX:0,deltaY:0.5,workspaceId:'ws-1'}});
+    const count = calls.length;
+    expect((await post({action:'scroll',surfaceId:'own',expectedURL:'https://example.com/',x:0.5,y:0.5,geometry,deltaX:0,deltaY:2})).status).toBe(400);
+    expect((await post({action:'tap',surfaceId:'own',expectedURL:'https://example.com/',x:1,y:0.25,geometry})).status).toBe(400);
+    expect((await post({action:'key',surfaceId:'own',expectedURL:'https://example.com/',key:'Control+l'})).status).toBe(400);
+    expect((await post({action:'type',surfaceId:'own',expectedURL:'https://example.com/',text:'x'.repeat(4097)})).status).toBe(400);
+    expect((await post({action:'type',surfaceId:'own',text:'missing URL'})).status).toBe(400);
+    expect(calls).toHaveLength(count);
+
+  });
+
+
+  it('opens browsers in a registered workspace without an attachable terminal', async () => {
+    const calls: {command:string;payload:unknown}[] = [];
+    desktopBridge = new DesktopPhoneBridge((_owner,raw) => {
+      const data = (raw as {data:{requestId:string;command:string;payload:unknown}}).data;
+      calls.push({command:data.command,payload:data.payload});
+      const result = data.command === 'workspaces.list' ? {workspaces:[{id:'empty',name:'Empty',sessionId:null}]} :
+        data.command === 'browser.open' ? {surfaceId:'new-browser'} : {pages:[]};
+      desktopBridge!.complete('main',{requestId:data.requestId,ok:true,result});
+      return true;
+    });
+    desktopBridge.register('main');
+    const ro = await startWithTranscript();
+    expect((await fetch(`${base()}/api/desktop-workspaces/empty/browser`,{headers:bearer(ro.token as string)})).status).toBe(403);
+    expect(calls).toHaveLength(0);
+    await server.stop();
+    const rw = await server.start({port:0,host:'127.0.0.1',allowInput:true,allowUpload:false,allowTranscript:true});
+    const headers = bearer(rw.token as string);
+    expect((await fetch(`${base()}/api/desktop-workspaces/empty/browser`,{headers})).status).toBe(200);
+    expect(calls.at(-1)).toEqual({command:'browser.list',payload:{workspaceId:'empty'}});
+    const opened = await fetch(`${base()}/api/desktop-workspaces/empty/browser`,{method:'POST',headers,body:JSON.stringify({action:'open',url:'https://example.com/',workspaceId:'forged'})});
+    expect(opened.status).toBe(200);
+    expect(await opened.json()).toEqual({surfaceId:'new-browser'});
+    expect(calls.at(-1)).toEqual({command:'browser.open',payload:{workspaceId:'empty',url:'https://example.com/'}});
+    expect((await fetch(`${base()}/api/desktop-workspaces/missing/browser`,{headers})).status).toBe(404);
+    expect(calls.at(-1)?.command).toBe('workspaces.list');
+    expect((await fetch(`${base()}/api/desktop-workspaces/empty/browser`)).status).toBe(401);
+  });
+
+  it('keeps the legacy live roster and desktop workspace registry on distinct routes', async () => {
+    const calls: string[] = [];
+    desktopBridge = new DesktopPhoneBridge((_owner,raw) => {
+      const data = (raw as {data:{requestId:string;command:string}}).data;
+      calls.push(data.command);
+      desktopBridge!.complete('main',{requestId:data.requestId,ok:true,result:{workspaces:[
+        {id:'ws-1',name:'Workspace 1',sessionId:'s1'},
+        {id:'empty',name:'Empty workspace',sessionId:null},
+      ]}});
+      return true;
+    });
+    desktopBridge.register('main');
+    const rw = await startRW();
+    const headers = bearer(rw.token as string);
+    const legacy = await (await fetch(`${base()}/api/workspaces`,{headers})).json();
+    expect(legacy.workspaces[0]).toHaveProperty('panes');
+    // The live roster asks the desktop only for its optional sidebar fields; a
+    // desktop-only workspace never becomes a roster row.
+    expect(legacy.workspaces.map((w: {id:string}) => w.id)).not.toContain('empty');
+    expect(calls).toEqual(['workspaces.list']);
+    const registry = await (await fetch(`${base()}/api/desktop-workspaces`,{headers})).json();
+    expect(registry.workspaces).toEqual([
+      {id:'ws-1',name:'Workspace 1',sessionId:'s1'},
+      {id:'empty',name:'Empty workspace',sessionId:null},
+    ]);
+    expect(calls).toEqual(['workspaces.list','workspaces.list']);
+  });
+
+  it('returns a named conflict when a phone-created workspace was already closed', async () => {
+    desktopBridge = new DesktopPhoneBridge((_owner, raw) => {
+      const data = (raw as {data:{requestId:string}}).data;
+      desktopBridge!.complete('main',{requestId:data.requestId,ok:true,result:{error:'workspace-request-closed'}});
+      return true;
+    });
+    desktopBridge.register('main');
+    const rw = await startRW();
+    const response = await fetch(`${base()}/api/workspaces`, {method:'POST',headers:bearer(rw.token as string),
+      body:JSON.stringify({requestId:'01234567-89ab-4cde-8123-456789abcdef',name:'Project'})});
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({error:'workspace-request-closed'});
+  });
+
+  it('gates workspace creation and does not forward arbitrary execution fields', async () => {
+    const calls: unknown[] = [];
+    desktopBridge = new DesktopPhoneBridge((_owner, raw) => {
+      const data = (raw as {data: {requestId: string; command: string; payload: unknown}}).data;
+      calls.push({command:data.command,payload:data.payload});
+      desktopBridge!.complete('main',{requestId:data.requestId,ok:true,result:{id:'ws-phone-test',name:'Project'}});
+      return true;
+    });
+    desktopBridge.register('main');
+    const ro = await startRO();
+    expect((await fetch(`${base()}/api/workspaces`,{method:'POST',headers:bearer(ro.token as string),body:'{}'})).status).toBe(403);
+    await server.stop();
+    const rw = await startRW();
+    const headers = bearer(rw.token as string);
+    const requestId = '01234567-89ab-4cde-8123-456789abcdef';
+    expect((await fetch(`${base()}/api/workspaces`,{method:'POST',body:'{}'})).status).toBe(401);
+    const result = await fetch(`${base()}/api/workspaces`,{method:'POST',headers,body:JSON.stringify({requestId,name:'Project',cwd:'/project',method:'shell.exec',command:'bad',env:{SECRET:'bad'}})});
+    expect(result.status).toBe(200);
+    expect(calls).toEqual([{command:'workspaces.create',payload:{requestId,name:'Project',cwd:'/project'}}]);
+    expect((await fetch(`${base()}/api/workspaces`,{method:'POST',headers,body:'{"name":"Project"}'})).status).toBe(400);
+  });
+
+  it('shares quick commands with input-gated writes and permits long instructions', async () => {
+    const calls: string[] = [];
+    desktopBridge = new DesktopPhoneBridge((_owner, raw) => {
+      const event = raw as { data: { requestId: string; command: string; payload: unknown } };
+      calls.push(event.data.command);
+      desktopBridge!.complete('main', { requestId: event.data.requestId, ok: true, result: { revision: 'r1', commands: [] } });
+      return true;
+    });
+    desktopBridge.register('main');
+    const ro = await startWithTranscript();
+    const headers = bearer(ro.token as string);
+    expect((await fetch(`${base()}/api/quick-commands`)).status).toBe(401);
+    expect((await fetch(`${base()}/api/quick-commands`, { headers })).status).toBe(200);
+    expect((await fetch(`${base()}/api/quick-commands`, { method: 'POST', headers, body: '{}' })).status).toBe(403);
+    await server.stop();
+    const rw = await server.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: false, allowTranscript: true });
+    const response = await fetch(`${base()}/api/quick-commands`, { method: 'POST', headers: bearer(rw.token as string), body: JSON.stringify({ revision: 'r1', commands: [{ id: 'one', title: 'Long', text: 'x'.repeat(10000) }] }) });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(calls).toEqual(['prompts.list', 'prompts.replace']);
+  });
+
+  it('requires authentication, transcript consent and input permission for account writes', async () => {
+    managed.meta.env = { WMUX_WORKSPACE_ID: 'ws-1' };
+    const off = await startRW();
+    const endpoint = `${base()}/api/sessions/s1/accounts`;
+    expect((await fetch(endpoint)).status).toBe(401);
+    expect((await fetch(endpoint, { headers: bearer(off.token as string) })).status).toBe(403);
+    await server.stop();
+    const info = await startWithTranscript();
+    const headers = bearer(info.token as string);
+    expect((await fetch(`${base()}/api/sessions/s1/accounts`, { method: 'POST', headers, body: '{"action":"usage","accountId":"a"}' })).status).toBe(403);
+    expect((await fetch(`${base()}/api/sessions/s1/accounts`, { headers })).status).toBe(503);
+    expect(await (await fetch(`${base()}/api/config`, { headers })).json()).toMatchObject({ desktopAccounts: false });
+  });
+
+  describe('/api/config desktop flags follow the routes\' availability check', () => {
+    const desktopFlags = ['browserScrolling', 'workspaceBrowsers', 'browserCreation', 'browserKeyboard', 'browserPreview', 'workspaceCreation', 'quickCommands', 'desktopAccounts'] as const;
+    const flags = async (token: string) => {
+      const body = await (await fetch(`${base()}/api/config`, { headers: bearer(token) })).json() as Record<string, unknown>;
+      return Object.fromEntries(desktopFlags.map(key => [key, body[key]]));
+    };
+    const all = (value: boolean) => Object.fromEntries(desktopFlags.map(key => [key, value]));
+    const startFull = () => server.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: false, allowTranscript: true });
+
+    it('advertises nothing when the getter returns no bridge, and the route agrees', async () => {
+      desktopBridge = null;
+      const info = await startFull();
+      expect(await flags(info.token as string)).toEqual(all(false));
+      expect((await fetch(`${base()}/api/quick-commands`, { headers: bearer(info.token as string) })).status).toBe(503);
+    });
+
+    it('advertises nothing when the bridge exists but no desktop process is attached', async () => {
+      desktopBridge = new DesktopPhoneBridge(() => true);
+      const info = await startFull();
+      expect(await flags(info.token as string)).toEqual(all(false));
+      expect((await fetch(`${base()}/api/quick-commands`, { headers: bearer(info.token as string) })).status).toBe(503);
+    });
+
+    it('advertises every flag once the desktop attaches, and drops them when it detaches', async () => {
+      desktopBridge = new DesktopPhoneBridge(() => true);
+      const info = await startFull();
+      desktopBridge.register('main');
+      expect(await flags(info.token as string)).toEqual(all(true));
+      desktopBridge.disconnect('main');
+      expect(await flags(info.token as string)).toEqual(all(false));
+    });
+
+    it('still ANDs availability with the input and transcript grants', async () => {
+      desktopBridge = new DesktopPhoneBridge(() => true);
+      desktopBridge.register('main');
+      const readOnly = await startRO();
+      expect(await flags(readOnly.token as string)).toEqual(all(false));
+      await server.stop();
+      const transcriptOnly = await startWithTranscript();
+      expect(await flags(transcriptOnly.token as string)).toEqual({
+        ...all(false),
+        browserPreview: true,
+        quickCommands: true,
+        desktopAccounts: true,
+      });
+      await server.stop();
+      const inputOnly = await startRW();
+      expect(await flags(inputOnly.token as string)).toEqual({ ...all(false), workspaceCreation: true });
+    });
+  });
+
+  it('derives account workspace scope from the pane and refuses internal env actions', async () => {
+    managed.meta.env = { WMUX_WORKSPACE_ID: 'ws-1' };
+    const calls: Array<{ command: string; payload: unknown }> = [];
+    desktopBridge = new DesktopPhoneBridge((_owner, raw) => {
+      const event = raw as { data: { requestId: string; command: string; payload: unknown } };
+      calls.push({ command: event.data.command, payload: event.data.payload });
+      desktopBridge!.complete('main', { requestId: event.data.requestId, ok: true, result: { workspaceId: 'ws-1', bindings: {}, accounts: [] } });
+      return true;
+    });
+    desktopBridge.register('main');
+    const info = await server.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: false, allowTranscript: true });
+    const headers = bearer(info.token as string);
+    const endpoint = `${base()}/api/sessions/s1/accounts`;
+    const list = await fetch(endpoint, { headers });
+    expect(list.status).toBe(200);
+    expect(list.headers.get('cache-control')).toBe('no-store');
+    const changed = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify({ action: 'bind', vendor: 'claude', accountId: 'a', workspaceId: 'forged', env: { CODEX_HOME: '/forged' } }) });
+    expect(changed.status).toBe(200);
+    expect(calls).toEqual([
+      { command: 'accounts.list', payload: { workspaceId: 'ws-1' } },
+      { command: 'accounts.bind', payload: { workspaceId: 'ws-1', vendor: 'claude', accountId: 'a' } },
+    ]);
+    expect((await fetch(endpoint, { method: 'POST', headers, body: '{"action":"accounts.env"}' })).status).toBe(400);
+    expect((await fetch(`${base()}/api/sessions/missing/accounts`, { headers })).status).toBe(404);
+    expect(calls).toHaveLength(2);
+    desktopBridge.disconnect('main');
+    expect((await fetch(endpoint, { headers })).status).toBe(503);
+  });
+
+  /**
+   * Drives a POST whose body arrives in two parts with the device's grant
+   * withdrawn in between. The handoff is synchronized on the ENTRY
+   * authentication's roster lookup, so the snapshot the handler took is already
+   * decided when the grant changes: a route that only consulted that snapshot
+   * would still run the mutation, and a route that re-authenticates after the
+   * body completes cannot.
+   */
+  const withdrawMidBody = async (
+    url: string,
+    phone: { deviceId: string; token: string },
+    head: string,
+    tail: string,
+    withdraw: (record: { revoked: boolean; allowInput: boolean }) => void,
+    headers: Record<string, string> = {},
+  ): Promise<number | undefined> => {
+    let entered!: () => void;
+    const authenticated = new Promise<void>((resolve) => { entered = resolve; });
+    const lookup = Map.prototype.get.bind(deviceRoster);
+    const spy = vi.spyOn(deviceRoster, 'get').mockImplementation((id: string) => { entered(); return lookup(id); });
+    let request!: ReturnType<typeof httpReq>;
+    const status = new Promise<number | undefined>((resolve, reject) => {
+      request = httpReq(url, { method: 'POST', headers: { ...bearer(phone.token), 'Content-Type': 'application/json', ...headers } }, (res) => {
+        res.resume(); res.on('end', () => resolve(res.statusCode));
+      });
+      request.on('error', reject);
+      request.write(head);
+    });
+    try {
+      await authenticated;
+      withdraw(deviceRoster.get(phone.deviceId) as unknown as { revoked: boolean; allowInput: boolean });
+      request.end(tail);
+      return await status;
+    } finally { spy.mockRestore(); request.destroy(); }
+  };
+
+  it('re-authorizes desktop workspace creation after the request body completes', async () => {
+    const calls: string[] = [];
+    desktopBridge = new DesktopPhoneBridge((_owner, raw) => {
+      const data = (raw as { data: { requestId: string; command: string } }).data;
+      calls.push(data.command);
+      desktopBridge!.complete('main', { requestId: data.requestId, ok: true, result: { id: 'ws-phone', name: 'Project' } });
+      return true;
+    });
+    desktopBridge.register('main');
+    await startRW();
+    const phone = await pairDevice('Workspace phone', true);
+    const body = JSON.stringify({ requestId: '01234567-89ab-4cde-8123-456789abcdef', name: 'Project' });
+    expect(await withdrawMidBody(`${base()}/api/workspaces`, phone, body.slice(0, 20), body.slice(20), (r) => { r.revoked = true; }))
+      .toBe(401);
+    expect(calls).toEqual([]);
+  });
+
+  it('re-authorizes a quick-command replace after the request body completes', async () => {
+    const calls: string[] = [];
+    desktopBridge = new DesktopPhoneBridge((_owner, raw) => {
+      const data = (raw as { data: { requestId: string; command: string } }).data;
+      calls.push(data.command);
+      desktopBridge!.complete('main', { requestId: data.requestId, ok: true, result: { revision: 'r1', commands: [] } });
+      return true;
+    });
+    desktopBridge.register('main');
+    await server.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: false, allowTranscript: true });
+    const phone = await pairDevice('Quick command phone', true);
+    const body = JSON.stringify({ revision: 'r1', commands: [{ id: 'one', title: 'One', text: 'echo' }] });
+    // The grant is narrowed rather than the credential revoked: this is the half
+    // that proves `mayInput` itself ran again on the freshly resolved principal.
+    expect(await withdrawMidBody(`${base()}/api/quick-commands`, phone, body.slice(0, 12), body.slice(12), (r) => { r.allowInput = false; }))
+      .toBe(403);
+    expect(calls).toEqual([]);
+  });
+
+  it('re-authorizes an account bind after the request body completes', async () => {
+    managed.meta.env = { WMUX_WORKSPACE_ID: 'ws-1' };
+    const calls: string[] = [];
+    desktopBridge = new DesktopPhoneBridge((_owner, raw) => {
+      const data = (raw as { data: { requestId: string; command: string } }).data;
+      calls.push(data.command);
+      desktopBridge!.complete('main', { requestId: data.requestId, ok: true, result: {} });
+      return true;
+    });
+    desktopBridge.register('main');
+    await server.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: false, allowTranscript: true });
+    const phone = await pairDevice('Account phone', true);
+    const body = JSON.stringify({ action: 'bind', vendor: 'claude', accountId: 'a' });
+    expect(await withdrawMidBody(`${base()}/api/sessions/s1/accounts`, phone, body.slice(0, 15), body.slice(15), (r) => { r.revoked = true; }))
+      .toBe(401);
+    expect(calls).toEqual([]);
+  });
+
+  it('re-authorizes a Git mutation after the request body completes', async () => {
+    await startRW();
+    const phone = await pairDevice('Git phone', true);
+    const root = path.join(uploadsDir, 'revoked-repo');
+    fs.mkdirSync(root);
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+    git('init', '-b', 'main');
+    git('config', 'user.name', 'HTTP Test'); git('config', 'user.email', 'http@example.invalid');
+    fs.writeFileSync(path.join(root, 'phone.txt'), 'reviewed');
+    managed.meta.spawnCwd = root;
+    const before = await (await fetch(`${base()}/api/sessions/s1/git`, { headers: bearer(phone.token) })).json();
+    const body = JSON.stringify({ requestId: crypto.randomUUID(), action: 'stage', paths: ['phone.txt'],
+      expectedHead: before.head, expectedTree: before.tree, expectedRef: before.ref });
+    expect(await withdrawMidBody(`${base()}/api/sessions/s1/git`, phone, body.slice(0, 30), body.slice(30), (r) => { r.revoked = true; }))
+      .toBe(401);
+    expect(git('ls-files')).toBe('');
+  });
+
+  it('re-authorizes pane creation after the request body completes', async () => {
+    await startRW();
+    const phone = await pairDevice('Create phone', true);
+    const body = JSON.stringify({ cwd: EXISTING_DIR });
+    const before = lifecycleCalls.length;
+    expect(await withdrawMidBody(`${base()}/api/sessions`, phone, body.slice(0, 6), body.slice(6), (r) => { r.revoked = true; }))
+      .toBe(401);
+    expect(lifecycleCalls).toHaveLength(before);
+  });
+
+  // The route's re-check is not the last word: create then awaits the workspace
+  // account environment, the installed-CLI lookup and the Codex relay
+  // reservation, and a device revoked inside THAT window still got a shell.
+  it('re-authorizes pane creation again inside create, after its own awaits', async () => {
+    await startRW();
+    const phone = await pairDevice('Create phone', true);
+    let open!: () => void;
+    lifecycleBox.createGate = new Promise<void>((resolve) => { open = resolve; });
+    const pending = fetch(`${base()}/api/sessions`, {
+      method: 'POST',
+      headers: { ...bearer(phone.token), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cwd: EXISTING_DIR }),
+    });
+    await vi.waitFor(() => expect(lifecycleCalls.at(-1)).toMatchObject({ op: 'create' }));
+    deviceRoster.get(phone.deviceId)!.revoked = true;
+    open();
+    const response = await pending;
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: 'authorization-expired' });
+    // Asked AFTER the awaits, and no PTY was spawned.
+    expect(lifecycleBox.authorizedAfterGate).toBe(true);
+    expect(lifecycleBox.spawned).toBe(false);
+  });
+
+  it('re-authorizes an approval answer after the request body completes', async () => {
+    await startRW();
+    const phone = await pairDevice('Approval phone', true);
+    approvalRecords.push(mkApproval({ id: 'ap-mid' }));
+    const body = JSON.stringify({ decision: 'approve' });
+    expect(await withdrawMidBody(`${base()}/api/approvals/ap-mid`, phone, body.slice(0, 8), body.slice(8), (r) => { r.revoked = true; }))
+      .toBe(401);
+    expect(resolveCalls).toEqual([]);
+  });
+
+  it('a grant narrowed mid-body refuses a permission gate but still answers a screen prompt', async () => {
+    await startRW();
+    const body = JSON.stringify({ decision: 'approve' });
+    const gatePhone = await pairDevice('Gate phone', true);
+    approvalRecords.push(mkApproval({ id: 'ap-gate-mid', kind: 'awaiting_permission', toolName: 'Bash' }));
+    expect(await withdrawMidBody(`${base()}/api/approvals/ap-gate-mid`, gatePhone, body.slice(0, 8), body.slice(8), (r) => { r.allowInput = false; }))
+      .toBe(403);
+    expect(resolveCalls).toEqual([]);
+
+    // The read-only carve-out: a screen prompt needs no input grant.
+    const promptPhone = await pairDevice('Prompt phone', true);
+    approvalRecords.push(mkApproval({ id: 'ap-prompt-mid' }));
+    expect(await withdrawMidBody(`${base()}/api/approvals/ap-prompt-mid`, promptPhone, body.slice(0, 8), body.slice(8), (r) => { r.allowInput = false; }))
+      .toBe(200);
+    expect(resolveCalls).toEqual([
+      { id: 'ap-prompt-mid', decision: 'approve', resolvedBy: `device Prompt phone (${promptPhone.deviceId})` },
+    ]);
+  });
+
+  // The registry re-checks from inside its mutation link, after the route's own
+  // re-check: a resolve can queue behind others and re-read the screen first.
+  it('the registry re-check refuses a device revoked or narrowed after the route re-check', async () => {
+    await startRW();
+    const phone = await pairDevice('Queued phone', true);
+    approvalRecords.push(mkApproval({ id: 'ap-queued' }));
+    approvalBox.beforeAuthorize = () => { deviceRoster.get(phone.deviceId)!.revoked = true; };
+    const revoked = await postApproval(phone.token, 'ap-queued', { decision: 'approve' });
+    expect(revoked.status).toBe(401);
+    expect(await revoked.json()).toEqual({ error: 'authorization-expired' });
+    expect(resolveCalls).toHaveLength(1);
+
+    const narrowed = await pairDevice('Narrowed phone', true);
+    approvalRecords.push(mkApproval({ id: 'ap-queued-gate', kind: 'awaiting_permission', toolName: 'Bash' }));
+    approvalBox.beforeAuthorize = () => {
+      (deviceRoster.get(narrowed.deviceId) as unknown as { allowInput: boolean }).allowInput = false;
+    };
+    const refused = await postApproval(narrowed.token, 'ap-queued-gate', { decision: 'approve' });
+    expect(refused.status).toBe(403);
+    expect((await refused.json()).error).toMatch(/^read-only:/);
+  });
+
+  // ── terminal_prompt: the agent's own dialog, per-client ──────────────────
+  describe('terminal_prompt records', () => {
+    const CAPS = { 'X-Wmux-Client-Caps': 'terminal-prompt-answer' };
+    const FP = 'ab'.repeat(16);
+    const tp = (over: Partial<ApprovalRequest> = {}): ApprovalRequest => mkApproval({
+      id: 'ap-tp',
+      kind: 'terminal_prompt',
+      toolName: 'Bash',
+      summary: 'rm -rf build/cache · Remove the build cache',
+      risk: 'critical',
+      question: 'Do you want to proceed?',
+      reason: 'Permission rule Bash(rm -rf *) requires confirmation for this command.',
+      choices: [{ key: '1', label: 'Yes' }, { key: '2', label: 'No' }],
+      promptFingerprint: FP,
+      // Daemon-internal: must never reach the web wire.
+      toolUseId: 'toolu_01',
+      dialogKey: 'k',
+      keyRevisionAtCreate: 3,
+      ...over,
+    });
+    const postTp = (token: string, body: unknown, headers: Record<string, string> = CAPS, id = 'ap-tp') =>
+      fetch(`${base()}/api/approvals/${id}`, {
+        method: 'POST',
+        headers: { ...bearer(token), 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      });
+    const answerBody = { decision: 'approve', choiceKey: '1', promptFingerprint: FP };
+
+    it('an older client sees the card only; a capable one sees the dialog', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp(), tp({ id: 'ap-tp-info', question: undefined, reason: undefined, choices: undefined, promptFingerprint: undefined }));
+      const legacy = await (await fetch(`${base()}/api/approvals`, { headers: bearer(info.token as string) })).json();
+      expect(legacy.pending[0]).toEqual({
+        id: 'ap-tp', sessionId: 's1', agent: 'claude', kind: 'terminal_prompt', state: 'pending',
+        createdAt: 1_700_000_000_000, toolName: 'Bash', summary: 'rm -rf build/cache · Remove the build cache',
+        risk: 'critical',
+      });
+      const capable = await (await fetch(`${base()}/api/approvals`, { headers: { ...bearer(info.token as string), ...CAPS } })).json();
+      expect(capable.pending[0]).toMatchObject({
+        question: 'Do you want to proceed?',
+        reason: 'Permission rule Bash(rm -rf *) requires confirmation for this command.',
+        choices: [{ key: '1', label: 'Yes' }, { key: '2', label: 'No' }],
+        promptFingerprint: FP,
+      });
+      // A record that is not answerable carries no dialog, whoever asks.
+      expect(capable.pending[1]).not.toHaveProperty('question');
+      expect(capable.pending[1]).not.toHaveProperty('choices');
+      expect(capable.pending[1]).not.toHaveProperty('promptFingerprint');
+      expect(capable.pending[0]).toMatchObject({ risk: 'critical' });
+      const wire = JSON.stringify([legacy, capable]);
+      for (const internal of ['screenTail', 'toolUseId', 'toolu_01', 'dialogKey', 'keyRevisionAtCreate']) {
+        expect(wire).not.toContain(internal);
+      }
+    });
+
+    it('once answered, the dialog stays readable but offers nothing to press', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp({ pressedAt: 1_700_000_005_000, selectedChoiceKey: '1', decision: 'approve' }));
+      const capable = await (await fetch(`${base()}/api/approvals`, { headers: { ...bearer(info.token as string), ...CAPS } })).json();
+      expect(capable.pending[0]).toMatchObject({ question: 'Do you want to proceed?', pressedAt: 1_700_000_005_000, selectedChoiceKey: '1' });
+      expect(capable.pending[0]).not.toHaveProperty('choices');
+      expect(capable.pending[0]).not.toHaveProperty('promptFingerprint');
+    });
+
+    it('a capable client answering a record that is not answerable gets 501 before any body check', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp({ question: undefined, reason: undefined, choices: undefined, promptFingerprint: undefined }));
+      // No fingerprint in the body at all: still 501, not 400.
+      const res = await postTp(info.token as string, { decision: 'approve', choiceKey: '1' });
+      expect(res.status).toBe(501);
+      expect(await res.json()).toEqual({ error: 'answer-in-terminal', reason: 'unsupported-shape' });
+      expect(resolveCalls).toEqual([]);
+    });
+
+    it('"No, …" is the deny option', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp({ choices: [{ key: '1', label: 'Yes' }, { key: '3', label: 'No, and tell Claude what to do differently (esc)' }] }));
+      expect((await postTp(info.token as string, { decision: 'deny', choiceKey: '3', promptFingerprint: FP })).status).toBe(200);
+      expect((await postTp(info.token as string, { decision: 'approve', choiceKey: '3', promptFingerprint: FP })).status).toBe(400);
+    });
+
+    it('an older client is answered 501 answer-in-terminal, and nothing reaches the registry', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp());
+      const res = await postTp(info.token as string, answerBody, {});
+      expect(res.status).toBe(501);
+      expect(await res.json()).toEqual({ error: 'answer-in-terminal', reason: 'no-capability' });
+      expect(resolveCalls).toEqual([]);
+    });
+
+    it('a capable answer reaches the registry with the fingerprint and the route\'s marker', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp());
+      approvalBox.result = { ok: true, durable: true, request: tp({ pressedAt: 1_700_000_005_000, selectedChoiceKey: '1', decision: 'approve' }) };
+      const res = await postTp(info.token as string, answerBody);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ state: 'pending', pressedAt: 1_700_000_005_000, durable: true });
+      expect(resolveCalls).toHaveLength(1);
+      expect(resolveCalls[0]).toMatchObject({ id: 'ap-tp', decision: 'approve', choiceKey: '1', promptFingerprint: FP });
+      expect((resolveCalls[0] as Record<string, unknown>).terminalPromptAnswer).toBe(TERMINAL_PROMPT_WEB_ANSWER);
+      // A deny names the plain No.
+      const deny = await postTp(info.token as string, { decision: 'deny', choiceKey: '2', promptFingerprint: FP });
+      expect(deny.status).toBe(200);
+    });
+
+    it.each([
+      ['no fingerprint', { decision: 'approve', choiceKey: '1' }, 'invalid-prompt-fingerprint'],
+      ['a malformed fingerprint', { decision: 'approve', choiceKey: '1', promptFingerprint: 'nope' }, 'invalid-prompt-fingerprint'],
+      ['deny on the Yes option', { decision: 'deny', choiceKey: '1', promptFingerprint: FP }, 'invalid-choice'],
+      ['approve on the No option', { decision: 'approve', choiceKey: '2', promptFingerprint: FP }, 'invalid-choice'],
+      ['no choiceKey', { decision: 'approve', promptFingerprint: FP }, 'invalid-choice'],
+      ['a choiceKey outside the choices', { decision: 'approve', choiceKey: '3', promptFingerprint: FP }, 'invalid-choice'],
+    ])('400 for %s, before the registry', async (_label, body, error) => {
+      const info = await startRW();
+      approvalRecords.push(tp());
+      const res = await postTp(info.token as string, body);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error });
+      expect(resolveCalls).toEqual([]);
+    });
+
+    it.each([
+      ['already-answered', 409],
+      ['prompt-changed', 409],
+      ['answer-too-soon', 425],
+      ['invalid-choice', 400],
+    ] as const)('maps the registry\'s %s to %i', async (reason, status) => {
+      const info = await startRW();
+      approvalRecords.push(tp());
+      approvalBox.result = { ok: false, reason, request: tp() };
+      const res = await postTp(info.token as string, answerBody);
+      expect(res.status).toBe(status);
+      expect(await res.json()).toEqual({ error: reason });
+    });
+
+    it('a registry answer-in-terminal carries its cause as the 501 reason', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp());
+      approvalBox.result = { ok: false, reason: 'answer-in-terminal', answerRefusal: 'unsupported-shape', request: tp() };
+      const res = await postTp(info.token as string, answerBody);
+      expect(res.status).toBe(501);
+      expect(await res.json()).toEqual({ error: 'answer-in-terminal', reason: 'unsupported-shape' });
+    });
+
+    it('a read-only caller is refused before the body (site 1)', async () => {
+      const ro = await startRO();
+      approvalRecords.push(tp());
+      expect((await postTp(ro.token as string, answerBody)).status).toBe(403);
+      await server.stop();
+      await startRW();
+      const phone = await pairDevice('Read-only phone', false);
+      expect((await postTp(phone.token, answerBody)).status).toBe(403);
+      expect(resolveCalls).toEqual([]);
+    });
+
+    it('a grant narrowed while the body is on the wire is refused (site 2)', async () => {
+      await startRW();
+      const phone = await pairDevice('Narrowing phone', true);
+      approvalRecords.push(tp());
+      const body = JSON.stringify(answerBody);
+      expect(await withdrawMidBody(`${base()}/api/approvals/ap-tp`, phone, body.slice(0, 8), body.slice(8), (r) => { r.allowInput = false; }, CAPS))
+        .toBe(403);
+      expect(resolveCalls).toEqual([]);
+    });
+
+    it('a grant narrowed inside the registry link is refused (site 3)', async () => {
+      await startRW();
+      const phone = await pairDevice('Queued tp phone', true);
+      approvalRecords.push(tp());
+      approvalBox.beforeAuthorize = () => {
+        (deviceRoster.get(phone.deviceId) as unknown as { allowInput: boolean }).allowInput = false;
+      };
+      const refused = await postTp(phone.token, answerBody);
+      expect(refused.status).toBe(403);
+      expect((await refused.json()).error).toMatch(/^read-only:/);
+    });
+
+    it('the SSE approval event carries the kind and no content', async () => {
+      const info = await startRO();
+      emitApproval('create', tp());
+      const { text: body } = await readEventStream(`${base()}/api/events`, /ap-tp/, bearer(info.token as string));
+      expect(body).toContain('event: approval');
+      expect(body).toContain('"kind":"terminal_prompt"');
+      expect(body).toContain('ap-tp');
+      expect(body).toContain('"risk":"critical"');
+      for (const content of ['rm -rf build/cache', 'Do you want to proceed', 'Permission rule', FP, '"toolName"', '"choices"', 'toolu_01']) {
+        expect(body).not.toContain(content);
+      }
+    });
+
+    describe('long commands: /detail, decline, the answered history', () => {
+      const DECLINE_CAPS = { 'X-Wmux-Client-Caps': 'terminal-prompt-answer, terminal-prompt-decline' };
+      const LONG = `rm -rf ${'x'.repeat(300)}/end`;
+      const detail = (id = 'ap-tp'): TerminalPromptDetail => ({
+        id, toolName: 'Bash', command: LONG, commandHash: crypto.createHash('sha256').update(LONG).digest('hex'),
+        commandBytes: LONG.length, truncated: false,
+      });
+      const postDecline = (token: string, body: unknown, headers: Record<string, string> = DECLINE_CAPS, id = 'ap-tp') =>
+        fetch(`${base()}/api/approvals/${id}/decline`, {
+          method: 'POST',
+          headers: { ...bearer(token), 'Content-Type': 'application/json', ...headers },
+          body: JSON.stringify(body),
+        });
+
+      it('/detail needs --allow-transcript and the dialog capability; the command is never on the list', async () => {
+        await startWithTranscript();
+        const phone = await pairDevice('Reader', false);
+        approvalRecords.push(tp());
+        approvalBox.details.set('ap-tp', detail());
+        const read = (headers: Record<string, string> = CAPS, id = 'ap-tp') =>
+          fetch(`${base()}/api/approvals/${id}/detail`, { headers: { ...bearer(phone.token), ...headers } });
+        const res = await read();
+        expect(res.status).toBe(200);
+        expect(res.headers.get('cache-control')).toBe('no-store');
+        expect(await res.json()).toEqual(detail());
+        const listed = await (await fetch(`${base()}/api/approvals`, { headers: { ...bearer(phone.token), ...CAPS } })).json();
+        expect(listed.pending[0]).toMatchObject({ hasDetail: true });
+        expect(JSON.stringify(listed)).not.toContain('/end');
+        // Without the capability that shows the dialog's question: 501.
+        expect((await read({})).status).toBe(501);
+        // Unauthenticated: 401. Unknown, informational or settled: 404.
+        expect((await fetch(`${base()}/api/approvals/ap-tp/detail`, { headers: CAPS })).status).toBe(401);
+        expect((await read(CAPS, 'nope')).status).toBe(404);
+        approvalBox.details.clear();
+        expect((await read()).status).toBe(404);
+        approvalBox.details.set('ap-tp', detail());
+        approvalRecords[0]!.state = 'resolved';
+        expect((await read()).status).toBe(404);
+      });
+
+      it('/detail is 403 on a server without --allow-transcript, and no record offers it', async () => {
+        const info = await startRW();
+        approvalRecords.push(tp());
+        approvalBox.details.set('ap-tp', detail());
+        const res = await fetch(`${base()}/api/approvals/ap-tp/detail`, { headers: { ...bearer(info.token as string), ...CAPS } });
+        expect(res.status).toBe(403);
+        expect(await res.text()).not.toContain('/end');
+        const listed = await (await fetch(`${base()}/api/approvals`, { headers: { ...bearer(info.token as string), ...CAPS } })).json();
+        expect(listed.pending[0]).not.toHaveProperty('hasDetail');
+      });
+
+      it('/api/config advertises detail (with --allow-transcript) and decline (with the input grant)', async () => {
+        await startRW();
+        const writer = await pairDevice('Writer', true);
+        const reader = await pairDevice('Reader', false);
+        const cfg = async (token: string) => (await fetch(`${base()}/api/config`, { headers: bearer(token) })).json();
+        expect(await cfg(writer.token)).toMatchObject({ terminalPromptDetail: false, terminalPromptDecline: true });
+        expect(await cfg(reader.token)).toMatchObject({ terminalPromptDetail: false, terminalPromptDecline: false });
+        await server.stop();
+        await startWithTranscript();
+        const later = await pairDevice('Transcript reader', false);
+        expect(await cfg(later.token)).toMatchObject({ terminalPromptDetail: true });
+      });
+
+      it('decline reaches the registry with the route\'s marker — on an informational record too', async () => {
+        await startRW();
+        const phone = await pairDevice('Decliner', true);
+        approvalRecords.push(tp({ question: undefined, reason: undefined, choices: undefined, promptFingerprint: undefined }));
+        approvalBox.result = { ok: true, durable: true, request: tp({ pressedAt: 1_700_000_005_000, decision: 'deny' }) };
+        const res = await postDecline(phone.token, {});
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ state: 'pending', pressedAt: 1_700_000_005_000, via: 'escape', durable: true });
+        expect(resolveCalls).toHaveLength(1);
+        expect(resolveCalls[0]).toMatchObject({ id: 'ap-tp', decision: 'deny' });
+        expect(resolveCalls[0]).not.toHaveProperty('choiceKey');
+        expect((resolveCalls[0] as Record<string, unknown>).terminalPromptDecline).toBe(TERMINAL_PROMPT_WEB_DECLINE);
+        expect((resolveCalls[0] as Record<string, unknown>).terminalPromptAnswer).toBeUndefined();
+        // The fingerprint rides along when sent; the optional decision/via must say deny/escape.
+        await postDecline(phone.token, { decision: 'deny', via: 'escape', promptFingerprint: FP });
+        expect(resolveCalls[1]).toMatchObject({ promptFingerprint: FP });
+      });
+
+      it.each([
+        ['no decline capability', {}, { 'X-Wmux-Client-Caps': 'terminal-prompt-answer' }, 501],
+        ['a malformed fingerprint', { promptFingerprint: 'nope' }, undefined, 400],
+        ['an approve', { decision: 'approve' }, undefined, 400],
+        ['another key than Esc', { via: 'enter' }, undefined, 400],
+      ])('%s → %i, nothing reaches the registry', async (_label, body, headers, status) => {
+        await startRW();
+        const phone = await pairDevice('Bad decliner', true);
+        approvalRecords.push(tp());
+        expect((await postDecline(phone.token, body, headers)).status).toBe(status);
+        expect(resolveCalls).toEqual([]);
+      });
+
+      it('needs the input grant, before and after the body', async () => {
+        await startRW();
+        const reader = await pairDevice('Read-only decliner', false);
+        approvalRecords.push(tp());
+        expect((await postDecline(reader.token, {})).status).toBe(403);
+        const phone = await pairDevice('Narrowing decliner', true);
+        const body = JSON.stringify({});
+        expect(await withdrawMidBody(`${base()}/api/approvals/ap-tp/decline`, phone, body.slice(0, 1), body.slice(1), (r) => { r.allowInput = false; }, DECLINE_CAPS))
+          .toBe(403);
+        expect(resolveCalls).toEqual([]);
+      });
+
+      it.each([
+        ['already-resolved', 409],
+        ['already-answered', 409],
+        ['prompt-changed', 409],
+        ['prompt-unverified', 409],
+        ['answer-too-soon', 425],
+        ['expired', 410],
+      ] as const)('maps the registry\'s %s to %i and says nothing was written', async (reason, status) => {
+        await startRW();
+        const phone = await pairDevice('Late decliner', true);
+        approvalRecords.push(tp());
+        approvalBox.result = { ok: false, reason, request: tp() };
+        const res = await postDecline(phone.token, {});
+        expect(res.status).toBe(status);
+        expect(await res.json()).toMatchObject({ error: reason, effect: 'none' });
+      });
+
+      it('a settled record still reaches the registry (so the caller learns 409/410), another kind does not', async () => {
+        await startRW();
+        const phone = await pairDevice('After the fact', true);
+        approvalRecords.push(tp({ state: 'resolved', resolvedBy: 'device Other (d2)' }), mkApproval({ id: 'ap-q' }));
+        approvalBox.result = { ok: false, reason: 'already-resolved', resolvedBy: 'device Other (d2)', request: tp({ state: 'resolved' }) };
+        expect((await postDecline(phone.token, {})).status).toBe(409);
+        expect((await postDecline(phone.token, {}, DECLINE_CAPS, 'ap-q')).status).toBe(400);
+        expect(resolveCalls.map((c) => c.id)).toEqual(['ap-tp']);
+      });
+
+      it('recently answered lists a terminal_prompt only when a phone answered it', async () => {
+        const info = await startRW();
+        approvalRecords.push(
+          tp({ id: 'tp-answered', state: 'resolved', pressedAt: 1, decision: 'approve', selectedChoiceKey: '1', resolvedAt: 5 }),
+          tp({ id: 'tp-superseded', state: 'superseded', resolvedAt: 4 }),
+          tp({ id: 'tp-info-expired', state: 'expired', question: undefined, choices: undefined, promptFingerprint: undefined, resolvedAt: 3 }),
+          tp({ id: 'tp-answerable-expired', state: 'expired', resolvedAt: 2 }),
+          // Declined from a phone while it could not be answered Yes/No: no question, still an answer.
+          tp({
+            id: 'tp-declined-info', state: 'resolved', pressedAt: 2, decision: 'deny', resolvedAt: 2,
+            question: undefined, reason: undefined, choices: undefined, promptFingerprint: undefined,
+          }),
+          mkApproval({ id: 'ap-question', state: 'resolved', question: 'Pick one', resolvedAt: 1 }),
+        );
+        const expected = ['tp-answered', 'tp-declined-info', 'ap-question'];
+        const capable = await (await fetch(`${base()}/api/approvals`, { headers: { ...bearer(info.token as string), ...CAPS } })).json();
+        expect(capable.recentlyResolved.map((r: { id: string }) => r.id)).toEqual(expected);
+        expect(capable.recentlyResolved[0]).toMatchObject({ question: 'Do you want to proceed?', decision: 'approve' });
+        expect(capable.recentlyResolved[1]).toMatchObject({ toolName: 'Bash', summary: expect.any(String), decision: 'deny' });
+        // Decided from the record, not from what this caller is shown: an older
+        // client (no question on the wire) sees the same rows.
+        const legacy = await (await fetch(`${base()}/api/approvals`, { headers: bearer(info.token as string) })).json();
+        expect(legacy.recentlyResolved.map((r: { id: string }) => r.id)).toEqual(expected);
+      });
+    });
+
+    describe('raw input while the dialog is up', () => {
+      const typeInto = (token: string, body: string, headers: Record<string, string> = {}) =>
+        fetch(`${base()}/api/input?session=s1`, { method: 'POST', headers: { ...bearer(token), ...headers }, body });
+
+      it('refuses a typed answer, whether or not the record is answerable', async () => {
+        const info = await startRW();
+        const phone = await pairDevice('Reply from a notification', true);
+        for (const record of [tp(), tp({ choices: undefined, promptFingerprint: undefined })]) {
+          approvalRecords.splice(0, approvalRecords.length, record);
+          for (const token of [phone.token, info.token as string]) {
+            for (const body of ['1\r', '1', '\r', '\x1b\r', '\x1b[B', '\x1b[200~1\r\x1b[201~']) {
+              const res = await typeInto(token, body);
+              expect(res.status, JSON.stringify(body)).toBe(409);
+              expect(await res.json()).toEqual({ error: 'terminal-prompt-active', effect: 'none' });
+            }
+          }
+        }
+        expect(write).not.toHaveBeenCalled();
+      });
+
+      it('lets a lone Esc or a lone Ctrl-C through', async () => {
+        const info = await startRW();
+        approvalRecords.push(tp());
+        expect((await typeInto(info.token as string, '\x1b')).status).toBe(204);
+        expect((await typeInto(info.token as string, '\x03')).status).toBe(204);
+        expect(write.mock.calls).toEqual([['\x1b'], ['\x03']]);
+      });
+
+      it('a refused input leaves a recovering pane inactive', async () => {
+        const activate = (sessionManager as unknown as { activateDeferred: ReturnType<typeof vi.fn> }).activateDeferred;
+        const info = await startRW();
+        managed.deferred = true;
+        approvalRecords.push(tp());
+        expect((await typeInto(info.token as string, 'ls\r')).status).toBe(409);
+        const receipted = await typeInto(info.token as string, '1\r', {
+          'X-Wmux-Input-Request-ID': `${Date.now()}.${crypto.randomUUID()}`,
+          'X-Wmux-Pane-Incarnation': 'incarnation-1',
+        });
+        expect(receipted.status).toBe(409);
+        approvalRecords[0].state = 'resolved';
+        // A receipted Return whose precondition no longer holds is refused too.
+        const stale = await typeInto(info.token as string, '\r', {
+          'X-Wmux-Input-Request-ID': `${Date.now()}.${crypto.randomUUID()}`,
+          'X-Wmux-Pane-Incarnation': 'incarnation-1',
+          'X-Wmux-Input-After': 'not-the-current-revision',
+        });
+        expect(stale.status).toBe(409);
+        expect(activate).not.toHaveBeenCalled();
+        expect(write).not.toHaveBeenCalled();
+        expect(managed.deferred).toBe(true);
+      });
+
+      it('only a terminal_prompt on THIS pane blocks it', async () => {
+        const info = await startRW();
+        approvalRecords.push(tp({ sessionId: 's2' }), mkApproval({ id: 'ap-gate', kind: 'awaiting_permission' }));
+        expect((await typeInto(info.token as string, '1\r')).status).toBe(204);
+        expect(write).toHaveBeenCalledWith('1\r');
+      });
+
+      it('flows again once the dialog is resolved', async () => {
+        const info = await startRW();
+        approvalRecords.push(tp());
+        expect((await typeInto(info.token as string, 'ls\r')).status).toBe(409);
+        approvalRecords[0].state = 'resolved';
+        expect((await typeInto(info.token as string, 'ls\r')).status).toBe(204);
+        expect(write).toHaveBeenCalledTimes(1);
+      });
+
+      it('a receipted input journals nothing when refused, and its retry is checked again', async () => {
+        const info = await startRW();
+        approvalRecords.push(tp());
+        const headers = {
+          'X-Wmux-Input-Request-ID': `${Date.now()}.${crypto.randomUUID()}`,
+          'X-Wmux-Pane-Incarnation': 'incarnation-1',
+        };
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const refused = await typeInto(info.token as string, '1\r', headers);
+          expect(refused.status).toBe(409);
+          expect(await refused.json()).toEqual({ error: 'terminal-prompt-active', effect: 'none' });
+        }
+        expect(write).not.toHaveBeenCalled();
+        approvalRecords[0].state = 'expired';
+        const written = await typeInto(info.token as string, '1\r', headers);
+        expect(written.status).toBe(200);
+        expect(await written.json()).toEqual({ status: 'written', replayed: false });
+        expect(write).toHaveBeenCalledTimes(1);
+      });
+
+      it('is decided when the body completes, not when the headers arrive', async () => {
+        await startRW();
+        const phone = await pairDevice('Slow typist', true);
+        let observed!: () => void;
+        const entered = new Promise<void>((resolve) => { observed = resolve; });
+        const original = sessionManager.getSession.bind(sessionManager);
+        const spy = vi.spyOn(sessionManager, 'getSession').mockImplementation((id) => {
+          const result = original(id);
+          if (id === 's1') observed();
+          return result;
+        });
+        let request: ReturnType<typeof httpReq>;
+        const response = new Promise<number | undefined>((resolve, reject) => {
+          request = httpReq(`${base()}/api/input?session=s1`, { method: 'POST', headers: bearer(phone.token) }, (res) => {
+            res.resume(); res.on('end', () => resolve(res.statusCode));
+          });
+          request.on('error', reject);
+          request.write('1');
+        });
+        try {
+          await entered;
+          approvalRecords.push(tp());
+          request!.end('\r');
+          expect(await response).toBe(409);
+          expect(write).not.toHaveBeenCalled();
+        } finally { spy.mockRestore(); request!.destroy(); }
+      });
+    });
+  });
+
+  describe('phone decision wire (decision-v2)', () => {
+    const FP = 'ab'.repeat(16);
+    const OLD_IOS = { 'X-Wmux-Client-Caps': 'terminal-prompt-answer, terminal-prompt-decline' };
+    const legacyRecords = (): ApprovalRequest[] => [
+      mkApproval({
+        id: 'g-tp', kind: 'terminal_prompt', toolName: 'Bash', summary: 'rm -rf build', risk: 'critical',
+        question: 'Do you want to proceed?', reason: 'Permission rule Bash(rm -rf *) requires confirmation.',
+        choices: [{ key: '1', label: 'Yes' }, { key: '2', label: 'No' }], promptFingerprint: FP,
+        toolUseId: 'toolu_01', dialogKey: 'k', keyRevisionAtCreate: 3,
+      }),
+      mkApproval({ id: 'g-tp-info', kind: 'terminal_prompt', toolName: 'Edit', summary: 'src/a.ts', createdAt: 1_700_000_000_001 }),
+      mkApproval({
+        id: 'g-q', sessionId: 's2', question: 'Pick one', options: ['A', 'B'],
+        choices: [{ key: '1', label: 'A' }, { key: '2', label: 'B' }], createdAt: 1_700_000_000_002,
+      }),
+      mkApproval({ id: 'g-gate', sessionId: 's3', kind: 'awaiting_permission', toolName: 'Bash', toolInputSummary: 'ls', createdAt: 1_700_000_000_003 }),
+      mkApproval({
+        id: 'g-tp-done', kind: 'terminal_prompt', toolName: 'Bash', summary: 'ls', state: 'resolved', pressedAt: 1_700_000_000_010,
+        decision: 'approve', selectedChoiceKey: '1', resolvedBy: 'device Phone (d1)', resolvedAt: 1_700_000_000_011,
+        question: 'Do you want to proceed?', choices: [{ key: '1', label: 'Yes' }, { key: '2', label: 'No' }], promptFingerprint: FP,
+      }),
+      mkApproval({ id: 'g-q-done', state: 'resolved', decision: 'deny', resolvedBy: 'web', resolvedAt: 1_700_000_000_009, question: 'Q?' }),
+    ];
+    // Captured from the tree BEFORE the decision-v2 wire existed: a client that
+    // declares none of the new capabilities must keep reading exactly this.
+    const GOLDEN_NO_CAPS =
+      '{"pending":[{"id":"g-tp","sessionId":"s1","agent":"claude","kind":"terminal_prompt","state":"pending","createdAt":1700000000000,"toolName":"Bash","summary":"rm -rf build","risk":"critical"},{"id":"g-tp-info","sessionId":"s1","agent":"claude","kind":"terminal_prompt","state":"pending","createdAt":1700000000001,"toolName":"Edit","summary":"src/a.ts"},{"id":"g-q","sessionId":"s2","agent":"claude","kind":"awaiting_input","state":"pending","createdAt":1700000000002,"question":"Pick one","options":["A","B"],"choices":[{"key":"1","label":"A"},{"key":"2","label":"B"}]},{"id":"g-gate","sessionId":"s3","agent":"claude","kind":"awaiting_permission","state":"pending","createdAt":1700000000003,"toolName":"Bash","toolInputSummary":"ls"}],"recentlyResolved":[{"id":"g-tp-done","sessionId":"s1","agent":"claude","kind":"terminal_prompt","state":"resolved","createdAt":1700000000000,"toolName":"Bash","summary":"ls","pressedAt":1700000000010,"decision":"approve","selectedChoiceKey":"1","resolvedBy":"device Phone (d1)","resolvedAt":1700000000011},{"id":"g-q-done","sessionId":"s1","agent":"claude","kind":"awaiting_input","state":"resolved","createdAt":1700000000000,"question":"Q?","decision":"deny","resolvedBy":"web","resolvedAt":1700000000009}]}';
+    const GOLDEN_OLD_IOS =
+      '{"pending":[{"id":"g-tp","sessionId":"s1","agent":"claude","kind":"terminal_prompt","state":"pending","createdAt":1700000000000,"toolName":"Bash","summary":"rm -rf build","risk":"critical","question":"Do you want to proceed?","reason":"Permission rule Bash(rm -rf *) requires confirmation.","choices":[{"key":"1","label":"Yes"},{"key":"2","label":"No"}],"promptFingerprint":"abababababababababababababababab"},{"id":"g-tp-info","sessionId":"s1","agent":"claude","kind":"terminal_prompt","state":"pending","createdAt":1700000000001,"toolName":"Edit","summary":"src/a.ts"},{"id":"g-q","sessionId":"s2","agent":"claude","kind":"awaiting_input","state":"pending","createdAt":1700000000002,"question":"Pick one","options":["A","B"],"choices":[{"key":"1","label":"A"},{"key":"2","label":"B"}]},{"id":"g-gate","sessionId":"s3","agent":"claude","kind":"awaiting_permission","state":"pending","createdAt":1700000000003,"toolName":"Bash","toolInputSummary":"ls"}],"recentlyResolved":[{"id":"g-tp-done","sessionId":"s1","agent":"claude","kind":"terminal_prompt","state":"resolved","createdAt":1700000000000,"toolName":"Bash","summary":"ls","question":"Do you want to proceed?","pressedAt":1700000000010,"decision":"approve","selectedChoiceKey":"1","resolvedBy":"device Phone (d1)","resolvedAt":1700000000011},{"id":"g-q-done","sessionId":"s1","agent":"claude","kind":"awaiting_input","state":"resolved","createdAt":1700000000000,"question":"Q?","decision":"deny","resolvedBy":"web","resolvedAt":1700000000009}]}';
+    const GOLDEN_SSE =
+      '[{"sessionId":"s1","approvalId":"g-tp","phase":"create","state":"pending","agent":"claude","createdAt":1700000000000,"risk":"critical","kind":"approval","tier":"act","id":1},{"sessionId":"s1","approvalId":"g-tp-info","phase":"create","state":"pending","agent":"claude","createdAt":1700000000001,"kind":"approval","tier":"act","id":2},{"sessionId":"s2","approvalId":"g-q","phase":"create","state":"pending","agent":"claude","createdAt":1700000000002,"tier":"act","id":3,"kind":"approval"},{"sessionId":"s3","approvalId":"g-gate","phase":"create","state":"pending","agent":"claude","createdAt":1700000000003,"kind":"approval","toolName":"Bash","toolInputSummary":"ls","tier":"act","id":4},{"sessionId":"s1","approvalId":"g-tp-done","phase":"resolve","state":"resolved","agent":"claude","createdAt":1700000000000,"decision":"approve","resolvedBy":"device Phone (d1)","resolvedAt":1700000000011,"kind":"approval","tier":"info","id":5},{"sessionId":"s1","approvalId":"g-q-done","phase":"resolve","state":"resolved","agent":"claude","createdAt":1700000000000,"decision":"deny","resolvedBy":"web","resolvedAt":1700000000009,"tier":"info","id":6,"kind":"approval"}]';
+
+    it('/api/approvals is byte-identical without the new capabilities (no header, and the shipped iOS header)', async () => {
+      const info = await startRW();
+      approvalRecords.push(...legacyRecords());
+      const read = async (headers: Record<string, string>) =>
+        (await fetch(`${base()}/api/approvals`, { headers: { ...bearer(info.token as string), ...headers } })).text();
+      expect(await read({})).toBe(GOLDEN_NO_CAPS);
+      expect(await read(OLD_IOS)).toBe(GOLDEN_OLD_IOS);
+    });
+
+    it('the SSE approval nudges are byte-identical (minus the per-run epoch)', async () => {
+      const info = await startRO();
+      for (const r of legacyRecords()) emitApproval(r.state === 'pending' ? 'create' : 'resolve', r);
+      const body = await (await fetch(`${base()}/api/events`, { headers: bearer(info.token as string) })).json() as { events: Array<Record<string, unknown>> };
+      const stripped = body.events.map(({ epoch: _epoch, at: _at, ...rest }) => rest);
+      expect(JSON.stringify(stripped)).toBe(GOLDEN_SSE);
+    });
+
+    it('/api/config advertises the decision-v2 keys the same way with or without the new capabilities', async () => {
+      const info = await startRW();
+      const cfg = async (headers: Record<string, string>) =>
+        (await fetch(`${base()}/api/config`, { headers: { ...bearer(info.token as string), ...headers } })).json();
+      const plain = await cfg({});
+      // No --allow-transcript and no chat bridge here, so `/chat/cancel` would refuse: not advertised.
+      expect(plain).toMatchObject({ decisionForms: [], chatCancel: false });
+      expect(await cfg(OLD_IOS)).toEqual(plain);
+      expect(await cfg({ 'X-Wmux-Client-Caps': 'terminal-prompt-answer, decision-v2, chat-cancel' })).toEqual(plain);
+    });
+
+    it('/api/config advertises the form kinds the daemon produces, for every client alike', async () => {
+      const info = await startRW();
+      decisionFormKinds = ['permission', 'questions'];
+      const cfg = async (headers: Record<string, string>) =>
+        (await fetch(`${base()}/api/config`, { headers: { ...bearer(info.token as string), ...headers } })).json();
+      const plain = await cfg({});
+      expect(plain).toMatchObject({ decisionForms: ['permission', 'questions'] });
+      expect(await cfg(OLD_IOS)).toEqual(plain);
+    });
+
+    it('a list asks for agent-native decisions to be refreshed, and never waits for it', async () => {
+      const info = await startRO();
+      const before = reconcileCalls;
+      expect((await fetch(`${base()}/api/approvals`, { headers: bearer(info.token as string) })).status).toBe(200);
+      expect(reconcileCalls).toBe(before + 1);
+    });
+
+    const V2 = { 'X-Wmux-Client-Caps': 'terminal-prompt-answer, terminal-prompt-decline, decision-v2' };
+    const FORM = { v: 1 as const, kind: 'permission' as const, actions: [{ id: 'approve', label: 'Allow once' }, { id: 'deny', label: 'Reject' }] };
+    const nativeTp = (over: Partial<ApprovalRequest> = {}): ApprovalRequest => mkApproval({
+      id: 'ap-native',
+      agent: 'opencode',
+      kind: 'terminal_prompt',
+      channel: 'native-rpc',
+      native: { adapter: 'opencode', requestId: 'per_secret_1', nativeSessionId: 'ses_1' },
+      form: FORM,
+      formFingerprint: FP,
+      question: 'Allow bash: npm test?',
+      toolName: 'bash',
+      choices: [{ key: '1', label: 'Yes' }, { key: '2', label: 'No' }],
+      promptFingerprint: FP,
+      ...over,
+    });
+    const nativeQuestion = (over: Partial<ApprovalRequest> = {}): ApprovalRequest => nativeTp({
+      id: 'ap-native-q',
+      kind: 'awaiting_input',
+      form: { v: 1, kind: 'questions', actions: [], questions: [{ id: 'q0', text: 'Which env?', multiSelect: true, allowOther: false, options: [{ key: '1', label: 'dev' }] }] },
+      question: 'Which env?',
+      choices: undefined,
+      promptFingerprint: undefined,
+      questionShape: 'multi-select',
+      ...over,
+    });
+    const answerBody = (over: Record<string, unknown> = {}) => ({ formFingerprint: FP, clientAnswerId: 'phone-answer-0001', action: 'approve', ...over });
+    const postAnswer = (token: string, body: unknown, headers: Record<string, string> = V2, id = 'ap-native') =>
+      fetch(`${base()}/api/approvals/${id}/answer`, {
+        method: 'POST',
+        headers: { ...bearer(token), 'Content-Type': 'application/json', ...headers },
+        body: typeof body === 'string' ? body : JSON.stringify(body),
+      });
+
+    it('/api/config lists the plan form while the daemon produces it', async () => {
+      const info = await startRW();
+      decisionFormKinds = ['plan'];
+      const cfg = await (await fetch(`${base()}/api/config`, { headers: bearer(info.token as string) })).json();
+      expect(cfg.decisionForms).toEqual(['plan']);
+    });
+
+    const PLAN_FORM = {
+      v: 1 as const,
+      kind: 'plan' as const,
+      actions: [{ id: 'approve-manual', label: 'Yes, manually approve edits' }, { id: 'feedback', label: 'Tell Claude what to change', needsText: true as const }],
+    };
+    const planTp = (over: Partial<ApprovalRequest> = {}): ApprovalRequest => mkApproval({
+      id: 'ap-plan',
+      kind: 'terminal_prompt',
+      toolName: 'ExitPlanMode',
+      summary: 'Plan: create hello.txt',
+      question: 'Claude has written up a plan and is ready to execute. Would you like to proceed?',
+      channel: 'fenced-keys',
+      form: PLAN_FORM,
+      formFingerprint: FP,
+      promptFingerprint: FP,
+      toolUseId: 'toolu_plan',
+      keyRevisionAtCreate: 3,
+      ...over,
+    });
+
+    it('a Claude question form carries the Other width of its pane; an agent-native one does not', async () => {
+      const info = await startRW();
+      approvalRecords.push(
+        mkApproval({
+          id: 'ap-ask',
+          kind: 'awaiting_input',
+          channel: 'fenced-keys',
+          form: { v: 1, kind: 'questions', actions: [{ id: 'submit', label: 'Submit' }], questions: [{ id: 'q0', header: 'Size', text: 'Which size?', multiSelect: false, allowOther: true, options: [{ key: '1', label: 'Small', description: 'Small size' }] }] },
+          formFingerprint: FP,
+        }),
+        nativeQuestion(),
+      );
+      const listed = await (await fetch(`${base()}/api/approvals`, { headers: { ...bearer(info.token as string), ...V2 } })).json();
+      const byId = (id: string) => listed.pending.find((r: { id: string }) => r.id === id);
+      // s1 is 80 columns: one row of its "Other" field holds 68.
+      expect(byId('ap-ask').form).toMatchObject({ kind: 'questions', otherMaxCells: 68, questions: [{ options: [{ key: '1', label: 'Small', description: 'Small size' }] }] });
+      expect(byId('ap-native-q').form.otherMaxCells).toBeUndefined();
+    });
+
+    it('a plan dialog is an informational card to the shipped app; v2 gets its form, question and detail until an answer starts', async () => {
+      const info = await server.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: false, allowTranscript: true });
+      approvalRecords.push(planTp());
+      const read = async (headers: Record<string, string>) =>
+        (await (await fetch(`${base()}/api/approvals`, { headers: { ...bearer(info.token as string), ...headers } })).json()).pending[0];
+      expect(await read(OLD_IOS)).toEqual({
+        id: 'ap-plan', sessionId: 's1', agent: 'claude', kind: 'terminal_prompt', state: 'pending',
+        createdAt: 1_700_000_000_000, toolName: 'ExitPlanMode', summary: 'Plan: create hello.txt',
+      });
+      const v2 = await read({ 'X-Wmux-Client-Caps': 'terminal-prompt-answer, terminal-prompt-decline, decision-v2' });
+      expect(v2).toMatchObject({ form: PLAN_FORM, formFingerprint: FP, question: planTp().question, hasDetail: true });
+      expect(v2).not.toHaveProperty('choices');
+      expect(v2).not.toHaveProperty('channel');
+      approvalRecords.splice(0, 1, planTp({
+        step: { answerId: 'phone-answer-0001', index: 1, total: 3, expectedRevision: 4, incarnation: 'inc', status: 'partial', startedAt: 1 },
+      }));
+      const partial = await read({ 'X-Wmux-Client-Caps': 'decision-v2' });
+      expect(partial.step).toEqual({ index: 1, total: 3, status: 'partial' });
+      expect(partial).not.toHaveProperty('form');
+      expect(partial).not.toHaveProperty('hasDetail');
+    });
+
+    it('a decision-v2 client may read a plan\'s detail without terminal-prompt-answer; other records still need it', async () => {
+      const info = await server.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: false, allowTranscript: true });
+      approvalRecords.push(planTp(), mkApproval({ id: 'ap-bash', kind: 'terminal_prompt', toolName: 'Bash', promptFingerprint: FP }));
+      const plan = { id: 'ap-plan', toolName: 'ExitPlanMode', command: '# Plan', commandHash: 'h', commandBytes: 6, truncated: false };
+      approvalBox.details.set('ap-plan', plan);
+      approvalBox.details.set('ap-bash', { ...plan, id: 'ap-bash', toolName: 'Bash' });
+      const get = (id: string) => fetch(`${base()}/api/approvals/${id}/detail`, { headers: { ...bearer(info.token as string), 'X-Wmux-Client-Caps': 'decision-v2' } });
+      const res = await get('ap-plan');
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual(plan);
+      expect((await get('ap-bash')).status).toBe(501);
+    });
+
+    it('a plan answered with feedback (stepwise, no pressedAt) is listed as answered here', async () => {
+      const info = await startRW();
+      approvalRecords.push(planTp({
+        state: 'resolved', decision: 'deny', resolvedAt: 1_700_000_000_050,
+        step: { answerId: 'phone-answer-0001', index: 3, total: 3, expectedRevision: 6, incarnation: 'inc', status: 'done', startedAt: 1 },
+      }), planTp({ id: 'ap-plan-gone', state: 'expired' }));
+      const list = await (await fetch(`${base()}/api/approvals`, { headers: bearer(info.token as string) })).json();
+      expect(list.recentlyResolved.map((r: { id: string }) => r.id)).toEqual(['ap-plan']);
+    });
+
+    it('a native permission reads to the shipped iOS app as a plain Yes/No dialog; v2 adds the form; nothing internal leaks', async () => {
+      await startWithTranscript();
+      const phone = await pairDevice('Old phone', false);
+      approvalRecords.push(nativeTp());
+      approvalBox.details.set('ap-native', { id: 'ap-native', command: 'npm test', commandHash: 'x', commandBytes: 8, truncated: false });
+      const list = async (headers: Record<string, string>) =>
+        (await (await fetch(`${base()}/api/approvals`, { headers: { ...bearer(phone.token), ...headers } })).json()).pending[0];
+      const old = await list(OLD_IOS);
+      expect(old).toMatchObject({ kind: 'terminal_prompt', question: 'Allow bash: npm test?', promptFingerprint: FP });
+      expect(old.choices).toEqual([{ key: '1', label: 'Yes' }, { key: '2', label: 'No' }]);
+      expect(old).not.toHaveProperty('hasDetail');
+      expect(old).not.toHaveProperty('form');
+      const v2 = await list(V2);
+      expect(v2).toMatchObject({ form: FORM, formFingerprint: FP });
+      expect(v2).not.toHaveProperty('hasDetail');
+      const wire = JSON.stringify([old, v2, await list({})]);
+      for (const internal of ['per_secret_1', 'ses_1', '"native"', '"channel"', 'native-rpc']) expect(wire).not.toContain(internal);
+      // No screen dialog, so no detail.
+      expect((await fetch(`${base()}/api/approvals/ap-native/detail`, { headers: { ...bearer(phone.token), ...OLD_IOS } })).status).toBe(404);
+    });
+
+    it('a native answer from the shipped app reaches the registry with its marker; 200 carries no pressedAt', async () => {
+      await startRW();
+      const phone = await pairDevice('Old phone', true);
+      approvalRecords.push(nativeTp());
+      approvalBox.result = { ok: true, durable: true, request: nativeTp({ state: 'resolved', decision: 'approve', selectedChoiceKey: '1' }) };
+      const res = await fetch(`${base()}/api/approvals/ap-native`, {
+        method: 'POST',
+        headers: { ...bearer(phone.token), 'Content-Type': 'application/json', ...OLD_IOS },
+        body: JSON.stringify({ decision: 'approve', choiceKey: '1', promptFingerprint: FP }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ state: 'resolved', durable: true });
+      expect((resolveCalls[0] as Record<string, unknown>).terminalPromptAnswer).toBe(TERMINAL_PROMPT_WEB_ANSWER);
+      // The offline queue replaying it meets the registry's CAS.
+      approvalBox.result = { ok: false, reason: 'already-resolved', resolvedBy: 'device Old phone', request: nativeTp({ state: 'resolved' }) };
+      approvalRecords[0]!.state = 'resolved';
+      const replay = await fetch(`${base()}/api/approvals/ap-native`, {
+        method: 'POST',
+        headers: { ...bearer(phone.token), 'Content-Type': 'application/json', ...OLD_IOS },
+        body: JSON.stringify({ decision: 'approve', choiceKey: '1', promptFingerprint: FP }),
+      });
+      expect(replay.status).toBe(409);
+      // Answered through the agent: listed as history though it has no pressedAt.
+      const listed = await (await fetch(`${base()}/api/approvals`, { headers: { ...bearer(phone.token), ...OLD_IOS } })).json();
+      expect(listed.recentlyResolved.map((r: { id: string }) => r.id)).toEqual(['ap-native']);
+    });
+
+    it('declining a native decision (a question too) goes to the registry with the decline marker, never refused as another kind', async () => {
+      await startRW();
+      const phone = await pairDevice('Decliner', true);
+      approvalRecords.push(nativeQuestion());
+      approvalBox.result = { ok: true, durable: true, request: nativeQuestion({ state: 'resolved', decision: 'deny' }) };
+      const res = await fetch(`${base()}/api/approvals/ap-native-q/decline`, {
+        method: 'POST',
+        headers: { ...bearer(phone.token), 'Content-Type': 'application/json', 'X-Wmux-Client-Caps': 'decision-v2' },
+        body: '{}',
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ state: 'resolved', via: 'native', durable: true });
+      expect((resolveCalls[0] as Record<string, unknown>).terminalPromptDecline).toBe(TERMINAL_PROMPT_WEB_DECLINE);
+    });
+
+    it('typing into a pane with a native decision pending is not refused (the agent judges its own input)', async () => {
+      const info = await startRW();
+      approvalRecords.push(nativeTp());
+      const res = await fetch(`${base()}/api/input?session=s1`, { method: 'POST', headers: bearer(info.token as string), body: '1\r' });
+      expect(res.status).toBe(204);
+      expect(write).toHaveBeenCalledWith('1\r');
+    });
+
+    it('a read-only device may not approve, decline or answer a native question', async () => {
+      await startRW();
+      const reader = await pairDevice('Read-only', false);
+      approvalRecords.push(nativeQuestion());
+      const approve = await fetch(`${base()}/api/approvals/ap-native-q`, {
+        method: 'POST', headers: { ...bearer(reader.token), 'Content-Type': 'application/json', ...V2 }, body: JSON.stringify({ decision: 'approve' }),
+      });
+      expect(approve.status).toBe(403);
+      const decline = await fetch(`${base()}/api/approvals/ap-native-q/decline`, {
+        method: 'POST', headers: { ...bearer(reader.token), 'Content-Type': 'application/json', ...V2 }, body: '{}',
+      });
+      expect(decline.status).toBe(403);
+      expect((await postAnswer(reader.token, answerBody(), V2, 'ap-native-q')).status).toBe(403);
+      expect(resolveCalls).toEqual([]);
+      // The single-key question that is not native stays answerable read-only.
+      approvalRecords.push(mkApproval({ id: 'ap-plain-q' }));
+      const plain = await fetch(`${base()}/api/approvals/ap-plain-q`, {
+        method: 'POST', headers: { ...bearer(reader.token), 'Content-Type': 'application/json' }, body: JSON.stringify({ decision: 'approve' }),
+      });
+      expect(plain.status).toBe(200);
+    });
+
+    it('a grant narrowed while the answer body is on the wire, or inside the registry link, is refused', async () => {
+      await startRW();
+      const phone = await pairDevice('Narrowing', true);
+      approvalRecords.push(nativeQuestion());
+      const body = JSON.stringify(answerBody());
+      expect(await withdrawMidBody(`${base()}/api/approvals/ap-native-q/answer`, phone, body.slice(0, 8), body.slice(8), (r) => { r.allowInput = false; }, V2))
+        .toBe(403);
+      expect(resolveCalls).toEqual([]);
+      (deviceRoster.get(phone.deviceId) as unknown as { allowInput: boolean }).allowInput = true;
+      approvalBox.beforeAuthorize = () => {
+        (deviceRoster.get(phone.deviceId) as unknown as { allowInput: boolean }).allowInput = false;
+      };
+      const refused = await postAnswer(phone.token, answerBody({ clientAnswerId: 'phone-answer-0002' }), V2, 'ap-native-q');
+      expect(refused.status).toBe(403);
+      expect((await refused.json()).error).toMatch(/^read-only:/);
+      // A refusal the caller can retry past is not journaled.
+      expect(answerReceiptStore.lookup(`device:${phone.deviceId}`, 'phone-answer-0002')).toBeNull();
+    });
+
+    it('a native single-select question is answerable from a client with no capability header, like AskUserQuestion', async () => {
+      await startRW();
+      const phone = await pairDevice('Oldest phone', true);
+      approvalRecords.push(nativeQuestion({
+        form: { v: 1, kind: 'questions', actions: [], questions: [{ id: 'q0', text: 'Which env?', multiSelect: false, allowOther: false, options: [{ key: '1', label: 'dev' }, { key: '2', label: 'prod' }] }] },
+        choices: [{ key: '1', label: 'dev' }, { key: '2', label: 'prod' }],
+        questionShape: undefined,
+      }));
+      approvalBox.result = { ok: true, durable: true, request: nativeQuestion({ state: 'resolved', selectedChoiceKey: '2' }) };
+      const res = await fetch(`${base()}/api/approvals/ap-native-q`, {
+        method: 'POST',
+        headers: { ...bearer(phone.token), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: 'approve', choiceKey: '2' }),
+      });
+      expect(res.status).toBe(200);
+      expect(resolveCalls[0]).toMatchObject({ id: 'ap-native-q', decision: 'approve', choiceKey: '2' });
+      expect((resolveCalls[0] as Record<string, unknown>).terminalPromptAnswer).toBe(TERMINAL_PROMPT_WEB_ANSWER);
+    });
+
+    it('a native answer whose agent server is unreachable is 503; one that timed out is 409 uncertain', async () => {
+      await startRW();
+      const phone = await pairDevice('Old phone', true);
+      approvalRecords.push(nativeTp());
+      const post = () => fetch(`${base()}/api/approvals/ap-native`, {
+        method: 'POST',
+        headers: { ...bearer(phone.token), 'Content-Type': 'application/json', ...OLD_IOS },
+        body: JSON.stringify({ decision: 'approve', choiceKey: '1', promptFingerprint: FP }),
+      });
+      approvalBox.result = { ok: false, reason: 'agent-unavailable', request: nativeTp() };
+      const down = await post();
+      expect(down.status).toBe(503);
+      expect(await down.json()).toEqual({ error: 'agent-unavailable', effect: 'none' });
+      approvalBox.result = { ok: false, reason: 'answer-uncertain', request: nativeTp() };
+      const unsure = await post();
+      expect(unsure.status).toBe(409);
+      expect(await unsure.json()).toEqual({ error: 'answer-uncertain', effect: 'uncertain' });
+    });
+
+    it('a native record made with the kill switch off does not block typing into its pane', async () => {
+      const info = await startRW();
+      approvalRecords.push(nativeTp({ channel: 'none', form: undefined, choices: undefined, promptFingerprint: undefined }));
+      const res = await fetch(`${base()}/api/input?session=s1`, { method: 'POST', headers: bearer(info.token as string), body: '1\r' });
+      expect(res.status).toBe(204);
+    });
+
+    describe('POST /api/approvals/:id/answer', () => {
+      it('needs the decision-v2 capability; nothing reaches the registry without it', async () => {
+        const info = await startRW();
+        approvalRecords.push(nativeTp());
+        const res = await postAnswer(info.token as string, answerBody(), OLD_IOS);
+        expect(res.status).toBe(501);
+        expect(await res.json()).toEqual({ error: 'answer-in-terminal', reason: 'no-capability' });
+        expect(resolveCalls).toEqual([]);
+      });
+
+      it.each([
+        ['an unknown field', answerBody({ decision: 'approve' }), 'invalid-body'],
+        ['a newline in the text', answerBody({ action: 'feedback', text: 'a\nb' }), 'invalid-text'],
+        ['text over 2000 units', answerBody({ action: 'feedback', text: 'x'.repeat(2001) }), 'invalid-text'],
+        ['a malformed fingerprint', answerBody({ formFingerprint: 'nope' }), 'invalid-prompt-fingerprint'],
+        ['a malformed answer id', answerBody({ clientAnswerId: 'x' }), 'invalid-body'],
+      ])('400 for %s, before the registry and the journal', async (label, body, error) => {
+        const info = await startRW();
+        approvalRecords.push(nativeTp());
+        const res = await postAnswer(info.token as string, body);
+        expect(res.status).toBe(400);
+        const reason = error !== 'invalid-text' ? undefined : label === 'text over 2000 units' ? 'too-wide' : 'unsafe-text';
+        expect(await res.json()).toEqual({ error, ...(reason ? { reason } : {}) });
+        expect(resolveCalls).toEqual([]);
+      });
+
+      it('reaches the registry with its marker and is refused 501 unsupported-shape for now; the receipt replays it', async () => {
+        await startRW();
+        const phone = await pairDevice('V2 phone', true);
+        approvalRecords.push(nativeTp());
+        approvalBox.result = { ok: false, reason: 'answer-in-terminal', answerRefusal: 'unsupported-shape', request: nativeTp() };
+        const first = await postAnswer(phone.token, answerBody());
+        expect(first.status).toBe(501);
+        expect(await first.json()).toEqual({ error: 'answer-in-terminal', reason: 'unsupported-shape' });
+        expect(resolveCalls).toHaveLength(1);
+        const call = resolveCalls[0] as Record<string, unknown>;
+        expect(call.decisionV2Answer).toBe(DECISION_V2_WEB_ANSWER);
+        expect(call.decisionAnswer).toEqual(answerBody());
+        expect(call.terminalPromptAnswer).toBeUndefined();
+        // The same id and body: the stored answer, not a second run.
+        const again = await postAnswer(phone.token, answerBody());
+        expect(again.status).toBe(501);
+        expect(await again.json()).toEqual({ error: 'answer-in-terminal', reason: 'unsupported-shape', replayed: true });
+        expect(resolveCalls).toHaveLength(1);
+        // The same id with another body.
+        const reused = await postAnswer(phone.token, answerBody({ action: 'deny' }));
+        expect(reused.status).toBe(409);
+        expect(await reused.json()).toEqual({ error: 'answer-id-reused', effect: 'none' });
+        // The owner reads the receipt; another caller cannot.
+        const receipt = await fetch(`${base()}/api/approvals/ap-native/answer/phone-answer-0001`, { headers: bearer(phone.token) });
+        expect(receipt.status).toBe(200);
+        expect(await receipt.json()).toEqual({
+          clientAnswerId: 'phone-answer-0001', approvalId: 'ap-native', state: 'refused', status: 501,
+          result: { error: 'answer-in-terminal', reason: 'unsupported-shape' },
+        });
+        const other = await pairDevice('Other phone', true);
+        expect((await fetch(`${base()}/api/approvals/ap-native/answer/phone-answer-0001`, { headers: bearer(other.token) })).status).toBe(404);
+        expect((await fetch(`${base()}/api/approvals/ap-other/answer/phone-answer-0001`, { headers: bearer(phone.token) })).status).toBe(404);
+      });
+
+      it('a stepwise answer a human interrupted is 409 partial with its progress, journaled as partial', async () => {
+        await startRW();
+        const phone = await pairDevice('Plan phone', true);
+        approvalRecords.push(planTp());
+        approvalBox.result = {
+          ok: false,
+          reason: 'prompt-changed',
+          effect: 'partial',
+          request: planTp({ step: { answerId: 'phone-answer-0001', index: 1, total: 3, expectedRevision: 4, incarnation: 'inc', status: 'partial', startedAt: 1 } }),
+        };
+        const body = answerBody({ action: 'feedback', text: 'use bye instead' });
+        const res = await postAnswer(phone.token, body, V2, 'ap-plan');
+        expect(res.status).toBe(409);
+        expect(await res.json()).toEqual({ error: 'prompt-changed', effect: 'partial', step: { index: 1, total: 3, status: 'partial' } });
+        const receipt = await fetch(`${base()}/api/approvals/ap-plan/answer/phone-answer-0001`, { headers: bearer(phone.token) });
+        expect(await receipt.json()).toMatchObject({ state: 'partial', status: 409 });
+        // A plain prompt-changed (nothing typed) stays `effect: none`.
+        approvalBox.result = { ok: false, reason: 'prompt-changed', request: planTp() };
+        const none = await postAnswer(phone.token, answerBody({ clientAnswerId: 'phone-answer-0002' }), V2, 'ap-plan');
+        expect(await none.json()).toEqual({ error: 'prompt-changed', effect: 'none' });
+      });
+
+      it('a partial answer stopped by a lost grant keeps its 403 status, says partial, and is journaled (not released)', async () => {
+        await startRW();
+        const phone = await pairDevice('Revoked mid-answer', true);
+        approvalRecords.push(planTp());
+        approvalBox.result = {
+          ok: false,
+          reason: 'input-revoked',
+          effect: 'partial',
+          request: planTp({ step: { answerId: 'phone-answer-0001', index: 1, total: 3, expectedRevision: 4, incarnation: 'inc', status: 'partial', startedAt: 1 } }),
+        };
+        const res = await postAnswer(phone.token, answerBody({ action: 'feedback', text: 'x' }), V2, 'ap-plan');
+        expect(res.status).toBe(403);
+        expect(await res.json()).toEqual({ error: 'input-revoked', effect: 'partial', step: { index: 1, total: 3, status: 'partial' } });
+        const again = await postAnswer(phone.token, answerBody({ action: 'feedback', text: 'x' }), V2, 'ap-plan');
+        expect(await again.json()).toMatchObject({ effect: 'partial', replayed: true });
+        expect(resolveCalls).toHaveLength(1);
+      });
+
+      it('a text the registry refuses is 400 invalid-text', async () => {
+        await startRW();
+        const phone = await pairDevice('Long text', true);
+        approvalRecords.push(planTp());
+        approvalBox.result = { ok: false, reason: 'invalid-text', request: planTp() };
+        const res = await postAnswer(phone.token, answerBody({ action: 'feedback', text: 'x' }), V2, 'ap-plan');
+        expect(res.status).toBe(400);
+        expect(await res.json()).toEqual({ error: 'invalid-text' });
+        // With the registry's reason.
+        approvalBox.result = { ok: false, reason: 'invalid-text', textRefusal: 'too-wide', request: planTp() };
+        const wide = await postAnswer(phone.token, answerBody({ action: 'feedback', text: 'y', clientAnswerId: 'phone-answer-0002' }), V2, 'ap-plan');
+        expect(wide.status).toBe(400);
+        expect(await wide.json()).toEqual({ error: 'invalid-text', reason: 'too-wide' });
+      });
+
+      it('an answer that was not confirmed keeps an uncertain receipt', async () => {
+        await startRW();
+        const phone = await pairDevice('Unconfirmed', true);
+        approvalRecords.push(nativeTp());
+        approvalBox.result = { ok: false, reason: 'answer-uncertain', effect: 'uncertain', request: nativeTp() };
+        const res = await postAnswer(phone.token, answerBody());
+        expect(res.status).toBe(409);
+        expect(await res.json()).toEqual({ error: 'answer-uncertain', effect: 'uncertain' });
+        const receipt = await fetch(`${base()}/api/approvals/ap-native/answer/phone-answer-0001`, { headers: { ...bearer(phone.token), ...V2 } });
+        expect(await receipt.json()).toMatchObject({ state: 'uncertain', effect: 'uncertain', status: 409 });
+        const again = await postAnswer(phone.token, answerBody());
+        expect(again.status).toBe(409);
+        expect(await again.json()).toEqual({ error: 'answer-uncertain', effect: 'uncertain' });
+        expect(resolveCalls).toHaveLength(1);
+      });
+
+      it('a retry while the answer runs is 202; one running when the daemon stopped is 409 uncertain and never re-run', async () => {
+        await startRW();
+        const phone = await pairDevice('Retrying phone', true);
+        approvalRecords.push(nativeTp());
+        let release!: () => void;
+        approvalBox.hold = new Promise<void>((resolve) => { release = resolve; });
+        approvalBox.result = { ok: true, durable: true, request: nativeTp({ state: 'resolved' }) };
+        const running = postAnswer(phone.token, answerBody());
+        await vi.waitFor(() => expect(resolveCalls).toHaveLength(1));
+        const retry = await postAnswer(phone.token, answerBody());
+        expect(retry.status).toBe(202);
+        expect(await retry.json()).toEqual({ state: 'pending', replayed: true });
+        // A restart while it runs: the reloaded journal cannot know whether it landed.
+        answerReceiptStore = new AnswerReceiptStore(uploadsDir);
+        const afterRestart = await postAnswer(phone.token, answerBody());
+        expect(afterRestart.status).toBe(409);
+        expect(await afterRestart.json()).toEqual({ error: 'answer-uncertain', effect: 'uncertain' });
+        release();
+        expect((await running).status).toBe(200);
+        expect(resolveCalls).toHaveLength(1);
+      });
+
+      it('a receipt replays even after the approval has left the list; a new id for a gone approval is 404', async () => {
+        await startRW();
+        const phone = await pairDevice('Late retry', true);
+        approvalRecords.push(nativeTp());
+        approvalBox.result = { ok: true, durable: true, request: nativeTp({ state: 'resolved' }) };
+        expect((await postAnswer(phone.token, answerBody())).status).toBe(200);
+        approvalRecords.splice(0, approvalRecords.length);
+        const replay = await postAnswer(phone.token, answerBody());
+        expect(replay.status).toBe(200);
+        expect(await replay.json()).toEqual({ state: 'resolved', effect: 'complete', durable: true, replayed: true });
+        expect((await postAnswer(phone.token, answerBody({ clientAnswerId: 'phone-answer-0009' }))).status).toBe(404);
+        expect(resolveCalls).toHaveLength(1);
+      });
+
+      it.each([
+        ['agent-unavailable', 503],
+        ['already-answered', 409],
+        ['answer-too-soon', 425],
+      ] as const)('%s (%i) is released, so a retry with the same id runs again', async (reason, status) => {
+        await startRW();
+        const phone = await pairDevice('Retry phone', true);
+        approvalRecords.push(nativeTp());
+        approvalBox.result = { ok: false, reason, request: nativeTp() };
+        const first = await postAnswer(phone.token, answerBody());
+        expect(first.status).toBe(status);
+        approvalBox.result = { ok: true, durable: true, request: nativeTp({ state: 'resolved' }) };
+        expect((await postAnswer(phone.token, answerBody())).status).toBe(200);
+        expect(resolveCalls).toHaveLength(2);
+      });
+
+      it('answer-uncertain is final: kept and replayed, never re-run', async () => {
+        await startRW();
+        const phone = await pairDevice('Uncertain phone', true);
+        approvalRecords.push(nativeTp());
+        approvalBox.result = { ok: false, reason: 'answer-uncertain', request: nativeTp() };
+        const first = await postAnswer(phone.token, answerBody());
+        expect(first.status).toBe(409);
+        expect(await first.json()).toEqual({ error: 'answer-uncertain', effect: 'uncertain' });
+        expect((await postAnswer(phone.token, answerBody())).status).toBe(409);
+        expect(resolveCalls).toHaveLength(1);
+      });
+
+      it('an unmapped registry reason is a closed 500, never echoed', async () => {
+        await startRW();
+        const phone = await pairDevice('Odd phone', true);
+        approvalRecords.push(nativeTp());
+        approvalBox.result = { ok: false, reason: 'secret-internal-reason' as never, request: nativeTp() };
+        const res = await postAnswer(phone.token, answerBody());
+        expect(res.status).toBe(500);
+        expect(await res.text()).not.toContain('secret-internal-reason');
+      });
+
+      it('a device may not answer or read a receipt for the brain pane', async () => {
+        await startRW();
+        const phone = await pairDevice('Brain prober', true);
+        approvalRecords.push(nativeTp({ sessionId: 'brain-9' }));
+        expect((await postAnswer(phone.token, answerBody())).status).toBe(404);
+        expect((await fetch(`${base()}/api/approvals/ap-native/answer/phone-answer-0001`, { headers: bearer(phone.token) })).status).toBe(404);
+        expect(resolveCalls).toEqual([]);
+      });
+    });
+  });
+
+  it('answers 500 rather than hanging when the registry list throws after the body arrives', async () => {
+    await startRW();
+    const phone = await pairDevice('List phone', true);
+    approvalRecords.push(mkApproval({ id: 'ap-list' }));
+    const body = JSON.stringify({ decision: 'approve' });
+    expect(await withdrawMidBody(`${base()}/api/approvals/ap-list`, phone, body.slice(0, 8), body.slice(8), () => { approvalBox.listThrows = true; }))
+      .toBe(500);
+    expect(resolveCalls).toEqual([]);
+  });
+
+  it('lists home folders only for a device that may type', async () => {
+    const readOnly = bearer((await startRO()).token as string);
+    expect((await fetch(`${base()}/api/folders`)).status).toBe(401);
+    const refused = await fetch(`${base()}/api/folders`, { headers: readOnly });
+    expect(refused.status).toBe(403);
+    expect((await refused.json()).error).toMatch(/^read-only/);
+    expect((await (await fetch(`${base()}/api/config`, { headers: readOnly })).json()).folderBrowse).toBe(false);
+    await server.stop();
+    const auth = bearer((await startRW()).token as string);
+    expect((await (await fetch(`${base()}/api/config`, { headers: auth })).json()).folderBrowse).toBe(true);
+    const res = await fetch(`${base()}/api/folders`, { headers: auth });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(await res.json()).toMatchObject({ path: fs.realpathSync.native(os.homedir()), parent: null, truncated: expect.any(Boolean) });
+    const outside = await fetch(`${base()}/api/folders?path=${encodeURIComponent(path.parse(fs.realpathSync.native(os.homedir())).root)}`, { headers: auth });
+    expect(outside.status).toBe(403);
+    expect(await outside.json()).toEqual({ error: 'outside-home' });
+  });
+
+  it('serves bounded workspace files only with authentication, transcript AND input consent', async () => {
+    const info = await startRO();
+    const headers = bearer(info.token as string);
+    expect((await fetch(`${base()}/api/sessions/s1/files`)).status).toBe(401);
+    expect((await fetch(`${base()}/api/sessions/s1/files`, { headers })).status).toBe(403);
+    await server.stop();
+    // Transcript consent ALONE is not a file browser over the spawn directory,
+    // which for a plain shell pane is the operator's home.
+    const readOnly = await startWithTranscript();
+    const readOnlyAuth = bearer(readOnly.token as string);
+    expect((await fetch(`${base()}/api/sessions/s1/files`, { headers: readOnlyAuth })).status).toBe(403);
+    expect((await (await fetch(`${base()}/api/config`, {headers: readOnlyAuth})).json()).workspaceFiles).toBe(false);
+    await server.stop();
+    const enabled = await server.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: false, allowTranscript: true });
+    const auth = bearer(enabled.token as string);
+    managed.meta.spawnCwd = uploadsDir;
+    fs.writeFileSync(path.join(uploadsDir, 'review.txt'), 'review this change');
+    const config = await (await fetch(`${base()}/api/config`, {headers: auth})).json();
+    expect(config.workspaceFiles).toBe(true);
+    const listing = await fetch(`${base()}/api/sessions/s1/files`, {headers: auth});
+    expect(listing.status).toBe(200);
+    expect(listing.headers.get('cache-control')).toBe('no-store');
+    expect(await listing.json()).toMatchObject({entries:[{name:'review.txt',directory:false}]});
+    const preview = await fetch(`${base()}/api/sessions/s1/files?path=review.txt&preview=1`, {headers: auth});
+    expect(await preview.json()).toMatchObject({text:'review this change'});
+    const search = await fetch(`${base()}/api/sessions/s1/files?query=REVIEW`, {headers: auth});
+    expect(search.headers.get('cache-control')).toBe('no-store');
+    expect(await search.json()).toMatchObject({entries:[{path:'review.txt'}],truncated:false});
+    expect((await fetch(`${base()}/api/sessions/s1/files?query=`, {headers:auth})).status).toBe(400);
+    expect((await fetch(`${base()}/api/sessions/s1/files?path=..%2Fsecret&preview=1`, {headers:auth})).status).toBe(400);
+    expect((await fetch(`${base()}/api/sessions/missing/files`, {headers:auth})).status).toBe(404);
+
+    // Dot-entries at any depth answer exactly as a path that is not there does,
+    // so the route cannot be used to prove a secret exists.
+    fs.mkdirSync(path.join(uploadsDir, '.git'), {recursive: true});
+    fs.writeFileSync(path.join(uploadsDir, '.git', 'config'), '[remote]');
+    fs.writeFileSync(path.join(uploadsDir, '.env'), 'TOKEN=private');
+    fs.mkdirSync(path.join(uploadsDir, '.ssh'), {recursive: true});
+    fs.writeFileSync(path.join(uploadsDir, '.ssh', 'id_ed25519'), 'PRIVATE KEY');
+    const absent = await fetch(`${base()}/api/sessions/s1/files?path=nothing-here.txt&preview=1`, {headers:auth});
+    expect(absent.status).toBe(404);
+    const absentBody = await absent.json();
+    for (const hidden of ['.git/config', '.env', '.ssh/id_ed25519', '.git']) {
+      const response = await fetch(`${base()}/api/sessions/s1/files?path=${encodeURIComponent(hidden)}&preview=1`, {headers:auth});
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual(absentBody);
+    }
+    const hiddenListing = await (await fetch(`${base()}/api/sessions/s1/files`, {headers: auth})).json();
+    expect(hiddenListing.entries.map((e: {name: string}) => e.name)).toEqual(['review.txt']);
+    expect((await (await fetch(`${base()}/api/sessions/s1/files?query=env`, {headers: auth})).json()).entries).toEqual([]);
+    // A normal file is unaffected.
+    expect((await fetch(`${base()}/api/sessions/s1/files?path=review.txt&preview=1`, {headers:auth})).status).toBe(200);
   });
 
   // ── pane diff (read-only git) ──────────────────────────────────────────────
@@ -3237,6 +6159,94 @@ describe('WebTerminalServer', () => {
     expect(((await res.json()) as { files: unknown[] }).files).toHaveLength(2);
   });
 
+  // ── pane slash commands + skills ──────────────────────────────────────────
+
+  const getCommands = (id: string, cred: string) =>
+    fetch(`${base()}/api/sessions/${encodeURIComponent(id)}/commands`, { headers: bearer(cred) });
+  type CommandRow = { name: string; description: string; source: string; kind: string };
+  const commandRows = async (res: Response): Promise<CommandRow[]> =>
+    ((await res.json()) as { commands: CommandRow[] }).commands;
+
+  /**
+   * A pane whose spawn cwd is a real directory on disk, so the route's scan has
+   * something to find. Returns the directory so the test can add files to it
+   * mid-flight — which is how the cache is observed.
+   */
+  const paneWithCatalog = (id: string): string => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-web-commands-'));
+    fs.mkdirSync(path.join(dir, '.claude', 'commands'), { recursive: true });
+    fs.mkdirSync(path.join(dir, '.claude', 'skills', 'bar'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.claude', 'commands', 'foo.md'), 'run the foo\n');
+    fs.writeFileSync(
+      path.join(dir, '.claude', 'skills', 'bar', 'SKILL.md'),
+      '---\nname: bar\ndescription: does the bar thing\n---\n\nbody\n',
+    );
+    live.push({
+      id, cwd: dir, cols: 80, rows: 24, state: 'detached',
+      agent: undefined, lastDetectedAgent: undefined,
+      lastActivity: '2020-01-01T00:00:00.000Z',
+      env: {}, cmd: '/bin/zsh',
+    });
+    return dir;
+  };
+
+  it('gates the commands route on the Bearer token', async () => {
+    const info = await startRO();
+    const token = info.token as string;
+    expect((await fetch(`${base()}/api/sessions/s1/commands`)).status).toBe(401);
+    // Same grade as /api/sessions: a query token is not a Bearer header here
+    // either, and the route answers once a real credential arrives.
+    expect(
+      (await fetch(`${base()}/api/sessions/s1/commands?token=${encodeURIComponent(token)}`)).status,
+    ).toBe(401);
+    expect((await getCommands('s1', token)).status).toBe(200);
+  });
+
+  it('404s an unknown session id', async () => {
+    const info = await startRO();
+    const token = info.token as string;
+    expect((await getCommands('nope', token)).status).toBe(404);
+    expect((await getCommands('a/b', token)).status).toBe(404);
+  });
+
+  it("★ lists the pane cwd's own commands and skills, each with its kind and source", async () => {
+    const dir = paneWithCatalog('sk1');
+    try {
+      const info = await startRO();
+      const rows = await commandRows(await getCommands('sk1', info.token as string));
+      // Containment, not equality: the scan also reads the operator's
+      // user-global catalog, which no test may assume the shape of.
+      expect(rows).toContainEqual({
+        name: 'foo', description: '', source: 'project', kind: 'command',
+      });
+      expect(rows).toContainEqual({
+        name: 'bar', description: 'does the bar thing', source: 'project', kind: 'skill',
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('★ serves the second call from cache instead of walking the directory again', async () => {
+    // The phone asks for this every time someone types `/`. Without the TTL a
+    // fast typist turns a directory walk into a poll.
+    const dir = paneWithCatalog('sk1');
+    try {
+      const info = await startRO();
+      const token = info.token as string;
+      const first = await commandRows(await getCommands('sk1', token));
+      expect(first.map((c) => c.name)).toContain('foo');
+
+      fs.writeFileSync(path.join(dir, '.claude', 'commands', 'baz.md'), 'added after\n');
+      const second = await commandRows(await getCommands('sk1', token));
+      // A route that re-read the disk would have picked `baz` up.
+      expect(second.map((c) => c.name)).not.toContain('baz');
+      expect(second).toEqual(first);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   // ── pane lifecycle (POST / DELETE /api/sessions) ───────────────────────────
 
   const postSession = (cred: string, body?: unknown) =>
@@ -3276,14 +6286,14 @@ describe('WebTerminalServer', () => {
   it('★ spawns a pane and describes it with the SAME projection /api/sessions uses', async () => {
     const info = await startRW();
     const token = info.token as string;
-    const res = await postSession(token, { workspaceId: 'ws-1', cwd: '/repo' });
+    const res = await postSession(token, { workspaceId: 'ws-1', cwd: EXISTING_DIR });
     expect(res.status).toBe(201);
     const row = await res.json();
     expect(row).toMatchObject({
-      id: 'web-1', cwd: '/repo', cols: 120, rows: 30,
+      id: 'web-1', cwd: EXISTING_DIR, cols: 120, rows: 30,
       state: 'detached', agent: null, workspace: 'Workspace 1', shell: 'zsh',
     });
-    expect(lifecycleCalls).toEqual([{ op: 'create', arg: { workspaceId: 'ws-1', cwd: '/repo' } }]);
+    expect(lifecycleCalls).toEqual([{ op: 'create', arg: { workspaceId: 'ws-1', cwd: EXISTING_DIR } }]);
 
     // Byte-identical to the row the list route serves for the same pane.
     const listed = (
@@ -3428,10 +6438,47 @@ describe('WebTerminalServer', () => {
     expect(await res.json()).toMatchObject({ error: 'destroy-failed' });
   });
 
+  // A cwd the shell cannot enter used to answer 201 for a pane whose child
+  // exited at once. The phone now learns why and can offer "open in home".
+  it('refuses a cwd that is missing, a file or relative, and spawns nothing', async () => {
+    const token = (await startRW()).token as string;
+    const file = path.join(fs.mkdtempSync(path.join(EXISTING_DIR, 'wmux-cwd-')), 'not-a-dir');
+    fs.writeFileSync(file, 'x');
+    const before = lifecycleCalls.length;
+    for (const cwd of [path.join(EXISTING_DIR, 'wmux-no-such-dir-' + crypto.randomUUID()), file, 'relative/dir']) {
+      const res = await postSession(token, { cwd });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: 'cwd-not-found', effect: 'none' });
+    }
+    expect(lifecycleCalls).toHaveLength(before);
+  });
+
+  it('checks the cwd only after re-authorizing, so a revoked device learns nothing about the disk', async () => {
+    await startRW();
+    const phone = await pairDevice('Create phone', true);
+    const body = JSON.stringify({ cwd: path.join(EXISTING_DIR, 'wmux-no-such-dir-' + crypto.randomUUID()) });
+    expect(await withdrawMidBody(`${base()}/api/sessions`, phone, body.slice(0, 6), body.slice(6), (r) => { r.revoked = true; }))
+      .toBe(401);
+  });
+
+  it('accepts a ~ cwd that exists, expanded like the spawn does', async () => {
+    const token = (await startRW()).token as string;
+    expect((await postSession(token, { cwd: '~' })).status).toBe(201);
+    expect(lifecycleCalls.at(-1)).toMatchObject({ op: 'create', arg: { cwd: '~' } });
+  });
+
+  it('lists the directory the daemon spawned each pane in as spawnCwd', async () => {
+    const token = (await startRW()).token as string;
+    const res = await fetch(`${base()}/api/sessions`, { headers: { Authorization: `Bearer ${token}` } });
+    const s1 = (await res.json()).sessions.find((row: { id: string }) => row.id === 's1');
+    // `cwd` is what the pane last claimed; `spawnCwd` is where it really started.
+    expect(s1).toMatchObject({ cwd: '/x', spawnCwd: '/x' });
+  });
+
   it('★ works from a paired device, not just the operator token', async () => {
     await startRW();
     const device = await pairDevice('Phone');
-    const created = await postSession(device.token, { cwd: '/repo' });
+    const created = await postSession(device.token, { cwd: EXISTING_DIR });
     expect(created.status).toBe(201);
     expect((await deleteSession('s1', device.token)).status).toBe(204);
     expect(lifecycleCalls.map((c) => c.op)).toEqual(['create', 'destroy']);
@@ -3480,6 +6527,40 @@ describe('WebTerminalServer', () => {
       headers: { ...bearer(token), 'Content-Type': contentType },
       body: new Uint8Array(body),
     });
+
+  it('stores a general attachment with server-owned naming and private non-executable permissions', async () => {
+    const info = await startUpload();
+    const body = Buffer.from('document\0bytes\n');
+    const response = await fetch(`${base()}/api/upload-file`, {
+      method: 'POST', headers: { ...bearer(info.token as string), 'X-Wmux-File-Extension': 'PDF' }, body,
+    });
+    expect(response.status).toBe(201);
+    const receipt = await response.json() as {path:string};
+    expect(path.dirname(receipt.path)).toBe(uploadsDir);
+    expect(path.basename(receipt.path)).toMatch(/^file-.*-[a-f0-9]{8}\.pdf$/);
+    expect(fs.readFileSync(receipt.path)).toEqual(body);
+    if (process.platform !== 'win32') expect(fs.statSync(receipt.path).mode & 0o777).toBe(0o600);
+    expect((await upload(info.token as string, body)).status).toBe(415);
+  });
+
+  it('rejects general upload traversal and unauthenticated requests without writing', async () => {
+    const info = await startUpload();
+    expect((await fetch(`${base()}/api/upload-file`, {method:'POST',body:'x'})).status).toBe(401);
+    for (const extension of ['../txt','a.txt','txt/sh','longextension123']) {
+      const response = await fetch(`${base()}/api/upload-file`, {
+        method:'POST',headers:{...bearer(info.token as string),'X-Wmux-File-Extension':extension},body:'x',
+      });
+      expect(response.status).toBe(400);
+    }
+    expect(fs.readdirSync(uploadsDir)).toEqual([]);
+  });
+
+  it('does not infer general file upload permission from input permission', async () => {
+    const info = await startRW();
+    const response = await fetch(`${base()}/api/upload-file`, {method:'POST',headers:bearer(info.token as string),body:'x'});
+    expect(response.status).toBe(403);
+    expect(fs.readdirSync(uploadsDir)).toEqual([]);
+  });
 
   it('refuses an unauthenticated upload before it looks at anything else', async () => {
     await startUpload();
@@ -3604,9 +6685,40 @@ describe('WebTerminalServer', () => {
   it('reports allowUpload on /api/config so the phone can hide the button', async () => {
     const info = await startUpload();
     const res = await fetch(`${base()}/api/config`, { headers: bearer(info.token as string) });
-    expect(await res.json()).toMatchObject({ allowInput: false, allowUpload: true });
+    expect(await res.json()).toMatchObject({ allowInput: false, allowUpload: true, generalFileUpload: true });
     // status() carries it too — that is what `wmux web --status` prints.
     expect(server.status().allowUpload).toBe(true);
+  });
+
+  it('shares document/photo quota and sweeps expired documents without deleting staged files', async () => {
+    let clock = Date.now();
+    const bounded = new WebTerminalServer({
+      sessionManager, log: () => { /* noop */ }, assetsDir: os.tmpdir(), uploadsDir,
+      now: () => clock, uploadLimits: {maxFiles: 1},
+    });
+    const info = await bounded.start({port:0,host:'127.0.0.1',allowInput:false,allowUpload:true});
+    const post = (endpoint: string, body: Buffer) => fetch(`http://127.0.0.1:${info.port}${endpoint}`, {
+      method:'POST',headers:{...bearer(info.token as string),'X-Wmux-File-Extension':'txt'},body: new Uint8Array(body),
+    });
+    try {
+      const staged = path.join(uploadsDir,'file-my-notes.txt');
+      fs.writeFileSync(staged,'operator file');
+      const first = await post('/api/upload-file',Buffer.from('document'));
+      expect(first.status).toBe(201);
+      const receipt = await first.json() as {path:string};
+      fs.utimesSync(receipt.path,clock / 1000,clock / 1000);
+      expect((await post('/api/upload',jpegBytes())).status).toBe(507);
+      expect((await post('/api/upload-file',Buffer.from('second'))).status).toBe(507);
+      clock += 25 * 60 * 60 * 1000;
+      const replacement = await post('/api/upload',jpegBytes());
+      expect(replacement.status).toBe(201);
+      const photo = await replacement.json() as {path:string};
+      // Keep filesystem mtime aligned with the injected clock after advancing it.
+      fs.utimesSync(photo.path,clock / 1000,clock / 1000);
+      expect(fs.existsSync(receipt.path)).toBe(false);
+      expect(fs.readFileSync(staged,'utf8')).toBe('operator file');
+      expect((await post('/api/upload-file',Buffer.from('third'))).status).toBe(507);
+    } finally { await bounded.stop(); }
   });
 
   it('answers 503 when the daemon wired no uploads directory', async () => {
@@ -4150,6 +7262,1901 @@ describe('WebTerminalServer', () => {
         await pump;
       }
     });
+
+    it('★ /api/sessions carries liveness state (never the tool) with no stream or watcher', async () => {
+      const info = await startRO();
+      // No SSE client, no turn-view watcher: the whole point of the list field
+      // is that a phone which only polls still knows which panes are working.
+      server.emitAgentLiveness({
+        sessionId: 's1',
+        state: 'busy',
+        tool: 'Bash',
+        agent: 'Claude Code',
+        at: Date.now(),
+      });
+
+      const res = await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) });
+      const body = (await res.json()) as {
+        sessions: Array<{ id: string; liveness?: { state: string; tool?: string; at: number } }>;
+      };
+      const s1 = body.sessions.find((s) => s.id === 's1');
+      expect(s1?.liveness?.state).toBe('busy');
+      // The tool name is watcher-only and must not have been widened with the state.
+      expect(s1?.liveness).not.toHaveProperty('tool');
+      expect(JSON.stringify(body)).not.toContain('Bash');
+      // A pane with no liveness signal carries no field at all — absent means
+      // "not known", not "idle".
+      expect(body.sessions.find((s) => s.id === 's2')).not.toHaveProperty('liveness');
+    });
+
+    // ── #1315: liveness on the pane stream the terminal face already holds ──
+    //
+    // The fleet copy above needs a `/turns` read, which is itself 403 without
+    // --allow-transcript, so a phone that only ever opens the terminal mirror
+    // saw no liveness at all and had to infer "is it running" from a poll plus
+    // an activity window. These four cover the contract: it arrives, it is
+    // narrowed, it is scoped to one pane, and it dies with the socket.
+
+    /** Drain an SSE body into a growing buffer until the test aborts it. */
+    const pumpSse = (res: Awaited<ReturnType<typeof fetch>>) => {
+      const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+      const state = { wire: '' };
+      // One continuous pump, for the same reason the /api/events test above
+      // gives: a read-with-timeout loop orphans a pending read() on every
+      // timeout, and the orphan swallows the next chunk into a promise nobody
+      // awaits — the event simply vanishes.
+      const done = (async () => {
+        try {
+          for (;;) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            if (chunk.value) state.wire += Buffer.from(chunk.value).toString('utf8');
+          }
+        } catch {
+          /* aborted at the end of the test */
+        }
+      })();
+      return { state, done };
+    };
+    const settleMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    /**
+     * Wait until a pumped buffer contains `want`, or fail at the deadline.
+     *
+     * A positive assertion must never be a fixed sleep: a loopback chunk that
+     * lands at 260 ms on a loaded runner would be a hard failure rather than a
+     * slower pass. Polling the buffer the pump already fills costs nothing and
+     * leaves no orphaned `read()` behind. (A NEGATIVE assertion is still a
+     * bounded sleep — proving absence has no event to wait for.)
+     */
+    const waitForWire = async (
+      state: { wire: string },
+      want: string,
+      budgetMs = 3_000,
+    ): Promise<void> => {
+      const deadline = Date.now() + budgetMs;
+      while (!state.wire.includes(want) && Date.now() < deadline) await settleMs(20);
+      expect(state.wire).toContain(want);
+    };
+
+    it('★ #1315 the pane stream carries liveness with no /turns read and no --allow-transcript', async () => {
+      const info = await startRO();
+      const ac = new AbortController();
+      const res = await fetch(
+        `${base()}/api/stream?session=s1&token=${encodeURIComponent(info.token as string)}`,
+        { signal: ac.signal },
+      );
+      expect(res.status).toBe(200);
+      const { state, done } = pumpSse(res);
+      try {
+        // A settled state skips the coalescing window — it is the transition a
+        // header exists to catch.
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'awaiting_input', agent: 'Claude Code', at: 2,
+        });
+        await waitForWire(state, 'event: agent.liveness');
+        expect(state.wire).toContain('"state":"awaiting_input"');
+        expect(state.wire).toContain('"sessionId":"s1"');
+      } finally {
+        ac.abort();
+        await done;
+      }
+    });
+
+    it('★ #1315 a coalesced working state reaches the pane stream too', async () => {
+      // Every other case here emits a SETTLED state, which skips the coalescing
+      // window entirely. `busy`/`tool` take the other path — the one that arms a
+      // timer and delivers from its callback — so without this the whole
+      // setTimeout branch onto the pane stream is untested.
+      const info = await startRO();
+      const ac = new AbortController();
+      const res = await fetch(
+        `${base()}/api/stream?session=s1&token=${encodeURIComponent(info.token as string)}`,
+        { signal: ac.signal },
+      );
+      expect(res.status).toBe(200);
+      const { state, done } = pumpSse(res);
+      try {
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'busy', agent: 'Claude Code', at: 1,
+        });
+        // Last-write-wins inside the window: the frame that lands is the newest
+        // state, not the one that opened it.
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'tool', tool: 'Bash', agent: 'Claude Code', at: 2,
+        });
+        await waitForWire(state, 'event: agent.liveness');
+        expect(state.wire).toContain('"state":"tool"');
+        expect(state.wire).not.toContain('"state":"busy"');
+        expect(state.wire).not.toContain('Bash');
+      } finally {
+        ac.abort();
+        await done;
+      }
+    });
+
+    it('★ #1315 pane-stream liveness withholds the tool name and never crosses panes', async () => {
+      const info = await startRO();
+      const ac = new AbortController();
+      const res = await fetch(
+        `${base()}/api/stream?session=s2&token=${encodeURIComponent(info.token as string)}`,
+        { signal: ac.signal },
+      );
+      expect(res.status).toBe(200);
+      const { state, done } = pumpSse(res);
+      try {
+        // This connection asked for s2 by name. Another pane's per-tool-call
+        // traffic is not its business.
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'awaiting_permission', tool: 'Bash', agent: 'Claude Code', at: 1,
+        });
+        await settleMs(200);
+        expect(state.wire).not.toContain('agent.liveness');
+
+        // Its own pane's state does arrive — but the tool name is agent-authored
+        // text off the hook pipe, withheld here exactly as /api/sessions
+        // withholds it. Widening the STATE is the point; widening what the pane
+        // is typing is not.
+        server.emitAgentLiveness({
+          sessionId: 's2', state: 'awaiting_permission', tool: 'Bash', agent: 'Claude Code', at: 2,
+        });
+        await waitForWire(state, 'event: agent.liveness');
+        expect(state.wire).toContain('"state":"awaiting_permission"');
+        expect(state.wire).not.toContain('Bash');
+        expect(state.wire).not.toContain('"tool"');
+      } finally {
+        ac.abort();
+        await done;
+      }
+    });
+
+    it('★ #1315 a closed pane stream leaves no liveness subscriber behind', async () => {
+      await startRO();
+      const phone = await pairDevice('Phone');
+      const ticket = await ticketFor(phone.token);
+      const ac = new AbortController();
+      const res = await fetch(
+        `${base()}/api/stream?session=s1&ticket=${encodeURIComponent(ticket)}`,
+        { signal: ac.signal },
+      );
+      expect(res.status).toBe(200);
+      const { state, done } = pumpSse(res);
+      server.emitAgentLiveness({
+        sessionId: 's1', state: 'awaiting_input', agent: 'Claude Code', at: 1,
+      });
+      await waitForWire(state, 'event: agent.liveness');
+      expect(server.status().clients).toBe(1);
+
+      ac.abort();
+      await done;
+      const deadline = Date.now() + 3_000;
+      while (server.status().clients !== 0 && Date.now() < deadline) await settleMs(20);
+
+      // The subscription IS the connection, so nothing survives it — the
+      // server's own client count going back to zero is that claim, and it
+      // cannot pass for the wrong reason the way a revoke count could.
+      // `transcriptWatchers`, the fleet channel's registry, is deliberately
+      // never undone; this path has nothing to undo.
+      expect(server.status().clients).toBe(0);
+      // Revoking the device finds nothing left to cut either.
+      expect(server.disconnectDevice(phone.deviceId)).toBe(0);
+    });
+
+    it('★ #1388 a paired device cannot stream or type into the brain pane; the operator still can', async () => {
+      live.push({
+        id: 'brain-abc', cwd: '/b', cols: 80, rows: 24, state: 'attached',
+        agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+        env: { WMUX_BRAIN_PTY: '1' }, cmd: '/usr/local/bin/claude',
+      });
+      const ac = new AbortController();
+      try {
+        const info = await startRW();
+        // A device credential, exactly as a phone gets one.
+        const paired = await fetch(`${base()}/api/pair?code=${info.pairCode as string}`);
+        expect(paired.status).toBe(200);
+        const deviceToken = ((await paired.json()) as { token: string }).token;
+        const operatorToken = encodeURIComponent(info.token as string);
+        // A device carries its credential in the Authorization header (an
+        // EventSource would use a stream ticket; the class gate is the same).
+        const asDevice = { Authorization: `Bearer ${deviceToken}` };
+
+        // Device: the brain id answers exactly like a missing pane (no
+        // confirmation that the id exists), a worker pane still streams.
+        const brainAsDevice = await fetch(`${base()}/api/stream?session=brain-abc`, {
+          headers: asDevice, signal: ac.signal,
+        });
+        expect(brainAsDevice.status).toBe(404);
+        const paneAsDevice = await fetch(`${base()}/api/stream?session=s1`, {
+          headers: asDevice, signal: ac.signal,
+        });
+        expect(paneAsDevice.status).toBe(200);
+        const panePump = pumpSse(paneAsDevice);
+
+        // Operator: unchanged — the desktop's own mirror streams the brain.
+        const brainAsOperator = await fetch(`${base()}/api/stream?session=brain-abc&token=${operatorToken}`, {
+          signal: ac.signal,
+        });
+        expect(brainAsOperator.status).toBe(200);
+        const brainPump = pumpSse(brainAsOperator);
+
+        // Device input into the brain pane is refused the same way; nothing
+        // reaches the pty. (404, not 403: "not yours" and "gone" are one answer.)
+        const typed = await fetch(`${base()}/api/input?session=brain-abc`, {
+          method: 'POST',
+          headers: { ...asDevice, 'Content-Type': 'text/plain' },
+          body: 'rm -rf /\r',
+        });
+        expect(typed.status).toBe(404);
+
+        // Every other per-pane route a device can reach answers the same way,
+        // so none of them confirms the id (review: resize/delete/diff/commands
+        // had the identical bare lookup).
+        const resized = await fetch(`${base()}/api/sessions/brain-abc/resize`, {
+          method: 'POST', headers: { ...asDevice, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cols: 100, rows: 30 }),
+        });
+        expect(resized.status).toBe(404);
+        const deleted = await fetch(`${base()}/api/sessions/brain-abc`, { method: 'DELETE', headers: asDevice });
+        expect(deleted.status).toBe(404);
+        const diffed = await fetch(`${base()}/api/sessions/brain-abc/diff`, { headers: asDevice });
+        expect(diffed.status).toBe(404);
+        const commands = await fetch(`${base()}/api/sessions/brain-abc/commands`, { headers: asDevice });
+        expect(commands.status).toBe(404);
+        expect(live.find((s) => s.id === 'brain-abc')).toBeDefined();
+
+        ac.abort();
+        await Promise.all([panePump.done, brainPump.done]);
+      } finally {
+        ac.abort();
+      }
+    });
+
+    it('★ #1397 a paired device can neither list nor answer a brain pane approval; the operator still can', async () => {
+      live.push({
+        id: 'brain-abc', cwd: '/b', cols: 80, rows: 24, state: 'attached',
+        agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+        env: { WMUX_BRAIN_PTY: '1' }, cmd: '/usr/local/bin/claude',
+      });
+      // Seeded straight into the registry rather than driven through the hook
+      // path: the producer refuses to create one of these (HookIngest), and
+      // this asserts the route refuses to serve one anyway — the reachability
+      // of the producer is the assumption #1397 is about.
+      approvalRecords.push(mkApproval({
+        id: 'ap-brain',
+        sessionId: 'brain-abc',
+        question: 'ship the orchestrator secret?',
+      }));
+      approvalRecords.push(mkApproval({ id: 'ap-worker', sessionId: 's1' }));
+
+      const info = await startRO();
+      const paired = await fetch(`${base()}/api/pair?code=${info.pairCode as string}`);
+      expect(paired.status).toBe(200);
+      const deviceToken = ((await paired.json()) as { token: string }).token;
+      const asDevice = { Authorization: `Bearer ${deviceToken}` };
+
+      // Listed: the worker's approval only, and nothing that names the brain.
+      const listed = await fetch(`${base()}/api/approvals`, { headers: asDevice });
+      expect(listed.status).toBe(200);
+      const text = await listed.text();
+      expect(text).toContain('ap-worker');
+      expect(text).not.toContain('ap-brain');
+      expect(text).not.toContain('brain-abc');
+      expect(text).not.toContain('orchestrator secret');
+
+      // Answerable: not with the id in hand either. Same 404 as an unknown id,
+      // and the registry is never asked to resolve it.
+      const answered = await postApproval(deviceToken, 'ap-brain', { decision: 'approve' });
+      expect(answered.status).toBe(404);
+      expect(resolveCalls).toEqual([]);
+
+      // The device's own panes are unaffected.
+      const worker = await postApproval(deviceToken, 'ap-worker', { decision: 'approve' });
+      expect(worker.status).toBe(200);
+      expect(resolveCalls.map((c) => c.id)).toEqual(['ap-worker']);
+
+      // Operator: unchanged. The desktop lists and answers the brain's own
+      // record exactly as before — the exclusion follows the credential class.
+      const asOperator = bearer(info.token as string);
+      const operatorList = await fetch(`${base()}/api/approvals`, { headers: asOperator });
+      expect(await operatorList.text()).toContain('ap-brain');
+      const operatorAnswer = await fetch(`${base()}/api/approvals/ap-brain`, {
+        method: 'POST',
+        headers: { ...asOperator, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: 'approve' }),
+      });
+      expect(operatorAnswer.status).toBe(200);
+      expect(resolveCalls.map((c) => c.id)).toEqual(['ap-worker', 'ap-brain']);
+    });
+
+
+    it('★ #1397 a device can neither read the detail of nor decline a brain pane terminal_prompt', async () => {
+      live.push({
+        id: 'brain-abc', cwd: '/b', cols: 80, rows: 24, state: 'attached',
+        agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+        env: { WMUX_BRAIN_PTY: '1' }, cmd: '/usr/local/bin/claude',
+      });
+      approvalRecords.push(mkApproval({ id: 'ap-brain-tp', sessionId: 'brain-abc', kind: 'terminal_prompt' }));
+      approvalBox.details.set('ap-brain-tp', {
+        id: 'ap-brain-tp', command: 'secret brain command', commandHash: 'h', commandBytes: 20, truncated: false,
+      });
+      const info = await server.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: false, allowTranscript: true });
+      const paired = await fetch(`${base()}/api/pair?code=${info.pairCode as string}`);
+      const deviceToken = ((await paired.json()) as { token: string }).token;
+      const asDevice = { Authorization: `Bearer ${deviceToken}`, 'X-Wmux-Client-Caps': 'terminal-prompt-answer, terminal-prompt-decline' };
+      const read = await fetch(`${base()}/api/approvals/ap-brain-tp/detail`, { headers: asDevice });
+      expect(read.status).toBe(404);
+      expect(await read.text()).not.toContain('secret');
+      const declined = await fetch(`${base()}/api/approvals/ap-brain-tp/decline`, {
+        method: 'POST', headers: { ...asDevice, 'Content-Type': 'application/json' }, body: '{}',
+      });
+      expect(declined.status).toBe(404);
+      expect(resolveCalls).toEqual([]);
+      // The operator keeps its view of the brain.
+      const asOperator = { ...bearer(info.token as string), 'X-Wmux-Client-Caps': 'terminal-prompt-answer' };
+      expect((await fetch(`${base()}/api/approvals/ap-brain-tp/detail`, { headers: asOperator })).status).toBe(200);
+    });
+
+    it('★ #1315 pane-stream liveness refuses the brain pane and an invented session id', async () => {
+      // `sessionId` arrives from the hook pipe, which is not a trusted producer,
+      // and the orchestrator brain is not a worker pane a phone may learn
+      // anything about. `handleStream` itself still resolves with a bare
+      // getSession, so the delivery side takes the gate the transcript routes
+      // take rather than inheriting that pane route's older, looser check.
+      live.push({
+        id: 'brain-abc', cwd: '/b', cols: 80, rows: 24, state: 'attached',
+        agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+        env: { WMUX_BRAIN_PTY: '1' }, cmd: '/usr/local/bin/claude',
+      });
+      const ac = new AbortController();
+      try {
+        const info = await startRO();
+        const token = encodeURIComponent(info.token as string);
+        const brain = await fetch(`${base()}/api/stream?session=brain-abc&token=${token}`, {
+          signal: ac.signal,
+        });
+        expect(brain.status).toBe(200);
+        const brainPump = pumpSse(brain);
+        const pane = await fetch(`${base()}/api/stream?session=s1&token=${token}`, {
+          signal: ac.signal,
+        });
+        expect(pane.status).toBe(200);
+        const panePump = pumpSse(pane);
+
+        server.emitAgentLiveness({
+          sessionId: 'brain-abc', state: 'awaiting_input', agent: 'Claude Code', at: 1,
+        });
+        // A pane the daemon does not have at all — an id a compromised pane
+        // could invent — reaches nobody either.
+        server.emitAgentLiveness({
+          sessionId: 'no-such-pane', state: 'awaiting_input', agent: 'Claude Code', at: 1,
+        });
+        await settleMs(250);
+        expect(brainPump.state.wire).not.toContain('agent.liveness');
+        expect(panePump.state.wire).not.toContain('agent.liveness');
+
+        // ...and the gate is the pane's identity, not a blanket refusal: a real
+        // worker pane on the same server still gets its own state.
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'awaiting_input', agent: 'Claude Code', at: 2,
+        });
+        await waitForWire(panePump.state, 'event: agent.liveness');
+
+        ac.abort();
+        await Promise.all([brainPump.done, panePump.done]);
+      } finally {
+        ac.abort();
+        live.length = 3;
+      }
+    });
+
+    it('★ #1315 the fleet stream keeps its watcher gate — the pane stream is a second door', async () => {
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      const ac = new AbortController();
+      // A pane stream for s1 AND a fleet stream, on one principal that has never
+      // read s1's turn view. The pane copy must arrive; the fleet copy must not.
+      const pane = await fetch(
+        `${base()}/api/stream?session=s1&token=${encodeURIComponent(info.token as string)}`,
+        { signal: ac.signal },
+      );
+      expect(pane.status).toBe(200);
+      const panePump = pumpSse(pane);
+      const fleet = await fetch(`${base()}/api/events`, {
+        signal: ac.signal,
+        headers: { ...h, Accept: 'text/event-stream' },
+      });
+      expect(fleet.status).toBe(200);
+      const fleetPump = pumpSse(fleet);
+      try {
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'awaiting_input', agent: 'Claude Code', at: 1,
+        });
+        await waitForWire(panePump.state, 'event: agent.liveness');
+        expect(fleetPump.state.wire).not.toContain('agent.liveness');
+      } finally {
+        ac.abort();
+        await Promise.all([panePump.done, fleetPump.done]);
+      }
+    });
+
+    it('★ a stale working state drops out of /api/sessions; a resting one does not', async () => {
+      const info = await startRO();
+      const old = Date.now() - 301_000;
+      server.emitAgentLiveness({ sessionId: 's1', state: 'busy', agent: 'Claude Code', at: old });
+      server.emitAgentLiveness({ sessionId: 's2', state: 'idle', agent: 'Claude Code', at: old });
+
+      const res = await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) });
+      const body = (await res.json()) as {
+        sessions: Array<{ id: string; liveness?: { state: string } }>;
+      };
+      // "Running Bash" from five minutes ago is a crashed agent, not a busy one.
+      expect(body.sessions.find((s) => s.id === 's1')).not.toHaveProperty('liveness');
+      // An agent that stopped five minutes ago is still stopped.
+      expect(body.sessions.find((s) => s.id === 's2')?.liveness?.state).toBe('idle');
+    });
+
+    it('★ liveness is not recorded for a sessionId the daemon does not have', async () => {
+      const info = await startRO();
+      // The hook pipe is not a trusted producer; an invented id must not enter
+      // the map (which nothing else would ever evict).
+      server.emitAgentLiveness({ sessionId: 'no-such-pane', state: 'busy', agent: 'Claude Code', at: Date.now() });
+
+      const res = await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) });
+      const body = (await res.json()) as { sessions: Array<{ id: string }> };
+      expect(body.sessions.map((s) => s.id)).toEqual(['s1', 's2', 's3']);
+      expect(JSON.stringify(body)).not.toContain('no-such-pane');
+    });
+
+    it('★ a liveness `at` is clamped forward and never walks backward', async () => {
+      const info = await startRO();
+      // A pane whose clock runs an hour fast would otherwise sit at "0s" for an
+      // hour AND outlive the staleness cutoff however long it had been dead.
+      const future = Date.now() + 3_600_000;
+      server.emitAgentLiveness({ sessionId: 's1', state: 'busy', agent: 'Claude Code', at: future });
+      // Hook delivery is not ordered: an older state arriving late must not
+      // resurrect itself over the newer one.
+      server.emitAgentLiveness({ sessionId: 's1', state: 'idle', agent: 'Claude Code', at: 1_000 });
+      // Not a number at all → refused; the believable entry survives.
+      server.emitAgentLiveness({
+        sessionId: 's1', state: 'idle', agent: 'Claude Code',
+        at: Number.NaN,
+      });
+
+      const body = (await (
+        await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) })
+      ).json()) as { sessions: Array<{ id: string; liveness?: { state: string; at: number } }> };
+      const liveness = body.sessions.find((s) => s.id === 's1')?.liveness;
+      expect(liveness?.state).toBe('busy');
+      expect(liveness?.at).toBeLessThan(future);
+      expect(liveness?.at).toBeGreaterThan(Date.now() - 10_000);
+    });
+
+    it('★ /api/sessions sweeps snapshot state for panes that died without a DELETE', async () => {
+      const info = await startRO();
+      const h = bearer(info.token as string);
+      server.emitAgentLiveness({ sessionId: 's2', state: 'idle', agent: 'Claude Code', at: Date.now() });
+      const first = (await (await fetch(`${base()}/api/sessions`, { headers: h })).json()) as {
+        sessions: Array<{ id: string; liveness?: { state: string } }>;
+      };
+      expect(first.sessions.find((s) => s.id === 's2')?.liveness?.state).toBe('idle');
+
+      // s2's process exits. Nothing tells the web server — it subscribes to no
+      // death event — so the sweep on the next list is the only thing that can
+      // drop the entry.
+      const [dead] = live.splice(1, 1);
+      await fetch(`${base()}/api/sessions`, { headers: h });
+      // Put an identically-named pane back. A leaked entry would show up here as
+      // a brand-new pane that is somehow already idle.
+      live.splice(1, 0, dead);
+      const after = (await (await fetch(`${base()}/api/sessions`, { headers: h })).json()) as {
+        sessions: Array<{ id: string; liveness?: { state: string } }>;
+      };
+      expect(after.sessions.find((s) => s.id === 's2')).not.toHaveProperty('liveness');
+    });
+
+    it('★ lastAssistantText rides --allow-transcript, is tail-cut to 140 graphemes, and is read off the loop', async () => {
+      // A real transcript on disk: the reader lstats and tail-reads the file, so
+      // a mock would test nothing that ships.
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-web-transcript-'));
+      const transcript = path.join(dir, 'session.jsonl');
+      // Over 600 characters, so `condense()` in the reader keeps the TAIL and
+      // the preview is cutting an already-cut string. Newlines on purpose — a
+      // list row is one line, and the flattening is part of the contract.
+      // U+200B and the RLO are the invisibles that must not survive; the ZWJ in
+      // the emoji must, or one grapheme shatters into three.
+      const said = `${Array.from({ length: 400 }, (_, i) => `줄${i}`).join('\n')}\n\u200b\u202e끝 👩\u200d💻`;
+      expect(said.length).toBeGreaterThan(600);
+      const entry = (text: string) =>
+        `${JSON.stringify({
+          type: 'assistant',
+          message: { role: 'assistant', content: [{ type: 'text', text }] },
+        })}\n`;
+      fs.writeFileSync(transcript, entry(said));
+      // Pin mtime to a whole millisecond so the (path, size, mtime) cache key can
+      // be reproduced exactly below — a natural mtime carries sub-ms precision
+      // that `utimesSync` cannot round-trip.
+      const pinned = new Date(1_700_000_000_000);
+      fs.utimesSync(transcript, pinned, pinned);
+      projectorMock.transcriptPath.mockReturnValue(transcript);
+
+      try {
+        // Transcript grant OFF → conversation content stays off the list, even
+        // though the projector would happily hand over the path.
+        const ro = await startRO();
+        const off = (await (
+          await fetch(`${base()}/api/sessions`, { headers: bearer(ro.token as string) })
+        ).json()) as { sessions: Array<{ id: string; lastAssistantText?: string }> };
+        expect(off.sessions.every((s) => s.lastAssistantText === undefined)).toBe(true);
+        // The path is the projector's ONE resolve per row; status() is not part
+        // of this path at all (it would re-walk the same binding for a size this
+        // stats for itself).
+        expect(projectorMock.status).not.toHaveBeenCalled();
+        await server.stop();
+
+        const on = await startWithTranscript();
+        const h = bearer(on.token as string);
+        const poll = async () => {
+          const body = (await (await fetch(`${base()}/api/sessions`, { headers: h })).json()) as {
+            sessions: Array<{ id: string; lastAssistantText?: string }>;
+          };
+          return body.sessions.find((s) => s.id === 's1')?.lastAssistantText;
+        };
+
+        // The FIRST poll answers with no field: the 256 KB read is started in
+        // the background, never on the request's own thread.
+        expect(await poll()).toBeUndefined();
+
+        let text: string | undefined;
+        await vi.waitFor(async () => {
+          text = await poll();
+          expect(text).toBeDefined();
+        });
+
+        expect(text).not.toContain('\n');
+        // Cut from the END: an agent's ask is the last thing it wrote.
+        expect(text?.startsWith('…')).toBe(true);
+        expect(text?.endsWith('끝 👩\u200d💻')).toBe(true);
+        expect(text).not.toContain('\u200b');
+        expect(text).not.toContain('\u202e');
+        const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+        // 140 INCLUDING the ellipsis — the truncated row is never the wider one.
+        expect([...segmenter.segment(text as string)].length).toBe(140);
+
+        // Same (path, size, mtime) → served from the memo. Rewriting the file
+        // with a byte-identical, content-different message and restoring the
+        // pinned mtime is the only way to prove the second poll never re-read:
+        // a re-read would answer with the new ending.
+        fs.writeFileSync(transcript, entry(said.replace('끝', '꾰')));
+        fs.utimesSync(transcript, pinned, pinned);
+        expect(await poll()).toBe(text);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('#782 - turn-view images (GET /api/sessions/:id/turns/image)', () => {
+    /** The smallest legal PNG: signature, IHDR for 1x1, one IDAT, IEND. */
+    const PNG_1X1 = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    /** Temp trees this describe made, torn down after every case. */
+    let dirs: string[];
+    const tmpTree = (): string => {
+      const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-turn-image-')));
+      dirs.push(dir);
+      return dir;
+    };
+    const imageUrl = (id: string, p: string): string =>
+      `${base()}/api/sessions/${id}/turns/image?path=${encodeURIComponent(p)}`;
+
+    beforeEach(() => { dirs = []; });
+    afterEach(() => {
+      for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('403 tagged transcript-disabled without --allow-transcript', async () => {
+      const dir = tmpTree();
+      const file = path.join(dir, 'a.png');
+      fs.writeFileSync(file, PNG_1X1);
+      managed.meta.spawnCwd = dir;
+      const info = await startRO();
+      const res = await fetch(imageUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(403);
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      const body = await res.json();
+      // The TAG is the contract, exactly as on /turns and /turns/block.
+      expect(body.error.startsWith('transcript-disabled:')).toBe(true);
+    });
+
+    it('401 without a Bearer header', async () => {
+      await startWithTranscript();
+      const res = await fetch(imageUrl('s1', '/x/a.png'));
+      expect(res.status).toBe(401);
+    });
+
+    it('404 for an unknown pane, and for the orchestrator brain', async () => {
+      const dir = tmpTree();
+      const file = path.join(dir, 'a.png');
+      fs.writeFileSync(file, PNG_1X1);
+      // The brain pane's own spawn cwd holds the image, so only readableSession
+      // stands between a guessed id and the orchestrator's screenshots.
+      live.push({
+        id: 'brain-ws-1', cwd: dir, cols: 80, rows: 24, state: 'detached',
+        agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+        env: {}, cmd: '/usr/bin/claude',
+      });
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      for (const id of ['no-such-pane', 'brain-ws-1']) {
+        const res = await fetch(imageUrl(id, file), { headers: h });
+        expect(res.status).toBe(404);
+        expect((await res.json()).error).toBe('session not found');
+      }
+    });
+
+    it('400 bad-image-ref for a missing, empty, relative or NUL-bearing path', async () => {
+      managed.meta.spawnCwd = tmpTree();
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      const refs = ['', '   ', 'relative/a.png', './a.png', `/x/a${String.fromCharCode(0)}.png`];
+      for (const ref of refs) {
+        const res = await fetch(imageUrl('s1', ref), { headers: h });
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toBe('bad-image-ref');
+      }
+      // No `path` at all is the same refusal.
+      const bare = await fetch(`${base()}/api/sessions/s1/turns/image`, { headers: h });
+      expect(bare.status).toBe(400);
+      expect((await bare.json()).error).toBe('bad-image-ref');
+    });
+
+    it('404 for a real file outside the boundary', async () => {
+      managed.meta.spawnCwd = tmpTree();
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', '/etc/hosts'), {
+        headers: bearer(info.token as string),
+      });
+      expect(res.status).toBe(404);
+      // "outside" and "missing" answer alike: a distinct code would confirm the
+      // file exists to a caller mapping the disk.
+      expect((await res.json()).error).toBe('image not found');
+    });
+
+    it('404 for a symlink inside the cwd that points outside it', async () => {
+      const root = tmpTree();
+      const cwd = path.join(root, 'cwd');
+      const outside = path.join(root, 'outside');
+      fs.mkdirSync(cwd);
+      fs.mkdirSync(outside);
+      const secret = path.join(outside, 'secret.png');
+      fs.writeFileSync(secret, PNG_1X1);
+      const link = path.join(cwd, 'looks-local.png');
+      fs.symlinkSync(secret, link);
+      managed.meta.spawnCwd = cwd;
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', link), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(404);
+    });
+
+    it('404 for a file under meta.cwd - only spawnCwd is a boundary', async () => {
+      const root = tmpTree();
+      const cwd = path.join(root, 'spawned');
+      const osc7 = path.join(root, 'osc7-said-so');
+      fs.mkdirSync(cwd);
+      fs.mkdirSync(osc7);
+      const wandered = path.join(osc7, 'a.png');
+      fs.writeFileSync(wandered, PNG_1X1);
+      // `meta.cwd` is whatever the pane's own process last claimed via OSC 7 -
+      // three bytes of terminal output, i.e. attacker-controlled. Honoring it
+      // would let a hostile process point this route at the whole home dir.
+      managed.meta.spawnCwd = cwd;
+      managed.meta.cwd = osc7;
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', wandered), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(404);
+    });
+
+    it('404 for a sibling directory sharing the boundary prefix', async () => {
+      const root = tmpTree();
+      const cwd = path.join(root, 'b');
+      const sibling = path.join(root, 'bc');
+      fs.mkdirSync(cwd);
+      fs.mkdirSync(sibling);
+      const file = path.join(sibling, 'a.png');
+      fs.writeFileSync(file, PNG_1X1);
+      managed.meta.spawnCwd = cwd;
+      const info = await startWithTranscript();
+      // A string prefix test passes `/a/bc/a.png` against root `/a/b`.
+      const res = await fetch(imageUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(404);
+    });
+
+    it('200 when the boundary root is itself a symlink', async () => {
+      const root = tmpTree();
+      const realDir = path.join(root, 'real');
+      fs.mkdirSync(realDir);
+      fs.writeFileSync(path.join(realDir, 'a.png'), PNG_1X1);
+      const linkDir = path.join(root, 'linked');
+      fs.symlinkSync(realDir, linkDir);
+      // The shape macOS hands us for free: `/tmp` is a symlink to `/private/tmp`,
+      // so a root compared unresolved rejects every file beneath it.
+      managed.meta.spawnCwd = linkDir;
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', path.join(linkDir, 'a.png')), {
+        headers: bearer(info.token as string),
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it('serves a photo out of the uploads directory, session-independently', async () => {
+      managed.meta.spawnCwd = tmpTree();
+      const photo = path.join(uploadsDir, 'photo.png');
+      fs.writeFileSync(photo, PNG_1X1);
+      try {
+        const info = await startWithTranscript();
+        const res = await fetch(imageUrl('s1', photo), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toBe('image/png');
+      } finally {
+        // uploadsDir is shared across describes; the tree cleanup does not cover it.
+        fs.rmSync(photo, { force: true });
+      }
+    });
+
+    it('404 for a FIFO inside the boundary instead of hanging on open', async () => {
+      const dir = tmpTree();
+      const fifo = path.join(dir, 'pipe.png');
+      execFileSync('mkfifo', [fifo]);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', fifo), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(404);
+    });
+
+    it('413 when the file grew past the size the gate approved', async () => {
+      // The route reads exactly the size it measured and probes one byte past
+      // it. A file that is already over the cap is the 413 the gate catches;
+      // this pins the second gate — the probe — by handing it a file whose
+      // stat and contents disagree the way a growing file would.
+      const dir = tmpTree();
+      const file = path.join(dir, 'grow.png');
+      fs.writeFileSync(file, PNG_1X1);
+      managed.meta.spawnCwd = dir;
+      const statSpy = vi.spyOn(fs.promises, 'open');
+      const info = await startWithTranscript();
+      statSpy.mockImplementationOnce(async (...args: Parameters<typeof fs.promises.open>) => {
+        const handle = await fs.promises.open(...args);
+        const realStat = handle.stat.bind(handle);
+        handle.stat = (async () => {
+          const st = await realStat();
+          return Object.assign(st, { size: st.size - 1 });
+        }) as typeof handle.stat;
+        return handle;
+      });
+      try {
+        const res = await fetch(imageUrl('s1', file), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(413);
+        const body = await res.json();
+        expect(body.detail).not.toMatch(/image is/);
+      } finally {
+        statSpy.mockRestore();
+      }
+    });
+
+    it('serves the pane cwd on a daemon with no uploads directory wired', async () => {
+      const dir = tmpTree();
+      const file = path.join(dir, 'a.png');
+      fs.writeFileSync(file, PNG_1X1);
+      managed.meta.spawnCwd = dir;
+      // `uploadsDir` is optional - a daemon started without `--allow-upload`
+      // has none, and the cwd root has to keep working on its own.
+      const noUploads = new WebTerminalServer({
+        sessionManager,
+        projector: () => projectorMock as unknown as TranscriptProjector,
+        log: () => { /* silent in tests */ },
+        assetsDir: os.tmpdir(),
+      });
+      const info = await noUploads.start({
+        port: 0, host: '127.0.0.1', allowInput: false, allowUpload: false, allowTranscript: true,
+      });
+      try {
+        const url = `http://127.0.0.1:${info.port}/api/sessions/s1/turns/image?path=${encodeURIComponent(file)}`;
+        const res = await fetch(url, { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+      } finally {
+        await noUploads.stop();
+      }
+    });
+
+    it('415 not-an-image for a text file inside the boundary', async () => {
+      const dir = tmpTree();
+      const file = path.join(dir, 'notes.png');
+      fs.writeFileSync(file, 'plain text wearing a .png suffix');
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(415);
+      expect((await res.json()).error).toBe('not-an-image');
+    });
+
+    it('404 for a directory inside the boundary', async () => {
+      const dir = tmpTree();
+      const sub = path.join(dir, 'pictures');
+      fs.mkdirSync(sub);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', sub), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(404);
+    });
+
+    it('413 image-too-large over the 8 MiB cap', async () => {
+      const dir = tmpTree();
+      const file = path.join(dir, 'huge.png');
+      // One byte over. The size gate runs before the magic-byte read on purpose:
+      // refusing on the stat is what keeps a huge file from being read at all.
+      fs.writeFileSync(file, Buffer.alloc(8 * 1024 * 1024 + 1));
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(413);
+      expect((await res.json()).error).toBe('image-too-large');
+    });
+
+    it('200 serves the bytes with the sniffed type, a length and no-store', async () => {
+      const dir = tmpTree();
+      const file = path.join(dir, 'shot.bin');
+      fs.writeFileSync(file, PNG_1X1);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(200);
+      // The BYTES decide the type, not the `.bin` the transcript named.
+      expect(res.headers.get('content-type')).toBe('image/png');
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(res.headers.get('content-length')).toBe(String(PNG_1X1.length));
+      expect(Buffer.from(await res.arrayBuffer()).equals(PNG_1X1)).toBe(true);
+    });
+
+    it('/api/config advertises turnImages only alongside the transcript grant', async () => {
+      const off = await startRO();
+      const offBody = await (
+        await fetch(`${base()}/api/config`, { headers: bearer(off.token as string) })
+      ).json();
+      // ABSENT, not false: that is exactly how a daemon predating the route reads.
+      expect(offBody).not.toHaveProperty('turnImages');
+
+      await server.stop();
+      const on = await startWithTranscript();
+      const onBody = await (
+        await fetch(`${base()}/api/config`, { headers: bearer(on.token as string) })
+      ).json();
+      expect(onBody).toHaveProperty('turnImages', true);
+    });
+  });
+
+  describe('turn-view files (GET /api/sessions/:id/turns/file)', () => {
+    /** The smallest legal PNG: signature, IHDR for 1x1, one IDAT, IEND. */
+    const PNG_1X1 = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    /**
+     * An ISO BMFF header: the `ftyp` box's own length, the marker at byte 4,
+     * the major brand at byte 8, a minor version, one compatible brand. Enough
+     * bytes for the sniffer and nothing more — what is being pinned is the
+     * brand table, not a decoder.
+     */
+    const bmff = (brand: string): Buffer => {
+      const box = Buffer.alloc(24);
+      box.writeUInt32BE(24, 0);
+      box.write('ftyp', 4, 'latin1');
+      box.write(brand, 8, 'latin1');
+      box.writeUInt32BE(512, 12);
+      box.write(brand, 16, 'latin1');
+      box.write('mp41', 20, 'latin1');
+      return box;
+    };
+    let dirs: string[];
+    const tmpTree = (): string => {
+      const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-turn-file-')));
+      dirs.push(dir);
+      return dir;
+    };
+    const fileUrl = (id: string, p: string): string =>
+      `${base()}/api/sessions/${id}/turns/file?path=${encodeURIComponent(p)}`;
+    /**
+     * A file of `size` bytes whose head is `head`. `truncate` makes the tail
+     * SPARSE, so a 128 MB fixture costs no disk and no wall clock — writing
+     * real bytes for the cap cases would dominate the run.
+     */
+    const sparse = (dir: string, name: string, head: Buffer, size: number): string => {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, head);
+      fs.truncateSync(file, size);
+      return file;
+    };
+
+    /**
+     * Wrap the FileHandle this route opens FOR ONE PATH. Scoping by path is not
+     * tidiness: `fs.promises.open` is global, the daemon opens files of its own
+     * (state, devices) while a test runs, and a `mockImplementationOnce` can be
+     * spent on one of those instead — the handler then gets a real handle and
+     * the case silently proves nothing, or worse, a stub that blocks parks a
+     * read the suite never finishes.
+     */
+    /**
+     * The paths every intercepted `open` was asked for, so a case that never
+     * fired says WHY in its failure rather than just asserting zero.
+     */
+    let openedPaths: string[] = [];
+    /**
+     * Wrap the FileHandle this route opens FOR ONE FILE. Scoping matters:
+     * `fs.promises.open` is global and the daemon opens files of its own while
+     * a case runs, so an unscoped `mockImplementationOnce` can be spent on one
+     * of those — the case then silently proves nothing, or parks the suite if
+     * the stub blocks.
+     *
+     * The file is identified by INODE, not by the path string. The handler
+     * opens whatever `realpath` returned, and a test that compares spellings is
+     * one `/tmp` symlink, one mount, one case difference away from matching
+     * nothing at all — silently, because "never intercepted" and "intercepted
+     * and the route behaved" look identical from the assertion side. The path
+     * is still accepted as a fallback for platforms that report no inode.
+     */
+    const interceptOpen = (
+      target: string,
+      wrap: (handle: fs.promises.FileHandle) => Promise<fs.promises.FileHandle>,
+    ) => {
+      const real = fs.promises.open;
+      const targetIno = fs.statSync(target).ino;
+      let used = false;
+      const spy = vi.spyOn(fs.promises, 'open');
+      spy.mockImplementation((async (...args: Parameters<typeof fs.promises.open>) => {
+        const handle = await real(...args);
+        openedPaths.push(String(args[0]));
+        if (used) return handle;
+        let mine = String(args[0]) === target;
+        if (!mine && targetIno !== 0) {
+          try {
+            mine = (await handle.stat()).ino === targetIno;
+          } catch {
+            mine = false;
+          }
+        }
+        if (!mine) return handle;
+        used = true;
+        return wrap(handle);
+      }) as never);
+      return spy;
+    };
+
+    beforeEach(() => { dirs = []; openedPaths = []; });
+    afterEach(() => {
+      for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('403 tagged transcript-disabled without --allow-transcript', async () => {
+      const dir = tmpTree();
+      const file = path.join(dir, 'a.mp4');
+      fs.writeFileSync(file, bmff('isom'));
+      managed.meta.spawnCwd = dir;
+      const info = await startRO();
+      const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(403);
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      // The phone splits this refusal from every other 403 by the PREFIX.
+      expect((await res.json()).error.startsWith('transcript-disabled:')).toBe(true);
+    });
+
+    it('401 without a Bearer header', async () => {
+      await startWithTranscript();
+      const res = await fetch(fileUrl('s1', '/x/a.mp4'));
+      expect(res.status).toBe(401);
+    });
+
+    it('serves mp4, QuickTime and every type the image route already served', async () => {
+      const dir = tmpTree();
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      // The BRANDS decide, and `qt  ` must not be folded into video/mp4: the
+      // phone names its cache file from this header, and AVPlayer will not
+      // open a QuickTime movie called `.mp4`.
+      const cases: Array<[string, Buffer, string]> = [
+        ['clip.mp4', bmff('isom'), 'video/mp4'],
+        ['clip2.mp4', bmff('mp42'), 'video/mp4'],
+        ['clip3.mp4', bmff('avc1'), 'video/mp4'],
+        ['clip4.m4v', bmff('M4V '), 'video/mp4'],
+        ['clip.mov', bmff('qt  '), 'video/quicktime'],
+        ['shot.png', PNG_1X1, 'image/png'],
+      ];
+      for (const [name, bytes, type] of cases) {
+        const file = path.join(dir, name);
+        fs.writeFileSync(file, bytes);
+        const res = await fetch(fileUrl('s1', file), { headers: h });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toBe(type);
+        expect(res.headers.get('cache-control')).toBe('no-store');
+        expect(res.headers.get('content-length')).toBe(String(bytes.length));
+        // Streamed, but byte-identical — and never a Range advertisement the
+        // route cannot honour.
+        expect(Buffer.from(await res.arrayBuffer()).equals(bytes)).toBe(true);
+        expect(res.headers.get('accept-ranges')).toBe(null);
+      }
+    });
+
+    it('415 unsupported-type for a text file, whatever it is named', async () => {
+      const dir = tmpTree();
+      const file = path.join(dir, 'notes.mp4');
+      fs.writeFileSync(file, 'plain text wearing an .mp4 suffix');
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(415);
+      // A DIFFERENT tag from the image route's `not-an-image`, so the phone's
+      // two error maps never collapse into one.
+      expect((await res.json()).error).toBe('unsupported-type');
+    });
+
+    it('415, not 413, for an unsupported file over every cap', async () => {
+      // The cap depends on the type, so the sniff runs first. Saying
+      // "too large" about a file that would be refused at any size is a lie,
+      // and the phone renders the two differently (no retry vs. a limit).
+      const dir = tmpTree();
+      const file = sparse(dir, 'huge.txt', Buffer.from('not a media file'), 200 * 1024 * 1024);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(415);
+      expect((await res.json()).error).toBe('unsupported-type');
+    });
+
+    it('413 file-too-large over the 128 MiB video cap, without leaking the size', async () => {
+      const dir = tmpTree();
+      const file = sparse(dir, 'big.mp4', bmff('isom'), 128 * 1024 * 1024 + 1);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(413);
+      const body = await res.json();
+      expect(body.error).toBe('file-too-large');
+      // The cap is the only number a caller learns.
+      expect(body.detail).toBe(`the cap is ${128 * 1024 * 1024} bytes`);
+      expect(body.detail).not.toContain(String(128 * 1024 * 1024 + 1));
+    });
+
+    it('413 for an image over the 8 MiB image cap - the caps stay per kind', async () => {
+      const dir = tmpTree();
+      const file = sparse(dir, 'big.png', PNG_1X1, 8 * 1024 * 1024 + 1);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(413);
+      expect((await res.json()).detail).toBe(`the cap is ${8 * 1024 * 1024} bytes`);
+    });
+
+    it('streams a 100 MB video instead of reading it whole', async () => {
+      const dir = tmpTree();
+      const file = sparse(dir, 'long.mp4', bmff('isom'), 100 * 1024 * 1024);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      // RSS alone cannot answer this question: server and client share one
+      // process, so the client's own chunks and whatever the GC has not got to
+      // yet are counted too, and a buffered handler's 100 MB would be freed
+      // before a post-hoc reading anyway. So the handle itself is watched. A
+      // route that buffers asks it for `stat.size` bytes in one call; this one
+      // never asks for more than a stream chunk, whatever the file weighs.
+      const reads: number[] = [];
+      let streams = 0;
+      const openSpy = interceptOpen(file, async (handle) => {
+        const realRead = handle.read.bind(handle);
+        const realStream = handle.createReadStream.bind(handle);
+        handle.read = ((...a: unknown[]) => {
+          reads.push(typeof a[2] === 'number' ? a[2] : 0);
+          return (realRead as (...x: unknown[]) => unknown)(...a);
+        }) as typeof handle.read;
+        handle.createReadStream = ((...a: Parameters<typeof handle.createReadStream>) => {
+          streams += 1;
+          return realStream(...a);
+        }) as typeof handle.createReadStream;
+        return handle;
+      });
+      try {
+        const before = process.memoryUsage().rss;
+        const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-length')).toBe(String(100 * 1024 * 1024));
+        // Counted, never accumulated: `arrayBuffer()` here would add 100 MB
+        // from the CLIENT side of the same process.
+        let seen = 0;
+        let peak = before;
+        for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+          seen += chunk.length;
+          const rss = process.memoryUsage().rss;
+          if (rss > peak) peak = rss;
+        }
+        expect(seen).toBe(100 * 1024 * 1024);
+        // Named with the evidence: a bare `toBe(1)` here reports "0 is not 1"
+        // and leaves the next reader guessing whether the route stopped
+        // streaming or the interception never landed.
+        expect({ streams, openedPaths }).toMatchObject({ streams: 1 });
+        // The largest single read is one stream chunk (64 KiB), not the 100 MB
+        // a `Buffer.allocUnsafe(stat.size)` route would have asked for. The
+        // count is left alone deliberately — it tracks the highWaterMark, and
+        // pinning it would break on a Node that changes the default.
+        expect(Math.max(...reads)).toBeLessThanOrEqual(64 * 1024);
+        expect(reads.length).toBeGreaterThan(100);
+        // Secondary, and loose on purpose: this number includes the client's
+        // uncollected chunks, so it is here to catch an order-of-magnitude
+        // regression, not to measure the handler.
+        expect(peak - before).toBeLessThan(100 * 1024 * 1024);
+      } finally {
+        openSpy.mockRestore();
+      }
+    });
+
+    it('cuts the response when the file shrank under the promised length', async () => {
+      // Content-Length is the size the gate approved. Fewer bytes than that
+      // leaves URLSession waiting for a remainder that is never coming, so the
+      // honest end - the header is already gone - is to cut the socket.
+      const dir = tmpTree();
+      const file = path.join(dir, 'shrink.mp4');
+      fs.writeFileSync(file, bmff('isom'));
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const openSpy = interceptOpen(file, async (handle) => {
+        const realStat = handle.stat.bind(handle);
+        // One byte MORE than there is: the same disagreement a file being
+        // truncated mid-flight produces.
+        handle.stat = (async () => {
+          const st = await realStat();
+          return Object.assign(st, { size: st.size + 1 });
+        }) as typeof handle.stat;
+        return handle;
+      });
+      try {
+        await expect(
+          fetch(fileUrl('s1', file), { headers: bearer(info.token as string) })
+            .then((r) => r.arrayBuffer()),
+        ).rejects.toThrow();
+      } finally {
+        openSpy.mockRestore();
+      }
+      // And the server is still serving: the cut released its handle.
+      const ok = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(ok.status).toBe(200);
+    });
+
+    it('finishes cleanly, with the approved prefix, when the file grows', async () => {
+      // The contract sketched a cut here. It cannot work: the stream is bounded
+      // by `end: stat.size - 1`, so the client already holds every byte the
+      // Content-Length announced and reads the message as complete. Destroying
+      // the socket at that point does not reach it as a failure — it lands on
+      // whatever is still in the userland buffer, so the SAME correct response
+      // arrives whole or truncated depending on timing. What this pins is the
+      // decision that replaced it: the approved prefix is delivered, intact,
+      // every time.
+      const dir = tmpTree();
+      const file = path.join(dir, 'grow.mp4');
+      const bytes = bmff('isom');
+      fs.writeFileSync(file, bytes);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      // The handler is told the file is one byte shorter than it is — the same
+      // disagreement a file being appended to mid-flight produces.
+      const openSpy = interceptOpen(file, async (handle) => {
+        const realStat = handle.stat.bind(handle);
+        handle.stat = (async () => {
+          const st = await realStat();
+          return Object.assign(st, { size: st.size - 1 });
+        }) as typeof handle.stat;
+        return handle;
+      });
+      try {
+        const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-length')).toBe(String(bytes.length - 1));
+        const got = Buffer.from(await res.arrayBuffer());
+        // Exactly the approved prefix: not one byte of the growth, and not one
+        // byte short of what the header promised.
+        expect(got.length).toBe(bytes.length - 1);
+        expect(got.equals(bytes.subarray(0, bytes.length - 1))).toBe(true);
+      } finally {
+        openSpy.mockRestore();
+      }
+    });
+
+    it("releases a stalled reader's file handle without a client disconnect", async () => {
+      const limits = new StreamResponseLimits(200);
+      const acquire = StreamResponseLimits.prototype.acquire;
+      const admission = vi.spyOn(StreamResponseLimits.prototype, 'acquire')
+        .mockImplementation((key, response, options) => acquire.call(limits, key, response, options));
+      const dir = tmpTree();
+      const file = sparse(dir, 'stalled.mp4', bmff('isom'), 32 * 1024 * 1024);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      let closed = false;
+      const openSpy = interceptOpen(file, async (handle) => {
+        const close = handle.close.bind(handle);
+        handle.close = async () => { closed = true; return close(); };
+        return handle;
+      });
+      const ac = new AbortController();
+      try {
+        const response = await fetch(fileUrl('s1', file), {
+          headers: bearer(info.token as string), signal: ac.signal,
+        });
+        expect(response.status).toBe(200);
+        // Do not read or cancel: the server must end the stalled transfer itself.
+        await vi.waitFor(() => expect(closed).toBe(true), { timeout: 2000 });
+      } finally {
+        ac.abort();
+        openSpy.mockRestore();
+        admission.mockRestore();
+      }
+    });
+
+    it('survives a client that walks away mid-download', async () => {
+      // `pipe` unpipes on a closed response but never destroys its source, so
+      // this is the path that would leak the FileHandle for the life of the
+      // daemon. What it must NOT do is leave the process with a pending wait.
+      const dir = tmpTree();
+      const file = sparse(dir, 'walked.mp4', bmff('isom'), 32 * 1024 * 1024);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      let closed = false;
+      const openSpy = interceptOpen(file, async (handle) => {
+        const realClose = handle.close.bind(handle);
+        handle.close = (async () => { closed = true; return realClose(); }) as typeof handle.close;
+        return handle;
+      });
+      try {
+        const ac = new AbortController();
+        const res = await fetch(fileUrl('s1', file), {
+          headers: bearer(info.token as string),
+          signal: ac.signal,
+        });
+        expect(res.status).toBe(200);
+        const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+        await reader.read();
+        ac.abort();
+        await reader.cancel().catch(() => { /* already aborted */ });
+        // THE assertion. A server leaking the descriptor still answers the next
+        // request happily, so "it answered again" proves nothing on its own.
+        await vi.waitFor(() => expect(closed).toBe(true));
+      } finally {
+        openSpy.mockRestore();
+      }
+      const after = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(after.status).toBe(200);
+      await after.body?.cancel();
+    });
+
+    it('releases the handle when the client leaves before the first byte', async () => {
+      // The window the abort test above cannot reach: every step of the gate is
+      // an await, so 'close' can fire BEFORE the handler subscribes to it. A
+      // listener registered after the event never runs, and writing to a
+      // destroyed response returns false rather than throwing — so a handler
+      // that only subscribed would park in `pipe` for ever holding this handle.
+      const dir = tmpTree();
+      const file = sparse(dir, 'early.mp4', bmff('isom'), 8 * 1024 * 1024);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      let entered!: () => void;
+      const inTheGate = new Promise<void>((r) => { entered = r; });
+      let release!: () => void;
+      const held = new Promise<void>((r) => { release = r; });
+      let closed = false;
+      const openSpy = interceptOpen(file, async (handle) => {
+        const realClose = handle.close.bind(handle);
+        handle.close = (async () => { closed = true; return realClose(); }) as typeof handle.close;
+        entered();
+        await held;
+        return handle;
+      });
+      try {
+        const ac = new AbortController();
+        const pending = fetch(fileUrl('s1', file), {
+          headers: bearer(info.token as string),
+          signal: ac.signal,
+        });
+        const settled = pending.catch(() => 'aborted' as const);
+        await inTheGate;
+        ac.abort();
+        // Let the abort reach the server before the gate finishes.
+        await new Promise((r) => setImmediate(r));
+        release();
+        expect(await settled).toBe('aborted');
+        // The handler has to finish on its own — a leak would leave this
+        // pending for the life of the daemon.
+        await vi.waitFor(() => expect(closed).toBe(true));
+      } finally {
+        openSpy.mockRestore();
+      }
+      const ok = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(ok.status).toBe(200);
+      await ok.body?.cancel();
+    });
+
+    it('404s outside the boundary, through a symlink, and on a FIFO', async () => {
+      const root = tmpTree();
+      const cwd = path.join(root, 'cwd');
+      const outside = path.join(root, 'outside');
+      fs.mkdirSync(cwd);
+      fs.mkdirSync(outside);
+      const secret = path.join(outside, 'secret.mp4');
+      fs.writeFileSync(secret, bmff('isom'));
+      const link = path.join(cwd, 'looks-local.mp4');
+      fs.symlinkSync(secret, link);
+      const fifo = path.join(cwd, 'pipe.mp4');
+      execFileSync('mkfifo', [fifo]);
+      const sibling = path.join(root, 'cwd-next-door');
+      fs.mkdirSync(sibling);
+      const prefixed = path.join(sibling, 'a.mp4');
+      fs.writeFileSync(prefixed, bmff('isom'));
+      const sub = path.join(cwd, 'clips');
+      fs.mkdirSync(sub);
+      managed.meta.spawnCwd = cwd;
+      // OSC 7 moves `meta.cwd`, so it is never a boundary.
+      managed.meta.cwd = outside;
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      // The escape hatch, the hang, the string-prefix sibling, the directory,
+      // the wandered cwd, and a path that is simply not there - one answer for
+      // all of them, or the difference maps the disk.
+      for (const p of [secret, link, fifo, prefixed, sub, path.join(cwd, 'nope.mp4')]) {
+        const res = await fetch(fileUrl('s1', p), { headers: h });
+        expect(res.status).toBe(404);
+        expect((await res.json()).error).toBe('file not found');
+      }
+    });
+
+    it('400 bad-file-ref for a missing, empty, relative or NUL-bearing path', async () => {
+      managed.meta.spawnCwd = tmpTree();
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      const refs = ['', '   ', 'relative/a.mp4', './a.mp4', `/x/a${String.fromCharCode(0)}.mp4`];
+      for (const ref of refs) {
+        const res = await fetch(fileUrl('s1', ref), { headers: h });
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toBe('bad-file-ref');
+      }
+      const bare = await fetch(`${base()}/api/sessions/s1/turns/file`, { headers: h });
+      expect(bare.status).toBe(400);
+      expect((await bare.json()).error).toBe('bad-file-ref');
+    });
+
+    it('404 for an unknown pane, and for the orchestrator brain', async () => {
+      const dir = tmpTree();
+      const file = path.join(dir, 'a.mp4');
+      fs.writeFileSync(file, bmff('isom'));
+      live.push({
+        id: 'brain-ws-1', cwd: dir, cols: 80, rows: 24, state: 'detached',
+        agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+        env: {}, cmd: '/usr/bin/claude',
+      });
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      for (const id of ['no-such-pane', 'brain-ws-1']) {
+        const res = await fetch(fileUrl(id, file), { headers: h });
+        expect(res.status).toBe(404);
+        expect((await res.json()).error).toBe('session not found');
+      }
+    });
+
+    it('serves a video out of the uploads directory, session-independently', async () => {
+      managed.meta.spawnCwd = tmpTree();
+      const clip = path.join(uploadsDir, 'clip.mp4');
+      fs.writeFileSync(clip, bmff('isom'));
+      try {
+        const info = await startWithTranscript();
+        const res = await fetch(fileUrl('s1', clip), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toBe('video/mp4');
+      } finally {
+        // uploadsDir is shared across describes; the tree cleanup misses it.
+        fs.rmSync(clip, { force: true });
+      }
+    });
+
+    it('serves fragmented mp4, whose major brand is not isom', async () => {
+      // `ffmpeg -movflags frag_keyframe+empty_moov` writes `iso5`. An agent
+      // rendering a clip for streaming is the use this route exists for, and a
+      // 415 there is permanent as far as a client is concerned.
+      const dir = tmpTree();
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      for (const brand of ['iso4', 'iso5', 'iso6', 'dash']) {
+        const file = path.join(dir, `frag-${brand.trim()}.mp4`);
+        fs.writeFileSync(file, bmff(brand));
+        const res = await fetch(fileUrl('s1', file), { headers: h });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toBe('video/mp4');
+        await res.body?.cancel();
+      }
+    });
+
+    it('415s a text file that merely contains the ftyp marker', async () => {
+      // The marker is twelve bytes of ASCII a document can hold. What it cannot
+      // also hold in front of it is a plausible box length: a `ftyp` box is
+      // 16 bytes or more and a multiple of four, and `<!--` read as a
+      // big-endian length is neither.
+      const dir = tmpTree();
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      const decoys = [
+        Buffer.from('<!--ftypisom this is a comment, not a movie -->'),
+        // Length zero: legal in MP4 only for the LAST box, never for `ftyp`.
+        Buffer.concat([Buffer.alloc(4), Buffer.from('ftypisom'), Buffer.alloc(8)]),
+        // 18: not a multiple of four, so not a box that holds whole brands.
+        (() => {
+          const b = Buffer.alloc(24);
+          b.writeUInt32BE(18, 0);
+          b.write('ftypisom', 4, 'latin1');
+          return b;
+        })(),
+      ];
+      for (const [i, bytes] of decoys.entries()) {
+        const file = path.join(dir, `decoy-${i}.mp4`);
+        fs.writeFileSync(file, bytes);
+        const res = await fetch(fileUrl('s1', file), { headers: h });
+        expect(res.status).toBe(415);
+        expect((await res.json()).error).toBe('unsupported-type');
+      }
+    });
+
+    it('carries the security headers onto the 200', async () => {
+      // Nothing else in this describe would notice if the spread of
+      // `securityHeaders()` were dropped from the streamed response, and this
+      // route hands a browser bytes it sniffed itself.
+      const dir = tmpTree();
+      const file = path.join(dir, 'clip.mp4');
+      fs.writeFileSync(file, bmff('isom'));
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(200);
+      expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+      await res.body?.cancel();
+    });
+
+    it('404s when the last component became a symlink after the boundary check', async () => {
+      // Every other symlink case in this file is caught one step earlier - by
+      // realpath - so nothing reaches the open. Handing the handler a path
+      // realpath did NOT resolve is what puts the swap in front of
+      // `openResolvedFile`, which refuses the link itself rather than trusting
+      // O_NOFOLLOW (absent on win32, #1434). The swaps that land between its
+      // checks and the open are pinned in openResolvedFile.runtime.test.ts.
+      const root = tmpTree();
+      const cwd = path.join(root, 'cwd');
+      const outside = path.join(root, 'outside');
+      fs.mkdirSync(cwd);
+      fs.mkdirSync(outside);
+      const secret = path.join(outside, 'secret.mp4');
+      fs.writeFileSync(secret, bmff('isom'));
+      const swapped = path.join(cwd, 'swapped.mp4');
+      fs.symlinkSync(secret, swapped);
+      managed.meta.spawnCwd = cwd;
+      const realRealpath = fs.promises.realpath;
+      const rpSpy = vi.spyOn(fs.promises, 'realpath');
+      rpSpy.mockImplementation((async (p: fs.PathLike, ...rest: unknown[]) => {
+        // The link resolves to itself: containment passes, and the file `open`
+        // then meets is the symlink the check never saw through.
+        if (String(p) === swapped) return swapped;
+        return (realRealpath as (...a: unknown[]) => Promise<string>)(p, ...rest);
+      }) as never);
+      try {
+        const info = await startWithTranscript();
+        const res = await fetch(fileUrl('s1', swapped), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(404);
+        expect((await res.json()).error).toBe('file not found');
+      } finally {
+        rpSpy.mockRestore();
+      }
+    });
+
+    it('serves a file under an uploads directory nested inside the pane cwd', async () => {
+      // The two roots are independent, and one containing the other must not
+      // turn into a rejection on whichever is checked second.
+      const cwd = tmpTree();
+      const nested = path.join(cwd, 'uploads');
+      fs.mkdirSync(nested);
+      const clip = path.join(nested, 'from-phone.mp4');
+      fs.writeFileSync(clip, bmff('isom'));
+      managed.meta.spawnCwd = cwd;
+      const nestedServer = new WebTerminalServer({
+        sessionManager,
+        projector: () => projectorMock as unknown as TranscriptProjector,
+        log: () => { /* silent in tests */ },
+        assetsDir: os.tmpdir(),
+        uploadsDir: nested,
+      });
+      const info = await nestedServer.start({
+        port: 0, host: '127.0.0.1', allowInput: false, allowUpload: true, allowTranscript: true,
+      });
+      try {
+        const url = `http://127.0.0.1:${info.port}/api/sessions/s1/turns/file?path=${encodeURIComponent(clip)}`;
+        const res = await fetch(url, { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toBe('video/mp4');
+        await res.body?.cancel();
+      } finally {
+        await nestedServer.stop();
+      }
+    });
+
+    it('/api/config advertises turnFiles only alongside the transcript grant', async () => {
+      const off = await startRO();
+      const offBody = await (
+        await fetch(`${base()}/api/config`, { headers: bearer(off.token as string) })
+      ).json();
+      // ABSENT, not false - the shape a daemon predating the route serves.
+      expect(offBody).not.toHaveProperty('turnFiles');
+
+      await server.stop();
+      const on = await startWithTranscript();
+      const onBody = await (
+        await fetch(`${base()}/api/config`, { headers: bearer(on.token as string) })
+      ).json();
+      expect(onBody).toHaveProperty('turnFiles', true);
+      // The older key keeps its meaning; this one is additive.
+      expect(onBody).toHaveProperty('turnImages', true);
+    });
+  });
+
+  describe('SendUserFile files on /turns/image and /turns/file', () => {
+    /** The smallest legal PNG: signature, IHDR for 1x1, one IDAT, IEND. */
+    const PNG_1X1 = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    /** An EBML header whose DocType is `webm`. */
+    const WEBM_HEAD = Buffer.from([
+      0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x86, 0x81, 0x01, 0x42, 0xf7, 0x81, 0x01,
+      0x42, 0xf2, 0x81, 0x04, 0x42, 0xf3, 0x81, 0x08, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d,
+    ]);
+    let dirs: string[];
+    /** The pane's spawn cwd, and a scratch folder outside it holding the sent files. */
+    let cwd: string;
+    let scratch: string;
+    let transcript: string;
+    const routeUrl = (route: 'image' | 'file', id: string, p: string): string =>
+      `${base()}/api/sessions/${id}/turns/${route}?path=${encodeURIComponent(p)}`;
+    const tmpTree = (): string => {
+      const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-sent-file-')));
+      dirs.push(dir);
+      return dir;
+    };
+    let seq = 0;
+    /** One SendUserFile call and its result, appended to `file`. */
+    const sendUserFile = (
+      file: string,
+      files: string[],
+      opts: { at?: number; isError?: boolean; answered?: boolean } = {},
+    ): void => {
+      const id = `toolu_sent_${++seq}`;
+      const timestamp = new Date(opts.at ?? Date.now()).toISOString();
+      const lines = [JSON.stringify({
+        type: 'assistant', timestamp,
+        message: { role: 'assistant', content: [{ type: 'tool_use', id, name: 'SendUserFile', input: { files } }] },
+      })];
+      if (opts.answered !== false) {
+        lines.push(JSON.stringify({
+          type: 'user', timestamp,
+          message: { role: 'user', content: [{
+            type: 'tool_result', tool_use_id: id,
+            content: opts.isError ? 'file not found' : `${files.length} file delivered to user.`,
+            ...(opts.isError ? { is_error: true } : {}),
+          }] },
+        }));
+      }
+      fs.appendFileSync(file, `${lines.join('\n')}\n`);
+    };
+
+    beforeEach(() => {
+      dirs = [];
+      const root = tmpTree();
+      cwd = path.join(root, 'cwd');
+      scratch = path.join(root, 'scratch');
+      fs.mkdirSync(cwd);
+      fs.mkdirSync(scratch);
+      transcript = path.join(root, 'session.jsonl');
+      fs.writeFileSync(transcript, '');
+      managed.meta.spawnCwd = cwd;
+      projectorMock.sentFileBinding.mockImplementation((id: string) =>
+        (id === 's1' ? { transcriptPath: transcript, agentSessionId: 'session', generation: 0 } : null));
+    });
+    afterEach(() => {
+      vi.restoreAllMocks();
+      for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('serves a sent PNG outside the spawn cwd on both routes, and audits basename and size only', async () => {
+      const file = path.join(scratch, 'shot.png');
+      fs.writeFileSync(file, PNG_1X1);
+      sendUserFile(transcript, [file]);
+      const info = await startWithTranscript();
+      for (const route of ['image', 'file'] as const) {
+        const res = await fetch(routeUrl(route, 's1', file), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toBe('image/png');
+        expect(res.headers.get('cache-control')).toBe('no-store');
+        expect(Buffer.from(await res.arrayBuffer()).equals(PNG_1X1)).toBe(true);
+      }
+      expect(sentFileAudits).toEqual([
+        { deviceId: '', sessionId: 's1', file: 'shot.png', bytes: PNG_1X1.length },
+        { deviceId: '', sessionId: 's1', file: 'shot.png', bytes: PNG_1X1.length },
+      ]);
+      expect(JSON.stringify(sentFileAudits)).not.toContain(scratch);
+    });
+
+    it('audits the paired device that fetched it', async () => {
+      const file = path.join(scratch, 'shot.png');
+      fs.writeFileSync(file, PNG_1X1);
+      sendUserFile(transcript, [file]);
+      await startWithTranscript();
+      const phone = await pairDevice('Phone', false);
+      const res = await fetch(routeUrl('image', 's1', file), { headers: bearer(phone.token) });
+      expect(res.status).toBe(200);
+      expect(sentFileAudits).toEqual([{ deviceId: phone.deviceId, sessionId: 's1', file: 'shot.png', bytes: PNG_1X1.length }]);
+    });
+
+    it('refuses a path no SendUserFile call named, with the same 404 as any path outside the roots', async () => {
+      const sent = path.join(scratch, 'sent.png');
+      const other = path.join(scratch, 'other.png');
+      fs.writeFileSync(sent, PNG_1X1);
+      fs.writeFileSync(other, PNG_1X1);
+      sendUserFile(transcript, [sent]);
+      // Named only in a different tool's input: not a sent file.
+      fs.appendFileSync(transcript, `${JSON.stringify({
+        type: 'assistant', timestamp: new Date().toISOString(),
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_read', name: 'Read', input: { file_path: other } }] },
+      })}\n`);
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      const image = await fetch(routeUrl('image', 's1', other), { headers: h });
+      expect(image.status).toBe(404);
+      expect(await image.json()).toEqual({ error: 'image not found' });
+      const media = await fetch(routeUrl('file', 's1', other), { headers: h });
+      expect(media.status).toBe(404);
+      expect(await media.json()).toEqual({ error: 'file not found' });
+      // A spelling that resolves to the sent file is still not the listed string.
+      const respelled = await fetch(routeUrl('image', 's1', `${scratch}/./sent.png`), { headers: h });
+      expect(respelled.status).toBe(404);
+      expect(sentFileAudits).toEqual([]);
+    });
+
+    it('refuses a call whose tool_result is an error, or that has no result yet', async () => {
+      const failed = path.join(scratch, 'failed.png');
+      const pending = path.join(scratch, 'pending.png');
+      fs.writeFileSync(failed, PNG_1X1);
+      fs.writeFileSync(pending, PNG_1X1);
+      sendUserFile(transcript, [failed], { isError: true });
+      sendUserFile(transcript, [pending], { answered: false });
+      const info = await startWithTranscript();
+      for (const file of [failed, pending]) {
+        const res = await fetch(routeUrl('image', 's1', file), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(404);
+        expect(await res.json()).toEqual({ error: 'image not found' });
+      }
+    });
+
+    it('refuses a call older than 24 hours, measured from the tool_use timestamp', async () => {
+      const file = path.join(scratch, 'old.png');
+      fs.writeFileSync(file, PNG_1X1);
+      sendUserFile(transcript, [file]);
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      clockOffsetMs = 23 * 60 * 60 * 1000;
+      expect((await fetch(routeUrl('image', 's1', file), { headers: h })).status).toBe(200);
+      clockOffsetMs = 24 * 60 * 60 * 1000 + 60_000;
+      const res = await fetch(routeUrl('image', 's1', file), { headers: h });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: 'image not found' });
+    });
+
+    it("refuses a file sent in another pane's transcript", async () => {
+      const file = path.join(scratch, 'theirs.png');
+      fs.writeFileSync(file, PNG_1X1);
+      const otherTranscript = path.join(path.dirname(transcript), 'other.jsonl');
+      sendUserFile(otherTranscript, [file]);
+      projectorMock.sentFileBinding.mockImplementation((id: string) =>
+        id === 's1' ? { transcriptPath: transcript, agentSessionId: 'session', generation: 0 }
+          : id === 's2' ? { transcriptPath: otherTranscript, agentSessionId: 'other', generation: 0 } : null);
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      // s2's own agent sent it: served there, not on s1 or s3.
+      expect((await fetch(routeUrl('image', 's2', file), { headers: h })).status).toBe(200);
+      for (const id of ['s1', 's3']) {
+        const res = await fetch(routeUrl('image', id, file), { headers: h });
+        expect(res.status).toBe(404);
+      }
+    });
+
+    it('refuses a path the transcript itself recorded with a dot segment', async () => {
+      const file = path.join(scratch, 'y.png');
+      fs.writeFileSync(file, PNG_1X1);
+      fs.mkdirSync(path.join(scratch, 'link'));
+      // Byte-identical to what the transcript says, and resolvable to a real
+      // file — refused on shape alone.
+      const recorded = [`${scratch}/./y.png`, `${scratch}/link/../y.png`, `${scratch}//y.png`];
+      sendUserFile(transcript, recorded);
+      const info = await startWithTranscript();
+      for (const p of recorded) {
+        const res = await fetch(routeUrl('image', 's1', p), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(404);
+        expect(await res.json()).toEqual({ error: 'image not found' });
+      }
+    });
+
+    it('refuses the previous session\'s files once a new session has started in the pane', async () => {
+      const file = path.join(scratch, 'shot.png');
+      fs.writeFileSync(file, PNG_1X1);
+      sendUserFile(transcript, [file]);
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      expect((await fetch(routeUrl('image', 's1', file), { headers: h })).status).toBe(200);
+      // `/clear`: the projector reports no usable binding until the new session binds.
+      projectorMock.sentFileBinding.mockImplementation(() => null);
+      for (const route of ['image', 'file'] as const) {
+        const res = await fetch(routeUrl(route, 's1', file), { headers: h });
+        expect(res.status).toBe(404);
+      }
+    });
+
+    it('refuses when the session changed while the transcript was being read', async () => {
+      const file = path.join(scratch, 'shot.png');
+      fs.writeFileSync(file, PNG_1X1);
+      sendUserFile(transcript, [file]);
+      let reads = 0;
+      projectorMock.sentFileBinding.mockImplementation(() =>
+        ({ transcriptPath: transcript, agentSessionId: 'session', generation: reads++ === 0 ? 0 : 1 }));
+      const info = await startWithTranscript();
+      const res = await fetch(routeUrl('image', 's1', file), { headers: bearer(info.token as string) });
+      expect(reads).toBe(2);
+      expect(res.status).toBe(404);
+    });
+
+    it('refuses a listed file written after the call that sent it', async () => {
+      const file = path.join(scratch, 'later.png');
+      fs.writeFileSync(file, PNG_1X1);
+      sendUserFile(transcript, [file]);
+      const later = new Date(Date.now() + 10 * 60 * 1000);
+      fs.utimesSync(file, later, later);
+      const info = await startWithTranscript();
+      for (const route of ['image', 'file'] as const) {
+        const res = await fetch(routeUrl(route, 's1', file), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(404);
+      }
+      expect(sentFileAudits).toEqual([]);
+    });
+
+    it('refuses a sent path whose last component is a symlink', async () => {
+      const target = path.join(scratch, 'real.png');
+      const link = path.join(scratch, 'link.png');
+      fs.writeFileSync(target, PNG_1X1);
+      fs.symlinkSync(target, link);
+      sendUserFile(transcript, [link]);
+      const info = await startWithTranscript();
+      const res = await fetch(routeUrl('image', 's1', link), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(404);
+    });
+
+    it('refuses a sent file swapped for a symlink between the check and the open', async () => {
+      const file = path.join(scratch, 'swap.png');
+      const elsewhere = path.join(path.dirname(scratch), 'elsewhere.png');
+      fs.writeFileSync(file, PNG_1X1);
+      fs.writeFileSync(elsewhere, PNG_1X1);
+      sendUserFile(transcript, [file]);
+      const info = await startWithTranscript();
+      // The swap lands right before the route's open of this one path: the
+      // lstat already saw a regular file. Matched on the spelling the route
+      // opens — the NATIVE realpath of the parent plus the name — which on
+      // Windows differs from `file` (JS realpath keeps 8.3 short names).
+      const opened = path.join(fs.realpathSync.native(scratch), 'swap.png');
+      const real = fs.promises.open;
+      let swapped = false;
+      vi.spyOn(fs.promises, 'open').mockImplementation((async (...args: Parameters<typeof fs.promises.open>) => {
+        if (!swapped && String(args[0]) === opened) {
+          swapped = true;
+          fs.unlinkSync(file);
+          fs.symlinkSync(elsewhere, file);
+        }
+        return real(...args);
+      }) as never);
+      for (const route of ['image', 'file'] as const) {
+        swapped = false;
+        if (fs.lstatSync(file).isSymbolicLink()) {
+          fs.unlinkSync(file);
+          fs.writeFileSync(file, PNG_1X1);
+        }
+        const res = await fetch(routeUrl(route, 's1', file), { headers: bearer(info.token as string) });
+        expect(swapped).toBe(true);
+        expect(res.status).toBe(404);
+      }
+      expect(sentFileAudits).toEqual([]);
+    });
+
+    it('refuses a sent .env renamed to .png by its leading bytes, with the routes\' existing 415', async () => {
+      const file = path.join(scratch, 'secrets.png');
+      fs.writeFileSync(file, 'API_KEY=not-an-image\n');
+      sendUserFile(transcript, [file]);
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      const image = await fetch(routeUrl('image', 's1', file), { headers: h });
+      expect(image.status).toBe(415);
+      expect((await image.json()).error).toBe('not-an-image');
+      const media = await fetch(routeUrl('file', 's1', file), { headers: h });
+      expect(media.status).toBe(415);
+      expect((await media.json()).error).toBe('unsupported-type');
+      expect(sentFileAudits).toEqual([]);
+    });
+
+    it('serves a sent WebM on /turns/file only', async () => {
+      const file = path.join(scratch, 'clip.webm');
+      fs.writeFileSync(file, Buffer.concat([WEBM_HEAD, Buffer.alloc(64)]));
+      sendUserFile(transcript, [file]);
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      const media = await fetch(routeUrl('file', 's1', file), { headers: h });
+      expect(media.status).toBe(200);
+      expect(media.headers.get('content-type')).toBe('video/webm');
+      await media.arrayBuffer();
+      expect((await fetch(routeUrl('image', 's1', file), { headers: h })).status).toBe(415);
+    });
+
+    it('a device on a server without --allow-transcript is refused; a revoked device is refused', async () => {
+      const file = path.join(scratch, 'shot.png');
+      fs.writeFileSync(file, PNG_1X1);
+      sendUserFile(transcript, [file]);
+      await startRO();
+      const phone = await pairDevice('Phone');
+      const off = await fetch(routeUrl('image', 's1', file), { headers: bearer(phone.token) });
+      expect(off.status).toBe(403);
+      expect((await off.json()).error.startsWith('transcript-disabled:')).toBe(true);
+
+      await server.stop();
+      await startWithTranscript();
+      const second = await pairDevice('Second phone');
+      expect((await fetch(routeUrl('image', 's1', file), { headers: bearer(second.token) })).status).toBe(200);
+      const row = deviceRoster.get(second.deviceId);
+      expect(row).toBeDefined();
+      if (row) row.revoked = true;
+      expect((await fetch(routeUrl('image', 's1', file), { headers: bearer(second.token) })).status).toBe(401);
+    });
+
+    it('/api/config advertises turnSentFiles only alongside the transcript grant', async () => {
+      const off = await startRO();
+      const offBody = await (await fetch(`${base()}/api/config`, { headers: bearer(off.token as string) })).json();
+      expect(offBody).not.toHaveProperty('turnSentFiles');
+      await server.stop();
+      const on = await startWithTranscript();
+      const onBody = await (await fetch(`${base()}/api/config`, { headers: bearer(on.token as string) })).json();
+      expect(onBody).toHaveProperty('turnSentFiles', true);
+    });
   });
 
   describe('GET /api/workspaces', () => {
@@ -4171,6 +9178,114 @@ describe('WebTerminalServer', () => {
       expect(body.workspaces[1].panes).toEqual([{ sessionId: 's2', shell: 'pwsh', cwd: '/y' }]);
       // The env-less session (s3) is omitted entirely.
       expect(body.workspaces.flatMap((w) => w.panes).map((p) => p.sessionId)).not.toContain('s3');
+    });
+
+    // #1163 — per-session agent metadata, so the attaching desktop's roster
+    // can count remote Claude sessions. Additive-optional: panes the host
+    // knows nothing about carry no agent fields at all.
+    it('surfaces per-pane agent name and status, omitting them when unknown', async () => {
+      live.push(
+        {
+          id: 's-agent', cwd: '/a', cols: 80, rows: 24, state: 'detached',
+          agent: undefined,
+          // X6 persisted what USED to run here; the daemon's canonical answer
+          // (below) says nothing runs now. The persisted slug must not
+          // resurrect a ghost roster row.
+          lastDetectedAgent: 'claude',
+          lastActivity: '2020-01-01T00:00:00.000Z',
+          env: { WMUX_WORKSPACE_ID: 'ws-1', WMUX_WORKSPACE_NAME: 'Workspace 1' },
+          cmd: '/usr/bin/bash',
+        },
+        {
+          id: 's-role', cwd: '/b', cols: 80, rows: 24, state: 'detached',
+          // Creation-time role metadata outranks the persisted slug.
+          agent: { role: 'worker', teamId: 't1', displayName: 'Codex' },
+          lastDetectedAgent: 'claude',
+          lastActivity: '2020-01-01T00:00:00.000Z',
+          env: { WMUX_WORKSPACE_ID: 'ws-1', WMUX_WORKSPACE_NAME: 'Workspace 1' },
+          cmd: '/usr/bin/bash',
+        },
+      );
+      // The daemon's canonical reader: s1 runs a live, blocked agent; s-agent's
+      // agent has exited (canonical null); s-role's canonical answer is
+      // outranked by its creation-time role metadata.
+      agentStates = {
+        s1: { agentName: 'Claude Code', agentStatus: 'awaiting_input' },
+        's-agent': { agentName: null, agentStatus: 'idle' },
+        's-role': { agentName: 'Claude Code', agentStatus: 'running' },
+      };
+      const info = await startRO();
+      const read = async () => {
+        const r = await fetch(`${base()}/api/workspaces`, { headers: bearer(info.token as string) });
+        expect(r.status).toBe(200);
+        return (await r.json()) as {
+          workspaces: Array<{ panes: Array<{ sessionId: string; agentName?: string; agentStatus?: string }> }>;
+        };
+      };
+      let body = await read();
+      let byId = new Map(body.workspaces.flatMap((w) => w.panes).map((p) => [p.sessionId, p]));
+      expect(byId.get('s1')).toMatchObject({ agentName: 'Claude Code', agentStatus: 'awaiting_input' });
+      // Role metadata outranks the canonical detector name.
+      expect(byId.get('s-role')).toMatchObject({ agentName: 'Codex', agentStatus: 'running' });
+      // Exited agent: the persisted slug does NOT resurrect a row.
+      expect(byId.get('s-agent')).not.toHaveProperty('agentName');
+      expect(byId.get('s-agent')).not.toHaveProperty('agentStatus');
+      // No canonical state for the session → no agent fields at all.
+      expect(byId.get('s2')).not.toHaveProperty('agentName');
+
+      // The agent in s1 exits → its row disappears on the next poll.
+      agentStates.s1 = { agentName: null, agentStatus: 'idle' };
+      body = await read();
+      byId = new Map(body.workspaces.flatMap((w) => w.panes).map((p) => [p.sessionId, p]));
+      expect(byId.get('s1')).not.toHaveProperty('agentName');
+    });
+
+    // #1342 — the resume block for a remote resume chip. Additive-optional, and
+    // the host-local transcript path is structurally absent from the wire.
+    it('surfaces the resume block with a cwd verdict and never the transcript path', async () => {
+      resumeStates = {
+        s1: {
+          binding: {
+            agent: 'claude',
+            sessionId: 'conv-1',
+            // Matches the fixture's cwd for s1 ('/x') → an EXACT resume is safe.
+            cwd: '/x',
+            permissionMode: 'bypassPermissions',
+            transcriptPath: '/home/host/.claude/projects/x/conv-1.jsonl',
+            ts: 1,
+          },
+          commandRunning: false,
+          agentProcessAlive: false,
+        },
+        s2: {
+          binding: {
+            // Recorded elsewhere than the pane's live cwd ('/y') → fallback only.
+            agent: 'claude', sessionId: 'conv-2', cwd: '/elsewhere', ts: 1,
+          },
+        },
+      };
+      const info = await startRO();
+      const r = await fetch(`${base()}/api/workspaces`, { headers: bearer(info.token as string) });
+      expect(r.status).toBe(200);
+      const raw = await r.text();
+      const body = JSON.parse(raw) as {
+        workspaces: Array<{ panes: Array<{ sessionId: string; resume?: Record<string, unknown>; commandRunning?: boolean; agentProcessAlive?: boolean }> }>;
+      };
+      const byId = new Map(body.workspaces.flatMap((w) => w.panes).map((p) => [p.sessionId, p]));
+      expect(byId.get('s1')?.resume).toEqual({
+        agent: 'claude',
+        sessionId: 'conv-1',
+        cwdMatches: true,
+        permissionMode: 'bypassPermissions',
+      });
+      expect(byId.get('s1')).toMatchObject({ commandRunning: false, agentProcessAlive: false });
+      // Recorded cwd no longer matches → the host says so; no mode was captured.
+      expect(byId.get('s2')?.resume).toEqual({ agent: 'claude', sessionId: 'conv-2', cwdMatches: false });
+      // A session the daemon reports nothing for carries no resume fields at all.
+      expect(byId.get('s2')).not.toHaveProperty('commandRunning');
+      // The host-local transcript path never crosses the API, under any key.
+      expect(raw).not.toContain('.jsonl');
+      expect(raw).not.toContain('transcriptPath');
     });
 
     it('groups multiple panes into the same workspace, sorted by sessionId', async () => {
@@ -4245,6 +9360,805 @@ describe('WebTerminalServer', () => {
         expect(body.workspaces.map((w) => w.id)).not.toContain('ws-brain');
       } finally {
         live.length = 3;
+      }
+    });
+  });
+
+  describe('phone Fleet sidebar fields on /api/sessions and /api/workspaces', () => {
+    const brainRow = {
+      id: 'brain-abc', cwd: '/b', cols: 80, rows: 24, state: 'attached',
+      agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+      env: { WMUX_BRAIN_PTY: '1', WMUX_WORKSPACE_ID: 'ws-brain', WMUX_WORKSPACE_NAME: 'Brain' },
+      cmd: '/usr/local/bin/claude',
+    };
+    const sidebar = (activeWorkspaceId: string | null = 'ws-1') => ({
+      activeWorkspaceId,
+      workspaces: [
+        {
+          id: 'ws-1', order: 0, pinned: true, color: 'teal', gitBranch: 'main', gitIsWorktree: false,
+          gitSync: { ahead: 2, behind: 0, hasUpstream: true },
+        },
+        { id: 'ws-legacy', order: 1, pinned: false, task: { ownerWorkspaceId: 'ws-1', detached: false, createdAt: 1_700_000_000_000, nested: true, state: { needYou: false, toReview: true, finished: true } } },
+        { id: 'ws-desktop-only', order: 2, pinned: false },
+        // Nested under ws-1 on the desktop but has no live pane: never a row, never counted.
+        { id: 'ws-unlisted-task', order: 4, pinned: false, task: { ownerWorkspaceId: 'ws-1', detached: false, nested: true, state: { needYou: true, toReview: true, finished: true } } },
+        // Nested on the desktop under an owner the phone does not list.
+        { id: 'ws-task-2', order: 5, pinned: false, task: { ownerWorkspaceId: 'ws-desktop-only', detached: false, nested: true, state: { needYou: true, toReview: false, finished: false } } },
+        { id: 'ws-brain', order: 3, pinned: true, gitBranch: 'brain-branch' },
+      ],
+      panes: [
+        { ptyId: 's1', workspaceId: 'ws-1', surfaceTitle: '✳ app review', paneName: 'w123-5' },
+        { ptyId: 'brain-abc', workspaceId: 'ws-brain', surfaceTitle: 'orchestrator title', paneName: 'w9-1' },
+        { ptyId: 'ghost', workspaceId: 'ws-1', surfaceTitle: 'ghost title', paneName: 'w1-9' },
+      ],
+    });
+    /** A desktop that answers `workspaces.list` with `reply`, counting calls. */
+    const attachDesktop = (reply: () => unknown, opts: { answer?: boolean; timeoutMs?: number } = {}) => {
+      const calls: string[] = [];
+      desktopBridge = new DesktopPhoneBridge((_owner, raw) => {
+        const data = (raw as { data: { requestId: string; command: string } }).data;
+        calls.push(data.command);
+        if (opts.answer !== false) {
+          const result = reply();
+          if (result instanceof Error) desktopBridge!.complete('main', { requestId: data.requestId, ok: false, error: result.message });
+          else desktopBridge!.complete('main', { requestId: data.requestId, ok: true, result });
+        }
+        return true;
+      }, opts.timeoutMs);
+      desktopBridge.register('main');
+      return calls;
+    };
+    const getJson = async (token: string, route: string) => {
+      const res = await fetch(`${base()}${route}`, { headers: bearer(token) });
+      expect(res.status).toBe(200);
+      return res.json() as Promise<Record<string, unknown>>;
+    };
+    type Row = Record<string, unknown>;
+
+    it('merges the desktop fields by id, never adding rows and never leaking a brain entry', async () => {
+      live.push({ ...brainRow }, {
+        id: 's-task-2', cwd: '/t2', cols: 80, rows: 24, state: 'detached',
+        agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+        env: { WMUX_WORKSPACE_ID: 'ws-task-2', WMUX_WORKSPACE_NAME: 'wtask: two' }, cmd: '/bin/zsh',
+      });
+      try {
+        const calls = attachDesktop(() => ({ workspaces: [], sidebar: sidebar() }));
+        const info = await startRO();
+        const token = info.token as string;
+        // Three concurrent polls across both routes share ONE desktop fetch.
+        const [sessionsBody, workspacesBody] = await Promise.all([
+          getJson(token, '/api/sessions'),
+          getJson(token, '/api/workspaces'),
+          getJson(token, '/api/sessions'),
+        ]);
+        expect(calls).toEqual(['workspaces.list']);
+
+        const sessions = sessionsBody.sessions as Row[];
+        expect(sessions.map((r) => r.id)).toEqual(['s1', 's2', 's3', 's-task-2']);
+        expect(sessions[0]).toMatchObject({ id: 's1', workspaceId: 'ws-1', surfaceTitle: '✳ app review', paneName: 'w123-5' });
+        expect(sessions[1]).toMatchObject({ id: 's2', workspaceId: 'ws-legacy' });
+        for (const key of ['surfaceTitle', 'paneName']) {
+          expect(key in sessions[1]).toBe(false);
+          expect(key in sessions[2]).toBe(false);
+        }
+
+        const workspaces = workspacesBody.workspaces as Row[];
+        expect(workspaces.map((w) => w.id)).toEqual(['ws-1', 'ws-task-2', 'ws-legacy']);
+        expect(workspaces[0]).toMatchObject({
+          id: 'ws-1', name: 'Workspace 1', order: 0, pinned: true, color: 'teal', gitBranch: 'main', gitIsWorktree: false,
+          gitSync: { ahead: 2, behind: 0, hasUpstream: true },
+          taskSummary: { tasks: 1, needYou: 0, toReview: 1, finished: 1 },
+        });
+        expect(workspaces[0]).not.toHaveProperty('ownerWorkspaceId');
+        const legacy = workspaces.find((w) => w.id === 'ws-legacy')!;
+        expect(legacy).toMatchObject({ order: 1, pinned: false, ownerWorkspaceId: 'ws-1', detached: false, createdAt: 1_700_000_000_000, nested: true });
+        expect(legacy).not.toHaveProperty('task');
+        expect(legacy).not.toHaveProperty('state');
+        // The desktop nests ws-task-2 under a workspace the phone does not list:
+        // on the phone it is not nested, and nobody's summary counts it.
+        const task2 = workspaces.find((w) => w.id === 'ws-task-2')!;
+        expect(task2).toMatchObject({ ownerWorkspaceId: 'ws-desktop-only', nested: false });
+        expect(workspaces.filter((w) => 'taskSummary' in w).map((w) => w.id)).toEqual(['ws-1']);
+        expect(workspacesBody.activeWorkspaceId).toBe('ws-1');
+
+        const wire = JSON.stringify([sessionsBody, workspacesBody]);
+        expect(JSON.stringify(workspacesBody)).not.toContain('"state"');
+        for (const leaked of ['brain-abc', 'ws-brain', 'orchestrator title', 'brain-branch', 'ghost', 'ws-unlisted-task']) {
+          expect(wire).not.toContain(leaked);
+        }
+        expect((workspacesBody.workspaces as Row[]).map((w) => w.id)).not.toContain('ws-desktop-only');
+      } finally {
+        live.length = 3;
+      }
+    });
+
+    it('passes a pending Moa hand-off notice through on its workspace row only, never a body', async () => {
+      const notice = { agentName: 'Claude Code', title: 'Fix the login redirect', raisedAt: 1_700_000_000_500 };
+      const plain = sidebar();
+      const base = { ...plain, workspaces: plain.workspaces.map((w, i) => (i === 0 ? { ...w, moaHandoff: notice, body: 'x'.repeat(64) } : w)) };
+      attachDesktop(() => ({ workspaces: [], sidebar: base }));
+      const info = await startRO();
+      const body = await getJson(info.token as string, '/api/workspaces');
+      const workspaces = body.workspaces as Row[];
+      expect(workspaces.find((w) => w.id === 'ws-1')).toMatchObject({ moaHandoff: notice });
+      expect(workspaces.filter((w) => 'moaHandoff' in w).map((w) => w.id)).toEqual(['ws-1']);
+      expect(JSON.stringify(body)).not.toContain('x'.repeat(64));
+    });
+
+    it("passes Moa's delegated jobs through at the top level, including a closed workspace's, and nothing when the desktop sent none", async () => {
+      const jobs = [
+        { taskId: 'task-2', workspaceId: 'ws-closed', agentName: 'Codex CLI', title: 'Done job', state: 'done', since: 1_700_000_000_900 },
+        { taskId: 'task-1', workspaceId: 'ws-1', agentName: 'Claude Code', title: 'Open job', state: 'blocked', since: 1_700_000_000_500 },
+      ];
+      attachDesktop(() => ({ workspaces: [], sidebar: { ...sidebar(), moaDelegations: [...jobs].reverse().map((j) => ({ ...j, result: 'secret report' })) } }));
+      const info = await startRO();
+      const body = await getJson(info.token as string, '/api/workspaces');
+      expect(body.moaDelegations).toEqual(jobs);
+      expect(JSON.stringify(body)).not.toContain('secret report');
+      await server.stop();
+      attachDesktop(() => ({ workspaces: [], sidebar: sidebar() }));
+      const older = await startRO();
+      expect(await getJson(older.token as string, '/api/workspaces')).not.toHaveProperty('moaDelegations');
+    });
+
+    it('merges the layout tree narrowed to the row\'s own live sessions, and lists the rest as unplaced', async () => {
+      const s1b = { ...live[0], id: 's1b' };
+      live.push({ ...brainRow }, s1b);
+      try {
+        const base = sidebar();
+        const layout = {
+          root: {
+            kind: 'split', direction: 'horizontal', sizes: [60, 40], children: [
+              // s2 is live but runs in ws-legacy by the daemon's own record.
+              { kind: 'leaf', paneId: 'pa', activeIndex: 2, surfaces: [{ surfaceId: 't1', kind: 'terminal', ptyId: 's1' }, { surfaceId: 't2', kind: 'terminal', ptyId: 's2' }, { surfaceId: 't3', kind: 'browser', title: 'Docs' }] },
+              // A brain session and one that is not live.
+              { kind: 'leaf', paneId: 'pb', activeIndex: 0, surfaces: [{ surfaceId: 't4', kind: 'terminal', ptyId: 'brain-abc' }, { surfaceId: 't5', kind: 'terminal', ptyId: 'ghost' }] },
+            ],
+          },
+          activePaneId: 'pb',
+        };
+        const workspacesWithLayout = base.workspaces.map((w) => (w.id === 'ws-1' ? { ...w, layout } : w));
+        attachDesktop(() => ({ workspaces: [], sidebar: { ...base, workspaces: workspacesWithLayout } }));
+        const info = await startRO();
+        const body = await getJson(info.token as string, '/api/workspaces');
+        const rows = body.workspaces as Row[];
+        const ws1 = rows.find((w) => w.id === 'ws-1')!;
+        expect(ws1.layout).toEqual({
+          root: {
+            kind: 'split', direction: 'horizontal', sizes: [60, 40], children: [
+              { kind: 'leaf', paneId: 'pa', activeIndex: 2, surfaces: [{ surfaceId: 't1', kind: 'terminal', ptyId: 's1' }, { surfaceId: 't2', kind: 'terminal' }, { surfaceId: 't3', kind: 'browser', title: 'Docs' }] },
+              { kind: 'leaf', paneId: 'pb', activeIndex: 0, surfaces: [{ surfaceId: 't4', kind: 'terminal' }, { surfaceId: 't5', kind: 'terminal' }] },
+            ],
+          },
+          activePaneId: 'pb',
+          unplaced: ['s1b'],
+        });
+        const wire = JSON.stringify(ws1.layout);
+        for (const leaked of ['brain-abc', 'ghost', '"s2"']) expect(wire).not.toContain(leaked);
+        // A row whose desktop entry has no tree carries none.
+        expect(rows.find((w) => w.id === 'ws-legacy')).not.toHaveProperty('layout');
+      } finally {
+        live.length = 3;
+      }
+    });
+
+    it('omits activeWorkspaceId when the active workspace is not a listed one', async () => {
+      live.push({ ...brainRow });
+      try {
+        attachDesktop(() => ({ workspaces: [], sidebar: sidebar('ws-brain') }));
+        const info = await startRO();
+        const body = await getJson(info.token as string, '/api/workspaces');
+        expect('activeWorkspaceId' in body).toBe(false);
+        expect(JSON.stringify(body)).not.toContain('ws-brain');
+      } finally {
+        live.length = 3;
+      }
+    });
+
+    it('omits every desktop key without a desktop, keeping the daemon-side workspaceId', async () => {
+      desktopBridge = null;
+      const info = await startRO();
+      const sessions = (await getJson(info.token as string, '/api/sessions')).sessions as Row[];
+      expect(sessions[0].workspaceId).toBe('ws-1');
+      expect(sessions.some((r) => 'surfaceTitle' in r || 'paneName' in r)).toBe(false);
+      const body = await getJson(info.token as string, '/api/workspaces');
+      expect('activeWorkspaceId' in body).toBe(false);
+      for (const w of body.workspaces as Row[]) expect(Object.keys(w).sort()).toEqual(['id', 'name', 'panes']);
+    });
+
+    /**
+     * A desktop whose every `workspaces.list` the test answers by hand, in
+     * order: `answer(i, value)` resolves request i, `fail(i, tag)` rejects it
+     * with a bridge error. While `autoReply` is set, a request is answered
+     * with it on arrival instead. `available` can be flipped to model a
+     * disconnect.
+     */
+    const manualDesktop = () => {
+      const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+      const stub = {
+        available: true,
+        autoReply: undefined as unknown,
+        request: vi.fn((_command: string) => new Promise<unknown>((resolve, reject) => {
+          pending.push({ resolve, reject });
+          if (stub.autoReply !== undefined) resolve(stub.autoReply);
+        })),
+      };
+      desktopBridge = stub as unknown as DesktopPhoneBridge;
+      return {
+        stub,
+        answer: (i: number, value: unknown) => pending[i].resolve(value),
+        fail: (i: number, tag: string) => pending[i].reject(new DesktopPhoneError(tag)),
+      };
+    };
+    /** Let a settled desktop answer run its handlers (they are promise callbacks). */
+    const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const snapshotTitled = (title: string) => ({ workspaces: [], sidebar: {
+      activeWorkspaceId: 'ws-1',
+      workspaces: [{ id: 'ws-1', order: 0, pinned: false }],
+      panes: [{ ptyId: 's1', workspaceId: 'ws-1', surfaceTitle: title, paneName: 'w1-1' }],
+    } });
+    const titleOf = async (token: string) => {
+      const sessions = (await getJson(token, '/api/sessions')).sessions as Row[];
+      return sessions.find((r) => r.id === 's1')?.surfaceTitle;
+    };
+
+    it('serves the current snapshot at once and refreshes it once in the background', async () => {
+      const desktop = manualDesktop();
+      const info = await startRO();
+      const token = info.token as string;
+      // First paint: a healthy desktop's first answer is in the first reply.
+      desktop.stub.autoReply = snapshotTitled('A');
+      expect(await titleOf(token)).toBe('A');
+      desktop.stub.autoReply = undefined;
+      expect(desktop.stub.request).toHaveBeenCalledTimes(1);
+      // Fresh: no new request.
+      clockOffsetMs += 500;
+      expect(await titleOf(token)).toBe('A');
+      expect(desktop.stub.request).toHaveBeenCalledTimes(1);
+      // Stale: answered from the snapshot immediately while ONE refresh runs.
+      clockOffsetMs += 1000;
+      expect(await titleOf(token)).toBe('A');
+      expect(await titleOf(token)).toBe('A');
+      expect((await getJson(token, '/api/workspaces')).activeWorkspaceId).toBe('ws-1');
+      expect(desktop.stub.request).toHaveBeenCalledTimes(2);
+      desktop.answer(1, snapshotTitled('B'));
+      await flush();
+      expect(await titleOf(token)).toBe('B');
+    });
+
+    it('never waits on a slow desktop past the shared first-paint deadline, and asks it once', async () => {
+      const desktop = manualDesktop();
+      const info = await startRO();
+      const token = info.token as string;
+      // The first poll waits out the (short, injected) first-paint window.
+      expect(await titleOf(token)).toBeUndefined();
+      // Past the deadline every poll answers at once, without the fields, and
+      // the single in-flight request is not duplicated.
+      clockOffsetMs += 5000;
+      expect(await titleOf(token)).toBeUndefined();
+      const body = await getJson(token, '/api/workspaces');
+      for (const w of body.workspaces as Row[]) expect(w).not.toHaveProperty('order');
+      expect(desktop.stub.request).toHaveBeenCalledTimes(1);
+      // When it finally answers, the next poll has the fields.
+      desktop.answer(0, snapshotTitled('late'));
+      await flush();
+      expect(await titleOf(token)).toBe('late');
+    });
+
+    it('keeps a good snapshot through transient failures for a bounded time, then omits it', async () => {
+      const desktop = manualDesktop();
+      const info = await startRO();
+      const token = info.token as string;
+      desktop.stub.autoReply = snapshotTitled('A');
+      expect(await titleOf(token)).toBe('A');
+      desktop.stub.autoReply = undefined;
+      // Refresh hits a full bridge: the snapshot keeps serving.
+      clockOffsetMs += 1500;
+      expect(await titleOf(token)).toBe('A');
+      desktop.fail(1, 'desktop-busy');
+      await flush();
+      expect(await titleOf(token)).toBe('A');
+      // Retried after the back-off, times out: still served, still bounded.
+      clockOffsetMs += 2500;
+      expect(await titleOf(token)).toBe('A');
+      expect(desktop.stub.request).toHaveBeenCalledTimes(3);
+      desktop.fail(2, 'desktop-timeout');
+      await flush();
+      expect(await titleOf(token)).toBe('A');
+      // Past the staleness bound (10 s after the snapshot) the fields go.
+      clockOffsetMs = 10_500;
+      expect(await titleOf(token)).toBeUndefined();
+    });
+
+    it('drops the fields at once when the desktop is gone', async () => {
+      const desktop = manualDesktop();
+      const info = await startRO();
+      const token = info.token as string;
+      desktop.stub.autoReply = snapshotTitled('A');
+      expect(await titleOf(token)).toBe('A');
+      desktop.stub.autoReply = undefined;
+      // The refresh learns the desktop disconnected: no stale serving.
+      clockOffsetMs += 1500;
+      expect(await titleOf(token)).toBe('A');
+      desktop.fail(1, 'desktop-disconnected');
+      await flush();
+      expect(await titleOf(token)).toBeUndefined();
+      // And a bridge that reports no desktop drops them without asking.
+      desktop.stub.available = false;
+      clockOffsetMs += 5000;
+      expect(await titleOf(token)).toBeUndefined();
+      expect(desktop.stub.request).toHaveBeenCalledTimes(2);
+    });
+
+    // Captured from a live fan-out (owner + "finish quickly" + "ask the user"):
+    // the renderer's projection, verbatim, as it crossed into the daemon.
+    const OWNER = 'ws-phone-e9b00e1b-60c6-46e4-9ae8-9b54e0b2cd77';
+    const TASK_DONE = 'ws-208c08e3-96bb-4b07-a9b4-e5bdad9728b6';
+    const TASK_ASK = 'ws-706df135-6033-47b7-bd3e-d0de474ea35a';
+    const PLAIN = 'ws-edaf3c5f-4aa1-420c-8c7c-12f4f7fdf5a4';
+    const liveFanoutSnapshot = {
+      activeWorkspaceId: OWNER,
+      workspaces: [
+        { id: PLAIN, order: 0, pinned: false, gitIsWorktree: false },
+        { id: OWNER, order: 1, pinned: false, gitBranch: 'main', gitIsWorktree: false, gitSync: { ahead: 0, behind: 0, hasUpstream: false } },
+        {
+          id: TASK_DONE, order: 2, pinned: false, gitBranch: 'wtask/finish-quickly-63gs0w4a', gitIsWorktree: true,
+          gitSync: { ahead: 0, behind: 0, hasUpstream: false },
+          task: { ownerWorkspaceId: OWNER, detached: false, createdAt: 1790368163922, nested: true, state: { needYou: false, toReview: true, finished: true } },
+        },
+        {
+          id: TASK_ASK, order: 3, pinned: false, gitBranch: 'wtask/ask-the-user-n9znqi5b', gitIsWorktree: true,
+          gitSync: { ahead: 0, behind: 0, hasUpstream: false },
+          task: { ownerWorkspaceId: OWNER, detached: false, createdAt: 1790368170163, nested: true, state: { needYou: true, toReview: false, finished: false } },
+        },
+      ],
+      panes: [
+        { ptyId: 'daemon-0567273e', workspaceId: PLAIN, surfaceTitle: 'Zsh', paneName: 'w1-1' },
+        { ptyId: 'daemon-41e038ce', workspaceId: OWNER, surfaceTitle: 'Zsh', paneName: 'w2-1' },
+        { ptyId: 'daemon-5b9aa7c3', workspaceId: TASK_DONE, surfaceTitle: '✳ Wmux task protocol and ledger', paneName: 'w3-1' },
+        { ptyId: 'daemon-4b1edf50', workspaceId: TASK_ASK, surfaceTitle: '✳ Tabs or spaces preference', paneName: 'w4-1' },
+      ],
+    };
+    const liveFanoutSessions = () => [
+      ['daemon-0567273e', PLAIN, 'Workspace 1'],
+      ['daemon-41e038ce', OWNER, 'fleet owner'],
+      ['daemon-5b9aa7c3', TASK_DONE, 'wtask: finish quickly'],
+      ['daemon-4b1edf50', TASK_ASK, 'wtask: ask the user'],
+    ].map(([id, ws, name]) => ({
+      id, cwd: '/repo', cols: 80, rows: 24, state: 'attached',
+      agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+      env: { WMUX_WORKSPACE_ID: ws, WMUX_WORKSPACE_NAME: name }, cmd: '/bin/zsh',
+    }));
+
+    it('still serves the fields on the first poll after a quiet spell (live fan-out data)', async () => {
+      // Regression: a snapshot older than the staleness bound because NOBODY
+      // polled (not because the desktop failed) was dropped, so any client
+      // polling less often than every 10 s saw no sidebar fields at all.
+      const fixture = live.splice(0, live.length, ...liveFanoutSessions());
+      try {
+        const calls = attachDesktop(() => ({ workspaces: [], sidebar: liveFanoutSnapshot }));
+        const info = await startRO();
+        const token = info.token as string;
+        const check = async () => {
+          const body = await getJson(token, '/api/workspaces');
+          expect(body.activeWorkspaceId).toBe(OWNER);
+          const rows = new Map((body.workspaces as Row[]).map((w) => [w.id as string, w]));
+          expect(rows.get(OWNER)).toMatchObject({ order: 1, gitBranch: 'main', taskSummary: { tasks: 2, needYou: 1, toReview: 1, finished: 1 } });
+          for (const id of [TASK_DONE, TASK_ASK]) expect(rows.get(id)).toMatchObject({ ownerWorkspaceId: OWNER, detached: false, nested: true });
+          expect(rows.get(PLAIN)).toMatchObject({ order: 0, gitIsWorktree: false });
+          const sessions = (await getJson(token, '/api/sessions')).sessions as Row[];
+          expect(sessions.find((r) => r.id === 'daemon-4b1edf50')).toMatchObject({ surfaceTitle: '✳ Tabs or spaces preference', paneName: 'w4-1' });
+        };
+        await check();
+        // Twelve quiet seconds, then a single poll.
+        clockOffsetMs += 12_000;
+        await check();
+        expect(calls).toEqual(['workspaces.list', 'workspaces.list']);
+      } finally {
+        live.splice(0, live.length, ...fixture);
+      }
+    });
+
+    it('keeps every other field when one live task row is malformed, and logs the reason once', async () => {
+      const logs: string[] = [];
+      const fixture = live.splice(0, live.length, ...liveFanoutSessions());
+      const logged = new WebTerminalServer({
+        sessionManager,
+        desktop: () => desktopBridge,
+        desktopSidebarFirstPaintMs: 150,
+        now: () => Date.now() + clockOffsetMs,
+        log: (level, msg) => { if (level === 'warn') logs.push(msg); },
+        assetsDir: os.tmpdir(),
+      } as ConstructorParameters<typeof WebTerminalServer>[0]);
+      try {
+        const broken = JSON.parse(JSON.stringify(liveFanoutSnapshot));
+        broken.workspaces[3].task.ownerWorkspaceId = { SECRET: 'value' };
+        attachDesktop(() => ({ workspaces: [], sidebar: broken }));
+        const info = await logged.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: false });
+        const get = async (route: string) => (await fetch(`http://127.0.0.1:${info.port}${route}`, { headers: bearer(info.token as string) })).json() as Promise<Record<string, unknown>>;
+        for (let i = 0; i < 3; i++) {
+          const body = await get('/api/workspaces');
+          const rows = new Map((body.workspaces as Row[]).map((w) => [w.id as string, w]));
+          expect(body.activeWorkspaceId).toBe(OWNER);
+          expect(rows.get(TASK_ASK)).toMatchObject({ order: 3, gitBranch: 'wtask/ask-the-user-n9znqi5b' });
+          expect(rows.get(TASK_ASK)).not.toHaveProperty('ownerWorkspaceId');
+          expect(rows.get(TASK_DONE)).toMatchObject({ ownerWorkspaceId: OWNER, nested: true });
+          expect(rows.get(OWNER)).toMatchObject({ taskSummary: { tasks: 1, needYou: 0, toReview: 1, finished: 1 } });
+          clockOffsetMs += 1500; // each poll after the first refreshes again
+        }
+        expect(logs.filter((m) => m.includes('sidebar'))).toEqual(['[web] desktop sidebar fields left out: workspace.task×1']);
+      } finally {
+        await logged.stop();
+        live.splice(0, live.length, ...fixture);
+      }
+    });
+
+    it('files tasks under the requesting pane only when this reply lists it, and drops it all when stale', async () => {
+      const task = (id: string, extra: Record<string, unknown>) => ({ id, order: 9, pinned: false, task: { ownerWorkspaceId: OWNER, detached: false, nested: true, ...extra } });
+      const snapshot = {
+        activeWorkspaceId: OWNER,
+        workspaces: [
+          { id: PLAIN, order: 0, pinned: false },
+          { id: OWNER, order: 1, pinned: false },
+          task('t-live', { paneGroup: 'pane', requesterPaneId: 'pane-a' }),
+          task('t-closed', { paneGroup: 'closedPane' }),
+          // Requester alive on the desktop, but a pane of browser tabs: no session here.
+          task('t-browser', { paneGroup: 'pane', requesterPaneId: 'pane-browser' }),
+          // Names a pane this reply lists — under another workspace.
+          task('t-foreign', { paneGroup: 'pane', requesterPaneId: 'pane-plain' }),
+          task('t-detached', { detached: true, nested: false }),
+          { id: 't-orphan', order: 9, pinned: false, task: { ownerWorkspaceId: 'ws-gone', detached: false, nested: false } },
+        ],
+        panes: [
+          { ptyId: 'd-plain', workspaceId: PLAIN, paneId: 'pane-plain', paneName: 'w1-1' },
+          { ptyId: 'd-a', workspaceId: OWNER, paneId: 'pane-a', paneName: 'w2-1' },
+          { ptyId: 'd-b', workspaceId: OWNER, paneId: 'pane-b', paneName: 'w2-2' },
+          // The desktop places this session in OWNER; the daemon runs it in PLAIN.
+          { ptyId: 'd-mis', workspaceId: OWNER, paneId: 'pane-mis', paneName: 'w2-3' },
+          ...['t-live', 't-closed', 't-browser', 't-foreign', 't-detached', 't-orphan'].map((id) => ({ ptyId: `d-${id}`, workspaceId: id, paneId: `pane-${id}` })),
+        ],
+      };
+      const sessions = [['d-plain', PLAIN], ['d-a', OWNER], ['d-b', OWNER], ['d-mis', PLAIN], ...['t-live', 't-closed', 't-browser', 't-foreign', 't-detached', 't-orphan'].map((id) => [`d-${id}`, id])]
+        .map(([id, ws]) => ({
+          id, cwd: '/repo', cols: 80, rows: 24, state: 'attached',
+          agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+          env: { WMUX_WORKSPACE_ID: ws, WMUX_WORKSPACE_NAME: ws }, cmd: '/bin/zsh',
+        }));
+      const fixture = live.splice(0, live.length, ...sessions);
+      try {
+        const desktop = manualDesktop();
+        const info = await startRO();
+        const token = info.token as string;
+        desktop.stub.autoReply = { workspaces: [], sidebar: snapshot };
+        const body = await getJson(token, '/api/workspaces');
+        desktop.stub.autoReply = undefined;
+        const rows = new Map((body.workspaces as Row[]).map((w) => [w.id as string, w]));
+        expect(rows.get('t-live')).toMatchObject({ nested: true, nestedUnder: 'pane', requesterPaneId: 'pane-a' });
+        expect(rows.get('t-closed')).toMatchObject({ nested: true, nestedUnder: 'closedPane' });
+        for (const id of ['t-browser', 't-foreign']) expect(rows.get(id)).toMatchObject({ nested: true });
+        for (const id of ['t-closed', 't-browser', 't-foreign', 't-detached', 't-orphan', OWNER, PLAIN]) {
+          expect(rows.get(id)).not.toHaveProperty('requesterPaneId');
+        }
+        for (const id of ['t-browser', 't-foreign', 't-detached', 't-orphan', OWNER, PLAIN]) expect(rows.get(id)).not.toHaveProperty('nestedUnder');
+        expect(rows.get('t-detached')).toMatchObject({ detached: true, nested: false });
+        expect(rows.get('t-orphan')).toMatchObject({ ownerWorkspaceId: 'ws-gone', nested: false });
+        // The requester is one of this reply's panes, under the owner.
+        expect(rows.get(OWNER)!.panes).toEqual([
+          expect.objectContaining({ sessionId: 'd-a', paneId: 'pane-a' }),
+          expect.objectContaining({ sessionId: 'd-b', paneId: 'pane-b' }),
+        ]);
+        const listed = (await getJson(token, '/api/sessions')).sessions as Row[];
+        expect(listed.find((r) => r.id === 'd-a')).toMatchObject({ paneId: 'pane-a', paneName: 'w2-1', workspaceId: OWNER });
+        expect(listed.find((r) => r.id === 'd-b')).toMatchObject({ paneId: 'pane-b' });
+        // Both routes expose the same pane ids: none where the workspaces disagree.
+        expect(listed.find((r) => r.id === 'd-mis')).toMatchObject({ paneName: 'w2-3' });
+        expect(listed.find((r) => r.id === 'd-mis')).not.toHaveProperty('paneId');
+        const routePaneIds = (body.workspaces as Row[]).flatMap((w) => (w.panes as Row[]).map((pane) => pane.paneId)).filter(Boolean).sort();
+        expect(listed.map((r) => r.paneId).filter(Boolean).sort()).toEqual(routePaneIds);
+        expect(JSON.stringify(body)).not.toContain('pane-browser');
+        // Stale past the bound: every desktop field goes, the new ones with them.
+        clockOffsetMs += 1500;
+        await getJson(token, '/api/workspaces');
+        desktop.fail(1, 'desktop-busy');
+        await flush();
+        clockOffsetMs += 9500;
+        const stale = await getJson(token, '/api/workspaces');
+        for (const w of stale.workspaces as Row[]) {
+          for (const key of ['order', 'nested', 'nestedUnder', 'requesterPaneId']) expect(w).not.toHaveProperty(key);
+          for (const pane of w.panes as Row[]) expect(pane).not.toHaveProperty('paneId');
+        }
+        for (const r of (await getJson(token, '/api/sessions')).sessions as Row[]) expect(r).not.toHaveProperty('paneId');
+      } finally {
+        live.splice(0, live.length, ...fixture);
+      }
+    });
+
+    it('answers at once without the fields when a quiet spell meets a hung desktop', async () => {
+      const desktop = manualDesktop();
+      const info = await startRO();
+      const token = info.token as string;
+      desktop.stub.autoReply = snapshotTitled('A');
+      expect(await titleOf(token)).toBe('A');
+      desktop.stub.autoReply = undefined;
+      clockOffsetMs += 12_000;
+      // One bounded wait on the refresh it started, then no more waiting and no duplicate request.
+      expect(await titleOf(token)).toBeUndefined();
+      clockOffsetMs += 1000;
+      expect(await titleOf(token)).toBeUndefined();
+      expect(desktop.stub.request).toHaveBeenCalledTimes(2);
+      desktop.answer(1, snapshotTitled('B'));
+      await flush();
+      expect(await titleOf(token)).toBe('B');
+    });
+
+    it('ignores a refresh that lands after the server restarted', async () => {
+      const desktop = manualDesktop();
+      let info = await startRO();
+      expect(await titleOf(info.token as string)).toBeUndefined(); // request 0 still pending
+      await server.stop();
+      info = await startRO();
+      const token = info.token as string;
+      expect(await titleOf(token)).toBeUndefined(); // request 1, under the new generation
+      expect(desktop.stub.request).toHaveBeenCalledTimes(2);
+      // The pre-restart answer lands: it must neither fill the cache nor free
+      // the new generation's in-flight slot.
+      desktop.answer(0, snapshotTitled('OLD'));
+      await flush();
+      clockOffsetMs += 5000;
+      expect(await titleOf(token)).toBeUndefined();
+      expect(desktop.stub.request).toHaveBeenCalledTimes(2);
+      desktop.answer(1, snapshotTitled('NEW'));
+      await flush();
+      expect(await titleOf(token)).toBe('NEW');
+    });
+
+    it('omits the fields when the desktop request fails', async () => {
+      const calls = attachDesktop(() => new Error('renderer unavailable'));
+      const info = await startRO();
+      const sessions = (await getJson(info.token as string, '/api/sessions')).sessions as Row[];
+      expect(calls).toEqual(['workspaces.list']);
+      expect(sessions.some((r) => 'surfaceTitle' in r || 'paneName' in r)).toBe(false);
+      expect(sessions[0].workspaceId).toBe('ws-1');
+    });
+
+    it('omits the fields for a desktop that predates them (no sidebar key)', async () => {
+      const calls = attachDesktop(() => ({ workspaces: [{ id: 'ws-1', name: 'Workspace 1', sessionId: 's1' }] }));
+      const info = await startRO();
+      const sessions = (await getJson(info.token as string, '/api/sessions')).sessions as Row[];
+      expect(calls).toEqual(['workspaces.list']);
+      expect(sessions.some((r) => 'surfaceTitle' in r || 'paneName' in r)).toBe(false);
+      const body = await getJson(info.token as string, '/api/workspaces');
+      for (const w of body.workspaces as Row[]) expect(Object.keys(w).sort()).toEqual(['id', 'name', 'panes']);
+    });
+
+    it('drops malformed desktop fields at the daemon boundary', async () => {
+      attachDesktop(() => ({ workspaces: [], sidebar: {
+        activeWorkspaceId: 'ws-1',
+        workspaces: [{ id: 'ws-1', order: 0, pinned: false, color: 'javascript:alert(1)', gitBranch: 'a\u0000b', extra: 'secret-extra' }],
+        panes: [{ ptyId: 's1', workspaceId: 'ws-1', surfaceTitle: 'x'.repeat(500), paneName: 'w1-1', cwd: '/secret-cwd' }],
+      } }));
+      const info = await startRO();
+      const sessions = (await getJson(info.token as string, '/api/sessions')).sessions as Row[];
+      expect(sessions[0]).toMatchObject({ paneName: 'w1-1' });
+      expect('surfaceTitle' in sessions[0]).toBe(false);
+      const body = await getJson(info.token as string, '/api/workspaces');
+      const ws1 = (body.workspaces as Row[]).find((w) => w.id === 'ws-1')!;
+      expect(ws1).toMatchObject({ order: 0, pinned: false });
+      expect(ws1).not.toHaveProperty('color');
+      expect(ws1).not.toHaveProperty('gitBranch');
+      expect(JSON.stringify(body)).not.toMatch(/secret-extra|secret-cwd/);
+    });
+
+    describe('the Moa HQ (role: "hq", /api/config moa)', () => {
+      /** The desktop's registry rows `/api/desktop-workspaces` forwards. */
+      const registryRows = [
+        { id: 'ws-1', name: 'Workspace 1', sessionId: 's1' },
+        { id: 'ws-legacy', name: 'Legacy', sessionId: 's2' },
+        { id: 'empty', name: 'Empty workspace', sessionId: null },
+      ];
+      const hqReply = (hqWorkspaceId: string, extra: Record<string, unknown> = {}, rows = sidebar().workspaces) => ({
+        workspaces: registryRows,
+        sidebar: { ...sidebar(), workspaces: rows, hqWorkspaceId, ...extra },
+      });
+      const roles = (rows: Row[]) => Object.fromEntries(rows.map((r) => [r.id, r.role ?? null]));
+
+      it('stamps role "hq" on the HQ\'s rows on all three routes, and on no other row', async () => {
+        attachDesktop(() => hqReply('ws-1'));
+        const info = await startRW();
+        const token = info.token as string;
+        const workspaces = (await getJson(token, '/api/workspaces')).workspaces as Row[];
+        expect(roles(workspaces)).toEqual({ 'ws-1': 'hq', 'ws-legacy': null });
+        const sessions = (await getJson(token, '/api/sessions')).sessions as Row[];
+        expect(roles(sessions)).toEqual({ s1: 'hq', s2: null, s3: null });
+        const registry = (await getJson(token, '/api/desktop-workspaces')).workspaces as Row[];
+        expect(roles(registry)).toEqual({ 'ws-1': 'hq', 'ws-legacy': null, empty: null });
+        // The projection itself is not part of the registry reply.
+        expect(registry.every((r) => !('sidebar' in r) && !('hqWorkspaceId' in r))).toBe(true);
+        for (const body of [workspaces, sessions, registry]) expect(JSON.stringify(body)).not.toContain('hqWorkspaceId');
+      });
+
+      it('stamps a session with no desktop label and a row with no sidebar entry by the daemon\'s own workspace record', async () => {
+        // ws-legacy is the HQ; the desktop sends no row for it and s2 has no pane label.
+        attachDesktop(() => hqReply('ws-legacy', {}, sidebar().workspaces.filter((w) => w.id !== 'ws-legacy')));
+        const info = await startRO();
+        const token = info.token as string;
+        const workspaces = (await getJson(token, '/api/workspaces')).workspaces as Row[];
+        expect(roles(workspaces)).toEqual({ 'ws-1': null, 'ws-legacy': 'hq' });
+        const sessions = (await getJson(token, '/api/sessions')).sessions as Row[];
+        expect(roles(sessions)).toEqual({ s1: null, s2: 'hq', s3: null });
+      });
+
+      it('tags every session of a multi-pane HQ, and never a task workspace the HQ delegated to', async () => {
+        const HQ = 'ws-hq';
+        const TASK = 't-from-hq';
+        const PLAIN = 'ws-plain';
+        const snapshot = {
+          activeWorkspaceId: HQ,
+          hqWorkspaceId: HQ,
+          workspaces: [
+            { id: PLAIN, order: 0, pinned: false },
+            { id: HQ, order: 1, pinned: false },
+            // A fan-out task the HQ started: owned by the HQ, nested under it.
+            { id: TASK, order: 2, pinned: false, task: { ownerWorkspaceId: HQ, detached: false, nested: true, paneGroup: 'pane', requesterPaneId: 'pane-h1' } },
+          ],
+          panes: [
+            { ptyId: 'h-1', workspaceId: HQ, paneId: 'pane-h1', paneName: 'w2-1' },
+            { ptyId: 'h-2', workspaceId: HQ, paneId: 'pane-h2', paneName: 'w2-2' },
+            { ptyId: 'h-3', workspaceId: HQ, paneId: 'pane-h2', paneName: 'w2-2' },
+            { ptyId: 't-1', workspaceId: TASK, paneId: 'pane-t1', paneName: 'w3-1' },
+            { ptyId: 'p-1', workspaceId: PLAIN, paneId: 'pane-p1', paneName: 'w1-1' },
+          ],
+        };
+        const sessions = [['h-1', HQ], ['h-2', HQ], ['h-3', HQ], ['t-1', TASK], ['p-1', PLAIN]].map(([id, ws]) => ({
+          id, cwd: '/repo', cols: 80, rows: 24, state: 'attached',
+          agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+          env: { WMUX_WORKSPACE_ID: ws, WMUX_WORKSPACE_NAME: ws }, cmd: '/bin/zsh',
+        }));
+        const fixture = live.splice(0, live.length, ...sessions);
+        try {
+          attachDesktop(() => ({
+            workspaces: [
+              { id: HQ, name: 'Moa', sessionId: 'h-1' },
+              { id: TASK, name: 'task', sessionId: 't-1' },
+              { id: PLAIN, name: 'plain', sessionId: 'p-1' },
+            ],
+            sidebar: snapshot,
+          }));
+          const info = await startRW();
+          const token = info.token as string;
+          const listed = (await getJson(token, '/api/sessions')).sessions as Row[];
+          expect(roles(listed)).toEqual({ 'h-1': 'hq', 'h-2': 'hq', 'h-3': 'hq', 't-1': null, 'p-1': null });
+          const workspaces = (await getJson(token, '/api/workspaces')).workspaces as Row[];
+          expect(roles(workspaces)).toEqual({ [PLAIN]: null, [HQ]: 'hq', [TASK]: null });
+          // The task still says who owns it, so the phone can nest it — just not as HQ.
+          expect(workspaces.find((w) => w.id === TASK)).toMatchObject({ ownerWorkspaceId: HQ, nested: true });
+          const registry = (await getJson(token, '/api/desktop-workspaces')).workspaces as Row[];
+          expect(roles(registry)).toEqual({ [HQ]: 'hq', [TASK]: null, [PLAIN]: null });
+        } finally {
+          live.splice(0, live.length, ...fixture);
+        }
+      });
+
+      it('carries no role without an HQ, without a desktop, or for a malformed HQ id', async () => {
+        attachDesktop(() => ({ workspaces: registryRows, sidebar: sidebar() }));
+        let info = await startRW();
+        for (const route of ['/api/workspaces', '/api/sessions', '/api/desktop-workspaces']) {
+          expect(JSON.stringify(await getJson(info.token as string, route))).not.toContain('"role"');
+        }
+        await server.stop();
+        attachDesktop(() => hqReply('ws-1\u202e'));
+        info = await startRW();
+        for (const route of ['/api/workspaces', '/api/sessions', '/api/desktop-workspaces']) {
+          expect(JSON.stringify(await getJson(info.token as string, route))).not.toContain('"role"');
+        }
+        await server.stop();
+        desktopBridge = null;
+        info = await startRW();
+        for (const route of ['/api/workspaces', '/api/sessions']) {
+          expect(JSON.stringify(await getJson(info.token as string, route))).not.toContain('"role"');
+        }
+      });
+
+      it('advertises moa only while the desktop says Moa is on, even on the first, cold /api/config', async () => {
+        attachDesktop(() => hqReply('ws-1', { moa: true }));
+        let info = await startRO();
+        // No list route polled first: the config answer waits for the first snapshot.
+        expect((await getJson(info.token as string, '/api/config')).moa).toBe(true);
+        await server.stop();
+        // HQ designated, Moa off (or HQ missing): the row is still HQ, moa is omitted.
+        attachDesktop(() => hqReply('ws-1'));
+        info = await startRO();
+        expect('moa' in (await getJson(info.token as string, '/api/config'))).toBe(false);
+        expect(roles((await getJson(info.token as string, '/api/workspaces')).workspaces as Row[])['ws-1']).toBe('hq');
+        await server.stop();
+        // A desktop that sends anything but true.
+        attachDesktop(() => hqReply('ws-1', { moa: 'yes' }));
+        info = await startRO();
+        expect('moa' in (await getJson(info.token as string, '/api/config'))).toBe(false);
+        await server.stop();
+        desktopBridge = null;
+        info = await startRO();
+        expect('moa' in (await getJson(info.token as string, '/api/config'))).toBe(false);
+      });
+
+      it('names the Moa pane in /api/config only beside moa and only while main vouches for a live HQ brain', async () => {
+        const hqBrain = { ...brainRow, id: 'brain-hq', env: { WMUX_BRAIN_PTY: '1', WMUX_WORKSPACE_ID: 'ws-1' } };
+        live.push(hqBrain);
+        try {
+          attachDesktop(() => hqReply('ws-1', { moa: true }));
+          moaFact = { sessionId: 'brain-hq', workspaceId: 'ws-1' };
+          let info = await startRO();
+          const phone = await pairDevice('Phone');
+          const config = await getJson(phone.token, '/api/config');
+          expect(config).toMatchObject({ moa: true, moaSessionId: 'brain-hq' });
+          // Never the brain's env, cwd or anything else about the pane.
+          expect(JSON.stringify(config)).not.toContain('WMUX_BRAIN_PTY');
+          // The pane itself stays out of the session list.
+          expect(((await getJson(phone.token, '/api/sessions')).sessions as Row[]).map((r) => r.id)).not.toContain('brain-hq');
+          // Withdrawn by main (Moa off, HQ changed or missing, brain gone): gone at once,
+          // even while the sidebar snapshot still says moa.
+          moaFact = null;
+          expect('moaSessionId' in (await getJson(phone.token, '/api/config'))).toBe(false);
+          // A fact that no longer matches a live HQ brain names nothing.
+          for (const fact of [{ sessionId: 'brain-gone', workspaceId: 'ws-1' }, { sessionId: 'brain-hq', workspaceId: 'ws-2' }, { sessionId: 'brain-abc', workspaceId: 'ws-1' }]) {
+            moaFact = fact;
+            expect('moaSessionId' in (await getJson(phone.token, '/api/config'))).toBe(false);
+          }
+          await server.stop();
+          // The desktop says Moa is off: no moaSessionId even with a fact standing.
+          attachDesktop(() => hqReply('ws-1'));
+          moaFact = { sessionId: 'brain-hq', workspaceId: 'ws-1' };
+          info = await startRO();
+          const off = await getJson(info.token as string, '/api/config');
+          expect('moa' in off || 'moaSessionId' in off).toBe(false);
+        } finally {
+          live.splice(live.indexOf(hqBrain), 1);
+        }
+      });
+
+      it('still delivers an approval raised in the HQ to a paired phone, on /api/approvals and /api/events', async () => {
+        attachDesktop(() => hqReply('ws-1', { moa: true }));
+        await startRW();
+        const phone = await pairDevice('Phone');
+        // The HQ is known to the daemon before the approval lands.
+        expect(roles((await getJson(phone.token, '/api/sessions')).sessions as Row[]).s1).toBe('hq');
+        approvalRecords.push(mkApproval({ id: 'ap-hq', sessionId: 's1', kind: 'awaiting_permission', toolName: 'Bash' }));
+        emitApproval('create', mkApproval({ id: 'ap-hq-event', sessionId: 's1' }));
+        const approvals = (await getJson(phone.token, '/api/approvals')) as { pending?: Row[] };
+        expect(approvals.pending?.map((r) => r.id)).toEqual(['ap-hq']);
+        expect(approvals.pending?.[0]).toMatchObject({ sessionId: 's1', toolName: 'Bash' });
+        const backlog = JSON.stringify(await getJson(phone.token, '/api/events'));
+        expect(backlog).toContain('ap-hq-event');
+      });
+    });
+
+    it('advertises fleetSidebar when a desktop bridge is wired, attached or not', async () => {
+      // Wired, nothing attached (the getter returns no bridge right now).
+      desktopBridge = null;
+      let info = await startRO();
+      expect((await getJson(info.token as string, '/api/config')).fleetSidebar).toBe(true);
+      await server.stop();
+      attachDesktop(() => ({ workspaces: [], sidebar: sidebar() }));
+      info = await startRO();
+      expect((await getJson(info.token as string, '/api/config')).fleetSidebar).toBe(true);
+      expect((await getJson(info.token as string, '/api/config')).moaDelegations).toBe(true);
+    });
+
+    it('omits fleetSidebar from a daemon with no desktop bridge wired', async () => {
+      const bare = new WebTerminalServer({
+        sessionManager,
+        log: () => { /* silent in tests */ },
+        assetsDir: os.tmpdir(),
+      } as ConstructorParameters<typeof WebTerminalServer>[0]);
+      const info = await bare.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: false });
+      try {
+        const res = await fetch(`http://127.0.0.1:${info.port}/api/config`, { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+        const config = (await res.json()) as Record<string, unknown>;
+        expect('fleetSidebar' in config).toBe(false);
+        expect('moaDelegations' in config).toBe(false);
+      } finally {
+        await bare.stop();
       }
     });
   });
@@ -4367,6 +10281,73 @@ describe('WebTerminalServer', () => {
       expect(first).toContain('\x1b[?2004h');
       // No alt-screen switch was sent, so none is asserted.
       expect(first).not.toContain('\x1b[?1049h');
+    });
+
+    /** Open the stream and return the `meta` that precedes the first snapshot. */
+    const firstSnapshotMeta = async (): Promise<Record<string, unknown>> => {
+      const info = await startRO();
+      const ac = new AbortController();
+      const text = await readStream(
+        `${base()}/api/stream?session=s1&token=${encodeURIComponent(info.token as string)}`,
+        ac,
+        (t) => snapshots(t).length >= 1,
+      );
+      ac.abort();
+      const [meta] = metas(text);
+      expect(meta).toBeDefined();
+      return meta;
+    };
+
+    it('★ stamps the snapshot meta with commandRunning so the client can disarm a dead TUI\'s mouse mode', async () => {
+      // The web client feeds this to the shared staleReplayResetLevel gate:
+      // `false` (shell at its prompt) is what earns the mouse/focus reset.
+      primeRing('\x1b[?1003h\x1b[?1006h');
+      resumeStates = { s1: { commandRunning: false } };
+      expect((await firstSnapshotMeta()).commandRunning).toBe(false);
+    });
+
+    it('stamps the snapshot meta with the inline images switch (#1641)', async () => {
+      expect((await firstSnapshotMeta()).inlineImages).toBe(true);
+      await server.stop();
+      const info = await server.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: false, inlineImages: false });
+      const ac = new AbortController();
+      const text = await readStream(
+        `${base()}/api/stream?session=s1&token=${encodeURIComponent(info.token as string)}`,
+        ac,
+        (t) => snapshots(t).length >= 1,
+      );
+      ac.abort();
+      expect(metas(text)[0].inlineImages).toBe(false);
+    });
+
+    it('omits commandRunning from the snapshot meta when the shell reports no prompt state', async () => {
+      primeRing('\x1b[?1003h\x1b[?1006h');
+      resumeStates = { s1: {} };
+      const meta = await firstSnapshotMeta();
+      expect(meta).not.toHaveProperty('commandRunning');
+      expect(meta).not.toHaveProperty('resumeAgent');
+    });
+
+    it('★ stamps resumeAgent for a pane recovered after a daemon restart (empty prompt log)', async () => {
+      // After a restart the prompt log is empty, so commandRunning is absent;
+      // the recovery hint is what tells the client the arming process is dead
+      // — the same input the desktop's pty.list gate reads.
+      primeRing('\x1b[?1003h\x1b[?1006h\x1b[?2004h');
+      resumeStates = { s1: { resumeAgent: 'claude' } };
+      const meta = await firstSnapshotMeta();
+      expect(meta.resumeAgent).toBe('claude');
+      expect(meta).not.toHaveProperty('commandRunning');
+    });
+
+    it('keeps resumeAgent off /api/workspaces (snapshot meta only)', async () => {
+      resumeStates = { s1: { resumeAgent: 'claude', commandRunning: false } };
+      const info = await startRO();
+      const res = await fetch(`${base()}/api/workspaces`, { headers: { Authorization: `Bearer ${info.token as string}` } });
+      expect(res.status).toBe(200);
+      const raw = JSON.stringify(await res.json());
+      // Non-vacuous: s1 is listed with its other resume facts.
+      expect(raw).toContain('"commandRunning":false');
+      expect(raw).not.toContain('resumeAgent');
     });
 
     it('ends just this stream when the initial frame cannot be built', async () => {

@@ -12,6 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { isSmallTalk } from '../smallTalk';
 import {
   beginOrContinueDeckWork,
   recordDeckWorkA2aTask,
@@ -29,6 +30,7 @@ import {
   loadLiveDeckWork,
   loadLiveDeckWorks,
   unparkDeckWork,
+  operatorDecisionContext,
 } from '../deckWorkStore';
 
 let dir: string;
@@ -106,11 +108,26 @@ describe('deckWorkStore — ownership lifecycle', () => {
   });
 
   it('caps the follow-up list, keeping the most recent', () => {
-    beginOrContinueDeckWork('ws-1', 'objective', dir);
-    for (let i = 1; i <= 20; i++) beginOrContinueDeckWork('ws-1', `step ${i}`, dir);
-    const work = loadActiveDeckWork('ws-1', dir)!;
-    expect(work.followUps.length).toBeLessThanOrEqual(12);
-    expect(work.followUps.at(-1)).toBe('step 20');
+    // Seed a record just under the 12-item cap with one raw write, then append
+    // three times through the store: the first append fills the list, the next
+    // two cross the cap, each through its own load/save cycle. Appending 20
+    // times through the store meant 21 durable, rotating atomic writes, which
+    // timed out on loaded Windows runners.
+    const work = beginOrContinueDeckWork('ws-1', 'objective', dir)!.work;
+    const seeded = Array.from({ length: 11 }, (_, i) => `step ${i + 1}`);
+    writeFileSync(
+      getDeckWorkPath(dir),
+      JSON.stringify({ version: 1, active: { 'ws-1': { ...work, followUps: seeded } } }),
+      'utf8',
+    );
+    expect(loadActiveDeckWork('ws-1', dir)!.followUps).toEqual(seeded);
+
+    for (let i = 12; i <= 14; i++) beginOrContinueDeckWork('ws-1', `step ${i}`, dir);
+    const capped = loadActiveDeckWork('ws-1', dir)!;
+    expect(capped.followUps.length).toBeLessThanOrEqual(12);
+    expect(capped.followUps.at(-1)).toBe('step 14');
+    expect(capped.followUps).not.toContain('step 1');
+    expect(capped.followUps).not.toContain('step 2');
   });
 
   it('refuses an empty or whitespace-only request', () => {
@@ -538,6 +555,15 @@ describe('renderActiveDeckWorkBlock', () => {
     expect(block).toMatch(/do NOT finish it/i);
   });
 
+  it('asks only for the closed list of forks, with a recommendation, and forbids progress reports', () => {
+    beginOrContinueDeckWork('ws-1', 'ship the roster', dir, 1_000);
+    const flat = renderActiveDeckWorkBlock(loadActiveDeckWork('ws-1', dir)!).replace(/\s+/g, ' ');
+    expect(flat).toContain('that one final report is all they hear, so no progress reports.');
+    expect(flat).toContain('Settle forks yourself (lookups first, then production impact).');
+    expect(flat).toContain('Use deck_ask_decision only for taste, a release, an irreversible outside action, a security-boundary change or ambiguous operator intent, with your recommended option first, and leave this work active.');
+    expect(flat).not.toContain('If blocked on a real human fork');
+  });
+
   it('lists tracked tasks as POINTERS and tells the brain to query canonical state', () => {
     beginOrContinueDeckWork('ws-1', 'objective', dir, 1_000);
     recordDeckWorkA2aTask(
@@ -597,3 +623,38 @@ describe('renderActiveDeckWorkBlock', () => {
     expect(block).not.toContain('Continue delegating');
   });
 });
+
+describe('deckWorkStore — small talk is not work', () => {
+  it('reads a thank-you or a greeting, alone, as small talk', () => {
+    for (const t of ['ㅋㅋㅋ', 'ㅎㅎ', 'lol', 'haha', '👍', '🙏🙏', 'ㅋㅋ 👍', '고마워', '고마워요!', '감사합니다 :)', '수고했어 ㅎㅎ', '정말 고마워요 🙏', '안녕하세요', 'ㄱㅅ', 'Thanks!', 'thank you so much', 'hi Moa', 'Good morning', 'nice work']) {
+      expect(isSmallTalk(t), t).toBe(true);
+    }
+  });
+
+  it('anything that asks for something is work', () => {
+    for (const t of ['math.js에 빼기 함수 추가해줘', '고마워, 이제 테스트도 돌려줘', 'thanks, now run the tests', 'ok', '네', '좋아', 'hi, what is running?', '', '   ']) {
+      expect(isSmallTalk(t), t).toBe(false);
+    }
+    expect(isSmallTalk('고마워 '.repeat(20))).toBe(false);
+  });
+});
+
+describe('operatorDecisionContext', () => {
+  it('reduces a PARKED brain block to the request it is about', () => {
+    const ctx = [
+      '[active-work PARKED] id: work-1',
+      'objective: ship the fleet rework',
+      'tracked A2A tasks (query canonical state before acting):',
+      '- task=task-1 to=ws-gone state=canceled',
+      'This request predates the current wmux session, so it is PARKED: it is recorded but NOT authorization to act.',
+      'Ask the human whether to resume or drop it (deck_ask_decision) and wait for the answer.',
+    ].join('\n');
+    expect(operatorDecisionContext(ctx)).toBe('Earlier request: "ship the fleet rework"');
+  });
+
+  it('does the same for a dropped-work block, and passes the brain\'s own prose through', () => {
+    expect(operatorDecisionContext('[dropped-work] id: work-2\nobjective: x')).toBe('Earlier request: "x"');
+    expect(operatorDecisionContext('Two options; I recommend A.')).toBe('Two options; I recommend A.');
+  });
+});
+

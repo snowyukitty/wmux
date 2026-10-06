@@ -1,5 +1,8 @@
 /** Utilities for safe PTY delivery of structured inter-agent messages. */
 
+import { agentDisplayToSlug, isAgentSlug, type AgentSlug } from './agentIdentity';
+import type { FreshContextReply } from './freshContext';
+
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
 const VISIBLE_ESCAPE = '␛';
@@ -19,4 +22,255 @@ export function formatBracketedPastePayload(text: string): string {
 
 export function isMultilinePtyPayload(text: string): boolean {
   return text.includes('\n') || text.includes('\r');
+}
+
+// ---------------------------------------------------------------------------
+// Per-agent submit profile (#1337)
+// ---------------------------------------------------------------------------
+//
+// Every structured message wmux pushes into an agent pane is written as two
+// separate PTY writes: the bracketed paste, then Enter after a gap.
+//
+//   t=0                      t=SUBMIT DELAY
+//   ├── ESC[200~ … ESC[201~  ├── '\r'
+//   │   (paste lands in the  │   (agent's composer submits — or does not)
+//   │    agent's composer)   │
+//
+// The gap is not cosmetic. A TUI that classifies a rapid run of input as a
+// paste (Codex ships `tui/src/bottom_pane/paste_burst.rs` and a
+// `disable_paste_burst` config key) can absorb an Enter that arrives while the
+// burst is still open, leaving the nudge in the composer with no turn started.
+// That is the most likely mechanism behind #1337; it is inferred from the
+// render-timing measurements below, not observed directly in Codex's input
+// buffer (see the bound stated after the table).
+//
+// MEASURED, not reasoned. codex-cli 0.154.0, driven through a real ConPTY on
+// Windows, fed the exact bytes this function writes (bracketed paste, wait,
+// CR), screen read back with a headless terminal and scored on the COMPOSER:
+// a composer showing its placeholder took the draft, a composer still holding
+// the nudge did not.
+//
+// Two machines, same binary and probe, pooled:
+//
+//     gap     paste PAINTED in the composer     nudge stranded
+//             by the time the CR was written
+//     100 ms  7 of 40 runs                      2 of 40 runs
+//     500 ms  20 of 20 runs                     0 of 20 runs
+//
+// The RACE is the durable finding, not the rate. At 100 ms the Enter is
+// usually written before the paste is even on screen; at 500 ms it never was.
+// That ordering reproduced on both machines (5 of 20 and 2 of 20 painted at
+// 100 ms, 10 of 10 each at 500 ms). The stranding is bursty and rare — both
+// failures fell in one batch of ten, and the second machine saw 0 in 20 — so
+// a short clean run does not disprove it and a short bad run does not size it.
+// Roughly 5% here; do not quote it as a rate.
+//
+// WHAT THE ORDERING SIGNAL ACTUALLY IS, since the last table got over-read:
+// it is read off the RENDERED SCREEN, so it says the paste had not been
+// PAINTED yet, not that Codex's input buffer had not received it. The
+// mechanism is an inference from render timing plus correlation (both stranded
+// runs sat in the not-yet-painted group, and every 500 ms run was painted
+// first), not a direct observation of the buffer. It is enough to size a
+// conservative default. It is not proof of what the burst logic did.
+//
+// Do not trust any "stranded" count taken before this scorer existed: the
+// earlier one keyed on the "Working" footer, which disappears as soon as the
+// turn fails, so it miscounted submitted runs as stranded. It could not
+// produce the opposite error, so its "submitted" observations still stand —
+// which is why 300, 350, 400, 600, 800, 1000 and 2000 ms are all still known
+// to submit.
+//
+// Two facts are keyed off the same signal, so they live in one table rather
+// than two parallel ones that can drift:
+//
+//   submitDelayMs — how long to wait before Enter.
+//   assurance     — whether wmux may claim the Enter actually started a turn.
+//
+// `assured` is reserved for Claude Code: wmux has a hook bridge that proves
+// turn start there (agent.user_prompt_submit / agent.stop) and the whole of
+// its dogfood history behind a bare CR. Every other agent, Codex included, is
+// `unverified` — wmux writes the bytes and has no way to learn whether the
+// composer took them. Same discipline as `keystrokesForAgent` in
+// `src/daemon/approvals/approvalKeystrokes.ts`: an agent we have not measured
+// gets the conservative answer, never a guess.
+//
+// UNKNOWN IS UNVERIFIED. A pane whose agent we cannot name may be a bare
+// shell, a remote session, or an agent this build predates. None of those is
+// evidence that Enter submitted anything.
+
+/** Whether wmux can vouch that a written Enter actually submitted the draft. */
+export type SubmitAssurance = 'assured' | 'unverified';
+
+export interface AgentSubmitProfile {
+  /** Gap between the bracketed paste and the Enter that submits it. */
+  submitDelayMs: number;
+  assurance: SubmitAssurance;
+}
+
+/**
+ * The gap that has always been used, and the only one with production proof
+ * behind it (Claude Code panes, every A2A nudge since the feature shipped).
+ */
+export const DEFAULT_SUBMIT_DELAY_MS = 100;
+
+/**
+ * The gap for agents that run a paste-burst heuristic on their input. See the
+ * measurement table above for where this number comes from. It is sized to
+ * close a race, not to beat an exact threshold: 500 ms is where the paste was
+ * observed to have reached the composer before the Enter in every run.
+ *
+ * The tradeoff being accepted: a wider gap is also a wider window in which a
+ * human can type into the same composer before our Enter lands, submitting a
+ * mixed draft. The nudge path has never guarded that (unlike
+ * `deliverScheduledPrompt`, which aborts when the input revision moved), so
+ * this trades a rare mixed draft for a nudge that actually arrives. The old
+ * 100 ms was not a safe window either, just a narrower one.
+ */
+export const PASTE_BURST_SUBMIT_DELAY_MS = 500;
+
+/**
+ * Agents known to classify rapid input as a paste, so an Enter written too
+ * soon after the paste is swallowed by the burst instead of submitting.
+ *
+ * Codex only, and only because the heuristic is named in the shipped binary.
+ * Adding a slug here is a claim about that agent's input handling; make it
+ * from a measurement, not from a family resemblance.
+ */
+const PASTE_BURST_AGENTS: ReadonlySet<AgentSlug> = new Set<AgentSlug>(['codex']);
+
+/**
+ * Agents whose Enter wmux may report as a real submit. Deliberately one entry
+ * — see the header. Widening this set means claiming a receipt on the
+ * sender's behalf, so it needs the same kind of evidence Claude's hook bridge
+ * provides, not a successful manual test.
+ */
+const SUBMIT_ASSURED_AGENTS: ReadonlySet<AgentSlug> = new Set<AgentSlug>(['claude']);
+
+/**
+ * A pane state in which even Claude's Enter does not start a turn: the TUI is
+ * showing a question or approval dialog, so the CR ANSWERS the dialog. Reported
+ * by the AskUserQuestion hook and by the detector's approval-prompt regexes.
+ */
+const AWAITING_INPUT_STATUS = 'awaiting_input';
+
+/**
+ * Resolve the submit profile for a pane.
+ *
+ * `agent` is whatever the caller has: the canonical slug, or the DISPLAY name
+ * the renderer carries in `surfaceAgent[ptyId].name` / workspace metadata
+ * ("Codex CLI", not "codex"). Both are accepted because both are what call
+ * sites actually hold, and a display name silently failing to match the table
+ * would be an invisible regression to the old global behavior.
+ *
+ * `agentStatus` only ever narrows `assurance`, never widens it. An ABSENT
+ * status stays assured for Claude: a Claude composer takes a CR as a submit,
+ * which is the behavior every nudge has relied on. It is specifically
+ * `awaiting_input` that breaks the claim, because there the CR is an answer to
+ * a dialog rather than the start of a turn.
+ */
+export function submitProfileForAgent(
+  agent?: string | null,
+  agentStatus?: string | null,
+): AgentSubmitProfile {
+  const slug = resolveAgentSlug(agent);
+  const assured =
+    !!slug && SUBMIT_ASSURED_AGENTS.has(slug) && agentStatus !== AWAITING_INPUT_STATUS;
+  return {
+    submitDelayMs:
+      slug && PASTE_BURST_AGENTS.has(slug) ? PASTE_BURST_SUBMIT_DELAY_MS : DEFAULT_SUBMIT_DELAY_MS,
+    assurance: assured ? 'assured' : 'unverified',
+  };
+}
+
+/**
+ * Accept a slug or a display name; anything else resolves to no agent. Both
+ * lookups come from `agentIdentity`'s canonical table, so a newly added agent
+ * is recognised here without touching this file — while the behavior tables
+ * above stay explicit opt-in.
+ */
+export function resolveAgentSlug(agent?: string | null): AgentSlug | undefined {
+  if (!agent) return undefined;
+  return agentDisplayToSlug(agent) ?? (isAgentSlug(agent) ? agent : undefined);
+}
+
+/**
+ * Outcome of a gated paste-and-submit (main's `gatedPasteSubmit`, reached from
+ * the renderer over IPC.GATED_SUBMIT). `approval_pending`: an approval is in
+ * front of the pane, send again once it is answered. `gate_unavailable`: the
+ * gate could not decide (screen unreadable, IPC failure), retry shortly.
+ * `pasted`: the text reached the composer but the Enter was withheld.
+ * `fresh_context_busy` (#1680): another new-task delivery held the pane too
+ * long; nothing was written.
+ * `fresh_context_timeout` (#1680): a new-task delivery typed the pane's
+ * fresh-context command and never saw it finish, so the text was not written.
+ * `usage_limited`: the pane hit its provider's usage limit and is held until
+ * the window resets (shared/usageLimit); nothing was written.
+ * `user_typing`: a `waitQuiet` delivery found a draft in the composer or keys
+ * still arriving within its wait; nothing was written.
+ */
+export interface GatedSubmitRefusal {
+  ok: false;
+  reason:
+    | 'approval_pending'
+    | 'gate_unavailable'
+    | 'write_failed'
+    | 'fresh_context_timeout'
+    | 'fresh_context_busy'
+    | 'usage_limited'
+    /** A `waitQuiet` delivery: the person kept typing (or left a draft) in
+     *  the pane, so nothing was written (or, after the paste, no Enter). */
+    | 'user_typing'
+    /** A `waitQuiet` delivery: the agent it was aimed at left the pane or was
+     *  replaced (or the pane is back at a shell). */
+    | 'agent_changed'
+    /** A `waitQuiet` delivery: the pane's agent could not be read, so it could
+     *  not be verified (a local pty, no daemon, or a failed read). */
+    | 'agent_unverified'
+    /** A `waitQuiet` delivery ran past its deadline; the sender has given up. */
+    | 'deadline'
+    /** A `waitQuiet` delivery carrying main's `guardKey`: main's own check for
+     *  that delivery refused it (e.g. Moa's auto hand-off saw a mode change). */
+    | 'guard_refused';
+  detail: string;
+  pasted?: boolean;
+  /** With `pasted`: whether the pasted text was cleared again (best effort:
+   *  one Ctrl+U, which empties an agent's composer or a shell's line). */
+  cleared?: boolean;
+}
+/** A delivered submit. A new-task delivery also says what its fresh-context
+ *  step did (shared/freshContext). */
+export type GatedSubmitSuccess = { ok: true } & Partial<FreshContextReply>;
+export type GatedSubmitResult = GatedSubmitSuccess | GatedSubmitRefusal;
+
+/** Options for a gated submit. */
+export interface GatedSubmitOptions {
+  /** The delivery starts a NEW task (a2a new-task branch only), so the pane's
+   *  role may ask for a fresh conversation first. Never set for a reply. */
+  newTask?: boolean;
+  /**
+   * With `newTask`: the pane's conversation must be kept anyway, and why.
+   * `open_a2a_task` — the pane has other open a2a tasks pinned to it (owner
+   * decision, #1680), so clearing it would drop a thread still in flight.
+   * Reported as `skipped_busy` when the role asks for fresh context.
+   */
+  keepContext?: 'open_a2a_task';
+  /** With `newTask`: the task being delivered, left out of the open-task check. */
+  taskId?: string;
+  /** With `newTask`: where the delivered pane sits, so main can check the
+   *  daemon's open tasks for it (a pane it cannot place is never cleared). */
+  pane?: { workspaceId: string; paneId: string; surfaceId: string };
+  /** Hold the paste until the pane has no draft and no key input for a quiet
+   *  window, within a bounded wait; refuse with `user_typing` otherwise (the
+   *  Git page's hand-off: the person may be typing in that pane). Also checks,
+   *  before the paste and before the Enter, that the same agent is there. */
+  waitQuiet?: boolean;
+  /** With `waitQuiet`: the agent the sender saw in the pane (display name). */
+  expectAgent?: string;
+  /** With `waitQuiet`: epoch ms after which nothing is written (main stamps
+   *  it from the send's own timeout). */
+  deadlineAt?: number;
+  /** With `waitQuiet`: a key main registered for this delivery (deliveryGuards
+   *  in main). Main runs that delivery's own check before the paste and before
+   *  the Enter; an unknown key refuses. Only adds checks, never removes one. */
+  guardKey?: string;
 }

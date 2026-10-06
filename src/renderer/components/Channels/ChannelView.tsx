@@ -22,21 +22,17 @@ import type {
   ChannelMention,
 } from '../../../shared/channels';
 import { useStore } from '../../stores';
+import type { WorkTask } from '../../../shared/workTask';
 import { loadChannelHistory, hydrateChannelsCatalog } from '../../hooks/useChannelsHydration';
 import { useT } from '../../hooks/useT';
 import { tokenAttrs } from '../../themes';
 import { FOCUS_RING } from '../focusRing';
-import { IconX, IconArchive, IconCheck, IconChevron } from '../icons';
-import { formatChannelAuthor } from '../../channels/authorDisplay';
+import { IconX, IconArchive, IconCheck, IconChevron, IconGitBranch } from '../icons';
 import { HUMAN_WORKSPACE_ID, HUMAN_MEMBER_ID } from '../../../shared/channels';
 import { Composer } from './Composer';
 import { ChannelMembersControl } from './ChannelMembers';
-import {
-  ownMessageDeliveryState,
-  needsDeliveryAgingClock,
-  DELIVERY_LABEL_KEY,
-  DELIVERY_LABEL_FALLBACK,
-} from './deliveryStatus';
+import { needsDeliveryAgingClock } from './deliveryStatus';
+import { ChannelMessageRow } from './ChannelMessageRow';
 import { paneNameForAuthor, paneNamesKey, parsePaneNamesKey } from '../../channels/paneMemberNames';
 
 // Stable empty references for the store selectors below. A selector that
@@ -259,6 +255,8 @@ export interface ChannelViewContentProps {
   workspaceName?: (workspaceId: string) => string | undefined;
   /** Wrapper rendered after the message list; the composer lives here. */
   composerSlot: React.ReactNode;
+  task?: WorkTask;
+  onOpenTask?: () => void;
   /** Header control for the members roster (count + join/leave popover).
    *  Slotted so the pure view stays store-free for the test harness. */
   membersSlot?: React.ReactNode;
@@ -287,6 +285,8 @@ export function ChannelViewContent({
   onLoadEarlier,
   workspaceName = () => undefined,
   composerSlot,
+  task,
+  onOpenTask,
   membersSlot,
   nudgeExhaustedAtByMember,
   now: nowProp,
@@ -320,6 +320,7 @@ export function ChannelViewContent({
   const now = nowProp ?? clock;
   // Two-click confirm for the one-way archive: first click arms (button turns
   // red + shows a check), second commits; blur cancels.
+  const [activityExpanded, setActivityExpanded] = useState(false);
   const [archiveArmed, setArchiveArmed] = useState(false);
   const visible = useMemo(
     () => sortMessagesBySeq(messages).filter((m) => isMessageVisibleToViewer(m, viewer)),
@@ -362,6 +363,7 @@ export function ChannelViewContent({
   // query/visibility, and the archive-arm/daemon-paging flags would leak into
   // the next channel (CodeRabbit review).
   useEffect(() => {
+    setActivityExpanded(false);
     setShownCount(SCROLLBACK_PAGE);
     setSearchOpen(false);
     setQuery('');
@@ -381,14 +383,14 @@ export function ChannelViewContent({
       data-channel-id={channel.id}
       data-channel-status={channel.status}
       data-message-count={visible.length}
-      className="flex flex-col h-full bg-[var(--bg-base)] border-l border-[var(--bg-surface)]"
+      className="wmux-record-view flex flex-col h-full min-h-0 bg-[var(--bg-base)] border-l border-[var(--bg-surface)]"
       style={{ borderColor: 'var(--border-soft)' }}
       {...tokenAttrs('bgBase', 'bg')}
       {...tokenAttrs('bgSurface', 'border')}
     >
       {/* Header — channel name + close affordance */}
       <div
-        className="flex items-center justify-between px-4 py-2 border-b border-[var(--bg-surface)] shrink-0"
+        className="wmux-record-header flex items-center justify-between px-4 py-2 border-b border-[var(--bg-surface)] shrink-0"
         style={{ borderColor: 'var(--border-soft)' }}
         {...tokenAttrs('bgSurface', 'border')}
       >
@@ -426,7 +428,7 @@ export function ChannelViewContent({
             data-channel-search-toggle
             {...tokenAttrs('textSub', 'text')}
           >
-            <span aria-hidden="true" className="text-caption">🔍</span>
+            <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" /><path d="m13 13 4 4" /></svg>
           </button>
           {membersSlot}
           {onArchive && channel.status !== 'archived' && (
@@ -485,6 +487,36 @@ export function ChannelViewContent({
         </div>
       </div>
 
+      {task ? (
+        <section data-channel-task-summary className="wmux-record-summary">
+          <div className="wmux-record-eyebrow">
+            <span>{t('channels.taskRecord')}</span>
+            <span data-channel-task-status className="wmux-record-status">
+              <span aria-hidden="true" />
+              {t(task.detachedAt !== undefined ? 'channels.taskDetached' : task.status === 'closed' ? 'channels.taskClosed' : 'channels.taskOpen')}
+            </span>
+          </div>
+          <h3>{task.title}</h3>
+          {task.branch && <p className="wmux-record-branch"><IconGitBranch size={14} /><span>{task.branch}</span></p>}
+          {onOpenTask && (
+            <button type="button" onClick={onOpenTask} data-channel-open-task className="wmux-record-workspace-link">
+              {t('channels.openTaskWorkspace')}
+            </button>
+          )}
+          <div className="wmux-record-update">
+            <p className="wmux-record-label">{t('channels.latestActivity')}</p>
+            <p data-channel-latest-activity>{visible.at(-1)?.text ?? t('channels.noActivity')}</p>
+          </div>
+          <button type="button" data-channel-activity-toggle aria-expanded={activityExpanded || searchOpen}
+            onClick={() => { setActivityExpanded((v) => !v); setSearchOpen(false); setQuery(''); }} className="wmux-record-disclosure">
+            <span>{t(activityExpanded || searchOpen ? 'channels.hideActivity' : 'channels.showActivity')}</span>
+            <IconChevron size={12} />
+          </button>
+        </section>
+      ) : (
+        <p className="wmux-record-purpose">{channel.topic || t('channels.discussionPurpose')}</p>
+      )}
+
       {/* Search bar (P3c) — revealed by the header search toggle. Filters the
             whole visible history, not just the scrollback window. */}
       {searchOpen && (
@@ -510,6 +542,7 @@ export function ChannelViewContent({
       {/* Message list — scrollable. Empty-state copy when the channel
             has nothing visible to the viewer yet. */}
       <div
+        hidden={!!task && !activityExpanded && !searchOpen}
         className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-2"
         data-channel-view-messages
       >
@@ -545,128 +578,18 @@ export function ChannelViewContent({
                 {hiddenEarlier > 0 ? ` (${hiddenEarlier})` : ''}
               </button>
             )}
-            {rendered.map((m) => {
-            // operator-join (§2.1.1/§3): a server-published system marker renders as
-            // a centered muted line, not an attributed chat message. The durable
-            // append is the audit trail; the copy is viewpoint-neutral because
-            // every member's view renders this same marker.
-            if (m.systemKind === 'operator-join') {
-              return (
-                <div
-                  key={`${channel.id}:${m.seq}`}
-                  data-channel-message
-                  data-channel-system-message="operator-join"
-                  data-seq={m.seq}
-                  className="flex items-center justify-center py-0.5 text-[10px] font-mono italic text-[var(--text-muted)]"
-                  {...tokenAttrs('textMuted', 'text')}
-                >
-                  {t('channels.systemOperatorJoin') || 'Operator joined this channel'}
-                </div>
-              );
-            }
-            const myStatus = ownMessageDeliveryState({
-              message: m,
-              viewerMemberId: viewer?.memberId ?? null,
-              now,
-              ...(nudgeExhaustedAtByMember
-                ? { exhaustedAtByMember: nudgeExhaustedAtByMember }
-                : {}),
-            });
-            const mentionsMe =
-              !!viewer && !!m.mentions?.some((mn) => mn.workspaceId === viewer.workspaceId);
-            const author = formatChannelAuthor(m, workspaceName);
-            // C-5: an agent's identity chip names its PANE the way the rest of
-            // the app names it. A pane that joined over MCP/CLI carries an
-            // opaque spawn-stamped memberId, which the chip used to print raw;
-            // the roster's principal resolves it back to "w26-1(claude)". The
-            // chip is dropped when the primary label already says it.
-            const paneName =
-              author.kind === 'agent' ? paneNameFor?.(m.workspaceId, m.memberId) : undefined;
-            const identityChip =
-              paneName && !author.primary.includes(paneName) ? paneName : author.chip;
-            return (
-              <div
+            {rendered.map((m) => (
+              <ChannelMessageRow
                 key={`${channel.id}:${m.seq}`}
-                data-channel-message
-                data-seq={m.seq}
-                data-member-id={m.memberId}
-                data-delivery={myStatus ?? 'unknown'}
-                data-mentions-me={mentionsMe ? 'true' : undefined}
-                className={`flex flex-col gap-0.5 ${
-                  mentionsMe ? 'border-l-2 border-[var(--accent-blue)] pl-1.5' : ''
-                }`}
-              >
-                <div className="flex items-baseline gap-2">
-                  {/* Identity audit 1a: per-workspace color badge — round for a
-                        human seat, square for an agent pane — so same-named
-                        senders from different workspaces stay tellable. */}
-                  <span
-                    aria-hidden="true"
-                    data-channel-author-badge={author.kind}
-                    className={`self-center inline-block w-2 h-2 shrink-0 ${
-                      author.kind === 'human' ? 'rounded-full' : 'rounded-[1px]'
-                    }`}
-                    style={{
-                      backgroundColor: `hsl(${author.hue} 55% 62%)`,
-                      // The hue is dynamic so it can't be a theme token; the
-                      // border keeps the badge visible on light themes where
-                      // L=62% alone would wash out (ship design review).
-                      border: '1px solid var(--border-soft)',
-                    }}
-                  />
-                  <span
-                    className="text-caption font-mono font-bold text-[var(--text-main)]"
-                    data-channel-message-author
-                    {...tokenAttrs('textMain', 'text')}
-                  >
-                    {/* Human/GUI senders read as "Me" (never the internal
-                          local-ui token); agent senders read as their display
-                          name with the pane memberId chip alongside — the fix
-                          for every agent collapsing into "Claude Code". */}
-                    {author.kind === 'human' ? (t('channels.me') || 'Me') : author.primary}
-                  </span>
-                  {identityChip && (
-                    <span
-                      data-channel-author-chip
-                      className="text-[10px] font-mono text-[var(--text-sub)]"
-                      title={author.kind === 'human' ? m.workspaceId : m.memberId}
-                      {...tokenAttrs('textSub', 'text')}
-                    >
-                      {identityChip}
-                    </span>
-                  )}
-                  <span
-                    className="text-[10px] font-mono text-[var(--text-muted)]"
-                    data-channel-message-time
-                    {...tokenAttrs('textMuted', 'text')}
-                  >
-                    {new Date(m.postedAt).toISOString().slice(11, 19)}
-                  </span>
-                </div>
-                <div
-                  className="text-[12px] font-mono text-[var(--text-main)] whitespace-pre-wrap break-words"
-                  data-channel-message-text
-                  {...tokenAttrs('textMain', 'text')}
-                >
-                  {renderMessageBody(m.text, m.mentions)}
-                </div>
-                {myStatus && (
-                  <div
-                    className={`text-[10px] font-mono self-end ${
-                      myStatus === 'nudge_exhausted'
-                        ? 'text-[var(--accent-yellow)]'
-                        : 'text-[var(--text-muted)]'
-                    }`}
-                    data-channel-message-delivery
-                    data-delivery-status={myStatus}
-                    {...tokenAttrs(myStatus === 'nudge_exhausted' ? 'warning' : 'textMuted', 'text')}
-                  >
-                    {t(DELIVERY_LABEL_KEY[myStatus]) || DELIVERY_LABEL_FALLBACK[myStatus]}
-                  </div>
-                )}
-              </div>
-            );
-            })}
+                message={m}
+                viewer={viewer}
+                now={now}
+                t={t}
+                workspaceName={workspaceName}
+                nudgeExhaustedAtByMember={nudgeExhaustedAtByMember}
+                paneNameFor={paneNameFor}
+              />
+            ))}
           </>
         )}
       </div>
@@ -675,7 +598,7 @@ export function ChannelViewContent({
             inject a fake composer without rendering the real one
             (which depends on store mutations and effects). */}
       <div
-        className="border-t border-[var(--bg-surface)] shrink-0"
+        className="wmux-record-composer-slot shrink-0"
         style={{ borderColor: 'var(--border-soft)' }}
         {...tokenAttrs('bgSurface', 'border')}
       >
@@ -767,6 +690,10 @@ export function ChannelView(): React.ReactElement | null {
     return (workspaceId: string, memberId: string) =>
       paneNameForAuthor({ members, names, workspaceId, memberId });
   }, [paneNamesProjection, members]);
+  const missions = useStore((s) => s.missionsByWorkspace);
+  const task = useMemo(() => Object.values(missions).flat().find((item) => item.missionChannelId === activeChannelId), [missions, activeChannelId]);
+  const taskWorkspaceExists = useStore((s) => !!task?.paneGroupId && s.workspaces.some((w) => w.id === task.paneGroupId));
+  const setActiveWorkspace = useStore((s) => s.setActiveWorkspace);
   const setActiveChannel = useStore((s) => s.setActiveChannel);
   const pushToast = useStore((s) => s.pushToast);
   const archiveChannelDaemon = useStore((s) => s.archiveChannelDaemon);
@@ -968,6 +895,8 @@ export function ChannelView(): React.ReactElement | null {
     <div className="flex flex-col flex-1 min-h-0" data-channel-view-wrapper>
       <ChannelViewContent
         channel={channel}
+        task={task}
+        onOpenTask={taskWorkspaceExists && task?.paneGroupId ? () => { if (task.paneGroupId) setActiveWorkspace(task.paneGroupId); } : undefined}
         messages={messages}
         viewer={viewer}
         onClose={handleClose}
@@ -1011,7 +940,7 @@ export function ChannelView(): React.ReactElement | null {
               </button>
             </div>
           ) : (
-            <Composer channelId={channel.id} onError={pushToast} />
+            <Composer channelId={channel.id} onError={pushToast} placeholder={task ? t('channels.taskCommentPlaceholder') : undefined} />
           )
         }
       />

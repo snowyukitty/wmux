@@ -14,6 +14,8 @@ import { createRoot } from 'react-dom/client';
 import { act } from 'react';
 import RemoteMirrorTerminal from '../RemoteMirrorTerminal';
 import { useStore } from '../../../stores';
+import { getLeafPanes } from '../../../../shared/paneUtils';
+import { holdFits, releaseFits } from '../../../utils/layoutTransitionGate';
 
 // One shared log so "before open()" is an assertion about the same clock.
 // Two independent counters would compare cleanly and prove nothing.
@@ -35,14 +37,39 @@ class FakeTerminal {
   resized: Array<{ cols: number; rows: number }> = [];
   resetCalls = 0;
   disposed = false;
+  /** xterm's user-input signal (`coreService.onUserInput`), which fires just
+   *  before the `onData` of anything the user produced — the gate keys on it. */
+  userInputListeners: Array<() => void> = [];
+  _core = {
+    coreService: {
+      onUserInput: (listener: () => void) => {
+        this.userInputListeners.push(listener);
+        return { dispose: vi.fn() };
+      },
+    },
+  };
+  /** User input: the signal, then `onData` — what xterm does for a key. */
   onDataHandler: ((data: string) => void) | null = null;
+  rawDataHandler: ((data: string) => void) | null = null;
+  /** An answer xterm gives by itself to a query in the output: `onData` alone. */
+  reply(data: string): void { this.rawDataHandler?.(data); }
 
   open(): void {
     // Ordering only — the fake never touches the DOM container.
     setupLog.push('open');
   }
   reset(): void { this.resetCalls++; }
-  resize(cols: number, rows: number): void { this.resized.push({ cols, rows }); }
+  /** xterm's own grid, as `term.cols`/`term.rows` report it. */
+  cols = 80;
+  rows = 24;
+  /** Left undefined unless a test lays the terminal out — `runFit` returns
+   *  early without an `.xterm-screen`, which is every other test's world. */
+  element: HTMLElement | undefined = undefined;
+  resize(cols: number, rows: number): void {
+    this.resized.push({ cols, rows });
+    this.cols = cols;
+    this.rows = rows;
+  }
   /**
    * xterm's `write(data, callback)` — the callback fires once the parser has
    * consumed the chunk, which is the seam the repaint gate hangs off. The fake
@@ -64,7 +91,11 @@ class FakeTerminal {
     cbs.forEach((cb) => cb());
   }
   onData(cb: (data: string) => void): { dispose: () => void } {
-    this.onDataHandler = cb;
+    this.rawDataHandler = cb;
+    this.onDataHandler = (data) => {
+      this.userInputListeners.forEach((listener) => listener());
+      cb(data);
+    };
     return { dispose: vi.fn() };
   }
 
@@ -89,6 +120,24 @@ class FakeTerminal {
   hasSelection(): boolean { return this.selection.length > 0; }
   clearSelection(): void { this.clearSelectionCalls++; this.selection = ''; }
   attachCustomKeyEventHandler(cb: (e: KeyboardEvent) => boolean): void { this.keyHandler = cb; }
+
+  /** xterm's OSC registry — the fake keeps the handlers so a test can play
+   *  the remote app emitting a sequence. */
+  oscHandlers = new Map<number, (data: string) => boolean>();
+  /** Read by the Alt+click guard on every mousedown in the mirror. */
+  modes = { mouseTrackingMode: 'none' };
+  parser = {
+    registerOscHandler: (ident: number, cb: (data: string) => boolean) => {
+      this.oscHandlers.set(ident, cb);
+      return { dispose: () => { this.oscHandlers.delete(ident); } };
+    },
+    /** DECSET / DECRST hooks of the #1792 prompt-mode guard. */
+    csiHandlers: [] as { id: { prefix?: string; final: string } }[],
+    registerCsiHandler(id: { prefix?: string; final: string }) {
+      this.csiHandlers.push({ id });
+      return { dispose: () => {} };
+    },
+  };
 
   dispose(): void { this.disposed = true; }
 }
@@ -131,6 +180,7 @@ describe('RemoteMirrorTerminal', () => {
   let errorHandlers: Handler[];
   let paneDetach: ReturnType<typeof vi.fn>;
   let paneWrite: ReturnType<typeof vi.fn>;
+  let paneResize: ReturnType<typeof vi.fn>;
   let clipboardWrite: ReturnType<typeof vi.fn>;
   let clipboardRead: ReturnType<typeof vi.fn>;
 
@@ -144,6 +194,7 @@ describe('RemoteMirrorTerminal', () => {
     errorHandlers = [];
     paneDetach = vi.fn(() => Promise.resolve());
     paneWrite = vi.fn();
+    paneResize = vi.fn(() => Promise.resolve({ ok: true }));
 
     (window as unknown as { electronAPI: unknown }).electronAPI = {
       remote: {
@@ -169,6 +220,7 @@ describe('RemoteMirrorTerminal', () => {
         },
         paneDetach,
         paneWrite,
+        paneResize,
       },
     };
 
@@ -199,6 +251,68 @@ describe('RemoteMirrorTerminal', () => {
     expect(term.written).toHaveLength(1);
 
     unmount();
+  });
+
+  // #1271: without a linkHandler xterm falls back to window.open(about:blank),
+  // which Electron denies, so a confirmed OSC 8 click did nothing.
+  describe('OSC 8 link handler', () => {
+    type LinkHandler = {
+      allowNonHttpProtocols?: boolean;
+      activate: (event: MouseEvent, uri: string, range: unknown) => void;
+    };
+    const browserSurfaceCount = () => useStore.getState().workspaces.flatMap((ws) =>
+      getLeafPanes(ws.rootPane).flatMap((pane) => pane.surfaces)
+        .filter((surface) => surface.surfaceType === 'browser')).length;
+
+    let openExternal: ReturnType<typeof vi.fn>;
+    let prevBackend: ReturnType<typeof useStore.getState>['browserBackend'];
+    beforeEach(() => {
+      openExternal = vi.fn(() => Promise.resolve());
+      (window as unknown as { electronAPI: { shell: unknown } }).electronAPI.shell = { openExternal };
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      vi.spyOn(window, 'open').mockReturnValue(null);
+      // Builtin is the mode where a local pane WOULD embed localhost, so it is
+      // the one that proves the mirror never does.
+      prevBackend = useStore.getState().browserBackend;
+      useStore.setState({ browserBackend: 'builtin' });
+    });
+    afterEach(() => {
+      useStore.setState({ browserBackend: prevBackend });
+      vi.restoreAllMocks();
+    });
+
+    function mountHandler(): { handler: LinkHandler; unmount: () => void } {
+      const { unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      return { handler: termInstances[0].ctorOptions.linkHandler as LinkHandler, unmount };
+    }
+
+    it('opens a confirmed web link in the system browser, never a local pane', () => {
+      const { handler, unmount } = mountHandler();
+      const panesBefore = browserSurfaceCount();
+      expect(handler.allowNonHttpProtocols).toBe(false);
+      handler.activate(new MouseEvent('click'), 'https://example.com/report', {});
+      expect(window.confirm).toHaveBeenCalledOnce();
+      expect(openExternal).toHaveBeenCalledExactlyOnceWith('https://example.com/report');
+      expect(window.open).not.toHaveBeenCalled();
+      expect(browserSurfaceCount()).toBe(panesBefore);
+      unmount();
+    });
+
+    it.each([
+      'http://localhost:3000/admin',
+      'http://127.0.0.1:8080/',
+      'http://[::1]:5000/',
+      'http://0.0.0.0:9000/',
+    ])('refuses remote loopback destination %s', (url) => {
+      const { handler, unmount } = mountHandler();
+      const panesBefore = browserSurfaceCount();
+      handler.activate(new MouseEvent('click', { ctrlKey: true }), url, {});
+      expect(window.confirm).not.toHaveBeenCalled();
+      expect(openExternal).not.toHaveBeenCalled();
+      expect(window.open).not.toHaveBeenCalled();
+      expect(browserSurfaceCount()).toBe(panesBefore);
+      unmount();
+    });
   });
 
   it('ignores meta/data events for a different attachId', () => {
@@ -277,6 +391,14 @@ describe('RemoteMirrorTerminal', () => {
 
     expect(paneWrite).toHaveBeenCalledWith('a1', 'ls\n');
 
+    unmount();
+  });
+
+  it('#1792 — installs the prompt-mode guard (OSC 133 + DECSET/DECRST hooks)', () => {
+    const { unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+    const term = termInstances[0];
+    expect(term.oscHandlers.has(133)).toBe(true);
+    expect(term.parser.csiHandlers.map((h) => `${h.id.prefix}${h.id.final}`)).toEqual(['?h', '?l']);
     unmount();
   });
 
@@ -369,19 +491,21 @@ describe('RemoteMirrorTerminal', () => {
       '\x1b[0n', // DSR
       '\x1b[24;80R', // CPR
       '\x1b[?2004;1$y', // DECRPM
+      '\x1b[4;2$y', // ANSI DECRPM (no `?`)
       '\x1b[8;24;80t', // text-area report
       '\x1bP1$r0m\x1b\\', // DECRQSS
       '\x1b]11;rgb:1e1e/1e1e/2e2e\x07', // OSC background report
     ];
-    act(() => { replies.forEach((r) => term.onDataHandler?.(r)); });
+    act(() => { replies.forEach((r) => term.reply(r)); });
     expect(paneWrite).not.toHaveBeenCalled();
 
     unmount();
   });
 
   it('still forwards the escape sequences a KEY produces', () => {
-    // The filter is shape-based, so it has to leave real input alone: arrows,
-    // modified arrows, function keys, shift-tab, bracketed paste, mouse.
+    // Real input passes whatever its shape: arrows, modified arrows, function
+    // keys (a modified F3 is byte for byte a cursor report), shift-tab,
+    // bracketed paste, mouse.
     const { unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
     const term = termInstances[0];
     attach();
@@ -390,6 +514,7 @@ describe('RemoteMirrorTerminal', () => {
     const keys = [
       '\x1b[A', '\x1b[D', '\x1b[1;5C', '\x1b[3~', '\x1b[15~', '\x1b[Z',
       '\x1bOR', '\x1b[200~pasted\x1b[201~', '\x1b[<0;10;5M', '\x03',
+      '\x1b[1;2R', '\x1b[1;5R',
     ];
     act(() => { keys.forEach((k) => term.onDataHandler?.(k)); });
     expect(paneWrite).toHaveBeenCalledTimes(keys.length);
@@ -423,6 +548,235 @@ describe('RemoteMirrorTerminal', () => {
     expect(term.written).toHaveLength(writesAfterAttach); // nothing repainted
 
     unmount();
+  });
+
+  // The remote mirror "breathing" bug: every grant arrived as a resize event,
+  // changed the remote grid, and re-armed the resize request — so the mirror
+  // asked again, against a font the fit had just changed, for a grid one or
+  // two cells away, forever (~2 Hz, SIGWINCH on the host each time).
+  describe('remote resize requests', () => {
+    // A stepped cell model: xterm's cell size is not proportional to the font
+    // size (it rounds through the pixel ratio), which is what made each
+    // extrapolation disagree.
+    const dpr = () => window.devicePixelRatio || 1;
+    const cellW = (f: number) => Math.ceil(0.6021 * f * dpr()) / dpr();
+    const cellH = (f: number) => Math.ceil(1.1719 * f * dpr()) / dpr();
+
+    function layOut(container: HTMLElement, term: FakeTerminal, box: { w: number; h: number }) {
+      const el = document.createElement('div');
+      const screen = document.createElement('div');
+      screen.className = 'xterm-screen';
+      el.appendChild(screen);
+      const font = () => Number(term.options['fontSize']);
+      Object.defineProperty(screen, 'offsetWidth', { get: () => term.cols * cellW(font()) });
+      Object.defineProperty(screen, 'offsetHeight', { get: () => term.rows * cellH(font()) });
+      term.element = el;
+      const boxEl = container.querySelector('div.relative') as HTMLElement;
+      Object.defineProperty(boxEl, 'clientWidth', { get: () => box.w, configurable: true });
+      Object.defineProperty(boxEl, 'clientHeight', { get: () => box.h, configurable: true });
+    }
+
+    const settle = (ms = 1000) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+    const remoteResize = (cols: number, rows: number) => act(async () => {
+      resizeHandlers.forEach((h) => h({ attachId: 'a1', cols, rows }));
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+
+    async function mountAttached(box: { w: number; h: number }, grid: { cols: number; rows: number } | null) {
+      const view = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      layOut(view.container, term, box);
+      if (grid) {
+        await act(async () => {
+          metaHandlers.forEach((h) => h({ attachId: 'a1', ...grid, snapshotB64: btoa('') }));
+          term.flushWrites();
+          await vi.advanceTimersByTimeAsync(1000);
+        });
+      }
+      return { ...view, term };
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      useStore.setState({ terminalFontSize: 12.5 });
+      paneResize.mockImplementation((_id: string, cols: number, rows: number) =>
+        Promise.resolve({ ok: true, cols, rows }));
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+      Object.defineProperty(window, 'devicePixelRatio', { value: 1, configurable: true });
+    });
+
+    it('★ the echo of our own grant never re-opens the decision', async () => {
+      const { unmount } = await mountAttached({ w: 448, h: 726 }, { cols: 36, rows: 44 });
+      expect(paneResize).toHaveBeenCalledTimes(1);
+      expect(paneResize).toHaveBeenLastCalledWith('a1', 56, 48);
+
+      await remoteResize(56, 48);
+      await settle(30_000);
+      expect(paneResize).toHaveBeenCalledTimes(1);
+      unmount();
+    });
+
+    it('an external re-grid re-opens the decision once, and it settles', async () => {
+      const { unmount } = await mountAttached({ w: 448, h: 726 }, { cols: 36, rows: 44 });
+      await remoteResize(56, 48); // our grant
+
+      // Someone else (the host window, another viewer) re-grids the pane.
+      await remoteResize(53, 46);
+      expect(paneResize).toHaveBeenCalledTimes(2);
+      expect(paneResize).toHaveBeenLastCalledWith('a1', 56, 48);
+
+      await remoteResize(56, 48); // the echo of the re-request
+      await settle(30_000);
+      expect(paneResize).toHaveBeenCalledTimes(2);
+      unmount();
+    });
+
+    it('yields to a party that keeps overriding its grants (no ping-pong)', async () => {
+      const { unmount } = await mountAttached({ w: 448, h: 726 }, { cols: 36, rows: 44 });
+      await remoteResize(56, 48);
+      await remoteResize(53, 46); // override 1 → one re-request
+      await remoteResize(56, 48);
+      expect(paneResize).toHaveBeenCalledTimes(2);
+
+      await remoteResize(53, 46); // override 2 inside the window → yield
+      await settle(30_000);
+      expect(paneResize).toHaveBeenCalledTimes(2);
+      unmount();
+    });
+
+    it('asks again when the box itself changes size', async () => {
+      const box = { w: 448, h: 726 };
+      const { unmount } = await mountAttached(box, { cols: 36, rows: 44 });
+      expect(paneResize).toHaveBeenCalledTimes(1);
+
+      box.w = 800;
+      // A ResizeObserver callback in the app; jsdom has none, and a remote
+      // resize event is the other path that re-runs the fit.
+      await remoteResize(56, 48);
+      expect(paneResize).toHaveBeenCalledTimes(2);
+      expect(paneResize).toHaveBeenLastCalledWith('a1', 100, 48);
+      unmount();
+    });
+
+    it('a sidebar toggle asks the remote once, after the transition, not per frame', async () => {
+      const roCallbacks: Array<() => void> = [];
+      vi.stubGlobal('ResizeObserver', class {
+        constructor(cb: () => void) { roCallbacks.push(cb); }
+        observe() {}
+        disconnect() {}
+      });
+      try {
+        const box = { w: 448, h: 726 };
+        const { unmount } = await mountAttached(box, { cols: 36, rows: 44 });
+        expect(paneResize).toHaveBeenCalledTimes(1);
+
+        holdFits(1000);
+        // The animation: the box grows every frame, one frame stalls past the
+        // fit debounce (a busy main thread).
+        for (let f = 1; f <= 12; f++) {
+          box.w = 448 + Math.round((352 * f) / 12);
+          act(() => { roCallbacks.forEach((cb) => cb()); });
+          await act(async () => { await vi.advanceTimersByTimeAsync(f === 6 ? 300 : 16); });
+        }
+        expect(paneResize).toHaveBeenCalledTimes(1);
+
+        act(() => releaseFits()); // transitionend
+        await settle(30_000);
+        expect(paneResize).toHaveBeenCalledTimes(2);
+        expect(paneResize).toHaveBeenLastCalledWith('a1', 100, 48);
+        unmount();
+      } finally {
+        releaseFits();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('a font change while shrunk measures the new ceiling first and ends at the configured font', async () => {
+      const { term, unmount } = await mountAttached({ w: 448, h: 726 }, { cols: 36, rows: 44 });
+      await remoteResize(56, 48);
+
+      await act(async () => {
+        useStore.setState({ terminalFontSize: 15 });
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      // 448 / ceil(0.6021 × 15) = 44 cols, 726 / ceil(1.1719 × 15) = 40 rows —
+      // the real 15px cell, not one extrapolated from the shrunk font.
+      expect(paneResize).toHaveBeenLastCalledWith('a1', 44, 40);
+      await remoteResize(44, 40);
+      expect(term.options['fontSize']).toBe(15);
+      unmount();
+    });
+
+    it('a change of device pixel ratio invalidates the measured cell and re-decides', async () => {
+      let onResolutionChange: (() => void) | null = null;
+      const matchMedia = vi.fn(() => ({
+        addEventListener: (_t: string, cb: () => void) => { onResolutionChange = cb; },
+        removeEventListener: vi.fn(),
+      }));
+      (window as unknown as { matchMedia: unknown }).matchMedia = matchMedia;
+      useStore.setState({ terminalFontSize: 12 });
+      try {
+        const { unmount } = await mountAttached({ w: 448, h: 726 }, { cols: 36, rows: 44 });
+        expect(paneResize).toHaveBeenLastCalledWith('a1', 56, 48);
+        await remoteResize(56, 48);
+
+        Object.defineProperty(window, 'devicePixelRatio', { value: 2, configurable: true });
+        await act(async () => {
+          onResolutionChange?.();
+          await vi.advanceTimersByTimeAsync(1000);
+        });
+        // At 2x, a 12px cell is ceil(14.45)/2 = 7.5 × ceil(28.13)/2 = 14.5.
+        expect(paneResize).toHaveBeenLastCalledWith('a1', 59, 50);
+        expect(matchMedia).toHaveBeenLastCalledWith('(resolution: 2dppx)');
+        unmount();
+      } finally {
+        delete (window as unknown as { matchMedia?: unknown }).matchMedia;
+      }
+    });
+
+    it('retries a rate-limited request with backoff, then stops at the grant', async () => {
+      paneResize
+        .mockImplementationOnce(() => Promise.resolve({ ok: false, reason: 'resize-too-often' }))
+        .mockImplementationOnce(() => Promise.reject(new Error('fetch failed')));
+      const { unmount } = await mountAttached({ w: 448, h: 726 }, { cols: 36, rows: 44 });
+      await settle(2000);
+      expect(paneResize).toHaveBeenCalledTimes(3);
+      expect(paneResize).toHaveBeenLastCalledWith('a1', 56, 48);
+      await remoteResize(56, 48);
+      await settle(30_000);
+      expect(paneResize).toHaveBeenCalledTimes(3);
+      unmount();
+    });
+
+    it('a desk-owned refusal is not hammered, only probed slowly until the host lets go', async () => {
+      paneResize.mockImplementation(() => Promise.resolve({ ok: false, reason: 'desk-owns-size' }));
+      const { unmount } = await mountAttached({ w: 448, h: 726 }, { cols: 36, rows: 44 });
+      expect(paneResize).toHaveBeenCalledTimes(1);
+      await settle(9_000);
+      expect(paneResize).toHaveBeenCalledTimes(1);
+
+      // The host window looked away (it sends no event for that).
+      paneResize.mockImplementation((_id: string, cols: number, rows: number) =>
+        Promise.resolve({ ok: true, cols, rows }));
+      await settle(2_000);
+      expect(paneResize).toHaveBeenCalledTimes(2);
+      await remoteResize(56, 48);
+      await settle(30_000);
+      expect(paneResize).toHaveBeenCalledTimes(2);
+      unmount();
+    });
+
+    it('learns the grid from a resize when the meta was missed', async () => {
+      const { unmount } = await mountAttached({ w: 448, h: 726 }, null);
+      await settle();
+      expect(paneResize).not.toHaveBeenCalled(); // xterm's default grid is not the remote's
+      await remoteResize(36, 44);
+      expect(paneResize).toHaveBeenCalledTimes(1);
+      expect(paneResize).toHaveBeenLastCalledWith('a1', 56, 48);
+      unmount();
+    });
   });
 
   it('ignores a resize aimed at a different attach', () => {
@@ -466,6 +820,41 @@ describe('RemoteMirrorTerminal', () => {
     expect(paneWrite).not.toHaveBeenCalled();
 
     unmount();
+  });
+
+  it('an attach refused for needs-HTTPS shows the notice and swallows input, even with an attachId present', () => {
+    const { container, unmount } = render(
+      <RemoteMirrorTerminal attachId="a1" error="attach refused" insecureTransport hostLabel="lan-mac" />,
+    );
+    const term = termInstances[0];
+    act(() => { term.onDataHandler?.('ls\n'); });
+    expect(paneWrite).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe('lan-mac needs HTTPS — re-pair over HTTPS');
+    // The generic error overlay does not cover the specific notice.
+    expect(container.textContent).not.toContain('attach refused');
+    unmount();
+  });
+
+  it('after the host rejects the credential, keystrokes are swallowed and the host is flagged', () => {
+    act(() => {
+      useStore.setState({
+        remoteWorkspaces: [{ key: 'host-1:ws-1', hostId: 'host-1', hostLabel: 'box', workspaceId: 'ws-1', name: '', panes: [] }],
+      });
+    });
+    const { unmount } = render(<RemoteMirrorTerminal attachId="a1" hostId="host-1" hostLabel="box" />);
+    const term = termInstances[0];
+
+    act(() => {
+      errorHandlers.forEach((h) => h({ attachId: 'a1', message: 'rejected', reason: 'auth-rejected' }));
+    });
+    act(() => {
+      term.onDataHandler?.('ls\n');
+    });
+
+    expect(paneWrite).not.toHaveBeenCalled();
+    expect(useStore.getState().remoteWorkspaces[0].authRejected).toBe(true);
+    unmount();
+    act(() => { useStore.setState({ remoteWorkspaces: [] }); });
   });
 
   it('does nothing while attachId is null (attach still in flight)', () => {
@@ -795,6 +1184,222 @@ describe('RemoteMirrorTerminal', () => {
       expect(clipboardWrite).toHaveBeenCalledWith('read me');
 
       unmount();
+    });
+  });
+
+  // Remote copy through OSC 52. With mouse tracking on (Claude Code
+  // fullscreen) a drag never becomes an xterm selection; the remote app copies
+  // by emitting OSC 52, which the mirror used to drop — so the highlight was
+  // visible and nothing reached the clipboard.
+  describe('OSC 52 clipboard writes from the remote app', () => {
+    const osc52 = (text: string) => `c;${btoa(String.fromCharCode(...new TextEncoder().encode(text)))}`;
+    const surface = (rootEl: HTMLElement) => rootEl.firstElementChild!.firstElementChild as HTMLElement;
+    const gesture = (el: HTMLElement) => {
+      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    };
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('★ a write right after a drag in the mirror reaches the local clipboard', () => {
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      gesture(surface(container));
+
+      const consumed = term.oscHandlers.get(52)?.(osc52('hello 한글 복사'));
+
+      expect(consumed).toBe(true);
+      expect(clipboardWrite).toHaveBeenCalledWith('hello 한글 복사');
+      unmount();
+    });
+
+    it('typing in the mirror does not open the window (no per-keystroke clipboard swap)', () => {
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      const el = surface(container);
+      for (const key of ['a', 'Shift', 'Meta', 'y']) {
+        el.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+      }
+
+      term.oscHandlers.get(52)?.(osc52('swapped while typing'));
+
+      expect(clipboardWrite).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('a bare mousedown with no matching mouseup does not open the window', () => {
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      surface(container).dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+
+      term.oscHandlers.get(52)?.(osc52('mid-press'));
+
+      expect(clipboardWrite).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('a lost mouseup is not revived by a later click elsewhere', () => {
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      // Pressed in the mirror, released where the window never saw it.
+      surface(container).dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      // A later, unrelated click somewhere else in the app.
+      document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+      term.oscHandlers.get(52)?.(osc52('injected'));
+
+      expect(clipboardWrite).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('a completed drag is revoked by a click elsewhere before the write arrives', () => {
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      gesture(surface(container));
+      document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+
+      term.oscHandlers.get(52)?.(osc52('injected'));
+
+      expect(clipboardWrite).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('window blur disarms a pending press', () => {
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      surface(container).dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      window.dispatchEvent(new Event('blur'));
+      window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+      term.oscHandlers.get(52)?.(osc52('injected'));
+
+      expect(clipboardWrite).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('a press held longer than the gesture bound does not count', () => {
+      vi.useFakeTimers();
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      surface(container).dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      vi.advanceTimersByTime(11_000);
+      window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+      term.oscHandlers.get(52)?.(osc52('late'));
+
+      expect(clipboardWrite).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('an honoured write is announced with the host it came from', () => {
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" hostLabel="build-box" />);
+      const term = termInstances[0]!;
+      gesture(surface(container));
+
+      term.oscHandlers.get(52)?.(osc52('hello'));
+
+      expect(clipboardWrite).toHaveBeenCalledWith('hello');
+      expect(document.getElementById('wmux-copy-toast')?.textContent).toContain('build-box');
+      unmount();
+    });
+
+    it('with no gesture in the mirror, the host cannot set the clipboard', () => {
+      const { unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+
+      const consumed = term.oscHandlers.get(52)?.(osc52('injected'));
+
+      // Consumed either way, so it cannot fall through to another handler.
+      expect(consumed).toBe(true);
+      expect(clipboardWrite).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('a gesture outside the mirror does not arm it', () => {
+      const { unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+      term.oscHandlers.get(52)?.(osc52('injected'));
+
+      expect(clipboardWrite).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('a gesture older than the window no longer counts', () => {
+      vi.useFakeTimers();
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      gesture(surface(container));
+      vi.advanceTimersByTime(2500);
+
+      term.oscHandlers.get(52)?.(osc52('late'));
+
+      expect(clipboardWrite).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('one gesture authorises one write', () => {
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      gesture(surface(container));
+
+      term.oscHandlers.get(52)?.(osc52('first'));
+      term.oscHandlers.get(52)?.(osc52('second'));
+
+      expect(clipboardWrite).toHaveBeenCalledTimes(1);
+      expect(clipboardWrite).toHaveBeenCalledWith('first');
+      unmount();
+    });
+
+    it('never answers a clipboard read/query', () => {
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      gesture(surface(container));
+
+      term.oscHandlers.get(52)?.('c;?');
+
+      expect(clipboardWrite).not.toHaveBeenCalled();
+      expect(clipboardRead).not.toHaveBeenCalled();
+      expect(paneWrite).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('is muted while an attach snapshot is being replayed', () => {
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      gesture(surface(container));
+      act(() => {
+        metaHandlers.forEach((h) => h({ attachId: 'a1', cols: 80, rows: 24, snapshotB64: btoa('x') }));
+      });
+
+      term.oscHandlers.get(52)?.(osc52('old copy in the snapshot'));
+      expect(clipboardWrite).not.toHaveBeenCalled();
+
+      term.flushWrites();
+      term.oscHandlers.get(52)?.(osc52('live copy'));
+      expect(clipboardWrite).toHaveBeenCalledWith('live copy');
+      unmount();
+    });
+
+    it('a read-only host is ignored — the remote app never saw the gesture', () => {
+      const { container, unmount } = render(<RemoteMirrorTerminal attachId="a1" readOnly />);
+      const term = termInstances[0]!;
+      gesture(surface(container));
+
+      term.oscHandlers.get(52)?.(osc52('from a spectator view'));
+
+      expect(clipboardWrite).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('unregisters the handler on unmount', () => {
+      const { unmount } = render(<RemoteMirrorTerminal attachId="a1" />);
+      const term = termInstances[0]!;
+      expect(term.oscHandlers.has(52)).toBe(true);
+      unmount();
+      expect(term.oscHandlers.has(52)).toBe(false);
     });
   });
 });

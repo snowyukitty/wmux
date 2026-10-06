@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { WebTlsConfig } from '../../../shared/web';
 import type { WebPersistedState } from '../webStateStore';
-import { decideWebStartPolicy, type WebStartPolicyInput } from '../webStartPolicy';
+import {
+  decideWebStartPolicy,
+  resolveWebInlineImages,
+  resolveWebStartGrants,
+  type WebStartPolicyInput,
+} from '../webStartPolicy';
 
 const TLS: WebTlsConfig = {
   certPath: '/absolute/certificate.pem',
@@ -173,5 +178,108 @@ describe('web start transport and credential policy', () => {
     expect(() => decide({ requestedTls: TLS, tailscale: true })).toThrow(
       'native TLS cannot be combined with the Tailscale transport',
     );
+  });
+});
+
+describe('web start grant resolution', () => {
+  const liveGrants = {
+    allowInput: false,
+    allowUpload: true,
+    allowTranscript: true,
+    allowDangerousLaunch: true,
+  };
+
+  it('keeps the CLI contract: an absent grant is off unless the caller opts into inheritance', () => {
+    expect(
+      resolveWebStartGrants({ allowInput: true }, liveGrants, previous({ allowTranscript: true })),
+    ).toEqual({
+      allowInput: true,
+      allowUpload: false,
+      allowTranscript: false,
+      allowDangerousLaunch: false,
+    });
+  });
+
+  it('a desktop start over a running server keeps the grants it does not send', () => {
+    expect(
+      resolveWebStartGrants(
+        { allowInput: true, allowUpload: false, inheritUnsetGrants: true },
+        liveGrants,
+        previous(),
+      ),
+    ).toEqual({
+      allowInput: true,
+      allowUpload: false,
+      allowTranscript: true,
+      allowDangerousLaunch: true,
+    });
+  });
+
+  it('a desktop start with no live server inherits the persisted, still-enabled record', () => {
+    expect(
+      resolveWebStartGrants(
+        { allowInput: false, inheritUnsetGrants: true },
+        undefined,
+        previous({ allowUpload: true, allowTranscript: true, allowDangerousLaunch: true }),
+      ),
+    ).toEqual({
+      allowInput: false,
+      allowUpload: true,
+      allowTranscript: true,
+      allowDangerousLaunch: true,
+    });
+  });
+
+  it('inherits nothing from a record an operator stop has disabled', () => {
+    expect(
+      resolveWebStartGrants(
+        { inheritUnsetGrants: true },
+        undefined,
+        previous({ enabled: false, allowTranscript: true, allowDangerousLaunch: true }),
+      ),
+    ).toEqual({
+      allowInput: false,
+      allowUpload: false,
+      allowTranscript: false,
+      allowDangerousLaunch: false,
+    });
+  });
+
+  it('never coerces a non-boolean grant into a decision', () => {
+    expect(
+      resolveWebStartGrants(
+        { allowTranscript: 'yes', allowDangerousLaunch: 1 },
+        undefined,
+        previous(),
+      ),
+    ).toEqual({
+      allowInput: false,
+      allowUpload: false,
+      allowTranscript: false,
+      allowDangerousLaunch: false,
+    });
+  });
+});
+
+describe('inline images switch (#1641)', () => {
+  const on = { inlineImages: true };
+  const off = { inlineImages: false };
+
+  it('is on for a fresh server', () => {
+    expect(resolveWebInlineImages(undefined, undefined, on)).toBe(true);
+  });
+
+  it('an explicit value always wins', () => {
+    expect(resolveWebInlineImages(false, { inlineImages: true }, on)).toBe(false);
+    expect(resolveWebInlineImages(true, { inlineImages: false }, off)).toBe(true);
+  });
+
+  it('a re-run that does not say keeps the running server\'s choice', () => {
+    expect(resolveWebInlineImages(undefined, { inlineImages: false }, on)).toBe(false);
+    expect(resolveWebInlineImages(undefined, { inlineImages: true }, off)).toBe(true);
+  });
+
+  it('with nothing running (a restart, or after --stop) the saved preference decides', () => {
+    expect(resolveWebInlineImages(undefined, undefined, off)).toBe(false);
   });
 });

@@ -45,8 +45,12 @@ export const CORE_TOOL_SURFACE: readonly string[] = [
   'workspace_list',
   'surface_list',
   'pane_list',
+  'fleet_triage',
   'pane_set_metadata',
   'pane_get_metadata',
+  // Merged pane_metadata {action} tool; the two names above stay registered
+  // (callable) but are unlisted from tools/list — see unlistedTools.ts.
+  'pane_metadata',
   'wmux_search_panes',
   'wmux_events_poll',
   'a2a_whoami',
@@ -73,6 +77,10 @@ export const CORE_TOOL_SURFACE: readonly string[] = [
   'channel_mission_list',
   'fanout_start',
   'ledger_update',
+  // Scheduled runs: draft-only propose + redacted reads.
+  'automation_propose',
+  'automation_list',
+  'automation_runs',
   'pane_split',
   'pane_close',
   'pane_focus',

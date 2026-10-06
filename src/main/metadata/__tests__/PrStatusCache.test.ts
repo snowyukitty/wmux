@@ -2,7 +2,20 @@ import { describe, it, expect, vi } from 'vitest';
 import { PrStatusCache, mapGhPrView } from '../PrStatusCache';
 
 describe('mapGhPrView', () => {
-  it('maps an open PR with passing checks', () => {
+  it('marks a conflicting PR, and only that one', () => {
+    const base = { number: 7, state: 'OPEN', isDraft: false, url: 'u', statusCheckRollup: [] };
+    expect(mapGhPrView({ ...base, mergeable: 'CONFLICTING' })?.conflicting).toBe(true);
+    expect(mapGhPrView({ ...base, mergeable: 'MERGEABLE' })).not.toHaveProperty('conflicting');
+    expect(mapGhPrView({ ...base, mergeable: 'UNKNOWN' })).not.toHaveProperty('conflicting');
+  });
+
+  it('carries the head commit only when it looks like one', () => {
+    const base = { number: 7, state: 'OPEN', isDraft: false, url: 'u', statusCheckRollup: [] };
+    expect(mapGhPrView({ ...base, headRefOid: '8f560cbee476d5849458403f7d9685ac8d197e74' })?.headSha).toBe('8f560cbee476d5849458403f7d9685ac8d197e74');
+    expect(mapGhPrView({ ...base, headRefOid: 'not a sha; rm' })).not.toHaveProperty('headSha');
+  });
+
+    it('maps an open PR with passing checks', () => {
     expect(mapGhPrView({
       number: 42,
       state: 'OPEN',
@@ -106,12 +119,59 @@ describe('PrStatusCache', () => {
     expect(exec).toHaveBeenCalledTimes(1);
   });
 
-  it('gh missing (ENOENT) disables the cache permanently for this process', async () => {
-    const exec = vi.fn().mockRejectedValue(Object.assign(new Error('spawn gh ENOENT'), { code: 'ENOENT' }));
-    const cache = new PrStatusCache(() => 0, exec);
+  it('gh missing (ENOENT) stays silent for the TTL, then probes again', async () => {
+    let now = 0;
+    const exec = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('spawn gh ENOENT'), { code: 'ENOENT' }))
+      .mockResolvedValue({ stdout: PR_JSON });
+    const cache = new PrStatusCache(() => now, exec);
     expect(await cache.get('D:\\a', 'main')).toBeNull();
+    now = 5 * 60 * 1000 - 1;
     expect(await cache.get('D:\\b', 'other')).toBeNull();
-    expect(exec).toHaveBeenCalledTimes(1); // never probed again
+    expect(exec).toHaveBeenCalledTimes(1); // not probed within the TTL
+    now = 5 * 60 * 1000;
+    expect((await cache.get('D:\\b', 'other'))?.number).toBe(7); // gh installed meanwhile
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  // getExecEnv() reads the platform at import and caches its env, so each case
+  // re-imports PrStatusCache with a mocked platform.
+  async function spawnedPath(platform: { isMac: boolean; isLinux: boolean }, path: string | undefined): Promise<string> {
+    const savedPath = process.env.PATH;
+    if (path === undefined) delete process.env.PATH;
+    else process.env.PATH = path;
+    vi.resetModules();
+    vi.doMock('../../../shared/platform', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../../../shared/platform')>()),
+      ...platform,
+    }));
+    try {
+      const { PrStatusCache: Fresh } = await import('../PrStatusCache');
+      const exec = vi.fn().mockResolvedValue({ stdout: PR_JSON });
+      await new Fresh(() => 0, exec).get('/repo', 'main');
+      return exec.mock.calls[0][2].env.PATH as string;
+    } finally {
+      vi.doUnmock('../../../shared/platform');
+      vi.resetModules();
+      process.env.PATH = savedPath;
+    }
+  }
+
+  it('macOS: a launchd PATH reaches gh with the Homebrew dirs added', async () => {
+    const path = await spawnedPath({ isMac: true, isLinux: false }, '/usr/bin:/bin:/usr/sbin:/sbin');
+    expect(path).toContain('/opt/homebrew/bin');
+    expect(path).toContain('/usr/local/bin');
+  });
+
+  it('Linux: keeps the original PATH first, without Homebrew dirs', async () => {
+    const path = await spawnedPath({ isMac: false, isLinux: true }, '/custom/bin:/usr/bin:/bin');
+    expect(path.startsWith('/custom/bin:/usr/bin:/bin')).toBe(true);
+    expect(path).not.toContain('/opt/homebrew/bin');
+  });
+
+  it('Linux: an unset PATH still lets gh resolve from /usr/bin and /bin', async () => {
+    const path = await spawnedPath({ isMac: false, isLinux: true }, undefined);
+    expect(path.startsWith('/usr/bin:/bin')).toBe(true);
   });
 
   it('invalidate() forces a refetch before the TTL', async () => {
@@ -121,5 +181,31 @@ describe('PrStatusCache', () => {
     cache.invalidate('D:\\repo', 'main');
     await cache.get('D:\\repo', 'main');
     expect(exec).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('PrStatusCache.observe', () => {
+  const fail = (stderr: string) => Object.assign(new Error('Command failed'), { stderr });
+
+  it('tells a branch with no PR from a failed lookup', async () => {
+    const exec = vi.fn().mockRejectedValueOnce(fail('no pull requests found for branch "x"'));
+    const cache = new PrStatusCache(() => 0, exec);
+    expect(await cache.observe('/r', 'x')).toEqual({ pr: null, failed: false });
+
+    const exec2 = vi.fn().mockRejectedValueOnce(fail('error connecting to api.github.com'));
+    const cache2 = new PrStatusCache(() => 0, exec2);
+    expect(await cache2.observe('/r', 'x')).toEqual({ pr: null, failed: true });
+  });
+
+  it('counts a missing gh as a failed lookup', async () => {
+    const exec = vi.fn().mockRejectedValueOnce(Object.assign(new Error('spawn gh ENOENT'), { code: 'ENOENT' }));
+    const cache = new PrStatusCache(() => 0, exec);
+    expect((await cache.observe('/r', 'x')).failed).toBe(true);
+  });
+
+  it('reports a found PR as not failed', async () => {
+    const exec = vi.fn().mockResolvedValueOnce({ stdout: JSON.stringify({ number: 3, state: 'MERGED', isDraft: false, url: 'u' }) });
+    const cache = new PrStatusCache(() => 0, exec);
+    expect(await cache.observe('/r', 'x')).toEqual({ pr: expect.objectContaining({ number: 3, state: 'merged' }), failed: false });
   });
 });

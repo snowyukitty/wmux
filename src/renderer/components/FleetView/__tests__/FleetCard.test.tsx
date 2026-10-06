@@ -1,21 +1,11 @@
-// FleetCard render tests (fleet-activity-line-hook.md, renderer half).
-//
-// Vitest runs in node env without jsdom — same pattern as
-// NotificationPanel.test.tsx / PermissionApprovalDialog.test.tsx: the card is a
-// stateless view, so renderToStaticMarkup produces the real markup. We use it to
-// pin the activity-vs-tail display contract:
-//   - activity present            → the activity accent line shows.
-//   - activity absent + terminal  → the raw tail fallback shows.
-//   - both present                → activity WINS (tail suppressed).
-//   - awaiting_input              → the affordance still takes priority.
-//
-// FleetCard calls useT() internally, which reads the module-singleton store's
-// locale (default en). useT does not touch the DOM, so SSR runs it fine.
+// Fleet rows say what the agent is doing in words; raw output lives in the
+// detail area, never in a row.
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { createElement } from 'react';
-import FleetCard, { FleetCardMissionLine, FleetCardEvidenceBadge } from '../FleetCard';
-import type { FleetPane } from '../../../stores/selectors/fleet';
+import FleetCard, { agentDisplayName, FleetCardMissionLine, FleetCardEvidenceBadge } from '../FleetCard';
+import { fleetRow, type FleetPane } from '../../../stores/selectors/fleet';
+import { fleetTitle } from '../fleetPresentation';
 import type { WorkTask } from '../../../../shared/workTask';
 import type { EvidenceItem, Task } from '../../../../shared/types';
 
@@ -37,58 +27,137 @@ function card(overrides: Partial<FleetPane> = {}): FleetPane {
   };
 }
 
-function render(props: { card: FleetPane; tail?: string[] }): string {
+function render(props: { card: FleetPane; ticketTitle?: string }): string {
   return renderToStaticMarkup(
-    createElement(FleetCard, { card: props.card, focused: false, onJump: noop, tail: props.tail }),
+    createElement(FleetCard, { card: props.card, focused: false, onJump: noop, ticketTitle: props.ticketTitle }),
   );
 }
 
-describe('FleetCard — activity line vs tail fallback', () => {
-  it('renders the activity line when card.activity is present', () => {
+describe('FleetCard — task-first rows', () => {
+  it('shows a reported tool activity', () => {
     const html = render({ card: card({ activity: '✎ fleet.ts' }) });
     expect(html).toContain('data-fleet-activity');
-    expect(html).toContain('✎ fleet.ts');
+    expect(html).toContain('data-fleet-now="now"');
+    expect(html).toContain('Editing fleet.ts');
+    expect(html).not.toContain('✎');
   });
 
-  it('renders the raw tail fallback when there is NO activity (terminal with output)', () => {
-    const html = render({ card: card({ activity: undefined }), tail: ['line one', 'line two'] });
+  it('names the row after the ticket the pane is working on', () => {
+    const html = render({ card: card(), ticketTitle: 'Fix the login redirect' });
+    expect(html).toContain('Fix the login redirect');
+  });
+
+  it('draws a usage-limit hold as a muted Waiting clock, not an error', () => {
+    const c = card({ agentStatus: 'error', usageLimitWaiting: true });
+    const html = renderToStaticMarkup(createElement(FleetCard, { card: c, row: fleetRow(c), focused: false, onJump: noop }));
+    expect(html).toContain('Waiting');
+    expect(html).toContain('data-shape="clock"');
+    expect(html).toContain('var(--text-muted)');
+    expect(html).not.toContain('var(--accent-red)');
+  });
+
+  it('treats whitespace-only activity as missing information', () => {
+    const html = render({ card: card({ agentStatus: 'idle', activity: '   ' }) });
     expect(html).not.toContain('data-fleet-activity');
-    expect(html).toContain('line one');
-    expect(html).toContain('line two');
+    expect(html).toContain('No recent activity reported');
   });
 
-  it('activity WINS over the tail when both are present (tail suppressed)', () => {
-    const html = render({ card: card({ activity: '$ npm test' }), tail: ['noisy spinner frame', '────────'] });
-    expect(html).toContain('data-fleet-activity');
-    expect(html).toContain('$ npm test');
-    // The fallback tail rows must NOT render when activity replaces the block.
-    expect(html).not.toContain('noisy spinner frame');
-  });
-
-  it('treats a whitespace-only activity as absent (falls back to the tail)', () => {
-    const html = render({ card: card({ activity: '   ' }), tail: ['fallback row'] });
-    expect(html).not.toContain('data-fleet-activity');
-    expect(html).toContain('fallback row');
-  });
-
-  it('awaiting_input affordance takes priority; the activity line is suppressed', () => {
+  it('puts an input request ahead of a previous tool activity', () => {
     const html = render({ card: card({ agentStatus: 'awaiting_input', activity: '✎ fleet.ts' }) });
-    // The yellow "needs your input" affordance shows...
     expect(html).toContain('Needs your input');
-    // ...and the activity accent line does NOT (the affordance owns that row).
+    expect(html).not.toContain('data-fleet-activity');
+    expect(html).toContain('Respond');
+  });
+
+  it('labels a question-less waiting pane as idle with a neutral dot, not an amber needs-you signal', () => {
+    const html = render({ card: card({ agentStatus: 'waiting' }) });
+    expect(html).toContain('Idle');
+    expect(html).not.toContain('Waiting');
+    expect(html).not.toContain('var(--attention)');
+    expect(html).toContain('var(--text-sub)');
+  });
+
+  it('shows a pane waiting out a usage limit as a muted Waiting clock, not a red error', () => {
+    const html = render({ card: card({ agentStatus: 'idle', usageLimitWaiting: true }) });
+    expect(html).toContain('Waiting');
+    expect(html).toContain('data-shape="clock"');
+    expect(html).toContain('var(--text-muted)');
+    expect(html).not.toContain('var(--accent-red)');
+    expect(html).not.toContain('Error');
+  });
+
+  it('labels response completion without claiming task success', () => {
+    const html = render({ card: card({ agentStatus: 'complete' }) });
+    expect(html).toContain('>Finished<');
+    expect(html).toContain('Turn finished');
+    expect(html).toContain('See result');
+  });
+
+  it('shows stale running evidence as unconfirmed', () => {
+    const html = render({ card: card({ unverifiable: true, activity: '$ old command' }) });
+    expect(html).toContain('Unconfirmed');
+    expect(html).toContain('No activity reported for 30m+');
     expect(html).not.toContain('data-fleet-activity');
   });
 
-  it('shows no activity line and no tail for a terminal with neither (idle baseline)', () => {
-    const html = render({ card: card({ activity: undefined }), tail: [] });
-    expect(html).not.toContain('data-fleet-activity');
+  it('uses the project to distinguish generic agent titles', () => {
+    expect(fleetTitle(card({ title: 'Claude Code', agentName: 'Claude Code' }))).toBe('alpha');
+    expect(fleetTitle(card({ title: 'Codex CLI' }))).toBe('alpha');
   });
 
-  it('does not show a terminal activity line on a browser surface (non-terminal type still labels itself)', () => {
-    // A browser card has no ptyId-driven activity in practice; even if a stray
-    // activity string were passed, the surfaceType label row is the affordance.
-    const html = render({ card: card({ surfaceType: 'browser', activity: undefined }) });
-    expect(html).toContain('browser'); // capitalized via CSS, raw text is 'browser'
+  it('preserves real terminal task titles instead of replacing them with the agent name', () => {
+    expect(fleetTitle(card({ title: '✳ 침대 범퍼 영상 검수', agentName: 'Claude Code' }))).toBe('침대 범퍼 영상 검수');
+    expect(fleetTitle(card({ paneLabel: '내 작업', title: 'Claude Code' }))).toBe('내 작업');
+  });
+
+  it('does not present a terminal tool activity on a browser surface', () => {
+    const html = render({ card: card({ surfaceType: 'browser', activity: '$ npm test' }) });
+    expect(html).not.toContain('data-fleet-activity');
+    expect(html).toContain('browser');
+  });
+});
+
+describe('FleetCard — one name, a short label', () => {
+  it('names a known agent by its display name, whatever the title says', () => {
+    expect(agentDisplayName('claude')).toBe('Claude Code');
+    expect(agentDisplayName('✳ Claude Code')).toBe('Claude Code');
+    expect(agentDisplayName('codex')).toBe('Codex CLI');
+    expect(agentDisplayName('my build')).toBe('my build');
+  });
+
+  it('keeps the accessible name short: name, status, place, the question clipped', () => {
+    const question = 'q'.repeat(200);
+    const html = renderToStaticMarkup(createElement(FleetCard, {
+      card: card({ agentStatus: 'awaiting_input' }), focused: false, onJump: noop,
+      row: { pane: card({ agentStatus: 'awaiting_input' }), section: 'needsYou', detail: question, detailSource: 'question', detailKey: 'fleet.needsYourInput' },
+    }));
+    const label = /aria-label="([^"]*)"/.exec(html)?.[1] ?? '';
+    expect(label.startsWith('alpha, Needs input, alpha, ')).toBe(true);
+    expect(label.length).toBeLessThan(140);
+    expect(label).not.toContain('Respond');
+  });
+
+  it('shows an error row\'s last error line in the now-doing slot, in mono', () => {
+    const html = renderToStaticMarkup(createElement(FleetCard, {
+      card: card({ agentStatus: 'error' }), focused: false, onJump: noop, errorLine: 'Error: build failed',
+    }));
+    expect(html).toContain('data-fleet-now="error"');
+    expect(html).toContain('is-activity');
+    expect(html).toContain('Error: build failed');
+    expect(html).toContain('Check');
+  });
+});
+
+describe('FleetCard — #1343 remote rows', () => {
+  it('marks a remote agent with the origin glyph and names the host in the label', () => {
+    const html = render({ card: card({ ptyId: 'remote:h1:s1', surfaceType: 'remote-terminal', remote: { hostId: 'h1', hostLabel: 'build-box' } }) });
+    expect(html).toContain('data-fleet-remote');
+    expect(html).toContain('title="@build-box"');
+    expect(html).toMatch(/aria-label="[^"]*, alpha, build-box"/);
+  });
+
+  it('renders no origin glyph for a local agent', () => {
+    expect(render({ card: card() })).not.toContain('data-fleet-remote');
   });
 });
 

@@ -52,6 +52,8 @@ export interface SnapshotRequest {
   drainQueue?: () => Buffer[];
   /** Wall-clock budget for the whole parse+serialize (default 2000 ms). */
   budgetMs?: number;
+  /** Text snapshots only: also return each row with dim (SGR 2) cells blanked. */
+  undimmed?: boolean;
 }
 
 export type SnapshotFallbackReason =
@@ -114,10 +116,13 @@ export interface TextSnapshotRow {
   text: string;
   /** `true` when this row is the soft-wrap continuation of the row above. */
   wrapped: boolean;
+  /** With `undimmed`: the row with dim cells as spaces, trailing space trimmed.
+   *  A TUI draws a placeholder or a suggested prompt dim; typed input is not. */
+  undimmed?: string;
 }
 
 export type TextSnapshotOutcome =
-  | { ok: true; rows: TextSnapshotRow[]; bytesIn: number; durationMs: number }
+  | { ok: true; rows: TextSnapshotRow[]; bufferType: 'normal' | 'alternate'; rowsBelowCursor: number; bytesIn: number; durationMs: number }
   | { ok: false; reason: SnapshotFallbackReason; detail?: string };
 
 /**
@@ -136,6 +141,15 @@ export type TextSnapshotOutcome =
  */
 export function generateTextSnapshot(req: SnapshotRequest): Promise<TextSnapshotOutcome> {
   return enqueueSnapshotJob(() => generateTextInner(req));
+}
+
+/**
+ * `generateTextSnapshot` for a caller that already holds the snapshot slot
+ * (inside `enqueueSnapshotJob`), so it can read the ring only once its turn
+ * comes: a ring copy taken before queueing stays pinned for the whole wait.
+ */
+export function generateTextSnapshotUnqueued(req: SnapshotRequest): Promise<TextSnapshotOutcome> {
+  return generateTextInner(req);
 }
 
 /** Per-row structural JSON overhead for `,{"text":,"wrapped":false}`. */
@@ -243,14 +257,27 @@ async function generateTextInner(req: SnapshotRequest): Promise<TextSnapshotOutc
     for (let i = 0; i < limit; i++) {
       const line = buffer.getLine(i);
       if (!line) continue;
-      rows.push({ text: line.translateToString(true), wrapped: i > 0 && line.isWrapped });
+      const row: TextSnapshotRow = { text: line.translateToString(true), wrapped: i > 0 && line.isWrapped };
+      if (req.undimmed) {
+        let plain = '';
+        for (let x = 0; x < line.length; x++) {
+          const cell = line.getCell(x);
+          if (!cell || cell.getWidth() === 0) continue;
+          plain += cell.isDim() ? ' '.repeat(cell.getWidth()) : cell.getChars() || ' ';
+        }
+        row.undimmed = plain.trimEnd();
+      }
+      rows.push(row);
     }
     // Drop trailing empty viewport rows: the grid is always `rows` tall, so a
     // short session leaves blank rows the live read path (readPtyBufferTail)
     // never returns — including them would make readScreen tail_lines come back
     // as blank lines.
     while (rows.length > 0 && rows[rows.length - 1].text === '') rows.pop();
-    return { ok: true, rows, bytesIn, durationMs: Date.now() - started };
+    // Rows below the cursor that survived the pop (#1595) — counted from the
+    // bottom, so it stays valid when a reader keeps only the last N rows.
+    const rowsBelowCursor = Math.max(0, rows.length - 1 - (buffer.baseY + buffer.cursorY));
+    return { ok: true, rows, bufferType: buffer.type, rowsBelowCursor, bytesIn, durationMs: Date.now() - started };
   } catch (err) {
     return { ok: false, reason: 'error', detail: err instanceof Error ? err.message : String(err) };
   } finally {

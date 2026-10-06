@@ -2,16 +2,22 @@ import type { TranslationKey } from '../i18n/locales/en';
 
 export type SettingsTabId =
   | 'general'
-  | 'terminal'
   | 'appearance'
-  | 'notifications'
+  | 'terminal'
   | 'shortcuts'
+  | 'notifications'
   | 'claude-integration'
-  | 'agents'
+  | 'accounts'
+  | 'moa'
+  | 'roles'
+  | 'tokens'
+  | 'browser'
+  | 'computer-use'
+  | 'remote'
   | 'lanlink'
   | 'about';
 
-export type SettingsNavGroupId = 'app' | 'agents' | 'system';
+export type SettingsNavGroupId = 'app' | 'agents' | 'connections' | 'about';
 
 export interface SettingsCatalogEntry {
   id: string;
@@ -22,27 +28,57 @@ export interface SettingsCatalogEntry {
   synonyms: string;
 }
 
+/**
+ * Left-nav order. The first and last groups carry no heading: the app tabs
+ * read as the default list and About sits alone at the end. Agents and
+ * Connections are headed because they gather several tabs of one kind.
+ */
 export const SETTINGS_NAV_GROUPS: {
   id: SettingsNavGroupId;
-  labelKey: TranslationKey;
+  labelKey?: TranslationKey;
   tabs: SettingsTabId[];
 }[] = [
   {
     id: 'app',
-    labelKey: 'settings.navGroupApp',
-    tabs: ['general', 'terminal', 'appearance', 'notifications', 'shortcuts'],
+    tabs: ['general', 'appearance', 'terminal', 'shortcuts', 'notifications'],
   },
   {
     id: 'agents',
     labelKey: 'settings.navGroupAgents',
-    tabs: ['claude-integration', 'agents'],
+    tabs: ['claude-integration', 'accounts', 'moa', 'roles', 'tokens', 'browser', 'computer-use'],
   },
   {
-    id: 'system',
-    labelKey: 'settings.navGroupSystem',
-    tabs: ['lanlink', 'about'],
+    id: 'connections',
+    labelKey: 'settings.navGroupConnections',
+    tabs: ['remote', 'lanlink'],
+  },
+  {
+    id: 'about',
+    tabs: ['about'],
   },
 ];
+
+/**
+ * Tab ids that no longer exist, mapped to the tab that now holds their
+ * settings. `agents` was split into Orchestrator and Roles & fan-out; the
+ * orchestrator half kept the tab's first section, so an old deep link lands
+ * there. Orchestrator then became Moa (the HQ main bot), which kept all of its
+ * rows. Every other tab id kept its spelling, so it needs no alias.
+ */
+export const LEGACY_SETTINGS_TAB_ALIASES: Readonly<Record<string, SettingsTabId>> = {
+  agents: 'moa',
+  orchestrator: 'moa',
+};
+
+const TAB_IDS: ReadonlySet<string> = new Set(SETTINGS_NAV_GROUPS.flatMap((g) => g.tabs));
+
+/** Resolve a tab id from any caller (current or legacy) to a tab that exists.
+ *  An unknown id opens General rather than a blank panel. */
+export function resolveSettingsTab(id: string | null | undefined): SettingsTabId {
+  if (!id) return 'general';
+  if (TAB_IDS.has(id)) return id as SettingsTabId;
+  return LEGACY_SETTINGS_TAB_ALIASES[id] ?? 'general';
+}
 
 /**
  * Searchable index over Settings. Labels/descriptions come from i18n at
@@ -56,6 +92,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'checkupdate', tab: 'general', labelKey: 'settings.checkUpdate', synonyms: 'update now latest release' },
   { id: 'startup', tab: 'general', labelKey: 'settings.startup', synonyms: 'autostart boot login launch 시작' },
   { id: 'tutorial', tab: 'general', labelKey: 'settings.restartTutorial', descKey: 'settings.restartTutorialDesc', synonyms: 'onboarding tour help 튜토리얼' },
+  { id: 'firstrun', tab: 'general', labelKey: 'settings.firstRunSetup', descKey: 'settings.firstRunSetupDesc', synonyms: 'first run setup doctor diagnose' },
   { id: 'reset', tab: 'general', labelKey: 'settings.reset', synonyms: 'factory default wipe 초기화' },
 
   { id: 'shell', tab: 'terminal', labelKey: 'settings.defaultShell', synonyms: 'zsh bash powershell pwsh fish 셸' },
@@ -64,8 +101,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'ime', tab: 'terminal', labelKey: 'settings.imeResidueGuard', descKey: 'settings.imeResidueGuardDesc', synonyms: 'ime korean cjk hangul 한글 입력' },
   { id: 'retention', tab: 'terminal', labelKey: 'settings.hiddenPaneRetention', descKey: 'settings.hiddenPaneRetentionDesc', synonyms: 'hidden render cpu park' },
   { id: 'coldpark', tab: 'terminal', labelKey: 'settings.coldPark', descKey: 'settings.coldParkDesc', synonyms: 'memory ram park idle unmount' },
-  { id: 'browserbackend', tab: 'terminal', labelKey: 'settings.browserBackend', descKey: 'settings.browserBackendDesc', synonyms: 'browser chrome chromium external builtin' },
-  { id: 'browserlight', tab: 'terminal', labelKey: 'settings.browserLightweight', descKey: 'settings.browserLightweightDesc', synonyms: 'browser throttle cpu lightweight' },
+  { id: 'inlineimages', tab: 'terminal', labelKey: 'settings.inlineImages', descKey: 'settings.inlineImagesDesc', synonyms: 'image sixel iterm2 osc 1337 picture graphics inline 이미지 画像' },
   { id: 'scrollback', tab: 'terminal', labelKey: 'settings.scrollbackLines', descKey: 'settings.scrollbackDesc', synonyms: 'history buffer lines scroll' },
   { id: 'restore', tab: 'terminal', labelKey: 'settings.scrollbackRestore', descKey: 'settings.scrollbackRestoreDesc', synonyms: 'restore persist reboot' },
   { id: 'imagepaste', tab: 'terminal', labelKey: 'settings.imagePaste', descKey: 'settings.imagePasteDesc', synonyms: 'image paste screenshot clipboard png inline native wsl 이미지 붙여넣기 스크린샷 클립보드' },
@@ -76,39 +112,81 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'cursorshape', tab: 'appearance', labelKey: 'settings.cursorShape', descKey: 'settings.cursorShapeDesc', synonyms: 'cursor caret bar block underline beam 커서 캐럿 막대 블록 shape type style' },
   { id: 'chrome', tab: 'appearance', labelKey: 'settings.chromePreset', descKey: 'settings.chromePresetDesc', synonyms: 'density compact comfortable' },
   { id: 'sidebarpos', tab: 'appearance', labelKey: 'settings.sidebarPosition', descKey: 'settings.sidebarPositionDesc', synonyms: 'sidebar left right dock' },
-  { id: 'sidebarattention', tab: 'appearance', labelKey: 'settings.sidebarAttentionFirst', descKey: 'settings.sidebarAttentionFirstDesc', synonyms: 'needs you waiting attention sort pin top 대기 정렬' },
+  { id: 'sidebarattention', tab: 'appearance', labelKey: 'settings.sidebarSort', descKey: 'settings.sidebarSortDesc', synonyms: 'needs you waiting attention sort order recent activity manual pin top 대기 정렬 순서 최근' },
+  { id: 'sidebarpanecoordinates', tab: 'appearance', labelKey: 'settings.sidebarShowPaneCoordinates', descKey: 'settings.sidebarShowPaneCoordinatesDesc', synonyms: 'roster coordinate w1-2 pane name label unnamed clutter agent' },
+  { id: 'workspacesettleidle', tab: 'appearance', labelKey: 'settings.workspaceSettleIdleDays', descKey: 'settings.workspaceSettleIdleDaysDesc', synonyms: 'settle settled idle days finished snooze hide quiet sidebar 마무리 미뤄두기 유휴' },
   { id: 'multiview', tab: 'appearance', labelKey: 'settings.multiviewArrangement', descKey: 'settings.multiviewArrangementDesc', synonyms: 'grid split stack columns rows' },
   { id: 'uiscale', tab: 'appearance', labelKey: 'settings.uiScale', descKey: 'settings.uiScaleDesc', synonyms: 'zoom dpi accessibility scale 배율' },
+  { id: 'toolbar', tab: 'appearance', labelKey: 'settings.agentToolbarShow', descKey: 'settings.agentToolbarShowDesc', synonyms: 'toolbar compose new chat' },
 
   { id: 'sound', tab: 'notifications', labelKey: 'settings.sound', descKey: 'settings.soundDesc', synonyms: 'sound audio beep alarm 소리' },
   { id: 'toast', tab: 'notifications', labelKey: 'settings.toast', descKey: 'settings.toastDesc', synonyms: 'toast popup banner' },
   { id: 'osnotify', tab: 'notifications', labelKey: 'settings.ring', descKey: 'settings.ringDesc', synonyms: 'system toast windows macos banner' },
   { id: 'catmute', tab: 'notifications', labelKey: 'settings.notificationCategories', descKey: 'settings.notificationCategoriesDesc', synonyms: 'mute category subagent approval' },
   { id: 'wsmute', tab: 'notifications', labelKey: 'settings.perWorkspaceNotifications', descKey: 'settings.perWorkspaceNotificationsDesc', synonyms: 'mute workspace quiet' },
+  { id: 'wsprwake', tab: 'notifications', labelKey: 'settings.prWake', descKey: 'settings.prWakeDesc', synonyms: 'pull request ci checks review comment conflict nudge agent' },
 
+  { id: 'quicklaunch', tab: 'shortcuts', labelKey: 'settings.quickLaunch', descKey: 'settings.quickLaunchDesc', synonyms: 'quick launch global shortcut hotkey composer spotlight launcher prompt 빠른 실행 전역 단축키' },
+  { id: 'quicklaunchkey', tab: 'shortcuts', labelKey: 'settings.quickLaunchShortcut', descKey: 'settings.quickLaunchShortcutDesc', synonyms: 'quick launch global hotkey cmd shift space 빠른 실행 단축키' },
   { id: 'prefix', tab: 'shortcuts', labelKey: 'settings.prefixKey', synonyms: 'prefix tmux ctrl+b leader' },
   { id: 'customkeys', tab: 'shortcuts', labelKey: 'settings.customKeybindings', synonyms: 'hotkey shortcut keymap bind 단축키' },
 
-  // Labelled by the tab's CURRENT name. `claudeIntegration.tab` still says
-  // "Claude Integration", which this PR renamed the tab away from — a result
-  // row naming a tab that no longer exists by that name sends the user looking
-  // for the wrong thing.
-  { id: 'plugin', tab: 'claude-integration', labelKey: 'settings.tabAccounts', synonyms: 'integration hook plugin setup install claude 계정' },
-  { id: 'claudeacct', tab: 'claude-integration', labelKey: 'accounts.title', synonyms: 'claude account login subscription max usage quota 계정' },
+  { id: 'plugin', tab: 'claude-integration', labelKey: 'claudeIntegration.signalHealth.title', synonyms: 'integration hook plugin setup install claude 계정' },
+  { id: 'setup', tab: 'claude-integration', labelKey: 'integrationSetup.title', descKey: 'integrationSetup.description', synonyms: 'hooks hook bridge statusline status line mcp install setup 훅 설치' },
+  { id: 'usage', tab: 'claude-integration', labelKey: 'claudeIntegration.usage.title', descKey: 'claudeIntegration.usage.description', synonyms: 'usage quota limit 5h 7d meter anthropic 사용량' },
+  { id: 'usagelimitresume', tab: 'claude-integration', labelKey: 'claudeIntegration.usageLimit.autoResume', descKey: 'claudeIntegration.usageLimit.autoResumeDesc', synonyms: 'usage limit rate resume continue reset pause codex 한도 이어가기 재개' },
+  { id: 'mcp', tab: 'claude-integration', labelKey: 'settings.mcpServers', synonyms: 'mcp plugin tools broker register codex' },
 
-  { id: 'brain', tab: 'agents', labelKey: 'settings.orchestratorBrain', descKey: 'settings.orchestratorBrainDesc', synonyms: 'orchestrator brain hermes claude acp' },
-  { id: 'model', tab: 'agents', labelKey: 'settings.orchestratorModel', descKey: 'settings.orchestratorModelDesc', synonyms: 'model opus sonnet haiku' },
-  { id: 'autowake', tab: 'agents', labelKey: 'settings.autoWake', descKey: 'settings.autoWakeDesc', synonyms: 'autowake wake event push tokens' },
-  { id: 'ledgergate', tab: 'agents', labelKey: 'settings.ledgerGate', descKey: 'settings.ledgerGateDesc', synonyms: 'ledger gate stop task orchestrator delegated experimental' },
-  { id: 'roles', tab: 'agents', labelKey: 'settings.roleBindings', descKey: 'settings.roleBindingsDesc', synonyms: 'role reviewer tester planner model bind' },
-  { id: 'a2a', tab: 'agents', labelKey: 'settings.a2aAutoApproveExecute', descKey: 'settings.a2aAutoApproveExecuteDesc', synonyms: 'a2a execute approve' },
-  { id: 'mcp', tab: 'agents', labelKey: 'settings.mcpServers', synonyms: 'mcp plugin tools broker register' },
-  { id: 'toolbar', tab: 'agents', labelKey: 'settings.agentToolbarShow', descKey: 'settings.agentToolbarShowDesc', synonyms: 'toolbar compose new chat' },
+  { id: 'claudeacct', tab: 'accounts', labelKey: 'accounts.title', synonyms: 'claude account login subscription max usage quota 계정' },
+
+  { id: 'moaswitch', tab: 'moa', labelKey: 'moa.settings.switch', descKey: 'moa.settings.switchDesc', synonyms: 'moa main bot hq orchestrator brain on off enable disable 모아 메인봇 오케스트레이터' },
+  { id: 'brain', tab: 'moa', labelKey: 'moa.settings.engine', descKey: 'moa.settings.engineDesc', synonyms: 'orchestrator brain engine runtime hermes claude acp sdk terminal' },
+  { id: 'model', tab: 'moa', labelKey: 'settings.orchestratorModel', descKey: 'settings.orchestratorModelDesc', synonyms: 'model opus sonnet haiku' },
+  { id: 'effort', tab: 'moa', labelKey: 'settings.orchestratorEffort', descKey: 'settings.orchestratorEffortDesc', synonyms: 'effort thinking reasoning budget low medium high max' },
+  { id: 'moahq', tab: 'moa', labelKey: 'moa.settings.hq', synonyms: 'hq headquarters workspace recreate reset setup' },
+  { id: 'moamodes', tab: 'moa', labelKey: 'moa.settings.modes', descKey: 'moa.settings.modesDesc', synonyms: 'mode off assist danger autonomy workspace 모드' },
+  { id: 'moaturncap', tab: 'moa', labelKey: 'moa.settings.turnCap', descKey: 'moa.settings.turnCapDesc', synonyms: 'turn cap limit rate hour budget usage' },
+  { id: 'moamemoryproposals', tab: 'moa', labelKey: 'moa.settings.memoryProposals', descKey: 'moa.settings.memoryProposalsDesc', synonyms: 'remember precedent skill proposal memory save 기억 판례 스킬' },
+  { id: 'moaapprovalpress', tab: 'moa', labelKey: 'moa.settings.approvalPress', descKey: 'moa.settings.approvalPressDesc', synonyms: 'approval approve press permission prompt auto yes danger worker 승인' },
+  { id: 'moaretro', tab: 'moa', labelKey: 'moa.settings.retro', descKey: 'moa.settings.retroDesc', synonyms: 'retro retrospective weekly review summary interruptions stalls 회고' },
+  { id: 'moastats', tab: 'moa', labelKey: 'moa.settings.stats', descKey: 'moa.settings.statsDesc', synonyms: 'track record stats statistics clear reset delegation 실적' },
+  { id: 'moaissueproposals', tab: 'moa', labelKey: 'moa.settings.issueProposals', descKey: 'moa.settings.issueProposalsDesc', synonyms: 'issue pr pull request propose new hand off github contributor 이슈 제안' },
+  { id: 'moaautohandoff', tab: 'moa', labelKey: 'moa.settings.autoHandoff', descKey: 'moa.settings.autoHandoffDesc', synonyms: 'hand off handoff auto danger delegate without asking card 위임 자동 핸드오프' },
+  { id: 'moareadwithoutasking', tab: 'moa', labelKey: 'moa.settings.readWithoutAsking', descKey: 'moa.settings.readWithoutAskingDesc', synonyms: 'read grep glob files permission prompt ask repo delegated verify 읽기 권한' },
+  { id: 'moaissuepoll', tab: 'moa', labelKey: 'moa.settings.issuePoll', descKey: 'moa.settings.issuePollDesc', synonyms: 'poll interval minutes scan check github issue' },
+  { id: 'moatrustedauthors', tab: 'moa', labelKey: 'moa.settings.trustedAuthors', descKey: 'moa.settings.trustedAuthorsDesc', synonyms: 'trusted author login github auto label wmux:auto' },
+  { id: 'moaignoredrepos', tab: 'moa', labelKey: 'moa.settings.ignoredRepos', descKey: 'moa.settings.ignoredReposDesc', synonyms: 'ignore mute repo repository proposals' },
+  { id: 'moabubbles', tab: 'moa', labelKey: 'moa.settings.bubbles', descKey: 'moa.settings.bubblesDesc', synonyms: 'bubble notification popup titlebar dot moa 말풍선 알림' },
+  { id: 'moareducemotion', tab: 'moa', labelKey: 'moa.settings.reduceMotion', descKey: 'moa.settings.reduceMotionDesc', synonyms: 'reduce motion animation mascot still accessibility 애니메이션 동작 줄이기' },
+  { id: 'fullpower', tab: 'moa', labelKey: 'settings.orchestratorFullPower', synonyms: 'full power sdk settings sources tools' },
+  { id: 'autowake', tab: 'moa', labelKey: 'settings.autoWake', descKey: 'settings.autoWakeDesc', synonyms: 'autowake wake event push tokens' },
+  { id: 'ledgergate', tab: 'moa', labelKey: 'settings.ledgerGate', descKey: 'settings.ledgerGateDesc', synonyms: 'ledger gate stop task orchestrator delegated experimental' },
+  { id: 'briefing', tab: 'moa', labelKey: 'settings.briefing', descKey: 'settings.briefingDesc', synonyms: 'briefing welcome home summary' },
+
+  { id: 'roles', tab: 'roles', labelKey: 'settings.roleBindings', descKey: 'settings.roleBindingsDesc', synonyms: 'role reviewer tester planner model bind' },
+  { id: 'a2a', tab: 'roles', labelKey: 'settings.a2aAutoApproveExecute', descKey: 'settings.a2aAutoApproveExecuteDesc', synonyms: 'a2a execute approve' },
+  { id: 'fanoutapproval', tab: 'roles', labelKey: 'settings.fanoutRequireApproval', descKey: 'settings.fanoutRequireApprovalDesc', synonyms: 'fanout fan-out approval approve prompt unattended ask' },
+  { id: 'fanoutagytrust', tab: 'roles', labelKey: 'settings.fanoutTrustAgyFolders', descKey: 'settings.fanoutTrustAgyFoldersDesc', synonyms: 'agy antigravity trust trusted folder workspace fanout fan-out' },
+  { id: 'fanoutworkers', tab: 'roles', labelKey: 'settings.fanoutWorkerPermissionMode', descKey: 'settings.fanoutWorkerPermissionModeDesc', synonyms: 'fanout fan-out worker permission auto bypass sandbox' },
+  { id: 'fanoutpresets', tab: 'roles', labelKey: 'settings.fanoutPresets', descKey: 'settings.fanoutPresetsDesc', synonyms: 'fanout fan-out preset image video agents codex grok output folder worktree' },
+  { id: 'fanoutallowtools', tab: 'roles', labelKey: 'settings.fanoutAllowWorkerTools', descKey: 'settings.fanoutAllowWorkerToolsDesc', synonyms: 'fanout worker allow tools permissions settings.json' },
+
+  { id: 'tokenprofile', tab: 'tokens', labelKey: 'settings.tokenProfile', descKey: 'settings.tokenProfileDesc', synonyms: 'token usage cost cheap minimal balanced effort model profile' },
+
+  { id: 'browserbackend', tab: 'browser', labelKey: 'settings.browserBackend', descKey: 'settings.browserBackendDesc', synonyms: 'browser chrome chromium external builtin' },
+  { id: 'browserlight', tab: 'browser', labelKey: 'settings.browserLightweight', descKey: 'settings.browserLightweightDesc', synonyms: 'browser throttle cpu lightweight' },
+  { id: 'sitememory', tab: 'browser', labelKey: 'settings.siteMemory', descKey: 'settings.siteMemoryDesc', synonyms: 'browser site memory domain replay failure remember' },
+  { id: 'computeruse', tab: 'computer-use', labelKey: 'settings.computerUse', descKey: 'settings.computerUseDesc', synonyms: 'computer use desktop control apps screenshot click automation 컴퓨터 사용 데스크톱 조작' },
+  { id: 'computerusehelper', tab: 'computer-use', labelKey: 'settings.computerUseHelper', descKey: 'settings.computerUseHelperDesc', synonyms: 'computer use helper native uia accessibility 헬퍼' },
+  { id: 'computerusestop', tab: 'computer-use', labelKey: 'settings.computerUseStopKey', descKey: 'settings.computerUseStopKeyDesc', synonyms: 'computer use stop abort kill emergency hotkey 정지 중단' },
+  { id: 'siteguides', tab: 'browser', labelKey: 'settings.siteGuides', descKey: 'settings.siteGuidesDesc', synonyms: 'browser site guides notes chrome agent' },
+
+  { id: 'paireddevices', tab: 'remote', labelKey: 'web.devicesTitle', descKey: 'web.devicesSubtitle', synonyms: 'phone mobile device paired revoke remote web 휴대폰 기기' },
+  { id: 'quickcommands', tab: 'remote', labelKey: 'settings.quickCommands', synonyms: 'quick command snippet phone reusable instruction 빠른 명령' },
 
   { id: 'lanenable', tab: 'lanlink', labelKey: 'settings.lanlinkEnable', descKey: 'settings.lanlinkEnableDesc', synonyms: 'lan link network peer remote pair' },
   { id: 'lannic', tab: 'lanlink', labelKey: 'settings.lanlinkNic', descKey: 'settings.lanlinkNicDesc', synonyms: 'nic interface ethernet wifi mac' },
   { id: 'lanpair', tab: 'lanlink', labelKey: 'settings.lanlinkPair', synonyms: 'pin pair join revoke peer' },
 
   { id: 'version', tab: 'about', labelKey: 'settings.aboutTagline', synonyms: 'version about changelog release 버전' },
-  { id: 'firstrun', tab: 'about', labelKey: 'settings.firstRunSetup', descKey: 'settings.firstRunSetupDesc', synonyms: 'first run setup doctor diagnose' },
 ];

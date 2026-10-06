@@ -1,3 +1,4 @@
+import { remoteAttachmentKey } from './remoteHosts';
 import type { Pane, PaneLeaf, PaneBranch } from './types';
 
 /** Find a leaf pane by ID */
@@ -20,6 +21,24 @@ export function findPane(root: Pane, id: string): Pane | null {
       const found = findPane(child, id);
       if (found) return found;
     }
+  }
+  return null;
+}
+
+/**
+ * Find the leaf pane that owns a surface.
+ *
+ * Surfaces know their own id but not which pane holds them, so anything that
+ * needs to ask "is my pane the focused one?" (#1266: the search bar) has to
+ * walk back up from the surface.
+ */
+export function findLeafBySurfaceId(root: Pane, surfaceId: string): PaneLeaf | null {
+  if (root.type === 'leaf') {
+    return root.surfaces?.some((s) => s.id === surfaceId) ? root : null;
+  }
+  for (const child of root.children) {
+    const found = findLeafBySurfaceId(child, surfaceId);
+    if (found) return found;
   }
   return null;
 }
@@ -139,6 +158,47 @@ function ownedRemoteSessionsOf(leaf: PaneLeaf): RemoteSessionRef[] {
       ? [{ hostId: s.remoteHostId, sessionId: s.remoteSessionId }]
       : [],
   );
+}
+
+/** One remote host workspace a local surface mirrors a session out of. */
+export interface RemoteSurfaceWorkspaceRef {
+  hostId: string;
+  workspaceId: string;
+}
+
+/**
+ * #1329 — every (host, remote workspace) pair this workspace's surfaces need a
+ * liveness feed for: visible tree plus stash, deduplicated, in tree order.
+ *
+ * Deliberately NOT gated on `remoteOwned`, unlike
+ * {@link getWorkspaceRemoteSessions}. Ownership decides who may DESTROY a
+ * session; it says nothing about who may WATCH one. A tab that merely views
+ * somebody else's session still wants its agent counted in the roster.
+ *
+ * The stash is included for the same reason {@link getWorkspacePtyIds}
+ * includes it: a stashed remote pane's session is still alive on the host, so
+ * dropping its feed would make the agent vanish from `pane_list` the moment
+ * the pane left the layout and reappear when it came back.
+ */
+export function collectRemoteSurfaceWorkspaces(
+  ws: WorkspacePaneOwner,
+): RemoteSurfaceWorkspaceRef[] {
+  const seen = new Set<string>();
+  const refs: RemoteSurfaceWorkspaceRef[] = [];
+  for (const leaf of getWorkspaceLeafPanes(ws)) {
+    for (const s of leaf.surfaces) {
+      if (s.surfaceType !== 'remote-terminal') continue;
+      const { remoteHostId: hostId, remoteWorkspaceId: workspaceId } = s;
+      if (!hostId || !workspaceId) continue;
+      // The same key shape the renderer's remoteWorkspaces rows use, so the
+      // dedup here and the row identity there can never disagree.
+      const key = remoteAttachmentKey(hostId, workspaceId);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      refs.push({ hostId, workspaceId });
+    }
+  }
+  return refs;
 }
 
 // ─── Not consolidated here (deliberate) ──────────────────────────────────────

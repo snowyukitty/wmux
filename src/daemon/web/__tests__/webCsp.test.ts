@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildWebCsp, cspHash, extractInlineBlocks, normalizeForHash } from '../webCsp';
+import { buildWebCsp, cspHash, extractInlineBlocks, normalizeForHash, WEB_APP_FONT_FILE } from '../webCsp';
 
 const page = (body: string): string =>
   `<!doctype html><html><head><style>\n.a { color: red }\n</style></head><body>${body}</body></html>`;
@@ -23,11 +23,12 @@ describe('webCsp', () => {
     expect(blocks.scripts).toEqual(['one();', 'two();']);
     expect(blocks.styles).toEqual(['\n.a { color: red }\n']);
 
-    const policy = buildWebCsp(html);
+    const policy = buildWebCsp(html, { wasm: true });
     const scriptSrc = policy.split('; ').find((d) => d.startsWith('script-src '))!;
-    expect(scriptSrc).toBe(`script-src ${cspHash('one();')} ${cspHash('two();')}`);
+    expect(scriptSrc).toBe(`script-src ${cspHash('one();')} ${cspHash('two();')} 'wasm-unsafe-eval'`);
     expect(scriptSrc).not.toContain('unsafe-inline');
-    expect(scriptSrc).not.toContain('unsafe-eval');
+    // WebAssembly compilation only (#1641); JS string evaluation stays refused.
+    expect(scriptSrc).not.toContain("'unsafe-eval'");
     expect(scriptSrc).not.toContain("'self'");
   });
 
@@ -58,8 +59,28 @@ describe('webCsp', () => {
     // page, or an empty script-src that some parser reads as permissive, is
     // worse than saying 'none' out loud.
     const policy = buildWebCsp(null);
-    expect(policy).toContain("script-src 'none'");
+    expect(policy).toContain("script-src 'none';");
+    expect(policy).not.toContain('wasm-unsafe-eval');
     expect(policy).toContain("default-src 'none'");
+  });
+
+  it('serves exactly this policy for the terminal page', () => {
+    // The whole header, spelled out: a directive added, dropped or loosened
+    // anywhere has to change this line on purpose.
+    expect(buildWebCsp(page('<script>x();</script>'), { wasm: true })).toBe(
+      "default-src 'none'; " +
+        `script-src ${cspHash('x();')} 'wasm-unsafe-eval'; ` +
+        "style-src 'unsafe-inline'; img-src 'self' data:; font-src 'self'; " +
+        "connect-src 'self'; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; " +
+        "base-uri 'none'; form-action 'none'",
+    );
+  });
+
+  it('gives WebAssembly only to a page that asks for it (/app does not)', () => {
+    const app = buildWebCsp(page('<script>x();</script>'));
+    expect(app).toContain(`script-src ${cspHash('x();')}; `);
+    expect(app).not.toContain('wasm-unsafe-eval');
+    expect(buildWebCsp(null, { wasm: true })).not.toContain('wasm-unsafe-eval');
   });
 
   it('keeps the directives the served page depends on', () => {
@@ -75,5 +96,14 @@ describe('webCsp', () => {
     expect(policy).toContain("frame-ancestors 'none'");
     expect(policy).toContain("base-uri 'none'");
     expect(policy).toContain("form-action 'none'");
+  });
+
+  it('names the /app font files the build may ship and the daemon serves', () => {
+    for (const ok of ['Inter-latin-8kRkwJBP.woff2', 'Inter.latin-B_x.1.woff2', 'JetBrainsMono-Be_q-A24.woff2']) {
+      expect(WEB_APP_FONT_FILE.test(ok)).toBe(true);
+    }
+    for (const bad of ['..woff2', '.hidden.woff2', 'a/b.woff2', 'font.woff', 'x.woff2.js', '../x.woff2']) {
+      expect(WEB_APP_FONT_FILE.test(bad)).toBe(false);
+    }
   });
 });

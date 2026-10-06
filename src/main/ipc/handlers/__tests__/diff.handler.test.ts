@@ -3,11 +3,22 @@
 // 실제 git worktree를 만들어 read → applyHunks 전 경로를 검증한다.
 // 커버: 워킹트리 대조(미커밋 포함)·untracked 합성·타겟 스냅샷·드리프트 거부·
 // dirty 거부·per-hunk 프로브·경로 검증·all-or-nothing apply.
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync, mkdirSync, symlinkSync, realpathSync } from 'node:fs';
+import {
+  mkdtempSync,
+  writeFileSync,
+  rmSync,
+  readFileSync,
+  mkdirSync,
+  symlinkSync,
+  realpathSync,
+  appendFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { copyDirSync } from '../../../../test-utils/copyDirSync';
+import { disableGitMaintenance } from '../../../../test-utils/gitFixture';
 
 // electron ipcMain을 캡처해 핸들러를 직접 호출한다.
 const captured = new Map<string, (...args: unknown[]) => unknown>();
@@ -77,6 +88,53 @@ function pick(
 
 // 태스크 worktree 시나리오를 구성한다: 본 repo + linked worktree.
 // worktree에 미커밋 변경 2파일 + untracked 1파일.
+// Each git spawn costs 100 ms+ on the Windows runner, so every fixture repo is
+// committed once (beforeAll) and each test gets a byte copy of it. A template
+// is always a plain repo: a linked worktree records absolute paths on both
+// sides, so it is added to the copy instead. The copied index carries the
+// template's stat data, so it is refreshed once — otherwise git reads every
+// tracked file as modified.
+const IDENTITY_CONFIG = '[user]\n\temail = t@t\n\tname = t\n';
+const NO_AUTOCRLF_CONFIG = '[core]\n\tautocrlf = false\n';
+
+function makeTemplateDir(): string {
+  return mkdtempSync(join(tmpdir(), 'wmux-diffh-tpl-'));
+}
+
+// init + config (written to .git/config directly) + one base commit of `files`.
+function initTemplateRepo(repo: string, config: string, files: Record<string, string>): void {
+  mkdirSync(repo, { recursive: true });
+  g(repo, ['init', '-q', '-b', 'main']);
+  disableGitMaintenance(repo);
+  appendFileSync(join(repo, '.git', 'config'), config);
+  for (const [rel, content] of Object.entries(files)) {
+    mkdirSync(join(repo, rel, '..'), { recursive: true });
+    writeFileSync(join(repo, rel), content);
+  }
+  g(repo, ['add', '-A']);
+  g(repo, ['commit', '-q', '-m', 'base']);
+}
+
+function copyRepo(templateRepo: string, repo: string): void {
+  copyDirSync(templateRepo, repo);
+  g(repo, ['update-index', '-q', '--refresh']);
+}
+
+// Shared makeScenario template: a.txt + b.txt committed on main.
+let scenarioTemplateBase: string;
+let scenarioTemplateRepo: string;
+let scenarioTemplateOid: string;
+beforeAll(() => {
+  scenarioTemplateBase = makeTemplateDir();
+  scenarioTemplateRepo = join(scenarioTemplateBase, 'repo');
+  initTemplateRepo(scenarioTemplateRepo, IDENTITY_CONFIG + NO_AUTOCRLF_CONFIG, {
+    'a.txt': 'a1\na2\na3\na4\na5\n',
+    'b.txt': 'b1\nb2\nb3\n',
+  });
+  scenarioTemplateOid = g(scenarioTemplateRepo, ['rev-parse', 'HEAD']).trim();
+});
+afterAll(() => removeScenarioTree(scenarioTemplateBase));
+
 function makeScenario(): {
   repoRoot: string;
   worktreePath: string;
@@ -85,16 +143,8 @@ function makeScenario(): {
 } {
   const base = mkdtempSync(join(tmpdir(), 'wmux-diffh-'));
   const repoRoot = join(base, 'repo');
-  mkdirSync(repoRoot);
-  g(repoRoot, ['init', '-q', '-b', 'main']);
-  g(repoRoot, ['config', 'user.email', 't@t']);
-  g(repoRoot, ['config', 'user.name', 't']);
-  g(repoRoot, ['config', 'core.autocrlf', 'false']);
-  writeFileSync(join(repoRoot, 'a.txt'), 'a1\na2\na3\na4\na5\n');
-  writeFileSync(join(repoRoot, 'b.txt'), 'b1\nb2\nb3\n');
-  g(repoRoot, ['add', '-A']);
-  g(repoRoot, ['commit', '-q', '-m', 'base']);
-  const targetHeadOid = g(repoRoot, ['rev-parse', 'HEAD']).trim();
+  copyRepo(scenarioTemplateRepo, repoRoot);
+  const targetHeadOid = scenarioTemplateOid;
 
   // linked worktree 생성(태스크 브랜치).
   const worktreePath = join(base, 'wt');
@@ -113,7 +163,19 @@ function makeScenario(): {
   };
 }
 
-describe('diff:read — 워킹트리 대조·untracked 합성·스냅샷', () => {
+// #1274: every suite in this file builds temp git repos and shells out to the real
+// `git` binary (init/commit/worktree/diff/apply) per test, so runtime tracks
+// process-spawn cost rather than code speed — and the numbers below are not
+// comparable to each other, so state the conditions. Run alone and serially on
+// macOS the whole file is ~35 s (cold) / ~11 s (warm) and the slowest single
+// test is ~2.4 s cold. On windows-latest `validate`, where the file shares the
+// runner with parallel vitest workers and Git-for-Windows process spawn costs
+// an order of magnitude more, ONE test measured 10.2 s and blew vitest's 5 s
+// per-test default — on a PR that never touched this code. The budget is sized
+// for that CI-parallel worst case, not for the local serial figure.
+const GIT_PROCESS_TIMEOUT_MS = 30_000;
+
+describe('diff:read — 워킹트리 대조·untracked 합성·스냅샷', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   let scn: ReturnType<typeof makeScenario>;
   beforeEach(() => {
     captured.clear();
@@ -143,7 +205,68 @@ describe('diff:read — 워킹트리 대조·untracked 합성·스냅샷', () =>
   });
 });
 
-describe('diff:applyHunks — 채택 all-or-nothing', () => {
+// T3: a fan-out task branches from origin's default branch, which can be ahead
+// of the owner's checkout. The task diff must compare against that base (read
+// from the task.json stamp beside the worktree), or every upstream commit in
+// between shows up as the worker's change.
+describe('diff:read — T3 task base from the task.json stamp', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
+  let base: string;
+  let worktreePath: string;
+  let templateBase: string;
+  let templateRepo: string;
+  let upstreamOid: string;
+  beforeAll(() => {
+    templateBase = makeTemplateDir();
+    templateRepo = join(templateBase, 'repo');
+    initTemplateRepo(templateRepo, IDENTITY_CONFIG + NO_AUTOCRLF_CONFIG, { 'a.txt': 'a1\n' });
+  });
+  // A separate hook so no single hook's 10 s budget has to cover every spawn.
+  beforeAll(() => {
+    // "origin/main" moved on: an upstream commit the owner's main does not have.
+    g(templateRepo, ['checkout', '-q', '-b', 'upstream']);
+    writeFileSync(join(templateRepo, 'up.txt'), 'upstream\n');
+    g(templateRepo, ['add', '-A']);
+    g(templateRepo, ['commit', '-q', '-m', 'upstream']);
+    upstreamOid = g(templateRepo, ['rev-parse', 'HEAD']).trim();
+    g(templateRepo, ['checkout', '-q', 'main']);
+  });
+  afterAll(() => removeScenarioTree(templateBase));
+  beforeEach(() => {
+    captured.clear();
+    registerDiffHandlers();
+    base = mkdtempSync(join(tmpdir(), 'wmux-diffbase-'));
+    const repoRoot = join(base, 'repo');
+    copyRepo(templateRepo, repoRoot);
+    // The task branched from the upstream commit and changed a.txt.
+    worktreePath = join(base, 'worktrees', 'task-1');
+    g(repoRoot, ['worktree', 'add', '-q', '--no-track', '-b', 'wtask/task-1', worktreePath, upstreamOid]);
+    writeFileSync(join(worktreePath, 'a.txt'), 'a1\nworker\n');
+    const metaDir = join(base, 'worktrees', '.meta', 'task-1');
+    mkdirSync(metaDir, { recursive: true });
+    writeFileSync(
+      join(metaDir, 'task.json'),
+      JSON.stringify({ taskId: 'wtask-1', title: 't', createdAt: 1, baseOid: upstreamOid }),
+    );
+  });
+  afterEach(() => removeScenarioTree(base));
+
+  it('shows only the worker change, not the upstream commit the owner lacks', async () => {
+    const read = captured.get(IPC.DIFF_READ)!;
+    const res = (await read({}, worktreePath)) as { ok: boolean; files: Array<{ path: string }> };
+    expect(res.ok).toBe(true);
+    expect(res.files.map((f) => f.path)).toEqual(['a.txt']);
+  });
+
+  it('without a stamped base, falls back to the owner HEAD comparison (pre-T3 behaviour)', async () => {
+    rmSync(join(base, 'worktrees', '.meta'), { recursive: true, force: true });
+    const read = captured.get(IPC.DIFF_READ)!;
+    const res = (await read({}, worktreePath)) as { ok: boolean; files: Array<{ path: string }> };
+    expect(res.ok).toBe(true);
+    expect(res.files.map((f) => f.path).sort()).toEqual(['a.txt', 'up.txt']);
+  });
+});
+
+describe('diff:applyHunks — 채택 all-or-nothing', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   let scn: ReturnType<typeof makeScenario>;
   beforeEach(() => {
     captured.clear();
@@ -224,9 +347,12 @@ describe('diff:applyHunks — 채택 all-or-nothing', () => {
       snapshot: r.snapshot,
       selections: [pick(r, 'a.txt', [0])],
     };
-    const res = (await apply({}, req, scn.worktreePath)) as { ok: boolean; code?: string };
+    const res = (await apply({}, req, scn.worktreePath)) as { ok: boolean; code?: string; error?: string };
     expect(res.ok).toBe(false);
     expect(res.code).toBe('dirty');
+    // The panel shows this reason verbatim, so it must be English (#1461).
+    expect(res.error).toContain('a.txt');
+    expect(res.error).not.toMatch(/[\u3131-\uD79D]/);
   });
 
   it('이미 적용된 hunk — reverse 프로브가 alreadyApplied 표시(거부 아님, best-effort)', async () => {
@@ -281,7 +407,7 @@ describe('diff:applyHunks — 채택 all-or-nothing', () => {
 // file with +/- and no hunks, or hunks that cannot be applied. Note neither
 // configured command is ever spawned once the flags are in place — these tests
 // assert the flags took effect, not the tools' behaviour.
-describe('diff:read — external diff drivers cannot replace the patch', () => {
+describe('diff:read — external diff drivers cannot replace the patch', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   let scn: ReturnType<typeof makeScenario>;
   beforeEach(() => {
     captured.clear();
@@ -338,7 +464,7 @@ describe('diff:read — external diff drivers cannot replace the patch', () => {
 // the worktree in between used to be adopted silently — the wrong hunk, or only
 // the part of the selection that still resolved. Every case below must reject
 // the whole request and leave the target byte-identical.
-describe('diff:applyHunks — source integrity gate', () => {
+describe('diff:applyHunks — source integrity gate', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   let scn: ReturnType<typeof makeScenario>;
   const BASE_A = 'a1\na2\na3\na4\na5\n';
   const BASE_B = 'b1\nb2\nb3\n';
@@ -549,7 +675,7 @@ describe('diff:applyHunks — source integrity gate', () => {
 });
 
 // ── F1: quotepath 경로 파싱(공백·한글·따옴표·rename) ─────────────────────────
-describe('diff:read/applyHunks — F1 특수문자 파일명(-z quotepath=false)', () => {
+describe('diff:read/applyHunks — F1 특수문자 파일명(-z quotepath=false)', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   let scn: ReturnType<typeof makeScenario>;
   beforeEach(() => {
     captured.clear();
@@ -598,7 +724,7 @@ describe('diff:read/applyHunks — F1 특수문자 파일명(-z quotepath=false)
 });
 
 // ── F2: 프로브 의미론 — 의존 hunk 결합 성공·alreadyApplied 명시 거부 ──────────
-describe('diff:applyHunks — F2 결합 게이트·alreadyApplied 거부', () => {
+describe('diff:applyHunks — F2 결합 게이트·alreadyApplied 거부', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   let scn: ReturnType<typeof makeScenario>;
   beforeEach(() => {
     captured.clear();
@@ -672,7 +798,7 @@ describe('diff:applyHunks — F2 결합 게이트·alreadyApplied 거부', () =>
 });
 
 // ── F3: untracked symlink 차단 ───────────────────────────────────────────────
-describe('diff:read — F3 symlink untracked는 unsupported(repo 밖 노출 차단)', () => {
+describe('diff:read — F3 symlink untracked는 unsupported(repo 밖 노출 차단)', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   let scn: ReturnType<typeof makeScenario>;
   beforeEach(() => {
     captured.clear();
@@ -711,7 +837,7 @@ describe('diff:read — F3 symlink untracked는 unsupported(repo 밖 노출 차�
 });
 
 // ── F4: delete diff의 dirty 게이트 경로 ──────────────────────────────────────
-describe('diff:applyHunks — F4 delete 파일이 타겟에서 dirty면 거부', () => {
+describe('diff:applyHunks — F4 delete 파일이 타겟에서 dirty면 거부', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   let scn: ReturnType<typeof makeScenario>;
   beforeEach(() => {
     captured.clear();
@@ -748,7 +874,7 @@ describe('diff:applyHunks — F4 delete 파일이 타겟에서 dirty면 거부',
 });
 
 // ── F7: truncated(캡 초과) 파일 채택 차단 ────────────────────────────────────
-describe('diff:read/applyHunks — F7 캡 초과 파일 채택 불가', () => {
+describe('diff:read/applyHunks — F7 캡 초과 파일 채택 불가', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   let scn: ReturnType<typeof makeScenario>;
   beforeEach(() => {
     captured.clear();
@@ -785,7 +911,7 @@ describe('diff:read/applyHunks — F7 캡 초과 파일 채택 불가', () => {
 });
 
 // ── F8: targetHeadOid 인자 가드 ──────────────────────────────────────────────
-describe('diff:read — F8 targetHeadOid 형식 가드', () => {
+describe('diff:read — F8 targetHeadOid 형식 가드', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   let scn: ReturnType<typeof makeScenario>;
   beforeEach(() => {
     captured.clear();
@@ -799,34 +925,37 @@ describe('diff:read — F8 targetHeadOid 형식 가드', () => {
     const res = (await read({}, scn.worktreePath, 'not-a-sha; rm -rf /')) as {
       ok: boolean;
       code?: string;
+      error?: string;
     };
     expect(res.ok).toBe(false);
     expect(res.code).toBe('bad-oid');
+    expect(res.error).not.toMatch(/[\u3131-\uD79D]/);
   });
 });
 
 // ── 워크스페이스 diff 모드 — 일반 repo를 targetHeadOid 미지정으로 읽기 ─────────
 // resolveTargetRepo→repo 자신, merge-base HEAD HEAD=HEAD → `git diff HEAD`
 // (staged+unstaged) + untracked 합성. 백엔드 무변경으로 성립하는 계약을 고정한다.
-describe('diff:read — 워크스페이스 모드(일반 repo, oid 미지정)', () => {
+describe('diff:read — 워크스페이스 모드(일반 repo, oid 미지정)', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   let base: string;
   let repo: string;
+  let templateBase: string;
 
+  beforeAll(() => {
+    templateBase = makeTemplateDir();
+    initTemplateRepo(join(templateBase, 'repo'), IDENTITY_CONFIG + NO_AUTOCRLF_CONFIG, {
+      'a.txt': 'a1\na2\na3\n',
+      // rename 테스트용 — rename 감지(유사도 50%+)가 성립할 만큼 라인 수를 확보.
+      'keep.txt': 'k1\nk2\nk3\nk4\nk5\nk6\nk7\nk8\nk9\nk10\n',
+    });
+  });
+  afterAll(() => removeScenarioTree(templateBase));
   beforeEach(() => {
     captured.clear();
     registerDiffHandlers();
     base = realpathSync.native(mkdtempSync(join(tmpdir(), 'wmux-diffws-')));
     repo = join(base, 'repo');
-    mkdirSync(repo);
-    g(repo, ['init', '-q', '-b', 'main']);
-    g(repo, ['config', 'user.email', 't@t']);
-    g(repo, ['config', 'user.name', 't']);
-    g(repo, ['config', 'core.autocrlf', 'false']);
-    writeFileSync(join(repo, 'a.txt'), 'a1\na2\na3\n');
-    // rename 테스트용 — rename 감지(유사도 50%+)가 성립할 만큼 라인 수를 확보.
-    writeFileSync(join(repo, 'keep.txt'), 'k1\nk2\nk3\nk4\nk5\nk6\nk7\nk8\nk9\nk10\n');
-    g(repo, ['add', '-A']);
-    g(repo, ['commit', '-q', '-m', 'base']);
+    copyRepo(join(templateBase, 'repo'), repo);
   });
   afterEach(() => removeScenarioTree(base));
 
@@ -887,8 +1016,7 @@ describe('diff:read — 워크스페이스 모드(일반 repo, oid 미지정)', 
     const fresh = join(base, 'fresh');
     mkdirSync(fresh);
     g(fresh, ['init', '-q', '-b', 'main']);
-    g(fresh, ['config', 'user.email', 't@t']);
-    g(fresh, ['config', 'user.name', 't']);
+    appendFileSync(join(fresh, '.git', 'config'), IDENTITY_CONFIG);
     writeFileSync(join(fresh, 'first.txt'), 'hello\n');
     g(fresh, ['add', '-A']); // staged, 커밋은 아직 없음(HEAD 없음).
     const read = captured.get(IPC.DIFF_READ)!;
@@ -918,10 +1046,16 @@ describe('diff:read — 워크스페이스 모드(일반 repo, oid 미지정)', 
 });
 
 // ── diff:resolveRepo — 팔레트 진입점의 cwd → worktree toplevel 정규화 ─────────
-describe('diff:resolveRepo — cwd 정규화', () => {
+describe('diff:resolveRepo — cwd 정규화', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   let base: string;
   let repo: string;
+  let templateBase: string;
 
+  beforeAll(() => {
+    templateBase = makeTemplateDir();
+    initTemplateRepo(join(templateBase, 'repo'), IDENTITY_CONFIG, { 'sub/f.txt': 'x\n' });
+  });
+  afterAll(() => removeScenarioTree(templateBase));
   beforeEach(() => {
     captured.clear();
     registerDiffHandlers();
@@ -929,14 +1063,7 @@ describe('diff:resolveRepo — cwd 정규화', () => {
     // git rev-parse가 반환하는 canonical 경로와 문자열 비교가 어긋나지 않게.
     base = realpathSync.native(mkdtempSync(join(tmpdir(), 'wmux-diffrr-')));
     repo = join(base, 'repo');
-    mkdirSync(repo);
-    g(repo, ['init', '-q', '-b', 'main']);
-    g(repo, ['config', 'user.email', 't@t']);
-    g(repo, ['config', 'user.name', 't']);
-    mkdirSync(join(repo, 'sub'));
-    writeFileSync(join(repo, 'sub', 'f.txt'), 'x\n');
-    g(repo, ['add', '-A']);
-    g(repo, ['commit', '-q', '-m', 'base']);
+    copyRepo(join(templateBase, 'repo'), repo);
   });
   afterEach(() => removeScenarioTree(base));
 
@@ -978,27 +1105,28 @@ describe('diff:resolveRepo — cwd 정규화', () => {
 
 // ── Guards for the README's adoption claim: hunks are picked individually, and
 //    the all-or-nothing part is the apply of that selection (not the whole diff).
-describe('diff:applyHunks — per-hunk selection granularity and selection-wide atomicity', () => {
+describe('diff:applyHunks — per-hunk selection granularity and selection-wide atomicity', { timeout: GIT_PROCESS_TIMEOUT_MS }, () => {
   // Local fixture: two files long enough that two distant edits each land in two
   // hunks. The shared makeScenario files are too short to split. `diff.context`
   // and `diff.interHunkContext` are pinned because the hunk split — and so the
   // index a selection refers to — depends on them, and a developer's global
   // gitconfig can widen both (a global `diff.context=10` merges these into one).
+  const baseText = `${Array.from({ length: 20 }, (_, i) => `L${i + 1}`).join('\n')}\n`;
+  let mhTemplateBase: string;
+  beforeAll(() => {
+    mhTemplateBase = makeTemplateDir();
+    initTemplateRepo(
+      join(mhTemplateBase, 'repo'),
+      `${IDENTITY_CONFIG}${NO_AUTOCRLF_CONFIG}[diff]\n\tcontext = 3\n\tinterHunkContext = 0\n`,
+      { 'long.txt': baseText, 'other.txt': baseText },
+    );
+  });
+  afterAll(() => removeScenarioTree(mhTemplateBase));
+
   function makeMultiHunkScenario() {
     const base = mkdtempSync(join(tmpdir(), 'wmux-diffh-mh-'));
     const repoRoot = join(base, 'repo');
-    mkdirSync(repoRoot);
-    g(repoRoot, ['init', '-q', '-b', 'main']);
-    g(repoRoot, ['config', 'user.email', 't@t']);
-    g(repoRoot, ['config', 'user.name', 't']);
-    g(repoRoot, ['config', 'core.autocrlf', 'false']);
-    g(repoRoot, ['config', 'diff.context', '3']);
-    g(repoRoot, ['config', 'diff.interHunkContext', '0']);
-    const baseText = `${Array.from({ length: 20 }, (_, i) => `L${i + 1}`).join('\n')}\n`;
-    writeFileSync(join(repoRoot, 'long.txt'), baseText);
-    writeFileSync(join(repoRoot, 'other.txt'), baseText);
-    g(repoRoot, ['add', '-A']);
-    g(repoRoot, ['commit', '-q', '-m', 'base']);
+    copyRepo(join(mhTemplateBase, 'repo'), repoRoot);
     const worktreePath = join(base, 'wt');
     g(repoRoot, ['worktree', 'add', '-q', '-b', 'wtask/mh', worktreePath, 'HEAD']);
     writeFileSync(

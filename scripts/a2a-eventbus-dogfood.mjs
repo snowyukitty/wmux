@@ -27,9 +27,10 @@
  * ---------------------------------------------------
  * The main-pipe RPC router applies workspaceId scoping from `params.workspaceId`
  * VERBATIM (events.rpc.ts:60-95) — the server-side pin lives only in the MCP
- * layer (requireWorkspaceId), NOT in the raw router. And a clientName-less RPC
- * is grandfathered through enforce-mode (RpcRouter.dispatch:206/239 → enforcer
- * legacy/first-party allow). So a single packaged instance + main-pipe RPC can
+ * layer (requireWorkspaceId), NOT in the raw router. And this driver passes the
+ * enforce-mode gate as `wmux-cli` plus a seeded trust row (see
+ * seedDogfoodTrust; the envelope-less grandfather it used to ride was closed by
+ * #1111). So a single packaged instance + main-pipe RPC can
  * impersonate the sender poll, the receiver poll, a third-party poll, and the
  * unscoped poll — the exact four vantage points the invariant is about.
  *   - a2a.task.send (a2a.rpc.ts:106) passes params straight to the renderer,
@@ -138,8 +139,48 @@ function pipeAlive(pipeName) {
   });
 }
 
-// One-shot newline-delimited JSON-RPC client (pra PipeClient). clientName is
-// deliberately OMITTED so the request is grandfathered through enforce mode.
+// One-shot newline-delimited JSON-RPC client (pra PipeClient).
+// #1111: these calls used to omit clientName and ride the `legacy`
+// grandfather, which closes in the first release on or after 2026-09-30. The
+// driver now identifies as 'wmux-cli' AND the sandbox trust DB is seeded with
+// a matching `trusted` row (seedDogfoodTrust) declaring exactly the extra
+// capabilities this script needs.
+//
+// Why the row and that particular name: this script also calls `wmux.internal`
+// methods that no declaration can ever contain, so those can only ride the
+// curated internal-CLI lane — which forces the name to 'wmux-cli'. The methods
+// OUTSIDE that allowlist (a2a.task.send / a2a.task.update / a2a.task.cancel / events.poll)
+// fall through to normal enforcement, where the seeded declaration grants them.
+// Nothing here widens a production allowlist: the row lives in this script's
+// throwaway sandbox HOME and dies with it.
+const DOGFOOD_CLIENT_NAME = 'wmux-cli';
+const DOGFOOD_CAPABILITIES = ["a2a.send", "a2a.read", "events.subscribe"];
+
+function seedDogfoodTrust(wmuxDir) {
+  fs.mkdirSync(wmuxDir, { recursive: true });
+  const now = Date.now();
+  fs.writeFileSync(
+    path.join(wmuxDir, 'plugin-trust.json'),
+    JSON.stringify({
+      schemaVersion: 1,
+      plugins: {
+        [DOGFOOD_CLIENT_NAME]: {
+          name: DOGFOOD_CLIENT_NAME,
+          version: '0.0.0-dogfood',
+          status: 'trusted',
+          declaredCapabilities: DOGFOOD_CAPABILITIES,
+          rationale: 'dogfood sandbox instance',
+          firstSeen: now,
+          lastSeen: now,
+        },
+      },
+    }, null, 2),
+    'utf8',
+  );
+}
+
+// Seed BEFORE the app boots: the first RPC is already gated.
+seedDogfoodTrust(path.join(home, `.wmux${suffix}`));
 function rpcCall(pipeName, token, method, params = {}, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
     const sock = net.createConnection(pipeName);
@@ -149,7 +190,7 @@ function rpcCall(pipeName, token, method, params = {}, timeoutMs = 8000) {
     const finish = (fn) => { if (settled) return; settled = true; clearTimeout(timer); try { sock.destroy(); } catch { /* */ } fn(); };
     const timer = setTimeout(() => finish(() => reject(new Error(`rpc timeout: ${method}`))), timeoutMs);
     sock.setEncoding('utf8');
-    sock.once('connect', () => sock.write(JSON.stringify({ id, method, params, token }) + '\n'));
+    sock.once('connect', () => sock.write(JSON.stringify({ id, method, params, token, clientName: DOGFOOD_CLIENT_NAME, clientVersion: '0.0.0-dogfood' }) + '\n'));
     sock.once('error', (e) => finish(() => reject(e)));
     sock.on('data', (chunk) => {
       buf += chunk;
@@ -178,7 +219,8 @@ function spawnApp() {
   let stdoutBuf = '';
   proc.stdout.on('data', (b) => {
     stdoutBuf += b.toString('utf8');
-    const m = stdoutBuf.match(/CDP enabled on port (\d+)/);
+    // "requested" since #1331; "enabled" stays matchable for older builds.
+    const m = stdoutBuf.match(/CDP (?:requested|listening|enabled) on port (\d+)/);
     if (m && cdpPort === null) { cdpPort = Number(m[1]); for (const w of cdpWaiters.splice(0)) w(cdpPort); }
     if (stdoutBuf.length > 65536) stdoutBuf = stdoutBuf.slice(-4096);
   });

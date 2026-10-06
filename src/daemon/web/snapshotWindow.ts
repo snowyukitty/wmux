@@ -52,6 +52,14 @@ const ESC_FORWARD_SCAN_BYTES = ESC_LOOKBEHIND_BYTES * 2;
  */
 const LINE_LOOKAHEAD_BYTES = 4096;
 
+/**
+ * How far forward we will look for the END of a string sequence whose start
+ * lies out of reach (an inline image: an OSC 1337 or sixel DCS payload runs to
+ * megabytes, far past the lookbehind). Never more than the window itself, so
+ * the cost stays bounded by what we were going to send anyway.
+ */
+const STRING_TAIL_SCAN_BYTES = 4 * 1024 * 1024;
+
 export interface CapSnapshotOptions {
   /**
    * Window size in bytes, or `'all'` for the entire buffer.
@@ -123,13 +131,42 @@ function escapeSafeOffset(buf: Buffer, offset: number): number {
       break;
     }
   }
-  if (esc === -1) return offset;
+  if (esc === -1) return stringTailOffset(buf, offset);
   const end = escapeSequenceEnd(buf, esc);
-  // end === -1: unterminated within the forward bound, i.e. not a sequence we
-  // can reason about. Leave the offset alone rather than skipping arbitrarily
-  // far ahead — the UTF-8 step below still guarantees a character boundary.
-  if (end === -1) return offset;
+  // end === -1: unterminated within the forward bound. Either a long string
+  // payload (handled below) or not a sequence we can reason about, where the
+  // offset is left alone — the UTF-8 step below still guarantees a character
+  // boundary.
+  if (end === -1) return stringTailOffset(buf, offset);
   return end > offset ? end : offset;
+}
+
+/**
+ * When the cut may sit inside a string payload whose introducer is out of
+ * reach, move past the payload's terminator. Without this the tail of a large
+ * inline image (#1641) paints as a screenful of base64 or sixel text.
+ *
+ * A payload is recognised by what follows the cut: a BEL or ST reached before
+ * any line feed or any other escape introducer. Within the first line's worth
+ * (LINE_LOOKAHEAD_BYTES) any bytes qualify: at worst a partial first line
+ * before a bell is dropped, which the line-boundary step would drop anyway.
+ * Past that, only payload bytes do — base64 and sixel data are printable ASCII
+ * with no space or control byte — so output without line feeds (a progress
+ * bar redrawn with CR, a long spaced line) that reaches a bell much later
+ * keeps its history. CAN/SUB abort a string, so they end it too. A payload that
+ * has not terminated by the end of the window is left alone.
+ */
+function stringTailOffset(buf: Buffer, offset: number): number {
+  const limit = Math.min(buf.length, offset + STRING_TAIL_SCAN_BYTES);
+  const lineEnd = offset + LINE_LOOKAHEAD_BYTES;
+  for (let i = offset; i < limit; i++) {
+    const b = buf[i];
+    if (b === 0x07 || b === 0x18 || b === 0x1a) return i + 1;
+    if (b === 0x0a) return offset;
+    if (b === 0x1b) return i + 1 < buf.length && buf[i + 1] === 0x5c ? i + 2 : offset;
+    if (i >= lineEnd && (b < 0x21 || b > 0x7e)) return offset;
+  }
+  return offset;
 }
 
 /**

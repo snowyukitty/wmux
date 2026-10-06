@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { BUDGET_BYTES, TranscriptProjector } from '../TranscriptProjector';
 import type { ResumeBinding } from '../../../shared/agentResume';
 import type { TranscriptAppendData } from '../../../shared/transcript/turnEvents';
+import { shortPathOf } from '../../../test-utils/shortPath';
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 
@@ -84,9 +85,16 @@ describe('TranscriptProjector.status — unavailable reasons', () => {
     expect(harness.projector.status('pty-1')).toEqual({ available: false, reason: 'stale-session' });
   });
 
-  it('not-claude for an agent that publishes no structured transcript', () => {
-    harness.bindings.set('pty-1', binding({ agent: 'codex', transcriptPath: '/tmp/x.jsonl' }));
-    expect(harness.projector.status('pty-1')).toEqual({ available: false, reason: 'not-claude' });
+  it('no-transcript-path, not stale-session, for a Codex pane still waiting for its binding (#1764)', () => {
+    // Codex binds only once its rollout is known; until then the phone must
+    // read "waiting for the record", not "this pane moved on to a new session".
+    harness.detectedAgents.set('pty-1', 'codex');
+    expect(harness.projector.status('pty-1')).toEqual({ available: false, reason: 'no-transcript-path' });
+  });
+
+  it('unsupported-agent for an agent that publishes no structured transcript', () => {
+    harness.bindings.set('pty-1', binding({ agent: 'grok', transcriptPath: '/tmp/x.jsonl' }));
+    expect(harness.projector.status('pty-1')).toEqual({ available: false, reason: 'unsupported-agent' });
   });
 
   it('no-transcript-path before the first turn ends (SessionStart has no path)', () => {
@@ -310,6 +318,33 @@ describe('TranscriptProjector.subscribe / unsubscribe — per (client, session)'
     harness.projector.subscribe('c1', 'pty-1');
     harness.projector.dropPty('pty-1');
     expect(harness.projector.watchCount).toBe(0);
+  });
+
+  it.runIf(process.platform === 'win32')('arms fs.watch on the long spelling of an 8.3 short transcript dir (#984)', (ctx) => {
+    // libuv 1.52 builds with asserts on abort the process on the first event
+    // for a directory watched through a short alias.
+    const shortDir = shortPathOf(harness.dir);
+    if (!shortDir) return ctx.skip(); // 8.3 names are off for this volume
+    fixture('claude-basic.jsonl');
+    const shortFile = path.join(shortDir, 'projects', '-synthetic-repo', 'claude-basic.jsonl');
+    // Config root and transcript in the same short spelling, the way a short
+    // %TEMP% or CLAUDE_CONFIG_DIR hands both over.
+    const projector = new TranscriptProjector({
+      getResumeBinding: () => binding({ transcriptPath: shortFile }),
+      getSessionEnv: () => ({ CLAUDE_CONFIG_DIR: shortDir }),
+      emitAppend: () => undefined,
+    });
+    const watch = vi.spyOn(fs, 'watch');
+    try {
+      projector.subscribe('c1', 'pty-1');
+      expect(watch).toHaveBeenCalledTimes(1);
+      const target = String(watch.mock.calls[0][0]);
+      expect(target).not.toContain('~');
+      expect(target.toLowerCase()).toBe(fs.realpathSync.native(harness.projects).toLowerCase());
+    } finally {
+      projector.dispose();
+      watch.mockRestore();
+    }
   });
 });
 
@@ -638,6 +673,42 @@ describe('TranscriptProjector.codeBlock — tool bodies', () => {
   });
 });
 
+describe('TranscriptProjector.searchPage — host search reads', () => {
+  it('answers the resolver reason for a pane it cannot read', () => {
+    expect(harness.projector.searchPage('pty-1')).toEqual({ ok: false, reason: 'no-hook' });
+  });
+
+  it('pages backward past the A3 budget, and each line end is a snapshot boundary', () => {
+    const file = path.join(harness.projects, 'search-pages.jsonl');
+    const lines: string[] = [];
+    for (let i = 0; i < 400; i++) {
+      lines.push(JSON.stringify({
+        type: 'assistant',
+        uuid: `page-${i}`,
+        message: { role: 'assistant', content: [{ type: 'text', text: `row ${i} ` + 'z'.repeat(4000) }] },
+      }));
+    }
+    fs.writeFileSync(file, lines.join('\n') + '\n', 'utf8');
+    harness.bindings.set('pty-1', binding({ transcriptPath: file }));
+
+    const first = harness.projector.searchPage('pty-1');
+    if (!first.ok) throw new Error(first.reason);
+    // A full 256 KiB window, not the budget-shrunk one `snapshot` serves.
+    expect(Buffer.byteLength(JSON.stringify(first.page.events), 'utf8')).toBeGreaterThan(BUDGET_BYTES);
+    expect(first.lineEnds).toHaveLength(first.page.events.length);
+    expect(first.lineEnds[first.lineEnds.length - 1]).toBe(fs.statSync(file).size);
+
+    // The window ending at an event's line end ends with that event.
+    const i = 3;
+    const around = harness.projector.snapshot('pty-1', { before: first.lineEnds[i] })!;
+    expect(around.events[around.events.length - 1].id).toBe(first.page.events[i].id);
+
+    const older = harness.projector.searchPage('pty-1', first.page.cursor.headOffset);
+    if (!older.ok) throw new Error(older.reason);
+    expect(older.page.events[older.page.events.length - 1].id).toBe(`page-${Number(first.page.events[0].id.slice(5)) - 1}`);
+  });
+});
+
 describe('TranscriptProjector — #782 phone turn-view contract (stateless delta)', () => {
   /**
    * A valid entry whose normalized events exceed BUDGET_BYTES while the raw
@@ -754,6 +825,16 @@ describe('TranscriptProjector — #782 phone turn-view contract (stateless delta
     expect(result.reset).toBe(true);
   });
 
+  it('staleCursor applies the same shrink and line-boundary checks to a back-paging head', () => {
+    const file = fixture('claude-basic.jsonl');
+    harness.bindings.set('pty-1', binding({ transcriptPath: file }));
+    const snap = harness.projector.snapshot('pty-1')!;
+    expect(harness.projector.staleCursor('pty-1', snap.cursor.headOffset, snap.cursor.fileSize)).toBe(false);
+    expect(harness.projector.staleCursor('pty-1', snap.cursor.headOffset, snap.cursor.fileSize + 1000)).toBe(true);
+    expect(harness.projector.staleCursor('pty-1', 5, snap.cursor.fileSize)).toBe(true);
+    expect(harness.projector.staleCursor('pty-unbound', 0)).toBe(true);
+  });
+
   it('codeBlock refuses a mid-line offset (#782 boundary check)', () => {
     const file = fixture('claude-basic.jsonl');
     harness.bindings.set('pty-1', binding({ transcriptPath: file }));
@@ -777,5 +858,54 @@ describe('TranscriptProjector — #782 phone turn-view contract (stateless delta
     expect(Buffer.byteLength(ev.output?.inline ?? '', 'utf8')).toBeLessThan(9000);
     // The full size is still reported so the UI can say how much was cut.
     expect(ev.bytes).toBeGreaterThan(100000);
+  });
+});
+
+describe('TranscriptProjector.sentFileBinding', () => {
+  const write = (name: string): string => {
+    const file = path.join(harness.projects, name);
+    fs.writeFileSync(file, '{"type":"system"}\n', 'utf8');
+    return file;
+  };
+
+  it('answers the bound transcript with no subscriber, and null while a new session has not bound yet', () => {
+    const first = write('first-session.jsonl');
+    harness.bindings.set('pty-1', binding({ transcriptPath: first }));
+    const before = harness.projector.sentFileBinding('pty-1');
+    expect(before).toMatchObject({ transcriptPath: first, agentSessionId: 'first-session' });
+
+    // `/clear`: the new session starts before its transcript exists, so the
+    // binding on file still names the previous one.
+    harness.projector.nudge('pty-1', 'agent.session_start', 'second-session');
+    expect(harness.projector.sentFileBinding('pty-1')).toBeNull();
+    harness.projector.nudge('pty-1', 'agent.stop');
+    expect(harness.projector.sentFileBinding('pty-1')).toBeNull();
+
+    const second = write('second-session.jsonl');
+    harness.bindings.set('pty-1', binding({ transcriptPath: second, ts: 2 }));
+    const after = harness.projector.sentFileBinding('pty-1');
+    expect(after).toMatchObject({ transcriptPath: second, agentSessionId: 'second-session' });
+    expect(after?.generation).not.toBe(before?.generation);
+  });
+
+  it('keeps the binding on a resume of the same session, but still moves the generation', () => {
+    const file = write('resumed.jsonl');
+    harness.bindings.set('pty-1', binding({ transcriptPath: file }));
+    const before = harness.projector.sentFileBinding('pty-1');
+    harness.projector.nudge('pty-1', 'agent.session_start', 'resumed');
+    const after = harness.projector.sentFileBinding('pty-1');
+    expect(after).toMatchObject({ transcriptPath: file });
+    expect(after?.generation).toBe((before?.generation ?? 0) + 1);
+  });
+
+  it('holds a session_start that names no session until the next stop', () => {
+    const file = write('anon.jsonl');
+    harness.bindings.set('pty-1', binding({ transcriptPath: file }));
+    harness.projector.nudge('pty-1', 'agent.session_start');
+    expect(harness.projector.sentFileBinding('pty-1')).toBeNull();
+    harness.projector.nudge('pty-1', 'agent.activity');
+    expect(harness.projector.sentFileBinding('pty-1')).toBeNull();
+    harness.projector.nudge('pty-1', 'agent.stop');
+    expect(harness.projector.sentFileBinding('pty-1')).toMatchObject({ transcriptPath: file });
   });
 });

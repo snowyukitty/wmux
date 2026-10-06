@@ -6,6 +6,7 @@ import { PlaywrightEngine } from '../PlaywrightEngine';
 import { withAutomationLease } from '../automationLease';
 import { matchSensitiveDomain } from '../security';
 import { evalFunctionOrRpc } from '../page-eval';
+import { evaluateIsolated } from '../isolated-eval';
 import { isChromiumUserAgent } from '../../../shared/uaMetadata';
 import { describeToolError } from '../toolError';
 import {
@@ -20,11 +21,64 @@ import {
   type BrowserToolDeps,
 } from '../browserScope';
 
+/**
+ * The viewport a page had before a device preset replaced it (#1357).
+ *
+ * `device: null` used to clear the UA and tell the caller to run
+ * browser_resize, so the page stayed at the phone's width: its media queries
+ * and touch checks kept matching the preset, and a manual resize afterwards
+ * landed the layout between breakpoints. Remembering the size here is what
+ * lets the reset put it back in the same call. Keyed weakly, so a closed page
+ * takes its entry with it.
+ *
+ * `null` is a recorded value, not a missing one: it means the page had no
+ * Playwright viewport at all and followed its window — which is every page the
+ * chrome backend drives. Such a page must never be given one, because
+ * Playwright has no way to hand a pinned viewport back to the window: the reset
+ * could then only keep the phone's size, and re-applying it dropped the real
+ * devicePixelRatio to 1 (#1357, found on the chrome backend after the first fix).
+ */
+const prePresetViewport = new WeakMap<Page, { width: number; height: number } | null>();
+
+/** Used only when a reset finds neither a remembered nor a current viewport. */
+const DEFAULT_RESET_VIEWPORT = { width: 1280, height: 720 };
+
+/**
+ * What the page itself reports, read after an emulate call so the caller sees
+ * the real state rather than the summary of what was asked for.
+ */
+const DEVICE_PROBE_EXPRESSION =
+  '({ w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio,'
+  + ' touch: navigator.maxTouchPoints })';
+
+interface DeviceProbe {
+  w: number;
+  h: number;
+  dpr: number;
+  touch: number;
+}
+
+/** Format a probe reading, or undefined when the page could not be asked. */
+export function formatDeviceProbe(probe: DeviceProbe | null | undefined): string | undefined {
+  if (!probe || typeof probe.w !== 'number' || typeof probe.h !== 'number') return undefined;
+  return `probe=${probe.w}x${probe.h} dpr=${probe.dpr} maxTouchPoints=${probe.touch}`;
+}
+
+async function deviceProbeLine(page: Page): Promise<string | undefined> {
+  try {
+    const probe = await evaluateIsolated<DeviceProbe>(page, DEVICE_PROBE_EXPRESSION);
+    return formatDeviceProbe(probe);
+  } catch {
+    // A probe that cannot be read must not fail the emulation it describes.
+    return undefined;
+  }
+}
+
 // Optional surfaceId schema reused across tools
 const optionalSurfaceId = z
   .string()
   .optional()
-  .describe('Omit for the active surface.');
+  .describe('Omit for the surface you opened last.');
 
 // Module-scope parameter shapes: hoisted out of the per-registration path so
 // every createWmuxServer() instance shares one set of zod schema objects.
@@ -186,7 +240,27 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
     async ({ action, url, cookies, allowSensitiveDomains, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
         // Playwright Page when available (dev), else CDP over RPC (packaged, #111).
-        const page = await engine.getPageForScope(scope).catch(allowScopedRpcFallback);
+        // 'get' is a read; set/clear write, and on Live Chrome a cookie write
+        // aimed at someone else's tab is refused before it reaches the page.
+        const page = await engine
+          .getPageForScope(scope, { intent: action === 'get' ? 'read' : 'write' })
+          .catch(allowScopedRpcFallback);
+
+        // The write gate above proves the agent may write to THIS tab. A
+        // cookie write is not a tab write: `page.context()` on Live Chrome is
+        // the user's whole profile, so `clearCookies()` logs them out of every
+        // site and `addCookies()` plants cookies every tab will send. With the
+        // agent-window policy in force there is no tab-sized version of this
+        // mutation to allow, so it is refused as a scope refusal.
+        const refuseProfileWideWriteOnLive = async (verb: 'set' | 'clear'): Promise<void> => {
+          if (!(await engine.isLiveWriteConfined(scope.workspaceId))) return;
+          throw new Error(
+            `agent_window_scope: browser_cookies ${verb} on Live Chrome changes the shared browser ` +
+              "profile — every tab and every site, not just this workspace's tabs — so it is refused " +
+              'while liveWriteScope is "agent". Ask the user to change the cookie in Chrome, or have ' +
+              'the operator set liveWriteScope to "all" in browser-backend.json.',
+          );
+        };
 
         switch (action) {
           case 'get': {
@@ -241,6 +315,7 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
             }));
 
             if (page) {
+              await refuseProfileWideWriteOnLive('set');
               await page.context().addCookies(cookiesToAdd);
             } else {
               await sendScopedBrowserRpc('browser.cookies', scope, {
@@ -261,6 +336,7 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
 
           case 'clear': {
             if (page) {
+              await refuseProfileWideWriteOnLive('clear');
               await page.context().clearCookies();
             } else {
               await sendScopedBrowserRpc('browser.cookies', scope, {
@@ -297,7 +373,9 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
         // browser_storage is pure page.evaluate, so it unifies over the same
         // evaluate transport the extraction tools use: a Playwright Page when
         // available, else browser.evaluate over RPC (packaged builds, #111).
-        const page = await engine.getPageForScope(scope).catch(allowScopedRpcFallback);
+        const page = await engine
+          .getPageForScope(scope, { intent: action === 'get' ? 'read' : 'write' })
+          .catch(allowScopedRpcFallback);
 
         const storageName = type === 'local' ? 'localStorage' : 'sessionStorage';
 
@@ -406,7 +484,7 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
     BROWSER_EMULATE_SHAPE,
     async ({ offline, headers, credentials, geo, media, timezone, locale, device, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
-        const page = await engine.getPageForScope(scope).catch(allowScopedRpcFallback);
+        const page = await engine.getPageForScope(scope, { intent: 'write' }).catch(allowScopedRpcFallback);
         const applied: string[] = [];
 
         // Resolve a device preset (if any) up front: both transports need its
@@ -497,7 +575,22 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
           // device preset
           if (device !== undefined) {
             if (deviceDescriptor) {
-              await page.setViewportSize(deviceDescriptor.viewport);
+              // Remember what the preset is about to replace, so `device: null`
+              // can put it back instead of leaving the page on a phone width
+              // (#1357). Only the first preset in a chain records: two presets
+              // in a row must still reset to the pre-emulation desktop size.
+              if (!prePresetViewport.has(page)) {
+                const before = page.viewportSize();
+                prePresetViewport.set(page, before ? { ...before } : null);
+              }
+              // A window-sized page (chrome backend) gets the preset's size from
+              // the device-metrics override applyUserAgentEmulation sends below,
+              // which the reset can clear. Pinning a Playwright viewport here
+              // instead is what left it stuck at the phone's size.
+              const windowSized = prePresetViewport.get(page) === null;
+              if (!windowSized) {
+                await page.setViewportSize(deviceDescriptor.viewport);
+              }
               // Apply user agent via extra headers
               await context.setExtraHTTPHeaders({
                 ...(headers ?? {}),
@@ -536,6 +629,15 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
                 // Client Hints stay on the real browser's values; the UA header
                 // is still applied. Worth reporting, not worth failing on.
                 applied.push('clientHints=unavailable (UA header applied without matching hints or device metrics)');
+                if (windowSized) {
+                  // Without the held session there is no override to carry the
+                  // size, so fall back to a Playwright viewport — and forget the
+                  // window-sized record, because that viewport cannot be undone
+                  // and a reset must not claim it returned to the window.
+                  await page.setViewportSize(deviceDescriptor.viewport);
+                  prePresetViewport.delete(page);
+                  applied.push('note=viewport pinned by Playwright; device:null cannot return this page to its window size');
+                }
               }
               applied.push(`device=${device} (${deviceDescriptor.viewport.width}x${deviceDescriptor.viewport.height})`);
               // A Safari/iOS preset on a Chromium browser cannot be made whole:
@@ -573,8 +675,47 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
                 await context.setExtraHTTPHeaders({ ...(headers ?? {}) });
                 applied.push('userAgent=reset');
               }
-              applied.push('device=reset (use browser_resize to set viewport)');
+              // clearUserAgentEmulation above drops the device metrics and the
+              // touch points on the sessions the preset was applied through,
+              // but the viewport is Playwright's own and survives it. Put the
+              // pre-preset size back here rather than telling the caller to run
+              // browser_resize: a page left at the phone width keeps matching
+              // the preset's media queries (#1357).
+              const hadRecord = prePresetViewport.has(page);
+              const remembered = prePresetViewport.get(page);
+              prePresetViewport.delete(page);
+              let summary: string;
+              if (hadRecord && remembered === null) {
+                // Window-sized page: the preset only ever lived in the metrics
+                // override, and clearUserAgentEmulation above has already
+                // dropped it. Setting any viewport now would pin the page again.
+                summary = 'window size restored';
+              } else {
+                const current = page.viewportSize();
+                const target = remembered ?? current ?? DEFAULT_RESET_VIEWPORT;
+                const how = remembered
+                  ? 'restored'
+                  : current
+                    ? 'kept (no pre-preset viewport recorded)'
+                    : 'default (no pre-preset viewport recorded)';
+                await page.setViewportSize(target);
+                summary = `viewport ${target.width}x${target.height} ${how}`;
+              }
+              // The page's media queries and `ontouchstart` checks already ran
+              // under the preset, so their results cannot be trusted without a
+              // fresh evaluation.
+              let reloaded = true;
+              await page.reload().catch(() => {
+                reloaded = false;
+              });
+              applied.push(
+                `device=reset (${summary}, ${reloaded ? 'reloaded' : 'reload failed'})`,
+              );
             }
+            // Say what the page actually reports now, on apply and on reset
+            // alike, so the caller does not have to trust the summary.
+            const probe = await deviceProbeLine(page);
+            if (probe) applied.push(probe);
           }
         } else {
           // Packaged RPC fallback (#111). The main-process handler applies each
@@ -657,7 +798,7 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
     BROWSER_RESIZE_SHAPE,
     async ({ width, height, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
-        const page = await engine.getPageForScope(scope).catch(allowScopedRpcFallback);
+        const page = await engine.getPageForScope(scope, { intent: 'write' }).catch(allowScopedRpcFallback);
 
         if (page) {
           await page.setViewportSize({ width, height });

@@ -135,6 +135,37 @@ describe('buildFleetSnapshots', () => {
   });
 });
 
+// #1343 — remote agents reach Fleet View and the vitals chip, but never the
+// deck. The mirror is the deck's view and the deck COMMANDS what it sees; a
+// remote pane is drivable only through its own host's input API. The callers
+// hand this builder the whole live store, so the exclusion has to be an
+// explicit runtime strip, not a narrower type.
+describe('buildFleetSnapshots — remote agents stay out of the deck mirror', () => {
+  it('never emits an agent resolved from the attached remote host mirror', () => {
+    const remote: Surface = {
+      id: 'rs1', ptyId: '', title: 'rs1', shell: 'ssh', cwd: '/remote',
+      surfaceType: 'remote-terminal', remoteHostId: 'host-1', remoteSessionId: 'rsession-9',
+    };
+    const ws = workspace('ws-r', 'remote-ws', leaf('pr', [remote], 'rs1'), 'pr');
+    const fleets = buildFleetSnapshots({
+      workspaces: [ws],
+      surfaceAgentStatus: {},
+      surfaceActivity: {},
+      // The live store always carries this; the builder must drop it anyway.
+      remoteWorkspaces: [{
+        key: 'host-1:rw-1', hostId: 'host-1', hostLabel: 'office-mac',
+        workspaceId: 'rw-1', name: 'proj',
+        panes: [{ sessionId: 'rsession-9', agentName: 'Codex', agentStatus: 'awaiting_input' }],
+      }],
+    } as unknown as FleetSnapshotState, 7777);
+
+    const rows = fleets.flatMap((f) => f.panes);
+    expect(rows.some((r) => r.ptyId.startsWith('remote:'))).toBe(false);
+    expect(rows.some((r) => r.agentName === 'Codex')).toBe(false);
+    expect(rows.some((r) => r.agentStatus === 'awaiting_input')).toBe(false);
+  });
+});
+
 describe('buildFleetSnapshots — single-surface byte-identical pin', () => {
   // Single-surface panes must serialize EXACTLY as the pre-surface-accuracy
   // build did (attention row when a status is retained, base row otherwise).
@@ -339,6 +370,51 @@ describe('buildWorkspaceMirrorPayload', () => {
     expect(payload.entries).toHaveLength(2);
     expect(payload.fleets.every((f) => f.ts === 5555)).toBe(true);
   });
+
+  it('carries sessionRestored, false unless the store says a saved session came back', () => {
+    expect(buildWorkspaceMirrorPayload(state(), () => 1).sessionRestored).toBe(false);
+    expect(
+      buildWorkspaceMirrorPayload({ ...state(), sessionRestored: true }, () => 1).sessionRestored,
+    ).toBe(true);
+  });
+
+  it('carries the viewed workspace and its active pane, following a switch', () => {
+    expect(buildWorkspaceMirrorPayload({ ...state(), activeWorkspaceId: 'ws-1' }, () => 1).viewed)
+      .toMatchObject({ workspaceId: 'ws-1', paneId: 'p1' });
+    expect(buildWorkspaceMirrorPayload({ ...state(), activeWorkspaceId: 'ws-2' }, () => 1).viewed)
+      .toMatchObject({ workspaceId: 'ws-2', paneId: 'p2a', cwd: 'C:\\repo\\s2a' });
+  });
+
+  it("carries the active surface's own cwd and branch, not the workspace's", () => {
+    // Two panes in one workspace: the workspace metadata holds the OTHER
+    // pane's values (the last reporter); the pointer must not.
+    const ws = workspace(
+      'ws-m', 'mixed',
+      branch('b', [
+        leaf('p-viewed', [surface('s-viewed', 'pty-viewed', { cwd: '/repo/viewed' })]),
+        leaf('p-other', [surface('s-other', 'pty-other')]),
+      ]),
+      'p-viewed',
+      { cwd: '/repo/other', gitBranch: 'other-branch' },
+    );
+    const st = {
+      ...state(),
+      workspaces: [ws],
+      activeWorkspaceId: 'ws-m',
+      surfaceGitBranch: { 'pty-viewed': 'feat/viewed', 'pty-other': 'other-branch' },
+    };
+    expect(buildWorkspaceMirrorPayload(st, () => 1).viewed).toEqual({
+      workspaceId: 'ws-m', paneId: 'p-viewed', cwd: '/repo/viewed', branch: 'feat/viewed',
+    });
+    // A branch the viewed pane never reported is omitted, not borrowed.
+    expect(buildWorkspaceMirrorPayload({ ...st, surfaceGitBranch: { 'pty-other': 'other-branch' } }, () => 1).viewed)
+      .toEqual({ workspaceId: 'ws-m', paneId: 'p-viewed', cwd: '/repo/viewed' });
+  });
+
+  it('omits viewed when no known workspace is active', () => {
+    expect(buildWorkspaceMirrorPayload(state(), () => 1).viewed).toBeUndefined();
+    expect(buildWorkspaceMirrorPayload({ ...state(), activeWorkspaceId: 'ws-gone' }, () => 1).viewed).toBeUndefined();
+  });
 });
 
 // ─── Workspace-OWNED walks (#977 review) ─────────────────────────────────────
@@ -444,5 +520,46 @@ describe('buildFleetSnapshots — pending question (#1168)', () => {
     } satisfies FleetSelectorState;
     const [fleet] = buildFleetSnapshots(st, 42);
     expect(fleet.panes[0]).toMatchObject({ ptyId: 'pty-1', agentStatus: 'complete' });
+  });
+});
+
+describe('buildFleetSnapshots — open dialog outlives the focus clear (#1509)', () => {
+  // Focusing a pane deletes its `surfaceAgentStatus` entry (the unread cue).
+  // The dialog is still open, and the pane's own lifecycle status says so. The
+  // deck's heartbeat and completion gate read this mirror: dropping the row
+  // would tell them a workspace blocked on an approval is quiescent.
+  it('keeps the blocked pane after focus moved to a new split', () => {
+    const ws = workspace(
+      'ws-1', 'alpha',
+      branch('b', [leaf('pA', [surface('sA', 'pty-a')]), leaf('pB', [surface('sB', 'pty-b')])]),
+      'pB',
+      { agentName: 'Claude Code', agentStatus: 'running' },
+    );
+    const st: FleetSelectorState = {
+      workspaces: [ws],
+      surfaceAgentStatus: {},
+      surfaceActivity: {},
+      surfaceAgent: { 'pty-a': { name: 'Claude Code', status: 'awaiting_input' } },
+    };
+    const [fleet] = buildFleetSnapshots(st, 7);
+    expect(fleet.panes.find((p) => p.ptyId === 'pty-a')).toMatchObject({ agentStatus: 'awaiting_input' });
+    expect(fleet.panes.find((p) => p.ptyId === 'pty-b')?.agentStatus).not.toBe('awaiting_input');
+  });
+
+  it('attributes a background tab\'s open dialog to THAT tab, not the active one', () => {
+    const st: FleetSelectorState = {
+      workspaces: [w2],
+      surfaceAgentStatus: {},
+      surfaceActivity: {},
+      surfaceAgent: {
+        'pty-2a-first': { name: 'Codex', status: 'awaiting_input' },
+        'pty-2a': { name: 'Codex', status: 'running' },
+      },
+      surfaceActivityAt: { 'pty-2a': 1_000 },
+      agentClockMs: 1_000,
+    };
+    const [fleet] = buildFleetSnapshots(st, 7);
+    expect(fleet.panes.find((p) => p.ptyId === 'pty-2a-first')).toMatchObject({ agentStatus: 'awaiting_input' });
+    expect(fleet.panes.find((p) => p.ptyId === 'pty-2a')).toMatchObject({ agentStatus: 'running', isActivePane: true });
   });
 });

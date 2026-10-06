@@ -65,6 +65,15 @@ export interface ConnectionScope {
    */
   snapshotCache?: unknown;
   /**
+   * Truncated-snapshot captures a continuation cursor pages through (capture id
+   * → stored text), per connection for the same reason as snapshotCache: a
+   * cursor is an opaque handle, and a process-global map would let one agent's
+   * token address another agent's capture of another agent's page. Typed as
+   * unknown to avoid an import cycle (snapshotCache imports this module); it
+   * owns the cast.
+   */
+  snapshotCaptures?: unknown;
+  /**
    * Per-connection REPL session registry, for the same reason as `playwright`:
    * a REPL session is a live runtime holding the caller's variables and open
    * handles, so a process-global map would hand one agent another agent's
@@ -78,6 +87,41 @@ export interface ConnectionScope {
    * the cast.
    */
   browserRepl?: unknown;
+  /**
+   * Site guide announcements (surface key → set of guide paths last announced),
+   * per connection so one agent's landing never silences another's. Typed as
+   * unknown to avoid an import cycle; guideAnnounce owns the cast.
+   */
+  siteGuideAnnounce?: unknown;
+  /**
+   * Frame refs minted by this connection's last snapshot of a surface, per
+   * connection for the same reason as snapshotCache: the guard answers "did
+   * *I* mint this ref inside an iframe", and a shared map let one agent's
+   * snapshot refuse another agent's perfectly good DOM ref. Typed as unknown
+   * to avoid an import cycle; snapshot.ts owns the cast.
+   */
+  frameRefs?: unknown;
+  /**
+   * Per-surface ref descriptors (role + name + nth-of-kind) for the last few
+   * snapshot generations, per connection for the same reason as snapshotCache:
+   * they decide which number an element keeps and which old ref may be
+   * recovered, so one agent's snapshot must never renumber another's. Typed as
+   * unknown to avoid an import cycle; refDescriptors owns the cast.
+   */
+  refDescriptors?: unknown;
+  /**
+   * Random id identifying this connection as the OPENER of a browser surface.
+   * Sent with every open so main can record who asked for a surface, and the
+   * default target of a call that names none stays on this connection's own
+   * tab. Minted on first use by surfaceRouting, which owns the semantics.
+   */
+  browserOpenerKey?: string;
+  /**
+   * The surface this connection last opened: its default target while it
+   * exists. Typed as unknown to avoid an import cycle (surfaceRouting imports
+   * this module); it owns the cast.
+   */
+  browserPin?: unknown;
 }
 
 const storage = new AsyncLocalStorage<ConnectionScope>();

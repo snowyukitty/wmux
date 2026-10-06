@@ -1,3 +1,6 @@
+import { isWslShell, resolveWslCwd, type WslTarget, type ResolvedWslCwd } from '../shared/wsl';
+import { buildWslInjection } from '../shared/wslIntegration';
+import { getWmuxDir } from './config';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import * as pty from 'node-pty';
@@ -6,18 +9,25 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { DaemonSession, DaemonSessionState, DaemonSessionSupervision, DaemonConfig } from './types';
+import type { PaneAccountVendor, StoredHandoffFrom } from '../shared/phonePaneAccount';
+import { MIN_SAFE_COLS, MIN_SAFE_ROWS } from '../shared/terminalGeometry';
 import { RingBuffer } from './RingBuffer';
 import { DaemonPTYBridge } from './DaemonPTYBridge';
 import { PromptEventLog } from './PromptEventLog';
-import { buildSpawnInjection, classifyShell } from './shell-integration';
+import { buildSpawnInjection, classifyShell, BASH_INIT } from './shell-integration';
+import { isWslDistroSpawnArgs } from '../shared/wslDistro';
 import { expandTilde } from '../shared/expandTilde';
 import { restoreSeam } from '../shared/restoreSeam';
 import { buildExecArgs } from './execWrapper';
-import { buildSafeChildEnv } from '../shared/envFilter';
+import { dropMissingAccountDirs, pinAccountEnv } from './phone/paneAccountSpawn';
+import { windowsPowerShellPolicyArgs } from '../shared/pwshExecutionPolicy';
+import { buildSafeChildEnv, isNestingMarker } from '../shared/envFilter';
+import { CLAUDE_SANDBOXED_ENV } from '../shared/agentFirstRun';
 import { isMac, parseWindowsBuildNumber } from '../shared/platform';
 import { shouldUseBundledConpty, spawnWithConptyPolicy } from '../shared/conptyWindows';
 import { getWindowsDefaultShell, resolveBareShellName, resolveLaunchableWindowsExe } from '../shared/shellResolution';
 import { ENV_KEYS } from '../shared/constants';
+import { containsControlChars } from '../shared/cwdShape';
 import { createDefaultConfig } from './config';
 import { getProcessStartTime, isPhantomExit, isPidAlive } from './phantomExit';
 
@@ -33,15 +43,29 @@ const RESERVED_AUTH_PREFIX = /^WMUX_AUTH/i;
 const RESERVED_PREFIX = /^WMUX_/i;
 
 /**
- * Return a fresh env copy with the daemon's reserved auth-token namespace
- * removed. Applied to every child env regardless of caller (substrate
- * invariant). WMUX_AUTH* is reserved, so this can never drop a legitimate
- * user/profile key.
+ * Return a fresh copy of a caller-supplied env with the keys no caller can
+ * legitimately supply removed. Applied to every supplied env, fresh create and
+ * recovery replay alike (substrate invariant):
+ *  - WMUX_AUTH*: the daemon's RPC auth token must never reach a child.
+ *  - WMUX_SOCKET_PATH: only local (non-daemon) mode sets it; main never forces
+ *    it for a daemon pane and the profile overlay skips WMUX_*. Present here it
+ *    can only be a parent instance's path (a pre-fix persisted blob), which the
+ *    CLI/MCP would try first and fail on with that instance's auth.
+ *  - agent-nesting markers (CLAUDE_CODE_CHILD_SESSION, CLAUDECODE, …): a
+ *    persisted blob written before main stripped them would otherwise replay
+ *    them and turn a claude in the recovered pane into a nested session. The
+ *    one exception is CLAUDE_CODE_SANDBOXED, which wmux sets on purpose for
+ *    fan-out and automation panes (skips claude's folder-trust dialog).
+ * None of these can be an intentional user/profile key, so this cannot strip
+ * one; CLAUDE_CONFIG_DIR and other CLAUDE_* config are untouched.
  */
-function stripReservedAuth(env: Record<string, string>): Record<string, string> {
+function stripReservedSuppliedEnv(env: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) {
     if (RESERVED_AUTH_PREFIX.test(k)) continue;
+    const upper = k.toUpperCase();
+    if (upper === ENV_KEYS.SOCKET_PATH) continue;
+    if (isNestingMarker(k) && upper !== CLAUDE_SANDBOXED_ENV) continue;
     out[k] = v;
   }
   return out;
@@ -77,11 +101,33 @@ export interface ManagedSession {
   promptLog: PromptEventLog;
   /**
    * True when the session was created in deferred-output mode (recovery)
-   * and is still waiting for its first `resizeSession` to activate.
-   * Once `resizeSession` runs, output capture starts and this flips to
-   * `false` for the rest of the session's lifetime.
+   * and is still waiting for a viewer to activate it — the desk's first
+   * `resizeSession`, or a web client opening its stream or typing into it
+   * (`activateDeferred`). Once activated, output capture starts and this
+   * flips to `false` for the rest of the session's lifetime.
    */
   deferred: boolean;
+  /**
+   * True from recovery until something shows an agent is running in the pane
+   * again: its banner is detected, one of its hooks reports, or the process
+   * watch finds it (`confirmAgent`). Separate from `deferred` on purpose:
+   * showing output says nothing about what runs there — a recovered pane is a
+   * fresh shell whatever `lastDetectedAgent` still says.
+   */
+  recoveredAgentUnconfirmed: boolean;
+  /**
+   * True from recovery until the first `resizeSession`. A web viewer can
+   * activate the pane before the desk's renderer reports its size; that first
+   * resize then still gets the ConPTY repaint the unmute path requests.
+   */
+  firstGeometryPending: boolean;
+  /**
+   * #1464: the PTY was resized to a new geometry while its output was still
+   * muted (recovery). Decides, when the unmute fires, whether the held output
+   * may be replayed — on Windows a size change inside the drain window means
+   * ConPTY's stale-geometry flush may be among it.
+   */
+  resizedWhileMuted?: boolean;
   /**
    * #766 — whether a desk renderer is actually SHOWING this pane (workspace +
    * tab active and the window itself visible), as last reported by the
@@ -106,6 +152,11 @@ export interface ManagedSession {
  */
 const DEFERRED_UNMUTE_DELAY_MS = 100;
 
+// #1305: minimum gap between two restarts of a pending entry's retention
+// clock. The clock is measured in days, so a finer restamp buys nothing, and
+// each one costs a synchronous whole-file sessions.json write at the daemon.
+const TOUCH_MIN_INTERVAL_MS = 60_000;
+
 /**
  * Narrowest PTY geometry the daemon will ever apply, on create or resize.
  *
@@ -119,10 +170,9 @@ const DEFERRED_UNMUTE_DELAY_MS = 100;
  * observed 6/7 boundary, which may shift with prompt width or locale. The
  * renderer's xterm view can briefly be narrower than the PTY during a layout
  * transition — harmless compared to a dead shell, and the next settled resize
- * reconciles them.
+ * reconciles them. (#1255: the renderer now skips sub-floor fits entirely —
+ * shared constant, see shared/terminalGeometry.ts.)
  */
-const MIN_SAFE_COLS = 10;
-const MIN_SAFE_ROWS = 2;
 const clampCols = (cols: number): number => Math.max(MIN_SAFE_COLS, cols);
 const clampRows = (rows: number): number => Math.max(MIN_SAFE_ROWS, rows);
 
@@ -172,7 +222,91 @@ export class DaemonSessionManager extends EventEmitter {
     this.config = config;
   }
 
-  createSession(params: {
+  private pendingRecovery = new Map<string, DaemonSession>();
+  private pendingCreates = new Map<string, symbol>();
+
+  cancelPendingCreates(): void { this.pendingCreates.clear(); }
+
+  /** Preserve retry state; unattempted placeholders retain normal suspended expiry. */
+  keepPendingRecovery(session: DaemonSession, error?: string): void {
+    const pending: DaemonSession = { ...session, state: 'suspended' };
+    // Older snapshots used this status text as an error even without a probe.
+    // Clear that exact marker so existing placeholders can age out as well.
+    if (error !== undefined && error !== 'WSL session is waiting to reconnect.') {
+      pending.recoveryError = error;
+      // #1305: start the retention clock the first time this entry becomes
+      // pending, and NEVER restart it here. Both the per-boot re-seed in
+      // recoverSessions and a failed retry land in this method, so restamping
+      // here would renew every entry on every boot — exactly the immortality
+      // the pending-recovery TTL exists to end.
+      pending.recoveryPendingSince ??= new Date(Date.now()).toISOString();
+    } else {
+      delete pending.recoveryError;
+      // No longer pending: drop the clock so a later failure starts a fresh
+      // retention window instead of inheriting a stale one.
+      delete pending.recoveryPendingSince;
+    }
+    this.pendingRecovery.set(session.id, pending);
+  }
+
+  getPendingRecovery(id: string): DaemonSession | undefined {
+    return this.pendingRecovery.get(id);
+  }
+
+  /**
+   * #1305: restart a pending-recovery entry's retention clock
+   * (`recoveryPendingSince`), the timestamp StateWriter's pending-recovery TTL
+   * reads.
+   *
+   * Call this ONLY for client-initiated interest in the pane (the Retry
+   * button, an attach/reconnect). The boot background retry must not, or every
+   * boot would renew the entry and it could never age out.
+   *
+   * @returns true when the clock actually moved, so the caller knows whether
+   *   it has anything to persist. False for an id that is not pending, and for
+   *   a repeat inside TOUCH_MIN_INTERVAL_MS — a held-down Retry button would
+   *   otherwise force one synchronous whole-file state write per click for no
+   *   change in meaning.
+   */
+  touchPendingRecovery(id: string): boolean {
+    const pending = this.pendingRecovery.get(id);
+    // An unattempted placeholder (no recoveryError) is governed by the ordinary
+    // suspended TTL, so it has no clock to restart.
+    if (!pending?.recoveryError) return false;
+    // Date.now() rather than new Date() so the TTL's clock and this restamp
+    // are the same clock under test.
+    const now = Date.now();
+    const since = Date.parse(pending.recoveryPendingSince ?? '');
+    if (!Number.isNaN(since) && now - since < TOUCH_MIN_INTERVAL_MS) return false;
+    pending.recoveryPendingSince = new Date(now).toISOString();
+    return true;
+  }
+
+  /** Synchronous native-shell API. Production callers use createSessionAsync. */
+  createSession(params: Parameters<DaemonSessionManager['spawnSession']>[0]): DaemonSession {
+    const cmd = this.resolveShellPath(params.cmd) || this.getDefaultShell();
+    if (isWslShell(cmd)) throw new Error('WSL creation requires createSessionAsync');
+    return this.spawnSession({ ...params, cmd });
+  }
+
+  async createSessionAsync(params: Parameters<DaemonSessionManager['spawnSession']>[0]): Promise<DaemonSession> {
+    const cmd = this.resolveShellPath(params.cmd) || this.getDefaultShell();
+    if (!isWslShell(cmd)) return this.createSession({ ...params, cmd });
+    if (this.pendingCreates.has(params.id)) throw new Error(`Session '${params.id}' creation is already pending`);
+    const token = Symbol(params.id);
+    this.pendingCreates.set(params.id, token);
+    try {
+      const wsl = await resolveWslCwd(cmd, params.cwd, params.wslTarget, undefined, params.args);
+      if (this.pendingCreates.get(params.id) !== token) throw new Error('Session creation cancelled');
+      const created = this.spawnSession({ ...params, cmd }, wsl);
+      this.pendingRecovery.delete(params.id);
+      return created;
+    } finally {
+      if (this.pendingCreates.get(params.id) === token) this.pendingCreates.delete(params.id);
+    }
+  }
+
+  private spawnSession(params: {
     id: string;
     /**
      * The command to run as the pane's root process. OPTIONAL: absent means
@@ -182,6 +316,13 @@ export class DaemonSessionManager extends EventEmitter {
      * `''` — see resolveShellPath.
      */
     cmd?: string;
+    /**
+     * #1103 — validated WSL distro selection (`['-d', '<name>']`), only ever
+     * for a wsl.exe cmd. Prepended IN FRONT of any integration args so
+     * wsl.exe parses it as its own flag. The RPC boundary has already
+     * enforced the exact shape; this is the spawn site.
+     */
+    args?: string[];
     /** Absent means the home directory. */
     cwd?: string;
     /**
@@ -198,6 +339,7 @@ export class DaemonSessionManager extends EventEmitter {
      * route depends on: the pane's process cannot choose it.
      */
     spawnCwd?: string;
+    wslTarget?: WslTarget;
     /**
      * The child environment. When provided it is treated as AUTHORITATIVE and
      * replayed verbatim — the caller (main process) has already run
@@ -257,13 +399,17 @@ export class DaemonSessionManager extends EventEmitter {
      * unless `exec` is also set. Defaults to `exec.command`.
      */
     execLaunchCommand?: string;
+    /** Phone handoff lineage, on the meta from creation (before the first hook can land). */
+    handoffFrom?: StoredHandoffFrom;
+    /** Vendor of the account chosen for this phone pane (its directory is in `env`). */
+    paneAccount?: { vendor: PaneAccountVendor };
     /**
      * X8 supervision policy + sticky status. Fresh creates pass
      * status:'armed'; recovery replays the persisted value so a
      * runaway-guard 'stopped' survives reboots.
      */
     supervision?: DaemonSessionSupervision;
-  }): DaemonSession {
+  }, wsl?: ResolvedWslCwd): DaemonSession {
     // Validate session ID to prevent path traversal, injection, or oversized keys
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(params.id)) {
       throw new Error(`Invalid session ID: must be 1-64 chars of [a-zA-Z0-9_-]`);
@@ -312,8 +458,9 @@ export class DaemonSessionManager extends EventEmitter {
     // argument that no shell ever touched, so `~/projects/foo` would otherwise
     // stay literal and silently fall back to $HOME (or throw as an unreadable
     // cwd). Single choke point — every caller-supplied cwd converges here.
-    const cwd = params.cwd ? expandTilde(params.cwd) : os.homedir();
     let cmd = this.resolveShellPath(params.cmd) || this.getDefaultShell();
+    const cwd = wsl?.cwd ?? (params.cwd ? expandTilde(params.cwd) : os.homedir());
+    const hostCwd = wsl ? os.homedir() : cwd;
 
     // Resolve the child environment. A caller-supplied env is AUTHORITATIVE —
     // main already ran buildSafeChildEnv + the workspace-profile overlay +
@@ -329,19 +476,24 @@ export class DaemonSessionManager extends EventEmitter {
     // (a profile can never set it) so this can't strip a user/profile key. This
     // bounds the trusted-env contract: a misbehaving/legacy caller that passes
     // a raw env can at worst leak ITS inherited vars, never wmux's auth token.
+    // The same pass drops WMUX_SOCKET_PATH and agent-nesting markers, which no
+    // caller supplies on purpose either (see stripReservedSuppliedEnv), so new
+    // and recovered panes alike come up without them.
     //
     // The fallback (no supplied env) carries NO caller-forced identity, so it
     // also drops the whole WMUX_* namespace — otherwise a daemon launched from
     // a wmux pane would leak its own inherited WMUX_WORKSPACE_ID/SURFACE_ID/
     // SOCKET_PATH into a session that should have none. Mirrors resolveSpawnEnv.
-    // KNOWN LIMITATION: a supplied env is replayed verbatim (minus AUTH), so a
-    // sessions.json written before the main-side identity-strip fix can still
-    // carry a stale identity on recovery. New sessions persist a clean env;
-    // pre-fix contaminated blobs are accepted rather than migrated (re-deriving
-    // identity on replay would need session→workspace/surface plumbing the
-    // daemon deliberately does not have).
+    // KNOWN LIMITATION: WMUX_WORKSPACE_ID / WMUX_SURFACE_ID /
+    // WMUX_WORKSPACE_NAME are replayed as persisted. They are spawn-time stamps:
+    // a sessions.json written before the main-side identity-strip fix can carry
+    // a parent pane's ids, and a pane later adopted into another workspace or
+    // onto a new surface keeps its old ids (MEMBER_ID / PTY_ID are the session
+    // id, which recovery keeps, so they stay correct). Re-deriving them on
+    // replay would need session→workspace/surface plumbing the daemon
+    // deliberately does not have.
     const env = params.env
-      ? stripReservedAuth(params.env)
+      ? stripReservedSuppliedEnv(params.env)
       : stripReservedNamespace(buildSafeChildEnv(globalThis.process.env));
 
     // X6 ③: stamp the pane's own daemon session id into its env so the Claude
@@ -356,8 +508,8 @@ export class DaemonSessionManager extends EventEmitter {
 
     // Instance-isolation suffix: force the child onto THIS daemon's instance (its
     // own inherited WMUX_DATA_SUFFIX), overriding whatever a replayed session.env
-    // blob carried. The recovery path above runs stripReservedAuth, which strips
-    // only WMUX_AUTH* — so a persisted (or hand-edited) WMUX_DATA_SUFFIX would
+    // blob carried. The recovery path above runs stripReservedSuppliedEnv, which
+    // keeps the rest of WMUX_* — so a persisted (or hand-edited) WMUX_DATA_SUFFIX would
     // otherwise survive verbatim and could point a recovered pane at a DIFFERENT
     // instance's control pipe. Sourced ONLY from the daemon's own process.env (the
     // authoritative instance key, inherited from main at spawn), never a child-
@@ -375,8 +527,19 @@ export class DaemonSessionManager extends EventEmitter {
       env[ENV_KEYS.DATA_SUFFIX] = globalThis.process.env[ENV_KEYS.DATA_SUFFIX] as string;
     }
 
-    let spawnArgs: string[] = [];
-    if (params.exec) {
+    // Phone workspace panes: a gone account directory is dropped with a warning
+    // (recovery), never handed to the CLI to recreate as an empty config.
+    dropMissingAccountDirs(params.id, env, (message) => console.warn(message));
+
+    let spawnArgs: string[] = isWslDistroSpawnArgs(cmd, params.args) ? [...params.args] : [];
+    if (wsl) {
+      const injection = buildWslInjection({ target: wsl.target, cwd, env,
+        integrationDir: getWmuxDir(), bashInit: BASH_INIT,
+        execCommand: params.exec ? (params.execLaunchCommand ?? params.exec.command) : undefined,
+      });
+      spawnArgs = injection.args;
+      Object.assign(env, injection.env);
+    } else if (params.exec) {
       // X8 exec unit: the command IS the pane process — no interactive
       // shell session, so OSC 133 injection is skipped (no prompt to mark,
       // and injection args would collide with the wrapper argv). When the
@@ -387,10 +550,14 @@ export class DaemonSessionManager extends EventEmitter {
       // the ORIGINAL below (meta.exec.command). Replay-only callers set
       // execLaunchCommand; brand-new sessions omit it → spawn === persisted.
       const launchCommand = params.execLaunchCommand ?? params.exec.command;
-      let execArgs = buildExecArgs(cmd, launchCommand);
+      // #1620: on a factory-default Windows client, powershell.exe resolves an
+      // npm agent (`codex`) to its .ps1 shim, which Restricted blocks.
+      // A phone workspace pane re-exports its account keys after the login
+      // profile, so the agent runs on the account the pane was created on.
+      let execArgs = buildExecArgs(cmd, pinAccountEnv(params.id, cmd, launchCommand, env), windowsPowerShellPolicyArgs(cmd));
       if (!execArgs) {
         cmd = this.resolveExecFallbackShell();
-        execArgs = buildExecArgs(cmd, launchCommand);
+        execArgs = buildExecArgs(cmd, pinAccountEnv(params.id, cmd, launchCommand, env), windowsPowerShellPolicyArgs(cmd));
       }
       if (!execArgs) {
         throw new Error(`No usable wrapper shell for exec session (resolved: ${cmd})`);
@@ -446,7 +613,7 @@ export class DaemonSessionManager extends EventEmitter {
           name: 'xterm-256color',
           cols,
           rows,
-          cwd,
+          cwd: hostCwd,
           env,
           useConpty: true,
           ...(useBundled ? { useConptyDll: true } : {}),
@@ -479,6 +646,7 @@ export class DaemonSessionManager extends EventEmitter {
       pid: ptyProcess.pid,
       cmd,
       cwd,
+      ...(wsl ? { wslTarget: wsl.target } : {}),
       // Same value as `cwd` for a brand-new session, and deliberately a second
       // field: `cwd` is about to start tracking OSC 7 (see the bridge's 'cwd'
       // handler) and will diverge the first time anything in the pane changes
@@ -501,9 +669,18 @@ export class DaemonSessionManager extends EventEmitter {
     if (params.agent) {
       meta.agent = params.agent;
     }
+    // #1103 — persist the distro selection so replays (recovery, supervised
+    // restart, promote) re-spawn the same distro. Re-validated here even
+    // though the RPC boundary already checked: createSession has direct
+    // callers too, and this field becomes spawn argv.
+    if (wsl || isWslDistroSpawnArgs(cmd, params.args)) {
+      meta.args = wsl ? ['-d', wsl.target.distribution] : [...params.args!];
+    }
     if (params.exec) {
       meta.exec = { command: params.exec.command };
     }
+    if (params.handoffFrom) meta.handoffFrom = { ...params.handoffFrom };
+    if (params.paneAccount) meta.paneAccount = { vendor: params.paneAccount.vendor };
     if (params.supervision) {
       // Own copy — meta is persisted via buildState and must not alias
       // caller-held objects (recovery replays the persisted blob verbatim).
@@ -558,6 +735,8 @@ export class DaemonSessionManager extends EventEmitter {
       bridge,
       promptLog,
       deferred,
+      recoveredAgentUnconfirmed: deferred,
+      firstGeometryPending: deferred,
       viewerVisible: true,
     };
     this.sessions.set(params.id, managed);
@@ -585,6 +764,34 @@ export class DaemonSessionManager extends EventEmitter {
       this.emit('session:critical', payload);
     });
 
+    bridge.on('usageLimit', (payload) => {
+      this.emit('session:usageLimit', payload);
+    });
+
+    bridge.on('inputSubmitted', (payload) => {
+      this.emit('session:inputSubmitted', payload);
+    });
+
+    // A human answered the dialog this pane was blocked on (see noteInput).
+    bridge.on('answered', (payload) => {
+      this.emit('session:answered', payload);
+    });
+
+    // Stdin or output on a pane blocked on a human: the awaiting-state screen
+    // verifier in daemon/index.ts schedules its check off this.
+    bridge.on('awaitingActivity', (payload) => {
+      this.emit('session:awaitingActivity', payload);
+    });
+
+    // A key or click reached the pane: a pending remote terminal-prompt answer
+    // is refreshed off this (daemon/index.ts → ApprovalRegistry.noteFenceInput).
+    bridge.on('fenceInput', (payload) => {
+      this.emit('session:fenceInput', payload);
+    });
+    bridge.on('typedInput', (payload) => {
+      this.emit('session:typedInput', payload);
+    });
+
     // OSC 133 shell integration markers — daemon-side parsing populates
     // PromptEventLog (canonical, byte-offset indexed); this re-emit teases
     // out the same parsed PromptEvent so main-process notification routing
@@ -610,6 +817,9 @@ export class DaemonSessionManager extends EventEmitter {
       // write (and the renderer broadcast) fire on cd, not on every prompt —
       // keeps the immediate cwd persistence cheap (no write amplification).
       if (meta.cwd === payload.cwd) return;
+      // #1729 — OSC 7 percent-decoding or a wrapped prompt can carry a control
+      // character; such a value names no directory and would break recovery.
+      if (containsControlChars(payload.cwd)) return;
       // Only `cwd`. `meta.spawnCwd` stays at the spawn value on purpose — this
       // payload originates in terminal output, which any process in the pane
       // can write, so it may not move a directory anything acts on.
@@ -694,8 +904,8 @@ export class DaemonSessionManager extends EventEmitter {
     // Set up data forwarding (PTY → RingBuffer + events), hooking the
     // prompt/command log so OSC 133 markers populate a structured journal.
     // For deferred (recovery) sessions we mute the data path before any
-    // PTY output can land — `resizeSession` unmutes once the renderer's
-    // true geometry is known.
+    // PTY output can land — `activateDeferred` unmutes once a viewer
+    // attaches (the renderer's first resize, or a web stream or input).
     if (deferred) {
       bridge.setMuted(true);
     }
@@ -717,6 +927,9 @@ export class DaemonSessionManager extends EventEmitter {
   }
 
   destroySession(id: string): void {
+    this.pendingCreates.delete(id);
+    const pending = this.pendingRecovery.delete(id);
+    if (pending) this.emit('session:destroyed', { id });
     const managed = this.sessions.get(id);
     if (!managed) return;
 
@@ -827,7 +1040,16 @@ export class DaemonSessionManager extends EventEmitter {
     // into the shell.
     const safeCols = clampCols(cols);
     const safeRows = clampRows(rows);
-    if (safeCols !== managed.meta.cols || safeRows !== managed.meta.rows) {
+    const geometryChanged = safeCols !== managed.meta.cols || safeRows !== managed.meta.rows;
+    const firstGeometry = managed.firstGeometryPending;
+    managed.firstGeometryPending = false;
+    if (geometryChanged) {
+      // #1464: output held by a still-muted (recovering) session so far was
+      // produced at the old size. Drop it BEFORE the resize — node-pty data
+      // arrives asynchronously, so the shell's repaint at the new size lands
+      // after this and stays held for the unmute to release.
+      managed.bridge.discardHeld();
+      if (managed.bridge.isMuted) managed.resizedWhileMuted = true;
       managed.ptyProcess.resize(safeCols, safeRows);
       managed.meta.cols = safeCols;
       managed.meta.rows = safeRows;
@@ -837,22 +1059,89 @@ export class DaemonSessionManager extends EventEmitter {
       managed.bridge.noteResize();
     }
 
-    // First resize on a deferred (recovery) session unmutes data
-    // capture. The 100ms delay drains any pre-resize output ConPTY
-    // queued at the saved/default geometry.
-    if (managed.deferred) {
-      managed.deferred = false;
-      const sessionId = id;
-      setTimeout(() => {
-        const current = this.sessions.get(sessionId);
-        if (!current) return;
-        current.bridge.setMuted(false);
-      }, DEFERRED_UNMUTE_DELAY_MS).unref?.();
+    // A web viewer activated this recovered pane before the desk's first
+    // resize, so capture is already live and the #1464 held-output handling
+    // below no longer applies. On Windows, request the same full ConPTY repaint
+    // at the new size once the drain delay has passed, so the pane's latest
+    // frame is drawn at the desk's geometry.
+    if (firstGeometry && geometryChanged && !managed.bridge.isMuted && process.platform === 'win32') {
+      setTimeout(() => this.repaintAtCurrentSize(id, managed), DEFERRED_UNMUTE_DELAY_MS).unref?.();
+    }
+
+    this.activateDeferred(id);
+  }
+
+  /**
+   * Mark a recovered pane's agent as running again. Called on any signal that
+   * names a live agent in the pane; see `recoveredAgentUnconfirmed`.
+   */
+  confirmAgent(id: string): void {
+    const managed = this.sessions.get(id);
+    if (managed) managed.recoveredAgentUnconfirmed = false;
+  }
+
+  /** Ask ConPTY for a full repaint by resizing to the size it already has. */
+  private repaintAtCurrentSize(id: string, managed: ManagedSession): void {
+    if (this.sessions.get(id) !== managed) return;
+    if (managed.meta.state === 'dead' || managed.meta.state === 'suspended') return;
+    // Same geometry, so no noteResize(): viewers keep their grid.
+    try {
+      managed.ptyProcess.resize(managed.meta.cols, managed.meta.rows);
+    } catch {
+      // The PTY exited in between: nothing to show.
     }
   }
 
+  /**
+   * Start output capture on a deferred (recovery) session WITHOUT changing
+   * its size. No-op for a session that is unknown or already active.
+   *
+   * Called by the desk's first `resizeSession`, and by a web client opening
+   * the pane's stream or typing into it — without that second path a session
+   * no desktop renderer mounts (headless daemon, phone-only panes) stayed
+   * muted forever. Only a viewer activates: there is deliberately no timer
+   * that unmutes on its own.
+   *
+   * The unmute waits 100ms so any output ConPTY queued at the saved/default
+   * geometry drains first.
+   *
+   * #1464: the output still held at unmute was produced at the size the
+   * viewer shows (`resizeSession` discards anything older), so replay it
+   * rather than drop it. Dropping it left a recovered pane blank until a key
+   * was pressed: the shell prints its prompt once, before the renderer
+   * attaches, and repaints only on a SIGWINCH — which an unchanged geometry
+   * never sends, and a changed one sends while still muted.
+   *
+   * Windows, when the geometry changed at ANY resize inside the window (not
+   * just the first — the renderer's first fit is often transient, and the
+   * Resume row shrinks the pane): the held bytes may mix ConPTY frames from
+   * more than one size, so none are replayed. Instead the PTY is resized to
+   * its current geometry once the unmute is in place. ConPTY owns the screen
+   * and answers every resize call, same size included, with a complete
+   * repaint at that geometry (CSI H, every row, the cursor), measured 1–15 ms
+   * after the call. That frame goes out live, so the prompt reaches the pane
+   * whatever the timing of the renderer's resizes. Discarding without it left
+   * the pane blank whenever the last repaint landed before this timer fired
+   * (4 of 6 panes in the Windows dogfood of #1469).
+   */
+  activateDeferred(id: string): void {
+    const managed = this.sessions.get(id);
+    if (!managed?.deferred) return;
+    if (managed.meta.state === 'dead' || managed.meta.state === 'suspended') return;
+    managed.deferred = false;
+    setTimeout(() => {
+      // A session destroyed and re-created under the same id is not this one.
+      if (this.sessions.get(id) !== managed) return;
+      const conptyRepaint = managed.resizedWhileMuted === true && process.platform === 'win32';
+      managed.resizedWhileMuted = false;
+      // setMuted(false) stamps the redraw guard the repaint below relies on.
+      managed.bridge.setMuted(false, { replayHeld: !conptyRepaint });
+      if (conptyRepaint) this.repaintAtCurrentSize(id, managed);
+    }, DEFERRED_UNMUTE_DELAY_MS).unref?.();
+  }
+
   listSessions(): DaemonSession[] {
-    return Array.from(this.sessions.values()).map((m) => ({ ...m.meta }));
+    return [...Array.from(this.sessions.values()).map((m) => ({ ...m.meta })), ...Array.from(this.pendingRecovery.values()).map((s) => ({ ...s }))];
   }
 
   /**
@@ -883,6 +1172,7 @@ export class DaemonSessionManager extends EventEmitter {
   }
 
   disposeAll(): void {
+    this.pendingCreates.clear();
     for (const id of Array.from(this.sessions.keys())) {
       this.destroySession(id);
     }

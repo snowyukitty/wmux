@@ -33,7 +33,7 @@ If your work touches multiple areas, split it into separate PRs.
 
 ### PR Checklist
 
-- [ ] `npx tsc --noEmit` passes
+- [ ] `npm run typecheck` passes
 - [ ] `npm test` passes
 - [ ] New code has tests
 - [ ] Commit messages are clear and descriptive
@@ -85,6 +85,25 @@ in `.local-scratch/`. Git-ignored files under `src/**/__tests__/` still run unde
 Vitest: an old vulnerability demonstration asserting that an exploit succeeds
 can keep failing after the production fix. Preserve that evidence separately
 and put the intended safe behavior in a tracked regression test.
+
+CI (`.github/workflows/ci.yml`) runs the two halves as parallel jobs:
+`validate` (type checks, builds, `npm run test:parallel`) and
+`validate-runtime` (`npm run test:runtime` against a freshly built daemon
+bundle). A PR needs both green; a branch-protection rule that requires status
+checks must list both.
+
+### Running tests as an agent
+
+Coding agents pay for every line of test output they read. While working,
+run only the files you touched and keep the output short:
+
+```
+npm run test:agent -- src/shared/__tests__/foo.test.ts   # dots + summary
+npm run test:changed                                      # files changed vs git HEAD
+npm run typecheck:quiet                                   # errors + one line
+```
+
+Run the full `npm test` and `npm run typecheck` once before opening the PR.
 
 ### Commit Style
 

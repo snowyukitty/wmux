@@ -1,19 +1,47 @@
-import { memo, useEffect, useMemo, useState } from 'react';
+// Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/app/shell/Sidebar.tsx), MIT License, Copyright (c) 2026 Nick
+import { Fragment, memo, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../../stores';
 import {
+  agentSurfaceTitle,
   createWorkspaceAgentRosterSelector,
-  createWorkspaceRosterCountsSelector,
+  type RosterChipAgent,
   type WorkspaceAgentRosterRow,
 } from '../../stores/selectors/workspaceAgentRoster';
 import { focusNotificationTarget, focusPaneByPtyId } from '../../hooks/useNotificationListener';
 import { useT } from '../../hooks/useT';
-import { IconEye, IconEyeOff, IconChevron } from '../icons';
+import { IconEye, IconEyeOff, IconChevron, IconExternalLink, IconFanOut } from '../icons';
 import { FOCUS_RING } from '../focusRing';
 import { HIT_TARGET_24_ROW } from '../hitArea';
 import { timeAgo } from '../../utils/timeAgo';
 import { AGENT_STATUS_ICON } from './agentStatusIcon';
-import { formatStaleMinutes, selectUnverifiablePaneMinutes } from '../../stores/selectors/fleet';
+import { fleetIdleForMs, formatStaleMinutes, selectUnverifiablePaneMinutes } from '../../stores/selectors/fleet';
+import { StatusMarkView } from './AgentMarks';
+import { selectSidebarUnseen } from '../../stores/selectors/sidebarSeen';
+import { formatIdle, IDLE_SHOW_AFTER_MS, IDLE_TICK_MS } from '../../utils/idleTime';
+import { buildMentionReference, buildMentionTargets, focusedMentionSource } from '../../utils/agentMention';
+import { insertMention, toastMentionInsert } from '../../utils/agentMentionInsert';
+import { PaneTaskGroup, usePaneTaskSplit } from './SidebarTaskGroup';
+import { getWorkspaceLeafPanes } from '../../../shared/paneUtils';
+import { computePaneAutoName, paneDisplayName } from '../../utils/paneNaming';
+import type { Workspace } from '../../../shared/types';
+
+/**
+ * The roster row's `@`: insert this agent's reference into the focused agent's
+ * input — the picker's Enter, without the picker. Says why when nothing was
+ * inserted: no agent pane has focus (the caller tells the user), or the row is
+ * not a target.
+ */
+function mentionRowInFocusedAgent(ptyId: string): 'inserted' | 'noSource' | 'notTarget' {
+  const state = useStore.getState();
+  const source = focusedMentionSource(state);
+  if (!source) return 'noSource';
+  const target = buildMentionTargets(state, source.ptyId).find((c) => c.kind === 'pane' && c.key === `pane:${ptyId}`);
+  if (!target) return 'notTarget';
+  const result = insertMention(source, buildMentionReference(target));
+  toastMentionInsert(result);
+  return 'inserted';
+}
 
 /** How long the just-stashed row stays highlighted. Long enough to catch the
  *  eye after the pane vanishes from the layout, short enough not to linger. */
@@ -60,6 +88,16 @@ interface WorkspaceAgentRosterProps {
    * component is only mounted once it is open.
    */
   pulsingPaneId: string | null;
+  /** 2026-09-27 — this workspace's fan-out tasks (Sidebar's tree, list
+   *  order). Each nests under the roster row of the pane that requested it;
+   *  the rest render in Sidebar's "From closed pane" group. */
+  taskIds?: readonly string[];
+  /** Renders one nested task row (Sidebar's WorkspaceItem in task mode). */
+  renderTask?: (id: string) => ReactNode;
+  /** Sidebar's workspace close, for a pane group's "Close finished tasks". */
+  onCloseTask?: (id: string) => void;
+  /** The workspace is the active one (opens its pane groups by default). */
+  ownerActive?: boolean;
 }
 
 interface WorkspaceRosterSummaryProps {
@@ -68,8 +106,31 @@ interface WorkspaceRosterSummaryProps {
    *  control holds no store subscription of its own and memoizes on numbers. */
   agentCount: number;
   stashedCount: number;
+  /** #1481 — up to three agents, most urgent first, grouped by status. */
+  agents?: readonly RosterChipAgent[];
+  /** Agents beyond the drawn ones ("+N"). */
+  extra?: number;
+  /** Fan-out tasks nested under this roster's pane rows — counted on the
+   *  collapsed chip, since folding the roster also hides them. */
+  paneTaskCount?: number;
+  /** How many of those need you — needs-you yellow on the folded chip, so a
+   *  task asking for you never disappears behind a fold. */
+  paneTaskNeedYou?: number;
   open: boolean;
   onToggle: () => void;
+  /** Tab order (the row's roving tabindex hands it out). */
+  tabIndex?: number;
+}
+
+/** Consecutive runs of the same status, so each run carries ONE mark. */
+export function groupChipAgents(agents: readonly RosterChipAgent[]): RosterChipAgent[][] {
+  const groups: RosterChipAgent[][] = [];
+  for (const agent of agents) {
+    const last = groups[groups.length - 1];
+    if (last && last[0].status === agent.status) last.push(agent);
+    else groups.push([agent]);
+  }
+  return groups;
 }
 
 /**
@@ -84,6 +145,20 @@ interface WorkspaceRosterSummaryProps {
  * Previously the title was rendered ONLY when a leaf had 2+ surfaces, so the
  * single-surface panes that make up most workspaces never showed it at all.
  */
+/**
+ * Whether a roster row names its agent kind after the title: only non-Claude
+ * agents, only beside a real title, and not when the title already is the
+ * agent ("Codex" beside "Codex CLI" says the same thing twice).
+ */
+export function rosterShowsAgentKind(row: Pick<WorkspaceAgentRosterRow, 'surfaceTitle' | 'slug' | 'agentName'>): boolean {
+  if (!row.surfaceTitle || !row.slug || row.slug === 'claude') return false;
+  const title = row.surfaceTitle.trim().toLowerCase();
+  const name = (row.agentName ?? '').trim().toLowerCase();
+  if (!name) return true;
+  const startsWord = (a: string, b: string) => a === b || a.startsWith(`${b} `);
+  return !(startsWord(name, title) || startsWord(title, name));
+}
+
 export function rosterPrimaryLabel(row: WorkspaceAgentRosterRow): string {
   // Truthiness, not `??`: the row type allows an empty title, and `??` would
   // let `''` win the lead. The trailer already tests truthiness, so `??` here
@@ -112,7 +187,15 @@ export function rosterSecondaryLabel(
   const showVendor = opts.showVendor ?? true;
   const parts: string[] = [];
   if (showVendor && row.surfaceTitle) parts.push(row.agentName);
-  parts.push(row.paneName);
+  // #1163 — a remote session's local pane coordinate is meaningless (it names
+  // the mirror cell, not the agent); the HOST is the "where" that identifies
+  // the row and marks its origin.
+  if (row.remote) parts.push(`@${row.remote.hostLabel}`);
+  // #1326 — the roster selector already withholds `paneName` when the
+  // sidebarShowPaneCoordinates setting is off AND the pane has no explicit
+  // label (empty string, never the coordinate). A real label still comes
+  // through here unaffected by the setting.
+  else if (row.paneName) parts.push(row.paneName);
   if (row.surfaceCount > 1) parts.push(`#${row.surfaceIndex + 1}/${row.surfaceCount}`);
   return parts.join(' · ');
 }
@@ -164,15 +247,28 @@ function WorkspaceRosterSummary({
   workspaceId,
   agentCount,
   stashedCount,
+  agents = [],
+  paneTaskCount = 0,
+  paneTaskNeedYou = 0,
   open,
   onToggle,
+  tabIndex,
 }: WorkspaceRosterSummaryProps) {
   const t = useT();
   const roster = { agentCount, stashedCount };
 
-  if (agentCount === 0 && stashedCount === 0) return null;
+  if (agentCount === 0 && stashedCount === 0 && paneTaskCount === 0) return null;
 
-  const ariaLabel = rosterSummaryAriaLabel(roster, open, t);
+  const showTasks = !open && paneTaskCount > 0;
+  // A workspace whose only rows are panes holding tasks (their agents ended)
+  // has no agent or stash count to lead with: "Stashed 0" would be false.
+  const ariaLabel = [
+    agentCount === 0 && stashedCount === 0
+      ? (open ? t('workspace.hideAgents') : t('workspace.showAgents'))
+      : rosterSummaryAriaLabel(roster, open, t),
+    showTasks ? (paneTaskCount === 1 ? t('sidebar.tasks.countOne') : t('sidebar.tasks.count', { count: paneTaskCount })) : undefined,
+    showTasks && paneTaskNeedYou > 0 ? t('strip.needsYou', { count: paneTaskNeedYou }) : undefined,
+  ].filter(Boolean).join(', ');
 
   return (
     <button
@@ -183,6 +279,7 @@ function WorkspaceRosterSummary({
       // behind that already-proven guard instead of leaving the mousedown
       // preventDefault below as the single line of defence.
       data-workspace-agent-roster
+      tabIndex={tabIndex}
       // The chevron is 8px and the count 10px type: the control measured ~20x14.
       // HIT_TARGET_24_ROW gives it a 24px box, refunds only the HEIGHT (so the
       // row keeps its own) and pays the ~4px of width in full — the name column
@@ -190,7 +287,7 @@ function WorkspaceRosterSummary({
       // over the end of the workspace name. `self-center` rides in the recipe:
       // the row is items-start, so a 24px box pinned to the top would float the
       // chevron above the caption line it belongs to.
-      className={`${HIT_TARGET_24_ROW} flex-shrink-0 gap-0.5 rounded px-0.5 text-[10px] font-mono tabular-nums text-[var(--text-muted)] transition-colors hover:text-[var(--text-sub)] ${FOCUS_RING}`}
+      className={`${HIT_TARGET_24_ROW} flex-shrink-0 gap-0.5 rounded-md px-0.5 text-[11px] font-mono tabular-nums text-[color-mix(in_srgb,var(--text-main)_45%,transparent)] transition-colors hover:text-[var(--text-main)] ${FOCUS_RING}`}
       aria-expanded={open}
       aria-controls={rosterListId(workspaceId)}
       aria-label={ariaLabel}
@@ -219,7 +316,22 @@ function WorkspaceRosterSummary({
       >
         <IconChevron size={8} />
       </span>
-      {agentCount > 0 && <span>{agentCount}</span>}
+      {/* #1481 — what is happening, instead of a bare count: one mark and a
+          count per non-idle status group, most urgent first. Idle agents are
+          not listed beside them (a bare number would read as part of the
+          previous group); when every agent is idle the total stands alone.
+          The accessible name carries the full count. */}
+      {(() => {
+        const active = groupChipAgents(agents).filter((group) => group[0].status !== 'idle');
+        // One idle agent: the chevron alone (a "1" restates the row).
+        if (active.length === 0) return agentCount > 1 ? <span>{agentCount}</span> : null;
+        return active.map((group, gi) => (
+          <span key={`${group[0].status}-${gi}`} className="flex items-center gap-0.5" data-roster-chip-group={group[0].status}>
+            <StatusMarkView status={group[0].status} quiet neutralRunning />
+            <span>{group.length}</span>
+          </span>
+        ));
+      })()}
       {/* The stash glyph draws only when it is the ONLY thing to report.
           Beside an agent count it cost 17px of a row whose name column has
           none to spare (measured: it was the difference between eleven
@@ -233,29 +345,69 @@ function WorkspaceRosterSummary({
           {stashedCount}
         </span>
       )}
+      {/* Folding the roster also folds the tasks its panes requested: the
+          collapsed chip keeps them accounted for — muted, with the ones that
+          need you counted in red (the only rendition while folded). */}
+      {showTasks && (
+        <span className="flex items-center gap-0.5" data-roster-chip-tasks={paneTaskCount} data-roster-chip-needs-you={paneTaskNeedYou || undefined}>
+          <IconFanOut size={8} />
+          {paneTaskNeedYou > 0 ? (
+            <span><span className="font-semibold text-[var(--attention-text)]">{paneTaskNeedYou}</span>/{paneTaskCount}</span>
+          ) : paneTaskCount}
+        </span>
+      )}
     </button>
   );
 }
 
 export const WorkspaceRosterSummaryMemo = memo(WorkspaceRosterSummary);
 
-function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRosterProps) {
+function WorkspaceAgentRoster({ workspaceId, pulsingPaneId, taskIds, renderTask, onCloseTask, ownerActive = false }: WorkspaceAgentRosterProps) {
   const t = useT();
   const selector = useMemo(
     () => createWorkspaceAgentRosterSelector(workspaceId),
     [workspaceId],
   );
   const roster = useStore(selector);
+  // #1481 — the elapsed column. A local ticker rather than a subscription to
+  // the per-PTY stamps: those move on every throttled output write, and the
+  // label only changes once a minute. Stamps are read at render time.
+  const [now, setNow] = useState(() => Date.now());
+  const hasRows = roster.rows.length > 0;
+  useEffect(() => {
+    if (!hasRows) return;
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), IDLE_TICK_MS);
+    return () => clearInterval(id);
+  }, [hasRows]);
   // Per-PTY silence, in whole minutes, for the rows whose agent still claims to
   // be running but has reported nothing for the hook-authority window. Keyed by
   // ptyId, which is the id these rows already carry; verifiable panes are absent.
   const unverifiableMinutesByPtyId = useStore(useShallow(selectUnverifiablePaneMinutes));
+  // Glance board: per-pane "changed since you last looked".
+  const unseenByPtyId = useStore(useShallow(selectSidebarUnseen));
+  // Browser mirror (wmux web /app): a stashed row cannot be brought back from here.
+  const readOnly = useStore((s) => s.readOnly);
+  // 2026-09-27 — this workspace's tasks, filed under the requesting pane.
+  const taskSplit = usePaneTaskSplit(workspaceId, renderTask ? taskIds : undefined);
+  // A pane that asked for tasks keeps a row while it is open even after its
+  // agent ended (no roster row): a muted one, so its tasks stay under it.
+  const firstRowOfPane = new Map<string, number>();
+  roster.rows.forEach((row, index) => { if (!firstRowOfPane.has(row.paneId)) firstRowOfPane.set(row.paneId, index); });
+  const barePaneIds = [...taskSplit.byPane.keys()].filter((paneId) => !firstRowOfPane.has(paneId));
+  const bareRows = useStore(useShallow((s) => barePanesOf(s, workspaceId, barePaneIds)));
 
-  if (roster.agentCount === 0 && roster.stashedCount === 0) return null;
+  if (roster.agentCount === 0 && roster.stashedCount === 0 && taskSplit.byPane.size === 0) return null;
 
   // Computed once per render, not per row: the vendor column earns its width
   // only when the workspace actually mixes vendors.
-  const mixedVendors = rosterHasMixedVendors(roster.rows);
+  const stamps = useStore.getState();
+  const stampCtx = {
+    now,
+    surfaceActivityAt: stamps.surfaceActivityAt,
+    surfaceOutputAt: stamps.surfaceOutputAt,
+    surfaceTurnOpenAt: stamps.surfaceTurnOpenAt,
+  };
 
   return (
     <div
@@ -263,6 +415,12 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
       id={rosterListId(workspaceId)}
       data-workspace-agent-roster
       onMouseDown={(event) => {
+        // A nested task row — in a list of THIS roster — is a drag source of
+        // its own and holds a rename input: its press keeps its default
+        // (focus, drag); its list stops the gestures that would reach the
+        // owner row instead. Only a task row: the list's own padding, and a
+        // nested roster's controls (whose own roster handles them), do not.
+        if (isOwnTaskRowPress(event.target, event.currentTarget)) return;
         // Prevent Chromium from promoting the draggable WorkspaceItem ancestor
         // to a native drag source when the gesture starts on roster controls.
         event.preventDefault();
@@ -270,7 +428,7 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
       }}
       onDoubleClick={(event) => event.stopPropagation()}
     >
-      <div className="ml-1 border-l border-[var(--border-soft)] pl-1.5">
+      <div className="pl-3" data-roster-list>
           {roster.rows.map((row, index) => {
             // The one-line group header, immediately before the FIRST stashed
             // row. With six of seven panes stashed the list otherwise looked
@@ -297,8 +455,14 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
             // no title either — without this the row would render with no text at
             // all. Visible rows always carry an agent name, so it is a no-op there.
             const primary = rosterPrimaryLabel(row) || t('surface.terminal');
-            const secondary = rosterSecondaryLabel(row, { showVendor: mixedVendors });
+            const secondary = rosterSecondaryLabel(row, { showVendor: false });
             const detail = row.pendingQuestion ?? row.activity;
+            // #1481 — last activity rides the title line (muted) unless the
+            // agent is blocked on a question, which keeps its own red line.
+            const inlineActivity = !row.pendingQuestion ? row.activity : undefined;
+            const elapsedMs = row.ptyId && !row.remote ? fleetIdleForMs(row.ptyId, stampCtx) : undefined;
+            const elapsed = elapsedMs !== undefined && elapsedMs >= IDLE_SHOW_AFTER_MS ? formatIdle(elapsedMs) : undefined;
+            const agentLabel = row.agentName || t('surface.terminal');
             // The verb rides the accessible name and the tooltip, NOT the
             // visible status slot. Swapping the status text on hover would hide
             // the one thing a stashed row exists to prove — that the session is
@@ -308,16 +472,21 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
               ? (exited ? t('roster.recoverAction') : t('roster.unstashAction'))
               : undefined;
             const stashedAgo = row.stashedAt ? timeAgo(row.stashedAt) : undefined;
-            const rowAriaLabel = [primary, secondary, unverifiableLabel ?? statusLabel, stashedAgo, detail, verb]
+            const rowAriaLabel = [row.ptyId && unseenByPtyId[row.ptyId] ? t('sidebar.changedSinceSeen') : undefined, primary, agentLabel !== primary ? agentLabel : undefined, secondary, unverifiableLabel ?? statusLabel, elapsed, stashedAgo, detail, verb]
               .filter(Boolean)
               .join(', ');
-            return (
-              // Keyed by paneId for stashed rows: an exited pane has no ptyId
-              // left, and two of them would collide on the empty string.
-              <div key={row.stashed ? row.paneId : row.ptyId} className="min-w-0">
+            const rowTaskIds = firstRowOfPane.get(row.paneId) === index ? taskSplit.byPane.get(row.paneId) : undefined;
+            // Keyed by paneId for stashed rows: an exited pane has no ptyId
+            // left, and two of them would collide on the empty string.
+            // Remote rows key by surfaceId: the synthetic remote:{...} ptyId
+            // collides when two mirror tabs attach to the SAME remote session
+            // (multi-attach is supported).
+            const rowKey = row.stashed ? row.paneId : row.remote ? row.surfaceId : row.ptyId;
+            const renderRow = (taskControls: ReactNode) => (
+              <div className="min-w-0">
                 {startsStashedGroup && (
                   <div
-                    className="mt-1 flex items-center gap-1.5 border-t border-[var(--border-soft)] pt-1 pr-1 text-[10px] font-mono uppercase tracking-widest text-[var(--text-muted)]"
+                    className="mt-1 flex items-center gap-1.5 border-t border-[var(--border-soft)] pt-1 pr-1 text-[11px] font-mono uppercase tracking-widest text-[var(--text-muted)]"
                     // Not a heading: the rows below it are already listed under
                     // the disclosure's own accessible name, and announcing a
                     // second level would imply a nesting that is not there.
@@ -327,19 +496,23 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
                     <span className="truncate">{t('roster.stashedCount', { count: roster.stashedCount })}</span>
                   </div>
                 )}
+                <div className="group/mention flex min-w-0 items-center">
                 <button
                   type="button"
                   draggable={false}
-                  className={`group/roster-row flex w-full min-w-0 items-center gap-1.5 rounded px-1 py-[3px] text-left transition-colors ${FOCUS_RING} ${
+                  className={`group/roster-row flex min-w-0 flex-1 min-w-0 items-center gap-1.5 rounded-md px-1 py-[3px] text-left transition-colors ${FOCUS_RING} ${
+                    // Inside the selected workspace's pill: no inner box — the
+                    // focused agent reads as full-strength text.
                     row.isFocused
-                      ? 'bg-[var(--bg-overlay)]'
-                      : 'hover:bg-[rgba(var(--bg-surface-rgb),0.65)]'
-                  } ${pulsingPaneId === row.paneId ? 'bg-[var(--bg-overlay)]' : ''}`}
+                      ? 'text-[var(--text-main)]'
+                      : 'text-[var(--text-sub)] hover:text-[var(--text-main)]'
+                  } ${pulsingPaneId === row.paneId ? 'bg-[var(--selection-strong)]' : ''}`}
                   style={pulsingPaneId === row.paneId ? { transition: 'background-color 150ms ease-out' } : undefined}
                   title={rowAriaLabel}
                   aria-label={rowAriaLabel}
                   onClick={(event) => {
                     event.stopPropagation();
+                    if (row.stashed && readOnly) return;
                     if (row.stashed) {
                       // focusNotificationTarget resolves ptyId → surfaceId and
                       // unstashes on the way, so an exited pane (no ptyId left)
@@ -352,6 +525,15 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
                       });
                       return;
                     }
+                    if (row.remote) {
+                      // #1163 — the synthetic remote:{host}:{session} key is
+                      // not a local ptyId; resolve the mirror's own surface.
+                      focusNotificationTarget(() => useStore.getState(), {
+                        ptyId: null,
+                        surfaceId: row.surfaceId,
+                      });
+                      return;
+                    }
                     focusPaneByPtyId(() => useStore.getState(), row.ptyId);
                   }}
                   onDoubleClick={(event) => event.stopPropagation()}
@@ -360,31 +542,68 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
                     event.stopPropagation();
                   }}
                 >
-                  {/* Filled, not a hollow ring. A ring drawn with box-shadow
-                      disappears entirely under forced-colors, taking the row's
-                      only status signal with it — and dimming would say "dead"
-                      about a pane whose whole claim is the opposite. The stash
-                      is signalled by the archive glyph, the list position, and
-                      the label instead. The one hollow rendition is silence
-                      (below): there the ring IS the claim being withdrawn, and
-                      it is drawn with a border, which forced-colors keeps. */}
-                  <span
-                    className={`sidebar-dot h-1.5 w-1.5 flex-none rounded-full ${
-                      unverifiableLabel ? 'sidebar-dot-unverifiable' : statusIcon.glowClass
-                    }`}
-                    style={unverifiableLabel ? undefined : { backgroundColor: statusIcon.dotVar }}
+                  {/* #1481 — status by shape (StatusMarkView) then identity by
+                      the agent kind in muted text (non-Claude only). A stashed row keeps a FILLED mark
+                      for its live statuses (DESIGN.md 2026-08-24): the mark
+                      table's shapes are all border- or fill-drawn, none uses
+                      box-shadow, so forced-colors keeps every one. #1176 — a
+                      SEEN question drops only the animated glow. */}
+                  <StatusMarkView
+                    // Plain waiting with no question is idle in the shared
+                    // class (fleetAttentionClass), so it draws no ring here.
+                    status={row.status === 'waiting' && !row.pendingQuestion ? 'idle' : row.status}
+                    unverifiable={!!unverifiableLabel}
+                    quiet={!!row.questionSeen && !row.attentionStatus}
+                    usageWaiting={!!row.usageLimitWaiting}
+                    label={row.usageLimitWaiting ? t('usageLimit.waiting') : undefined}
                   />
                   {/* Name and location on one line. The title truncates first;
                       the coordinate (w85-1 etc.) takes at most 40% before it
                       ellipses too. */}
                   <span className="flex min-w-0 flex-1 items-baseline gap-1">
-                    <span className="min-w-0 flex-1 truncate text-[10px] font-semibold text-[var(--text-main)]">
+                    {row.remote && (
+                      // #1163 — origin glyph: this agent runs on another
+                      // host. Same steel-not-accent rule as the tab strip's
+                      // RemoteSurfaceGlyph (a provenance marker must not read
+                      // as focus); shape carries the meaning.
+                      <span className="flex-none self-center text-[var(--text-muted)]" aria-hidden="true">
+                        <IconExternalLink size={9} />
+                      </span>
+                    )}
+                    <span className="min-w-0 flex-1 truncate text-[11px] font-semibold text-[var(--text-main)]">
                       {primary}
                     </span>
-                    <span className="flex-none text-[10px] text-[var(--text-muted)]">·</span>
-                    <span className="max-w-[40%] flex-none truncate text-[10px] font-mono text-[var(--text-muted)]">
-                      {secondary}
-                    </span>
+                    {/* Claude is the default agent and gets no mark; any other
+                        agent names itself in muted text so the exception is
+                        the only thing that reads. */}
+                    {rosterShowsAgentKind(row) && (
+                      <span className="max-w-[35%] flex-none truncate text-[11px] text-[var(--text-muted)]" data-roster-agent-kind>
+                        {agentLabel}
+                      </span>
+                    )}
+                    {row.ptyId && unseenByPtyId[row.ptyId] && (
+                      <span className="h-1.5 w-1.5 flex-none self-center rounded-full bg-[var(--text-main)]" aria-hidden="true" data-sidebar-unseen />
+                    )}
+                    {/* #1326 — secondary can be empty now (coordinate hidden,
+                        no title, no label): drop the "·" too, or a titleless,
+                        coordinate-hidden row would end in a dangling dot.
+                        #1481 — live activity takes the trailer's place while
+                        it lasts; the coordinate stays in the tooltip. */}
+                    {inlineActivity ? (
+                      <>
+                        <span className="flex-none text-[11px] text-[var(--text-muted)]">·</span>
+                        <span className="min-w-0 max-w-[55%] flex-none truncate text-[11px] text-[var(--text-muted)]" data-roster-activity>
+                          {inlineActivity}
+                        </span>
+                      </>
+                    ) : secondary && (
+                      <>
+                        <span className="flex-none text-[11px] text-[var(--text-muted)]">·</span>
+                        <span className="max-w-[40%] flex-none truncate text-[11px] font-mono text-[var(--text-muted)]">
+                          {secondary}
+                        </span>
+                      </>
+                    )}
                   </span>
                   {row.stashed && (
                     // The ICON is the verb slot: eye-off at rest ("not on your
@@ -402,24 +621,64 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
                       </span>
                     </span>
                   )}
-                  <span
-                    className={`flex-none whitespace-nowrap text-[10px] ${exited ? 'text-[var(--text-muted)]' : statusIcon.className}`}
-                  >
-                    {statusLabel}
-                  </span>
+                  {/* The status word stays visible only on stashed rows — their
+                      proof of life (2026-08-24). Elsewhere the mark carries the
+                      status and the slot shows how long since the last sign of
+                      activity; the word is in the accessible name. */}
+                  {row.stashed ? (
+                    <span
+                      className={`flex-none whitespace-nowrap text-[11px] ${exited ? 'text-[var(--text-muted)]' : statusIcon.className}`}
+                    >
+                      {statusLabel}
+                    </span>
+                  ) : elapsed ? (
+                    <span className="flex-none whitespace-nowrap text-[11px] font-mono tabular-nums text-[var(--text-muted)]" data-roster-elapsed>
+                      {elapsed}
+                    </span>
+                  ) : null}
                 </button>
+                {taskControls}
+                {/* Mention this agent in the focused one — shown on hover or
+                    keyboard focus, never on the focused pane's own row. A
+                    sibling of the row button (a button cannot hold one). */}
+                {!row.stashed && !row.remote && row.agentName && !row.isFocused && (
+                  <button
+                    type="button"
+                    draggable={false}
+                    data-roster-mention
+                    // A 24x24 target (height refunded like the row recipe), revealed:
+                    // zero width at rest so it never covers the elapsed slot; on
+                    // row hover or keyboard focus it takes its own 24px and the
+                    // row gives it the room. The shared recipe's min-width would
+                    // keep it 24px wide at rest, so the classes are spelled out.
+                    className={`inline-flex h-6 w-0 min-w-0 flex-none items-center justify-center self-center -my-1.5 overflow-hidden rounded-md text-[11px] leading-none text-[var(--text-sub)] hover:bg-[var(--selection)] hover:text-[var(--text-main)] group-hover/mention:w-6 focus-visible:w-6 ${FOCUS_RING}`}
+                    title={t('mention.button', { name: primary })}
+                    aria-label={t('mention.button', { name: primary })}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      if (mentionRowInFocusedAgent(row.ptyId) === 'noSource') {
+                        useStore.getState().pushToast({ message: t('mention.noSource'), level: 'info' });
+                      }
+                    }}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onDoubleClick={(event) => event.stopPropagation()}
+                  >
+                    @
+                  </button>
+                )}
+                </div>
                 {/* How long it has been off-screen. Free cost visibility: a
                     stashed agent burns tokens whether or not anyone remembers
                     it, and "3d ago" is the cheapest possible reminder. */}
                 {row.stashed && stashedAgo && (
-                  <div className="truncate pl-[18px] pr-1 text-[10px] text-[var(--text-muted)]">
+                  <div className="truncate pl-[37px] pr-1 text-[11px] text-[var(--text-muted)]">
                     {stashedAgo}
                   </div>
                 )}
-                {/* 확인 필요일 때만 질문을 빨강 2번째 줄로 편다(실제로 봐야 하는 신호). */}
+                {/* The question opens as an amber second line only while it waits for an answer. */}
                 {row.pendingQuestion && (
                   <div
-                    className="truncate pl-[18px] pr-1 text-[10px] text-[var(--accent-red)]"
+                    className="truncate pl-[37px] pr-1 text-[11px] text-[var(--attention-text)]"
                     title={row.pendingQuestion}
                   >
                     ? {row.pendingQuestion}
@@ -427,10 +686,102 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
                 )}
               </div>
             );
+            if (!rowTaskIds || !renderTask || !onCloseTask) return <Fragment key={rowKey}>{renderRow(null)}</Fragment>;
+            return (
+              <PaneTaskGroup
+                key={rowKey}
+                ownerId={workspaceId}
+                paneId={row.paneId}
+                paneName={[primary, secondary].filter(Boolean).join(' · ')}
+                taskIds={rowTaskIds}
+                ownerActive={ownerActive}
+                renderTask={renderTask}
+                onCloseWorkspace={onCloseTask}
+              >
+                {renderRow}
+              </PaneTaskGroup>
+            );
+          })}
+          {renderTask && onCloseTask && bareRows.map((entry) => {
+            const [paneId, surfaceId, label] = entry.split('\u0000');
+            const rowTaskIds = taskSplit.byPane.get(paneId);
+            if (!rowTaskIds) return null;
+            return (
+              <PaneTaskGroup
+                key={`bare:${paneId}`}
+                ownerId={workspaceId}
+                paneId={paneId}
+                paneName={label}
+                taskIds={rowTaskIds}
+                ownerActive={ownerActive}
+                renderTask={renderTask}
+                onCloseWorkspace={onCloseTask}
+              >
+                {(taskControls) => (
+                  <div className="group/mention flex min-w-0 items-center" data-roster-bare-pane={paneId}>
+                    <button
+                      type="button"
+                      draggable={false}
+                      className={`flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-[3px] text-left transition-colors hover:bg-[var(--hover-fill)] ${FOCUS_RING}`}
+                      title={t('roster.barePane', { name: label })}
+                      aria-label={t('roster.barePane', { name: label })}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        focusNotificationTarget(() => useStore.getState(), { ptyId: null, surfaceId });
+                      }}
+                      onDoubleClick={(event) => event.stopPropagation()}
+                    >
+                      {/* No agent here any more: no status mark, muted name. */}
+                      <span className="h-2.5 w-2.5 flex-none" aria-hidden="true" />
+                      <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-muted)]">{label}</span>
+                    </button>
+                    {taskControls}
+                  </div>
+                )}
+              </PaneTaskGroup>
+            );
           })}
       </div>
     </div>
   );
 }
+
+/** Whether a press started on a task row nested in a list this roster owns. */
+export function isOwnTaskRowPress(target: EventTarget | null, roster: Element): boolean {
+  if (!(target instanceof Element)) return false;
+  const list = target.closest('[data-pane-tasks]');
+  if (!list || !roster.contains(list)) return false;
+  const row = target.closest('.sidebar-row');
+  return !!row && list.contains(row);
+}
+
+/**
+ * Open panes of `workspaceId` among `paneIds`, as `paneId \0 surfaceId \0
+ * label` strings (reference-stable under useShallow). The label is the pane's
+ * name and coordinate, as the roster names a pane.
+ */
+function barePanesOf(
+  state: { workspaces: readonly Workspace[]; paneLabel: Record<string, string | undefined>; sidebarShowPaneCoordinates?: boolean },
+  workspaceId: string,
+  paneIds: readonly string[],
+): string[] {
+  if (paneIds.length === 0) return NO_BARE_PANES;
+  const ws = state.workspaces.find((w) => w.id === workspaceId);
+  if (!ws) return NO_BARE_PANES;
+  const out: string[] = [];
+  for (const leaf of getWorkspaceLeafPanes(ws)) {
+    if (!paneIds.includes(leaf.id)) continue;
+    const surface = leaf.surfaces.find((sf) => sf.id === leaf.activeSurfaceId) ?? leaf.surfaces[0];
+    if (!surface) continue;
+    const coord = computePaneAutoName(ws.wsOrdinal ?? 0, leaf.ordinal ?? 0);
+    const name = paneDisplayName(state.paneLabel[leaf.id], coord);
+    const title = agentSurfaceTitle(surface);
+    const label = [title, name].filter(Boolean).join(' · ');
+    out.push([leaf.id, surface.id, label].join('\u0000'));
+  }
+  return out;
+}
+
+const NO_BARE_PANES: string[] = [];
 
 export default memo(WorkspaceAgentRoster);

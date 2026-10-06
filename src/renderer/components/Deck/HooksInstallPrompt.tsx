@@ -40,8 +40,9 @@
 // window.electronAPI.deck.hooksBridge in the container.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { tokenAttrs } from '../../themes';
-import { FOCUS_RING } from '../focusRing';
+import Dialog, { DialogBody, DialogFooter, DialogHeader } from '../ui/Dialog';
+import Button from '../ui/Button';
+import type { HooksLaunchCheck } from '../Layout/firstBootSequence';
 
 export const HOOKS_PROMPT_EVENT = 'wmux:hooks-install-prompt';
 
@@ -62,15 +63,33 @@ export function requestHooksInstallPrompt(): void {
 
 type Phase = 'hidden' | 'prompt' | 'installing' | 'done' | 'error';
 
+/** How long the launch check may take before it is reported done anyway. */
+export const LAUNCH_CHECK_REPORT_TIMEOUT_MS = 10_000;
+
 export function HooksInstallPrompt({
   api,
   t,
   checkOnMount = true,
+  launchCheck = 'check',
+  deferred = false,
+  onLaunchCheckDone,
 }: {
   api: HooksBridgeApi;
   t: (key: string) => string;
   /** The launch-time check. Disable in tests that only exercise the event path. */
   checkOnMount?: boolean;
+  /** When the launch-time check may run (see hooksLaunchCheck): `wait` holds
+   *  it until the first-run probe settles, `skip` drops it for this boot. It
+   *  runs at most once either way. */
+  launchCheck?: HooksLaunchCheck;
+  /** Another first-boot dialog (the first-run wizard) owns the screen. The
+   *  initial ask stays pending and is re-checked once this clears, instead of
+   *  opening on top. An install or refusal already in flight stays visible. */
+  deferred?: boolean;
+  /** The launch-time check has answered (asked, or found nothing to ask). The
+   *  first-boot queue holds its own surfaces until then, so nothing opens in
+   *  the same moment as this dialog. */
+  onLaunchCheckDone?: () => void;
 }): React.ReactElement | null {
   const [phase, setPhase] = useState<Phase>('hidden');
   const [errorDetail, setErrorDetail] = useState<string | null>(null);
@@ -107,7 +126,7 @@ export function HooksInstallPrompt({
   // Both triggers funnel here: consult the durable refusal, then verify hooks
   // are actually missing, then show. Status errors fail-soft to "don't prompt"
   // — a broken status check must never nag a user whose hooks are fine.
-  const maybePrompt = useCallback(() => {
+  const maybePrompt = useCallback((): Promise<void> => {
     const epoch = dismissEpochRef.current;
     const seq = ++prefSeqRef.current;
     const checkStatus = () =>
@@ -124,11 +143,8 @@ export function HooksInstallPrompt({
           // are fine.
         });
     // Older preload: no durable preference to consult, behave as before.
-    if (!api.getPromptPreference) {
-      void checkStatus();
-      return;
-    }
-    api
+    if (!api.getPromptPreference) return checkStatus();
+    return api
       .getPromptPreference()
       .then((pref) => {
         // Superseded by a newer read — that one owns the cache and will run
@@ -152,7 +168,7 @@ export function HooksInstallPrompt({
         // otherwise stand on the last one, so an IPC hiccup cannot re-nag
         // someone who already refused.
         if (lastKnownSuppressedRef.current === true) return;
-        void checkStatus();
+        return checkStatus();
       });
   }, [api]);
 
@@ -195,9 +211,42 @@ export function HooksInstallPrompt({
       });
   }, [api]);
 
+  // One launch check per mount, and only once the gate opens: a fresh profile
+  // mounts this before the first-run probe knows the wizard is coming.
+  const launchCheckDoneRef = useRef(false);
+  const onLaunchCheckDoneRef = useRef(onLaunchCheckDone);
+  onLaunchCheckDoneRef.current = onLaunchCheckDone;
   useEffect(() => {
-    if (checkOnMount) maybePrompt();
-  }, [checkOnMount, maybePrompt]);
+    if (!checkOnMount || launchCheckDoneRef.current || launchCheck === 'wait') return;
+    launchCheckDoneRef.current = true;
+    // Reported once: when the check answers, or after a bound so a bridge
+    // that never answers cannot hold the first-boot queue for the whole boot.
+    if (launchCheck !== 'check') {
+      onLaunchCheckDoneRef.current?.();
+      return;
+    }
+    let reported = false;
+    const done = () => {
+      if (reported) return;
+      reported = true;
+      clearTimeout(timer);
+      onLaunchCheckDoneRef.current?.();
+    };
+    const timer = setTimeout(done, LAUNCH_CHECK_REPORT_TIMEOUT_MS);
+    void maybePrompt().finally(done);
+  }, [checkOnMount, launchCheck, maybePrompt]);
+
+  // Deferral ended with an ask still pending: that ask is as old as the
+  // wizard, which can install the hooks itself (or the user can refuse in
+  // Settings meanwhile). Drop it and ask again from fresh status/preference.
+  const wasDeferredRef = useRef(deferred);
+  useEffect(() => {
+    const was = wasDeferredRef.current;
+    wasDeferredRef.current = deferred;
+    if (!was || deferred || phase !== 'prompt') return;
+    setPhase('hidden');
+    maybePrompt();
+  }, [deferred, phase, maybePrompt]);
 
   useEffect(() => {
     const onRequest = () => maybePrompt();
@@ -225,101 +274,94 @@ export function HooksInstallPrompt({
       });
   }, [api]);
 
-  if (phase === 'hidden') return null;
+  if (phase === 'hidden' || (deferred && phase === 'prompt')) return null;
+
+  // Later, Escape, the backdrop and the post-install Close share one
+  // lifetime (this modal only) — and none of them works mid-write.
+  //
+  // It opens by itself after an async check at launch or on a mode change, so
+  // it leaves focus where the user is: a Space or Enter typed into a terminal
+  // must not press Don't ask again (a durable refusal) or Install unseen.
+  // Escape applies once focus is inside it.
+  const dismissIfIdle = () => {
+    if (!busy) dismissNow();
+  };
 
   return (
-    <div
-      className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50"
-      data-hooks-install-prompt
-      onClick={(e) => {
-        // Backdrop dismiss — but never mid-install (the write is in flight).
-        // Same lifetime as Later: this session only.
-        if (e.target === e.currentTarget && !busy) dismissNow();
-      }}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={t('hooks.prompt.title') || 'Install wmux hooks'}
-        className="w-[420px] max-w-[90vw] bg-[var(--bg-overlay)] border border-[var(--bg-surface)] rounded-[7px] shadow-xl p-4 text-[13px] text-[var(--text-main)]"
-        {...tokenAttrs('textMain', 'text')}
-      >
+    <div className="contents" data-hooks-install-prompt>
+      <Dialog onClose={dismissIfIdle} closeOnBackdrop focusOnOpen="none" width={440}>
         {phase === 'done' ? (
           <>
-            <div className="font-semibold mb-2">{t('hooks.prompt.doneTitle') || 'Hooks installed'}</div>
-            <p className="text-[var(--text-sub)] mb-3">
-              {t('hooks.prompt.doneBody') ||
-                'Restart the Claude sessions in your panes to activate the hooks.'}
-            </p>
-            <div className="flex justify-end">
-              <button
-                type="button"
-                data-hooks-close
-                onClick={dismissNow}
-                className={`px-3 py-1 rounded-md bg-[var(--accent)] text-[var(--bg-base)] font-semibold hover:opacity-90 ${FOCUS_RING}`}
-              >
+            <DialogHeader
+              title={t('hooks.prompt.doneTitle') || 'Hooks installed'}
+              description={
+                t('hooks.prompt.doneBody') ||
+                'Restart the Claude sessions in your panes to activate the hooks.'
+              }
+            />
+            <DialogFooter className="pt-5">
+              <Button size="md" variant="primary" data-hooks-close onClick={dismissNow}>
                 {t('hooks.prompt.close') || 'Close'}
-              </button>
-            </div>
+              </Button>
+            </DialogFooter>
           </>
         ) : (
           <>
-            <div className="font-semibold mb-2">
-              {t('hooks.prompt.title') || 'Install wmux hooks for accurate agent signals'}
-            </div>
-            <p className="text-[var(--text-sub)] mb-2">
-              {t('hooks.prompt.body') ||
-                'Without hooks, wmux falls back to screen-reading to guess when an agent finishes — it can miss completions and approvals. Installing the hook bridge into your Claude Code settings makes these signals exact.'}
-            </p>
-            {phase === 'error' && (
-              <p className="text-[var(--accent)] mb-2" role="alert" data-hooks-error>
-                {errorKind === 'never'
-                  ? t('hooks.prompt.neverError') ||
-                    'Could not save that preference, so this prompt would return on the next launch.'
-                  : t('hooks.prompt.error') || 'Install failed.'}
-                {errorDetail ? ` ${errorDetail}` : ''}
+            <DialogHeader
+              title={t('hooks.prompt.title') || 'Install wmux hooks for accurate agent signals'}
+            />
+            <DialogBody className="!gap-2">
+              <p className="m-0 text-[13px] leading-5 text-[var(--text-sub)]">
+                {t('hooks.prompt.body') ||
+                  'Without hooks, wmux falls back to screen-reading to guess when an agent finishes — it can miss completions and approvals. Installing the hook bridge into your Claude Code settings makes these signals exact.'}
               </p>
-            )}
-            <div className="flex justify-end gap-2">
+              {phase === 'error' && (
+                <p className="ui-row-error text-[13px] leading-5" role="alert" data-hooks-error>
+                  {errorKind === 'never'
+                    ? t('hooks.prompt.neverError') ||
+                      'Could not save that preference, so this prompt would return on the next launch.'
+                    : t('hooks.prompt.error') || 'Install failed.'}
+                  {errorDetail ? ` ${errorDetail}` : ''}
+                </p>
+              )}
+            </DialogBody>
+            <DialogFooter>
               {/* Only offered when it can actually persist. On an older
                   preload this control could not do what its label promises,
                   and a durable-looking button that silently acts as Later is
                   worse than no button. */}
               {api.setPromptPreference && (
-              <button
-                type="button"
-                data-hooks-never
-                disabled={busy}
-                onClick={neverAsk}
-                className={`px-3 py-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50 ${FOCUS_RING}`}
-              >
-                {t('hooks.prompt.never') || "Don't ask again"}
-              </button>
+                <Button
+                  size="md"
+                  variant="ghost"
+                  className="mr-auto"
+                  data-hooks-never
+                  disabled={busy}
+                  onClick={neverAsk}
+                >
+                  {t('hooks.prompt.never') || "Don't ask again"}
+                </Button>
               )}
-              <button
-                type="button"
-                data-hooks-later
-                disabled={busy}
-                onClick={dismissNow}
-                className={`px-3 py-1 rounded-md text-[var(--text-sub)] hover:text-[var(--text-main)] disabled:opacity-50 ${FOCUS_RING}`}
-              >
+              <Button size="md" variant="secondary" data-hooks-later disabled={busy} onClick={dismissNow}>
                 {t('hooks.prompt.later') || 'Later'}
-              </button>
-              <button
-                type="button"
+              </Button>
+              {/* In flight it is not the primary: nothing to press until the
+                  write returns. */}
+              <Button
+                size="md"
+                variant={phase === 'installing' ? 'secondary' : 'primary'}
                 data-hooks-install
                 disabled={busy}
                 onClick={install}
-                className={`px-3 py-1 rounded-md bg-[var(--accent)] text-[var(--bg-base)] font-semibold hover:opacity-90 disabled:opacity-50 ${FOCUS_RING}`}
               >
                 {phase === 'installing'
                   ? t('hooks.prompt.installing') || 'Installing…'
                   : t('hooks.prompt.install') || 'Install hooks'}
-              </button>
-            </div>
+              </Button>
+            </DialogFooter>
           </>
         )}
-      </div>
+      </Dialog>
     </div>
   );
 }
@@ -327,12 +369,26 @@ export function HooksInstallPrompt({
 /** Container: binds the preload bridge; renders nothing on older preloads. */
 export function HooksInstallPromptContainer({
   t,
+  launchCheck,
+  deferred,
+  onLaunchCheckDone,
 }: {
   t: (key: string) => string;
+  launchCheck?: HooksLaunchCheck;
+  deferred?: boolean;
+  onLaunchCheckDone?: () => void;
 }): React.ReactElement | null {
   const api = (window as unknown as {
     electronAPI?: { deck?: { hooksBridge?: HooksBridgeApi } };
   }).electronAPI?.deck?.hooksBridge;
   if (!api) return null;
-  return <HooksInstallPrompt api={api} t={t} />;
+  return (
+    <HooksInstallPrompt
+      api={api}
+      t={t}
+      launchCheck={launchCheck}
+      deferred={deferred}
+      onLaunchCheckDone={onLaunchCheckDone}
+    />
+  );
 }

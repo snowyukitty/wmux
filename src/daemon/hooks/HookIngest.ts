@@ -45,6 +45,7 @@ import {
   normalizeHookCue,
   normalizeDetectorCue,
   type AlarmCue,
+  type ConfirmedWindow,
 } from '../../shared/hooks/CompletionAlarm';
 import { SignalLatencyMeter, type LatencyStats } from '../../shared/hooks/SignalLatencyMeter';
 import { HookFloodMeter, describeHookFlood, type HookFloodSummary } from '../../shared/hooks/HookFloodMeter';
@@ -56,13 +57,15 @@ import {
   type AgentSlug,
   type HookSignalResponse,
 } from '../../shared/hooks/signal-types';
-import { ENV_KEYS } from '../../shared/constants';
+import { ENV_KEYS, isBrainPty } from '../../shared/constants';
+import { hasCriticalRisk } from '../../shared/criticalPatterns';
 // Pure regex/lookup module (no electron), already imported by src/daemon/index.ts.
 import { agentDisplayToSlug, agentStatusToSignalKind, type AgentEventStatus } from '../../main/pty/AgentDetector';
 import type { ResumeBinding, PermissionMode } from '../../shared/agentResume';
-import type { ApprovalHookSink } from '../approvals/types';
-import { extractAskUserQuestion } from '../approvals/askUserQuestion';
-import { checkTranscriptPath } from './transcriptPathGuard';
+import type { ApprovalHookSink, TerminalPromptNote } from '../approvals/types';
+import { claudeQuestionsForm, extractAskUserQuestion } from '../approvals/askUserQuestion';
+import { boundRecordText, isClaudeFamilyAgent, TERMINAL_PROMPT_TOOL_NAME_MAX } from '../approvals/terminalPrompt';
+import { checkNativeTranscriptPath } from '../transcript/providers';
 
 /** Rolling flood-summary interval. Mirrors the main-side handler. */
 const HOOK_FLOOD_LOG_INTERVAL_MS = 30_000;
@@ -72,6 +75,7 @@ const VALID_PERMISSION_MODES: ReadonlySet<string> = new Set([
   'bypassPermissions',
   'acceptEdits',
   'plan',
+  'auto',
   'default',
 ]);
 
@@ -85,6 +89,10 @@ export interface HookIngestSession {
   env?: Record<string, string>;
   /** ISO 8601. Tie-break when several panes match the same cwd. */
   lastActivity?: string;
+  /** The pane's current resume binding; only `agent` is read, to guard a guessed route. */
+  resumeBinding?: Pick<ResumeBinding, 'agent'>;
+  /** Canonical agent the detector/process tracker last saw in this pane. */
+  lastDetectedAgent?: string;
 }
 
 /**
@@ -202,6 +210,12 @@ export interface HookIngestDeps {
    */
   gateConfig?: () => { gatedTools: string[] };
   /**
+   * Every resolved signal with its payload, for consumers that read a field
+   * the event shapes drop (the usage-limit registry reads a StopFailure's
+   * `error` and `last_assistant_message`). Optional; only the daemon supplies it.
+   */
+  onResolvedSignal?: (sessionId: string, signal: AgentSignal) => void;
+  /**
    * Transcript projection — tell the TranscriptProjector that this pane's
    * transcript may have grown. Fired for EVERY resolved signal, including the
    * non-emit kinds: `agent.activity` is the mid-turn liveness nudge,
@@ -227,9 +241,13 @@ export interface HookIngestDeps {
    * candidate has already returned `decision:'pending'` to that site, so the
    * only path left for its stash is this callback at window expiry.
    *
+   * Returns `false` when the daemon withheld the broadcast (a detection its
+   * canonical identity contradicts, #919): a confirmed attention then raises
+   * no `terminal_prompt` record either. Anything else counts as delivered.
+   *
    * Optional: only the daemon supplies it, and no hook behaviour depends on it.
    */
-  emitDetectorEvent?: (sessionId: string, data: DetectorHeldEventData) => void;
+  emitDetectorEvent?: (sessionId: string, data: DetectorHeldEventData) => boolean | void;
   /**
    * #919 — fired after every resolved signal touches hook authority (both the
    * `handle()` path and the permission-gate interceptor). Gives the daemon a
@@ -238,9 +256,40 @@ export interface HookIngestDeps {
    * become corroborable. The session is resolved; the callback owes the caller
    * nothing back and its failure is non-fatal.
    *
-   * Optional: only the daemon supplies it.
+   * Optional: only the daemon supplies it. `signal` is the resolved signal
+   * (#1727: a WSL hook's report of its agent process rides on it).
    */
-  onAuthorityTouched?: (sessionId: string) => void;
+  onAuthorityTouched?: (sessionId: string, signal: AgentSignal) => void;
+  /**
+   * #1463 — the agent itself reported that the question its pane was blocked
+   * on has been answered (`agent.input_answered`, AskUserQuestion's
+   * PostToolUse). The daemon releases the pane's awaiting state through the
+   * same path a recognised answer key takes, so the status leaves "Needs you"
+   * now. Without it, an answer the key check cannot see (a mouse click on an
+   * option) waited for the screen verifier or the turn end. `answeredAt` is
+   * the hook's fire time. Called only for an EXACT-routed signal: a cwd guess
+   * could release a sibling pane's question. Only the daemon supplies it; a
+   * failure is non-fatal.
+   */
+  onInputAnswered?: (sessionId: string, answeredAt: number) => void;
+  /**
+   * OpenCode — bring the pane's native permission/question records in line
+   * with what the wmux TUI plugin lists. `native`: a native record now stands
+   * for this request (`requestId`, the hook's `permId`; without one, for what
+   * the plugin listed). Anything else — `missing` (not listed, no answerable
+   * form), a plugin that predates decisions, no answer — keeps the
+   * informational `awaiting_input` card, so a blocked pane always has one.
+   * Only the daemon supplies it; a rejection counts as `unavailable`.
+   */
+  openCodeDecisions?: (sessionId: string, requestId?: string) => Promise<'native' | 'missing' | 'unsupported' | 'unavailable'>;
+  /**
+   * Scheduled runs — is this pane a live run in the automation engine's
+   * registry? Such a pane raises no #783 gate: nobody is at a phone for an
+   * unattended run, so a gate would only stall it until the deadline. Its
+   * permission boundary is the launch mode (and the agent's own prompt in
+   * approval mode). Registry membership, never the id prefix.
+   */
+  isAutomationPane?: (sessionId: string) => boolean;
 }
 
 /**
@@ -308,7 +357,11 @@ function mostRecent(sessions: HookIngestSession[]): HookIngestSession | null {
  *      workspaceId — only when that session really belongs to the claimed
  *      workspace. Pane env is attacker-writable from inside the pane, so
  *      without the cross-check an authenticated hook could target a different
- *      live pane by id.
+ *      live pane by id. A signal that claims a ptyId failing either check is
+ *      REFUSED (null) — it never falls through to the tiers below (#1523).
+ *      Its pane is gone (or it is not who it says), so any other pane the
+ *      workspace/cwd tiers would pick is a guess, and a wrong guess hands that
+ *      pane another agent's turn and resume binding.
  *   2. `workspaceId` — WMUX_WORKSPACE_ID. Narrow the candidate set to that
  *      workspace, then pick by cwd within it. Main resolves this tier to the
  *      workspace's ACTIVE surface, which the daemon cannot know (focus lives
@@ -323,10 +376,9 @@ export function resolveSessionIdForSignal(
 ): string | null {
   if (signal.ptyId) {
     const exact = sessions.find((s) => s.id === signal.ptyId);
-    if (exact) {
-      const ws = exact.env?.[ENV_KEYS.WORKSPACE_ID];
-      if (!signal.workspaceId || ws === signal.workspaceId) return exact.id;
-    }
+    if (!exact) return null;
+    const ws = exact.env?.[ENV_KEYS.WORKSPACE_ID];
+    return !signal.workspaceId || ws === signal.workspaceId ? exact.id : null;
   }
 
   if (signal.workspaceId) {
@@ -408,6 +460,41 @@ function summarizeToolInput(payload: Record<string, unknown> | undefined): strin
   return undefined;
 }
 
+/** Bounds on the critical scan's walk of a tool input. Past either, the input
+ *  is treated as critical: an unread remainder is not evidence of safety, and
+ *  the cost of the over-fire is one approval going to a human. */
+const RISK_SCAN_MAX_CHARS = 1_000_000;
+const RISK_SCAN_MAX_NODES = 10_000;
+
+/**
+ * Whether the gated call's FULL input names a critical action. Judged before
+ * `summarizeToolInput` cuts the text to 200 characters: an `rm -rf` past the
+ * cut is still the call being approved. Every string LEAF counts, however
+ * deep — MultiEdit's `edits[]` and an MCP tool's nested arguments included. A
+ * match in a file's content over-fires, which only sends it to a human.
+ */
+export function gateInputIsCritical(payload: Record<string, unknown> | undefined): boolean {
+  const root = payload?.['tool_input'];
+  if (root === undefined || root === null) return false;
+  const stack: unknown[] = [root];
+  let nodes = 0;
+  let chars = 0;
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (++nodes > RISK_SCAN_MAX_NODES) return true;
+    if (typeof v === 'string') {
+      chars += v.length;
+      if (chars > RISK_SCAN_MAX_CHARS) return true;
+      if (hasCriticalRisk(v)) return true;
+    } else if (Array.isArray(v)) {
+      for (const item of v) stack.push(item);
+    } else if (v && typeof v === 'object') {
+      for (const item of Object.values(v as Record<string, unknown>)) stack.push(item);
+    }
+  }
+  return false;
+}
+
 /**
  * Emit-class kinds — the turn boundaries. These are the only kinds that
  * produce a user-visible event and the only ones that touch the dedup ledger.
@@ -487,6 +574,12 @@ function eventShapeFor(
   }
 }
 
+/** OpenCode's request id on a bridge 0.3.0 signal (`payload.permId`), when well-formed. */
+function openCodeRequestId(signal: AgentSignal): string | undefined {
+  const raw = signal.payload?.['permId'];
+  return signal.agent === 'opencode' && typeof raw === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(raw) ? raw : undefined;
+}
+
 export class HookIngest {
   readonly router: HookSignalRouter;
   private readonly meter: SignalLatencyMeter;
@@ -496,6 +589,30 @@ export class HookIngest {
   private readonly now: () => number;
   /** CompletionAlarm — gates every "turn finished" alarm on real turn end. */
   private readonly alarm: CompletionAlarm;
+  /**
+   * #1463 — sessions whose lead turn has ENDED as far as this ingest has
+   * broadcast (a Stop / StopFailure, or a fresh session with no turn yet), and
+   * nothing has reported work since. A `SubagentStop` landing here is not a
+   * subagent inside the lead turn: Claude Code runs a background subagent a
+   * few seconds after every Stop, and projecting it as `running` repainted a
+   * finished pane Running for the full 120 s activity window. Maintained in
+   * `broadcast`, the one place every status this ingest writes passes through.
+   */
+  private readonly leadTurnEnded = new Set<string>();
+  /** Claimed ptyIds already logged as refused, so a closed pane logs once (#1523). */
+  private readonly refusedClaims = new Set<string>();
+  /**
+   * OpenCode requests the agent reported answered (`pane|permId`), so a
+   * fallback card decided after that report is not raised for them. Bounded:
+   * the oldest go first; a request is answered once.
+   */
+  private readonly answeredRequests = new Set<string>();
+  /** Every signal refused because its claimed pane is not live here. Never decremented. */
+  private refusedClaimCount = 0;
+  /** Gate ptyIds already logged as allowed-on-refusal (bounded, like refusedClaims). */
+  private readonly refusedGateClaims = new Set<string>();
+  /** PreToolUse gates allowed (fail-open) because their claimed pane was refused. */
+  private refusedGateCount = 0;
 
   constructor(deps: HookIngestDeps) {
     this.deps = deps;
@@ -514,8 +631,10 @@ export class HookIngest {
         t.unref?.();
         return () => clearTimeout(t);
       },
-      onConfirmed: (_pane, _slug, _cls, resume) => {
-        resume();
+      // The window's `firm` flag rides along: the detector resume below uses
+      // it to tell a hook-reported dialog from a detector-only one.
+      onConfirmed: (_pane, _slug, cls, resume, firm) => {
+        resume({ cls, firm });
       },
       log: (level, message) => {
         this.deps.log?.(level === 'warn' ? 'warn' : 'info', message);
@@ -550,11 +669,25 @@ export class HookIngest {
    *     30s log flush, so it is null on an idle daemon and its `total` is not
    *     comparable to `latency.total`. Read non-destructively (`peek`), so
    *     polling this RPC never blanks the daemon's own rolling log line.
+   *   - `refused.claimedPaneNotLive` counts signals dropped because the ptyId
+   *     they claim is not a live pane here, or lives in another workspace
+   *     (#1523). Cumulative since daemon start, like `workspaceMatchRate`.
+   *     `refused.gateBypassedOnRefusedClaim` counts the PreToolUse gates among
+   *     them separately: those are not dropped silently but ALLOWED (fail-open),
+   *     so the tool ran without a wmux gate.
    */
-  health(): { latency: LatencyStats; flood: HookFloodSummary | null } {
+  health(): {
+    latency: LatencyStats;
+    flood: HookFloodSummary | null;
+    refused: { claimedPaneNotLive: number; gateBypassedOnRefusedClaim: number };
+  } {
     return {
       latency: this.meter.getStats(),
       flood: this.floodMeter.peek(HOOK_FLOOD_LOG_INTERVAL_MS),
+      refused: {
+        claimedPaneNotLive: this.refusedClaimCount,
+        gateBypassedOnRefusedClaim: this.refusedGateCount,
+      },
     };
   }
 
@@ -598,7 +731,8 @@ export class HookIngest {
     this.meter.recordWorkspaceMatch(sessionId != null);
 
     if (!sessionId) {
-      // Agent running outside any wmux pane — fail open.
+      // Agent running outside any wmux pane, or its claimed pane is gone — fail open.
+      this.noteRefusedGate(signal);
       return { ok: false, reason: 'no-workspace-match' };
     }
 
@@ -606,7 +740,7 @@ export class HookIngest {
     // `exact` (#919): only exact-ptyId routing may decide identity alone.
     this.router.touchAuthority(sessionId, signal.agent, this.now(), signal.ptyId === sessionId, signal.kind);
     try {
-      this.deps.onAuthorityTouched?.(sessionId);
+      this.deps.onAuthorityTouched?.(sessionId, signal);
     } catch (err) {
       this.deps.log?.('warn', `[hooks] authority-touch callback failed for ${sessionId}: ${String(err)}`);
     }
@@ -629,6 +763,12 @@ export class HookIngest {
     const toolName = typeof signal.payload?.tool_name === 'string'
       ? signal.payload.tool_name
       : null;
+    // Another tool is starting on this pane: a question Esc'd away earlier may
+    // still be on record. The registry retires it only if the screen shows it
+    // gone — a subagent's tool can run while the lead's question is up.
+    if (toolName !== null && toolName !== 'AskUserQuestion') {
+      this.deps.approvals?.retireStaleQuestion?.(sessionId);
+    }
     const gatedTools = this.deps.gateConfig?.().gatedTools ?? [];
     // A `bypassPermissions` session has already declared "never ask me" — the
     // user launched it with `--dangerously-skip-permissions` (or set
@@ -641,7 +781,23 @@ export class HookIngest {
     // meaningful.
     const bypassing = typeof signal.payload?.permission_mode === 'string'
       && signal.payload.permission_mode === 'bypassPermissions';
-    const isGated = !bypassing && toolName !== null && gatedTools.includes(toolName);
+    // #1397 — the orchestrator brain's own pane raises no gate card. A record
+    // here would carry the brain's tool name and input summary to every paired
+    // device and let one answer it, which is exactly what every other
+    // device-facing surface (`/api/sessions`, the transcript routes, the
+    // critical/notify fan-out) already refuses. Nothing in the approvals
+    // pipeline said so until now: the brain simply did not arm these hooks,
+    // because `ClaudePtyBrainAdapter` spawns it with `WMUX_HOOKS_TO_MAIN=1`.
+    // That is a property of how one adapter spawns a process, not a gate — a
+    // different spawn profile, or a hook that reaches the daemon anyway, and
+    // the record appears. Refused as NOT GATED, so the tool is allowed and the
+    // agent keeps its own local permission prompt, which is what happens today.
+    const isBrain = isBrainPty({
+      id: sessionId,
+      env: sessions.find((s) => s.id === sessionId)?.env,
+    });
+    const isAutomation = this.deps.isAutomationPane?.(sessionId) === true;
+    const isGated = !bypassing && !isBrain && !isAutomation && toolName !== null && gatedTools.includes(toolName);
 
     if (!isGated) {
       // Non-gated tool (or a bypass session) — emit tool_started for the phone
@@ -667,6 +823,9 @@ export class HookIngest {
       ...(workspaceId ? { workspaceId } : {}),
       toolName,
       ...(toolInputSummary ? { toolInputSummary } : {}),
+      ...(gateInputIsCritical(signal.payload) ? { risk: 'critical' as const } : {}),
+      // Only a hook that named this pane exactly may be approved by a machine.
+      attribution: signal.ptyId === sessionId ? 'exact' : 'inexact',
     }) ?? crypto.randomUUID();
 
     this.broadcast(sessionId, {
@@ -722,8 +881,10 @@ export class HookIngest {
 
     this.meter.recordWorkspaceMatch(sessionId != null);
     if (!sessionId) {
-      // The agent is running outside any live wmux pane. Expected for
-      // standalone use; the per-pane event is dropped, health still recorded.
+      // The agent is running outside any live wmux pane (expected for
+      // standalone use), or the pane it claims is gone. The per-pane event is
+      // dropped, health still recorded.
+      this.noteRefusedClaim(signal);
       return { ok: false, reason: 'no-workspace-match' };
     }
 
@@ -735,9 +896,14 @@ export class HookIngest {
     // a cwd-prefix-resolved signal may corroborate identity but never stand alone.
     this.router.touchAuthority(sessionId, signal.agent, this.now(), signal.ptyId === sessionId, signal.kind);
     try {
-      this.deps.onAuthorityTouched?.(sessionId);
+      this.deps.onAuthorityTouched?.(sessionId, signal);
     } catch (err) {
       this.deps.log?.('warn', `[hooks] authority-touch callback failed for ${sessionId}: ${String(err)}`);
+    }
+    try {
+      this.deps.onResolvedSignal?.(sessionId, signal);
+    } catch (err) {
+      this.deps.log?.('warn', `[hooks] resolved-signal callback failed for ${sessionId}: ${String(err)}`);
     }
 
     // User answered a pending approval locally — no turn boundary, just expire the request.
@@ -745,7 +911,28 @@ export class HookIngest {
     // window, and these kinds return before any other cue-feeding site below.
     this.alarm.observe(sessionId, signal.agent, normalizeHookCue(signal));
     if (signal.kind === 'agent.input_answered') {
-      this.deps.approvals?.expireForSession(sessionId, 'answered-locally', 'awaiting_input');
+      const permId = openCodeRequestId(signal);
+      if (permId && this.deps.approvals?.expireHookAwaiting) {
+        // One OpenCode request answered: only its own card goes, not a card
+        // another pending request on the pane still needs.
+        this.answeredRequests.add(`${sessionId}|${permId}`);
+        if (this.answeredRequests.size > 1024) this.answeredRequests.delete(this.answeredRequests.values().next().value as string);
+        void Promise.resolve(this.deps.approvals.expireHookAwaiting(sessionId, [permId])).catch(() => undefined);
+      } else {
+        // Claude's AskUserQuestion reports what was answered: an answer the
+        // phone typed but could not confirm is settled by it.
+        this.deps.approvals?.expireForSession(sessionId, 'answered-locally', 'awaiting_input', reportedAnswers(signal.payload));
+      }
+      // A native request answered at the terminal: the plugin is the judge of
+      // which ones are gone (a screen-inferred expiry never touches them).
+      if (signal.agent === 'opencode' && this.deps.openCodeDecisions) {
+        void this.deps.openCodeDecisions(sessionId).catch(() => undefined);
+      }
+      try {
+        if (signal.ptyId === sessionId) this.deps.onInputAnswered?.(sessionId, signal.ts);
+      } catch (err) {
+        this.deps.log?.('warn', `[hooks] input-answered callback failed for ${sessionId}: ${String(err)}`);
+      }
       return { ok: true };
     }
 
@@ -784,7 +971,7 @@ export class HookIngest {
       let transcriptPath: string | undefined;
       if (claimedPath) {
         const sessionEnv = sessions.find((s) => s.id === sessionId)?.env;
-        const check = checkTranscriptPath(claimedPath, signal.agentSessionId, sessionEnv);
+        const check = checkNativeTranscriptPath(signal.agent, claimedPath, signal.agentSessionId, sessionEnv);
         if (check.ok) {
           transcriptPath = claimedPath;
         } else {
@@ -794,19 +981,36 @@ export class HookIngest {
           );
         }
       }
-      try {
-        this.deps.applyResumeBinding(sessionId, {
-          agent: signal.agent,
-          sessionId: signal.agentSessionId,
-          cwd: signal.cwd,
-          ...(permissionMode ? { permissionMode } : {}),
-          ...(transcriptPath ? { transcriptPath } : {}),
-          ts: signal.ts,
-        });
-      } catch (err) {
-        // A binding we failed to persist costs an exact resume after a
-        // reboot, never the signal itself.
-        this.deps.log?.('warn', `[hooks] resume binding failed for ${sessionId}: ${String(err)}`);
+      // A guessed route (workspace/cwd tier) never replaces a DIFFERENT agent's
+      // binding: only a signal whose ptyId named this pane may rebind it. A
+      // claimed-ptyId signal is exact-or-refused above, so this only ever
+      // holds back senders that carry no ptyId at all.
+      // The pane switching agents is not a clobber: when the detector/process
+      // tracker already sees `signal.agent` running there, the old binding is
+      // the stale one and the new session must be captured.
+      const routed = sessions.find((s) => s.id === sessionId);
+      const prevAgent = routed?.resumeBinding?.agent;
+      if (signal.ptyId !== sessionId && prevAgent && prevAgent !== signal.agent
+          && routed?.lastDetectedAgent !== signal.agent) {
+        this.deps.log?.(
+          'info',
+          `[hooks] kept ${prevAgent} resume binding on ${sessionId}: ${signal.agent} signal was not pane-exact`,
+        );
+      } else {
+        try {
+          this.deps.applyResumeBinding(sessionId, {
+            agent: signal.agent,
+            sessionId: signal.agentSessionId,
+            cwd: signal.cwd,
+            ...(permissionMode ? { permissionMode } : {}),
+            ...(transcriptPath ? { transcriptPath } : {}),
+            ts: signal.ts,
+          });
+        } catch (err) {
+          // A binding we failed to persist costs an exact resume after a
+          // reboot, never the signal itself.
+          this.deps.log?.('warn', `[hooks] resume binding failed for ${sessionId}: ${String(err)}`);
+        }
       }
     }
 
@@ -844,6 +1048,12 @@ export class HookIngest {
       // a key into a conversation that no longer exists.
       if (signal.kind === 'agent.session_start') {
         this.deps.approvals?.expireForSession(sessionId, 'session-start');
+      }
+      // A submitted prompt means the input box is back, so a question still
+      // on record was dismissed (Esc sends no hook of its own). Only the
+      // question kind: a gate or permission dialog has its own lifecycle.
+      if (signal.kind === 'agent.user_prompt_submit') {
+        this.deps.approvals?.expireForSession(sessionId, 'prompt-submitted', 'awaiting_input');
       }
       return this.broadcast(sessionId, {
         agent: agentSlugToDisplay(signal.agent),
@@ -885,6 +1095,9 @@ export class HookIngest {
       // subagent's 'complete' at face value would flip the status dot (and the
       // phone liveness header, which special-cases this hookKind) mid-turn.
       this.alarm.observe(sessionId, signal.agent, cue);
+      // #1463 — after the lead turn ended there is no turn for it to be
+      // running in: say nothing rather than reopen a finished pane.
+      if (this.leadTurnEnded.has(sessionId)) return { ok: true };
       return this.broadcast(sessionId, {
         agent: agentSlugToDisplay(signal.agent),
         status: 'running',
@@ -976,20 +1189,107 @@ export class HookIngest {
   ): void {
     const approvals = this.deps.approvals;
     if (!approvals) return;
-    const workspaceId = sessions.find((s) => s.id === sessionId)?.env?.[ENV_KEYS.WORKSPACE_ID];
+    const session = sessions.find((s) => s.id === sessionId);
+    // #1397 — same refusal as the gate path: the orchestrator brain's own pane
+    // gets no approval record, so its prompt text never reaches a paired device
+    // and no device can answer on its behalf.
+    if (isBrainPty({ id: sessionId, env: session?.env })) return;
+    const workspaceId = session?.env?.[ENV_KEYS.WORKSPACE_ID];
+    // Claude Code's own permission dialog is never an `awaiting_input` card:
+    // that card's keystroke map and screen check are built for an
+    // AskUserQuestion select (approvalKeystrokes.ts), and its "approve" would
+    // press `1` on a Bash command nobody on the phone has read. It is recorded
+    // as a `terminal_prompt` instead, so the phone knows the pane is blocked (a
+    // bypassPermissions session that hits a `permissions.ask` rule used to
+    // leave it with nothing at all for hours). The registry parses the dialog
+    // off the screen; the record is answerable only from a capable client, only
+    // as a plain Yes/No, and only while the live screen still shows that exact
+    // dialog — the registry re-reads it and fences the one-byte write. Anything
+    // less is a card with nothing to press (see ApprovalRegistry.resolveTerminalPrompt).
+    if (isClaudeFamilyAgent(signal.agent) && signal.payload?.hook_event_name === 'PermissionRequest') {
+      const toolName = boundRecordText(signal.payload?.tool_name, TERMINAL_PROMPT_TOOL_NAME_MAX);
+      const summary = summarizeToolInput(signal.payload);
+      const rawInput = signal.payload?.tool_input;
+      const toolInput = rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput)
+        ? rawInput as Record<string, unknown>
+        : undefined;
+      const toolUseId = typeof signal.payload?.tool_use_id === 'string' ? signal.payload.tool_use_id : undefined;
+      const hookSessionId = typeof signal.payload?.session_id === 'string' ? signal.payload.session_id : undefined;
+      const promptId = typeof signal.payload?.prompt_id === 'string' ? signal.payload.prompt_id : undefined;
+      this.recordTerminalPrompt({
+        sessionId,
+        agent: signal.agent,
+        ...(workspaceId ? { workspaceId } : {}),
+        ...(toolName ? { toolName } : {}),
+        ...(summary ? { summary } : {}),
+        ...(toolInput ? { toolInput } : {}),
+        ...(toolUseId ? { toolUseId } : {}),
+        ...(hookSessionId ? { hookSessionId } : {}),
+        ...(promptId ? { promptId } : {}),
+        source: 'hook',
+      });
+      return;
+    }
     // A4 — carry WHAT is being asked. Extraction happens here because this is
     // the envelope-aware layer; the registry never learns hook payload shapes.
     // Total and non-throwing (see extractAskUserQuestion): an unusable payload
     // yields absent fields, never a skipped request.
     const asked = extractAskUserQuestion(signal.payload);
-    approvals.noteHookAwaitingInput({
+    const permId = signal.agent === 'opencode' ? openCodeRequestId(signal) : undefined;
+    // The whole prompt as a `decision-v2` form: Claude's picker is what the
+    // registry's stepwise driver knows how to answer.
+    const form = isClaudeFamilyAgent(signal.agent) ? claudeQuestionsForm(signal.payload) : null;
+    const legacy = (): void => approvals.noteHookAwaitingInput({
       sessionId,
       agent: signal.agent,
+      attribution: signal.ptyId === sessionId ? 'exact' : 'inexact',
       ...(workspaceId ? { workspaceId } : {}),
+      ...(permId ? { requestId: permId } : {}),
       ...(asked.question ? { question: asked.question } : {}),
       ...(asked.options ? { options: asked.options } : {}),
       ...(asked.choices ? { choices: asked.choices } : {}),
+      ...(asked.questionShape ? { questionShape: asked.questionShape } : {}),
+      ...(form ? { form } : {}),
     });
+    // OpenCode's plugin, when it lists decisions, makes the records itself:
+    // the hook then only marks the pane blocked (the broadcast below).
+    if (signal.agent === 'opencode' && this.deps.openCodeDecisions) {
+      // Decided after the plugin round trip: a request answered meanwhile
+      // gets no card.
+      const fallback = (): void => { if (!permId || !this.answeredRequests.has(`${sessionId}|${permId}`)) legacy(); };
+      void this.deps.openCodeDecisions(sessionId, permId).then(
+        (outcome) => { if (outcome !== 'native') fallback(); },
+        fallback,
+      );
+      return;
+    }
+    legacy();
+  }
+
+  /** Count a refused claimed-pane signal; log it once per ptyId (bounded set). */
+  private noteRefusedClaim(signal: AgentSignal): void {
+    const ptyId = signal.ptyId;
+    if (!ptyId) return;
+    this.refusedClaimCount += 1;
+    if (this.refusedClaims.has(ptyId)) return;
+    if (this.refusedClaims.size >= 256) this.refusedClaims.clear();
+    this.refusedClaims.add(ptyId);
+    this.deps.log?.('info', `[hooks] refused ${signal.agent} ${signal.kind} for ${ptyId}: claimed-pane-not-live`);
+  }
+
+  /** Count a gate allowed because its claimed pane was refused; log once per ptyId with the tool. */
+  private noteRefusedGate(signal: AgentSignal): void {
+    const ptyId = signal.ptyId;
+    if (!ptyId) return;
+    this.refusedGateCount += 1;
+    if (this.refusedGateClaims.has(ptyId)) return;
+    if (this.refusedGateClaims.size >= 256) this.refusedGateClaims.clear();
+    this.refusedGateClaims.add(ptyId);
+    const tool = typeof signal.payload?.tool_name === 'string' ? signal.payload.tool_name.slice(0, 64).replace(/[^\w.:-]/g, '_') : 'unknown';
+    this.deps.log?.(
+      'info',
+      `[hooks] allowed ${signal.agent} tool ${tool} ungated for ${ptyId}: claimed-pane-not-live`,
+    );
   }
 
   /**
@@ -998,6 +1298,14 @@ export class HookIngest {
    * process on a hard 2s budget and treats an RPC error as a fatal hook.
    */
   private broadcast(sessionId: string, data: HookAgentEventData): HookSignalResponse {
+    // #1463 — track whether the lead turn is over (see `leadTurnEnded`). A
+    // Stop that still projects `running` (background agents left) is not an end.
+    if (data.hookKind === 'agent.session_start'
+      || ((data.hookKind === 'agent.stop' || data.hookKind === 'agent.stop_failure') && data.status !== 'running')) {
+      this.leadTurnEnded.add(sessionId);
+    } else if (data.hookKind !== 'agent.subagent_stop') {
+      this.leadTurnEnded.delete(sessionId);
+    }
     try {
       this.deps.emitAgentEvent(sessionId, data);
     } catch (err) {
@@ -1020,8 +1328,11 @@ export class HookIngest {
    *   - 'awaiting_input' is deliberately EXEMPT from the hook-authority veto.
    *     Claude's hooks.json wires PreToolUse for the AskUserQuestion tool
    *     ONLY — the far more common approval prompts ("Do you want to
-   *     proceed?", the permission-mode Y/N gate) have no hook at all, so the
-   *     detector regexes are their only signal source. Vetoing them would
+   *     proceed?", the permission-mode Y/N gate) are reported by a hook only
+   *     where the PermissionRequest hook was installed (a user-run install),
+   *     so the detector regexes are often their only signal source. Where
+   *     both report one dialog, CompletionAlarm carries them in a single
+   *     attention window (a later attention supersedes). Vetoing them would
    *     leave a pane blocked on a real approval silent for the full 30-minute
    *     authority TTL, which is worse than the double-toast this arbitration
    *     exists to prevent.
@@ -1064,26 +1375,82 @@ export class HookIngest {
       // Unreachable for the kind-filtered statuses above; kept defensive.
       return { source, decision: this.router.recordDetector(slug, kind, sessionId, this.now()) };
     }
-    const resume = () => {
+    const resume = (confirmed?: ConfirmedWindow) => {
       const decision = this.router.recordDetector(slug, kind, sessionId, this.now());
+      let delivered = false;
       try {
-        this.deps.emitDetectorEvent?.(sessionId, {
+        delivered = this.deps.emitDetectorEvent?.(sessionId, {
           agent: event.agent,
           status: event.status,
           message: event.message ?? '',
           source,
           decision,
-        });
+        }) !== false;
       } catch (err) {
         this.deps.log?.(
           'warn',
           `[hooks] held detector broadcast failed for ${sessionId}: ${String(err)}`,
         );
       }
+      // Detector attention that survived its window: the agent's own dialog
+      // is on screen, so record it for the phone as a `terminal_prompt`.
+      //
+      // Not for a FIRM window. Firm means the agent's hook reported this
+      // dialog (an AskUserQuestion, or the PermissionRequest behind "Do you
+      // want to proceed?"), and the hook path already created the record the
+      // moment the hook landed — `noteAwaitingInput` runs before the hold, not
+      // at confirmation. A window stays firm when a detector report replaces a
+      // hook-reported one, so this skip covers both arrival orders.
+      if (
+        delivered
+        && confirmed?.cls === 'attention'
+        && !confirmed.firm
+        && event.status === 'awaiting_input'
+      ) {
+        this.noteDetectorTerminalPrompt(sessionId, slug);
+      }
     };
     const outcome = this.alarm.observe(sessionId, slug, cue, resume);
     if (outcome === 'hold') return { source, decision: 'pending' };
     return { source, decision: 'internal' };
+  }
+
+  /**
+   * The detector half of `terminal_prompt` creation (the hook half is in
+   * `noteAwaitingInput`). Same refusals: not for the brain's own pane, not for
+   * an agent outside the Claude family, not for a pane that is gone. The
+   * registry adds the rest (anything already pending, the cooldown).
+   */
+  private noteDetectorTerminalPrompt(sessionId: string, slug: string): void {
+    const approvals = this.deps.approvals;
+    if (!approvals?.noteTerminalPrompt || !isClaudeFamilyAgent(slug)) return;
+    let session: HookIngestSession | undefined;
+    try {
+      session = this.deps.listLiveSessions().find((s) => s.id === sessionId);
+    } catch {
+      return;
+    }
+    if (!session) return;
+    if (isBrainPty({ id: sessionId, env: session.env })) return;
+    const workspaceId = session.env?.[ENV_KEYS.WORKSPACE_ID];
+    this.recordTerminalPrompt({
+      sessionId,
+      agent: slug,
+      ...(workspaceId ? { workspaceId } : {}),
+      source: 'detector',
+    });
+  }
+
+  /** Hand a `terminal_prompt` to the registry; its async work never escapes unhandled. */
+  private recordTerminalPrompt(note: TerminalPromptNote): void {
+    const fail = (err: unknown): void => {
+      this.deps.log?.('warn', `[hooks] terminal prompt record failed for ${note.sessionId}: ${String(err)}`);
+    };
+    try {
+      Promise.resolve(this.deps.approvals?.noteTerminalPrompt?.(note)).catch(fail);
+    } catch (err) {
+      fail(err);
+    }
   }
 
   /**
@@ -1125,6 +1492,17 @@ export class HookIngest {
   }
 
   /**
+   * A human answered the dialog the pane was blocked on (DaemonPTYBridge saw
+   * the answer keystroke). Cancels a still-held awaiting window: confirming it
+   * after the answer would re-mark the pane "needs you" and re-arm the
+   * bridge's awaiting state with nothing left on screen to answer.
+   */
+  noteAnswered(sessionId: string, slug?: string): void {
+    if (!slug) return;
+    this.alarm.observe(sessionId, slug, { class: 'answered' });
+  }
+
+  /**
    * Drop every ledger + authority entry for a disposed pane. Wired to
    * session:died / session:destroyed so a long daemon lifetime does not
    * accumulate dead-id entries, and so a reused id starts from the detector
@@ -1132,6 +1510,7 @@ export class HookIngest {
    */
   dropPty(sessionId: string): void {
     this.router.dropPty(sessionId);
+    this.leadTurnEnded.delete(sessionId);
     // Cancel any open provisional window for the disposed pane — a reused id
     // must start from an empty gate, not an inherited pending confirmation.
     this.alarm.dropPty(sessionId);
@@ -1145,4 +1524,28 @@ export class HookIngest {
     clearInterval(this.floodTimer);
     this.alarm.dispose();
   }
+}
+
+/** Most questions an AskUserQuestion answer report is read for (Claude asks at most four). */
+const REPORTED_ANSWERS_MAX = 8;
+
+/**
+ * The answers a Claude AskUserQuestion PostToolUse reports
+ * (`tool_response.answers`: question text → answer), or undefined when the
+ * payload carries none in that shape.
+ */
+export function reportedAnswers(payload: unknown): Readonly<Record<string, string>> | undefined {
+  const response = payload !== null && typeof payload === 'object' ? (payload as Record<string, unknown>)['tool_response'] : undefined;
+  const answers = response !== null && typeof response === 'object' && !Array.isArray(response)
+    ? (response as Record<string, unknown>)['answers']
+    : undefined;
+  if (answers === null || typeof answers !== 'object' || Array.isArray(answers)) return undefined;
+  const entries = Object.entries(answers as Record<string, unknown>);
+  if (entries.length === 0 || entries.length > REPORTED_ANSWERS_MAX) return undefined;
+  const out: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const [question, answer] of entries) {
+    if (typeof answer !== 'string') return undefined;
+    out[question] = answer;
+  }
+  return out;
 }

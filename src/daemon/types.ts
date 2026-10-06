@@ -1,12 +1,15 @@
 // === Daemon-specific type definitions ===
 
+import type { WslTarget } from '../shared/wsl';
 import type { DaemonSupervisionPolicy } from '../shared/rpc';
 import type { AgentSlug } from '../shared/events';
 import type { ResumeBinding } from '../shared/agentResume';
 import type { LanLinkConfig } from '../shared/lanlink';
 import type { GateConfig } from './approvals/gateConfig';
+import type { PhoneDecisionsConfig } from './approvals/decisionConfig';
 import type { NotifySinkConfig } from './push/WebhookSink';
 import type { PushPresenceSuppressionConfig } from './push/presence';
+import type { PaneAccountVendor, StoredHandoffFrom } from '../shared/phonePaneAccount';
 
 /** Session lifecycle state */
 export type DaemonSessionState = 'detached' | 'attached' | 'dead' | 'suspended';
@@ -41,7 +44,7 @@ export interface DaemonSession {
   pid: number;              // child process PID
   /**
    * OS-reported creation time of `pid`, as the platform prints it (Windows
-   * WMIC `CreationDate`, posix `ps -o lstart=`). Opaque — only ever compared
+   * CIM `CreationDate` in wmic's DMTF format, posix `ps -o lstart=`). Opaque — only ever compared
    * for equality against a fresh reading of the same pid.
    *
    * A pid alone is not an identity: Windows recycles pids aggressively and a
@@ -56,6 +59,29 @@ export interface DaemonSession {
    */
   pidStartTime?: string;
   cmd: string;              // executed command
+  wslTarget?: WslTarget;
+  /** Recoverable WSL launch failure; preserve identity and scrollback until retry. */
+  recoveryError?: string;
+  /**
+   * #1305 — when this entry's pending-recovery retention clock started: the
+   * moment it first became pending, restarted whenever a client asks for the
+   * pane (Retry, attach). NOT `lastActivity`, which is the shell's last output
+   * and can already be months old when the pane goes pending — an exec or
+   * supervised WSL unit is allowed to sit silent, so clocking retention off it
+   * would discard the unit's conversation binding and scrollback on the boot
+   * after it first failed. Absent on records written before this field existed
+   * and on entries that are not pending; absent is treated as "clock not
+   * started yet", so such a record is kept until the boot re-seed stamps it.
+   */
+  recoveryPendingSince?: string;
+  /**
+   * #1103 — validated WSL distro selection (`['-d', '<name>']`), persisted so
+   * every replay path (recovery, supervised restart, suspended promote) re-
+   * spawns the SAME distro instead of silently booting the system default.
+   * Absent for every non-wsl session and all pre-#1103 sessions (which had no
+   * distro pinned either — identical behaviour).
+   */
+  args?: string[];
   /**
    * LIVE working directory. Updated at runtime from the OSC 7 sequences the
    * pane's shell emits, so it follows a `cd` — and so it is whatever any
@@ -110,6 +136,20 @@ export interface DaemonSession {
    * resume (`--resume <id>`) on both the recovery pill and the supervised replay.
    */
   resumeBinding?: ResumeBinding;
+  /** Exact thread observed on this pane's owned Codex TUI relay. Never hook-derived. */
+  codexRelayResume?: {threadId:string;cwd:string;codeHome:string;transcriptPath:string};
+  /**
+   * Phone handoff lineage (contract v-next item 4): the pane this one was
+   * created to continue, set once at `POST /api/sessions` and carried across
+   * recovery. Absent on every other pane.
+   */
+  handoffFrom?: StoredHandoffFrom;
+  /**
+   * The vendor of the account chosen for this pane at `POST /api/sessions`
+   * (its directory is in `env`). Absent for every other pane, including one
+   * that runs on the workspace binding. Carried across recovery.
+   */
+  paneAccount?: { vendor: PaneAccountVendor };
 }
 
 /** Top-level schema for ~/.wmux/sessions.json */
@@ -266,6 +306,11 @@ export interface DaemonConfig {
    * entirely (same as `WMUX_GATE=0`, but durable).
    */
   gate?: GateConfig;
+  /**
+   * Kill switch for the phone decision channels. Absent ⇒ both on; only an
+   * explicit `false` turns one off (see approvals/decisionConfig.ts).
+   */
+  phoneDecisions?: Partial<PhoneDecisionsConfig>;
   /**
    * Outbound notification sinks — a webhook or ntfy URL that gets a small
    * plaintext ping when an approval is raised or an agent turn ends. For people

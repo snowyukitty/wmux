@@ -1,5 +1,7 @@
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { sendRpc } from '../wmux-client';
 import {
+  leaseSurfaceScope,
   requireBrowserTargetScope,
   sendScopedBrowserRpc,
   type BrowserTargetScope,
@@ -7,6 +9,9 @@ import {
 } from './browserScope';
 
 import { hintBlockMeta } from './hintBlock';
+import { describeToolError } from './toolError';
+import { createEffectProbe, withEffectTrailer, type EffectProbe } from './resultTrailer';
+import { takeGuideAnnouncement } from './guideAnnounce';
 import { redactPasswordParams } from './redact';
 import { invalidateSnapshotBaseline, invalidateSnapshotBaselineIfStale } from './snapshotCache';
 import { PlaywrightEngine } from './PlaywrightEngine';
@@ -19,6 +24,12 @@ import {
   renderPromotedHintBlock,
   type PromotedRecord,
 } from '../../shared/browserReplay/promotedSkill';
+import {
+  domainFromUrl,
+  renderSiteMemoryBlock,
+  type SiteMemoryRecord,
+} from '../../shared/browserMemory/siteMemory';
+import type { SiteGuideMatch } from '../../shared/browserGuides/siteGuides';
 
 // Renew well inside main's 30s RPC-lease TTL so a long-running tool op
 // (browser_wait_for, slow page interactions) never lapses mid-flight.
@@ -53,6 +64,10 @@ interface LifecycleEventWire {
 }
 
 async function collectLifecycleEvents(scope: BrowserTargetScope): Promise<LifecycleEventWire[]> {
+  // No surface of this caller's to drain. An unnamed drain is DESTRUCTIVE on
+  // main's workspace default — another connection's ring — so the events would
+  // be removed from that agent's next result and reported in this one.
+  if (!scope.surfaceId) return [];
   const res = await sendScopedBrowserRpc<{ entries?: LifecycleEventWire[] }>(
     'browser.lifecycle.get',
     scope,
@@ -187,7 +202,24 @@ async function prependReplayHints<T>(
     // Both stores, in one round trip pair. A promoted flow may have outlived
     // its recording, so consulting only the cache would go silent on exactly
     // the flows the user chose to keep.
-    const [res, promotedRes] = await Promise.all([
+    const domain = domainFromUrl(landed.url);
+    // Guide loading is isolated in its own try/catch, not only a `.catch`:
+    // null means "unknown" (older main, transport failure, a synchronous
+    // throw) and must neither break the other hints nor reset what this
+    // surface last announced.
+    const guidesLoad = (async (): Promise<SiteGuideMatch[] | null> => {
+      try {
+        const r = await sendScopedBrowserRpc<{ guides?: SiteGuideMatch[] }>(
+          'browser.siteGuides.match',
+          scope,
+          { url: urlKey },
+        );
+        return Array.isArray(r?.guides) ? r.guides : [];
+      } catch {
+        return null;
+      }
+    })();
+    const [res, promotedRes, siteRes, guides] = await Promise.all([
       sendScopedBrowserRpc<{ traces?: TraceRecord[] }>('browser.actionCache.list', scope, {
         urlKey,
       }),
@@ -196,6 +228,18 @@ async function prependReplayHints<T>(
         scope,
         { urlKey },
       ).catch(() => ({ promoted: [] as PromotedRecord[] })),
+      // The `.catch` is not optional. Without it, attaching to a main that
+      // predates this method rejects the whole Promise.all, the outer
+      // try/catch swallows it, and the EXISTING [replay] and [skill] hints
+      // vanish too — a new feature silently deleting two working ones.
+      domain
+        ? sendScopedBrowserRpc<{ memory?: SiteMemoryRecord | null }>(
+            'browser.siteMemory.list',
+            scope,
+            { domain },
+          ).catch(() => ({ memory: null }))
+        : Promise.resolve({ memory: null }),
+      guidesLoad,
     ]);
     const promoted = promotedRes?.promoted ?? [];
     const promotedNames = new Set(promoted.map((r) => r.name));
@@ -215,12 +259,36 @@ async function prependReplayHints<T>(
         ? `[replay] ${names.length} recorded flow(s) for this page: ${names.join(', ')} — ` +
           `browser_replay {action:"run", name:"..."} repeats one without a snapshot.\n`
         : '';
-    if (!promotedBlock && !replayBlock) return result;
+    // What this domain has cost before. First, because it is the only block
+    // that can stop the agent from doing something rather than offer it
+    // something to do — and re-rendered from the record rather than served
+    // from a stored string, so a hand-edited file still meets the guards.
+    const siteBlock = renderSiteMemoryBlock(siteRes?.memory ?? null, urlKey);
+    // siteBlock is part of the early return, not just the concatenation. The
+    // main scenario for this feature is a domain with NO recorded flows —
+    // failure memory and nothing else — and checking only the other two would
+    // mean the block never appears on exactly those pages.
+    // Guide rendering is isolated too: any exception yields no guide lines and
+    // the blocks above are still assembled.
+    let guideBlock = '';
+    try {
+      if (guides !== null) {
+        guideBlock = takeGuideAnnouncement(
+          scope.workspaceId,
+          scope.surfaceId,
+          guides,
+          siteRes?.memory ?? null,
+        );
+      }
+    } catch {
+      guideBlock = '';
+    }
+    if (!promotedBlock && !replayBlock && !siteBlock && !guideBlock) return result;
     // Marked, not just prefixed: browser_repl separates hints from tool output
     // by this marker, and a page must not be able to forge one. See hintBlock.ts.
     shaped.content.unshift({
       type: 'text',
-      text: `${promotedBlock}${replayBlock}`,
+      text: `${siteBlock}${guideBlock}${promotedBlock}${replayBlock}`,
       _meta: hintBlockMeta(),
     });
   } catch {
@@ -288,16 +356,28 @@ export async function withAutomationLease<T>(
   fn: (scope: BrowserTargetScope) => Promise<T>,
   opts?: AutomationLeaseOpts<T>,
 ): Promise<T> {
-  const scope = await requireBrowserTargetScope(deps, surfaceId);
+  // Settle the surface BEFORE the lease: an unnamed browser.lease.acquire
+  // resolves to the workspace's first live session, so under lightweight mode
+  // the lease kept ANOTHER connection's guest unthrottled while Playwright
+  // drove this caller's own.
+  const scope = await leaseSurfaceScope(await requireBrowserTargetScope(deps, surfaceId));
   let token: string | null = null;
-  try {
-    const res = await sendScopedBrowserRpc<{ token: string | null }>(
-      'browser.lease.acquire',
-      scope,
-    );
-    token = res?.token ?? null;
-  } catch {
-    /* lease unavailable — proceed unleased */
+  // Only ever leased BY NAME. Without a surface to name, the acquire would be
+  // answered with the workspace's first live session, and holding a lease on
+  // somebody else's guest is worse than holding none: it exempts their page
+  // from lightweight mode and leaves this caller's own page throttled. The
+  // late-acquire loop below covers the body that opens its own surface — it
+  // picks up the pin as soon as there is one.
+  if (scope.surfaceId) {
+    try {
+      const res = await sendScopedBrowserRpc<{ token: string | null }>(
+        'browser.lease.acquire',
+        scope,
+      );
+      token = res?.token ?? null;
+    } catch {
+      /* lease unavailable — proceed unleased */
+    }
   }
 
   if (!token) {
@@ -379,5 +459,40 @@ export async function withAutomationLease<T>(
     sendRpc('browser.lease.release', { token: heldToken }).catch(() => {
       /* TTL expiry cleans up */
     });
+  }
+}
+
+/**
+ * withAutomationLease for a MUTATING tool: the effect trailer covers whatever
+ * escapes the lease, not only what the body catches itself.
+ *
+ * The lease settles the workspace scope BEFORE it calls the body — that is the
+ * whole point of requireBrowserTargetScope — so a scope refusal, or a surface
+ * that was opened and never became addressable, rejects outside the body's own
+ * try/catch. Those were the one failure shape reaching the agent with no
+ * `effect_state` at all, while the tool's description promises one on every
+ * result. They are `none` as reliably as any refusal: nothing can have been
+ * dispatched before the scope exists.
+ *
+ * The probe is created here and handed to the body, so both catch sites read the
+ * same dispatch flag.
+ */
+export async function leasedMutation<T extends CallToolResult>(
+  deps: BrowserToolDeps,
+  surfaceId: string | undefined,
+  body: (scope: BrowserTargetScope, effect: EffectProbe) => Promise<T>,
+  opts?: AutomationLeaseOpts<T>,
+): Promise<T | CallToolResult> {
+  const effect = createEffectProbe();
+  try {
+    return await withAutomationLease(deps, surfaceId, (scope) => body(scope, effect), opts);
+  } catch (error) {
+    return withEffectTrailer(
+      {
+        content: [{ type: 'text' as const, text: describeToolError(error) }],
+        isError: true,
+      },
+      effect.failure(error),
+    );
   }
 }

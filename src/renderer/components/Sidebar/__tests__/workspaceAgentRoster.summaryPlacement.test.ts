@@ -34,7 +34,8 @@ describe('#997 — roster summary sits on the workspace row', () => {
     // The list is mounted only while expanded — a collapsed list would still
     // subscribe to the whole roster projection to render nothing, and with
     // eleven collapsed workspaces that is eleven pointless subscriptions.
-    expect(itemSource).toMatch(/rosterOpen && \(\s*<WorkspaceAgentRoster/);
+    // rosterShown = rosterOpen, or held open while a nested task is active.
+    expect(itemSource).toMatch(/rosterShown && \(\s*<WorkspaceAgentRoster/);
   });
 
   it('the list renders no disclosure row of its own', () => {
@@ -79,11 +80,12 @@ describe('#997 — roster summary sits on the workspace row', () => {
     expect(onMouseDown).toContain('event.currentTarget.focus()');
   });
 
-  it('the summary subscribes on counts alone, not on every roster field', () => {
+  it('the summary subscribes on its chip projection, not on every roster field', () => {
     // The projection's reference changes whenever any row field does — an
-    // activity string, a focus flag. This control draws two integers, and it
-    // now sits on a row that renders for every workspace.
-    expect(itemSource).toContain('createWorkspaceRosterCountsSelector(workspaceId)');
+    // activity string, a focus flag. This control sits on a row that renders
+    // for every workspace, so it reads the reference-stable chip (#1481:
+    // counts plus up to three glyphs and their statuses).
+    expect(itemSource).toContain('createWorkspaceRosterChipSelector(workspaceId)');
   });
 });
 

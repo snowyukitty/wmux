@@ -1,3 +1,6 @@
+// Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/features/sessions/ui/AccessPicker.tsx), MIT License, Copyright (c) 2026 Nick
+// The chip is the filled 26px picker chip with a turning chevron; the menu is
+// a 12px popover with rounded-lg rows.
 // ─── Command Deck — per-workspace agent mode chip ───────────────────────────
 //
 // The single user-facing autonomy control (owner design 2026-07-13, revised
@@ -21,9 +24,10 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { tokenAttrs } from '../../themes';
 import { FOCUS_RING } from '../focusRing';
+import { IconChevron } from '../icons';
 import type { AgentMode } from '../../../main/deck/deckAutonomyStore';
 import { requestHooksInstallPrompt } from './HooksInstallPrompt';
-import { notifyAgentModeChanged } from './deckModeBus';
+import { notifyAgentModeChanged, onAgentModeChanged } from './deckModeBus';
 
 export interface AgentModeApi {
   get: (workspaceId: string) => Promise<{ mode: AgentMode | null }>;
@@ -34,7 +38,7 @@ export interface AgentModeApi {
 }
 
 /** Order shown in the dropdown, least → most autonomous. */
-const MODE_ORDER: readonly AgentMode[] = ['off', 'assist', 'danger'];
+export const MODE_ORDER: readonly AgentMode[] = ['off', 'assist', 'danger'];
 
 // Per-mode DOT so the CURRENT autonomy state reads at a glance (the chip is the
 // one always-visible answer to "why is it quiet/talking?"). The chip body stays
@@ -79,11 +83,67 @@ function modeText(mode: AgentMode): string {
   return MODE_TEXT[mode] ?? MODE_TEXT.off;
 }
 
-function modeLabel(t: (k: string) => string, mode: AgentMode): string {
+export function modeLabel(t: (k: string) => string, mode: AgentMode): string {
   return t(`deck.mode.${mode}`) || mode;
 }
-function modeDesc(t: (k: string) => string, mode: AgentMode): string {
+export function modeDesc(t: (k: string) => string, mode: AgentMode): string {
   return t(`deck.mode.${mode}Desc`) || '';
+}
+
+/** The workspace's mode and the one way to change it, shared by the chip and
+ *  Moa's options menu. `null` until the first read (or with no api). */
+export function useAgentMode(
+  api: AgentModeApi | undefined,
+  workspaceId: string | undefined,
+): { mode: AgentMode | null; pick: (next: AgentMode) => void } {
+  const [mode, setMode] = useState<AgentMode | null>(null);
+
+  useEffect(() => {
+    if (!api || !workspaceId) {
+      setMode(null);
+      return;
+    }
+    let cancelled = false;
+    const read = () => {
+      api
+        .get(workspaceId)
+        .then((r) => { if (!cancelled) setMode(r.mode ?? 'off'); })
+        .catch(() => { if (!cancelled) setMode('off'); });
+    };
+    read();
+    // A flip made elsewhere (Settings › Moa, another chip) must reach this
+    // label too: Moa's header shows the mode at all times, Danger in red.
+    const off = onAgentModeChanged(read);
+    return () => { cancelled = true; off(); };
+  }, [api, workspaceId]);
+
+  const pick = useCallback(
+    (next: AgentMode) => {
+      if (!api || !workspaceId) return;
+      const prev = mode;
+      setMode(next); // optimistic
+      api
+        .set(workspaceId, next)
+        .then((r) => {
+          if (r.ok && r.mode) setMode(r.mode);
+          else setMode(prev);
+          // Sibling surfaces re-read the mode from main: `off` disables the
+          // composer, so a flip has to reach it without a remount.
+          notifyAgentModeChanged();
+        })
+        .catch(() => {
+          setMode(prev);
+          notifyAgentModeChanged();
+        });
+      // Raising autonomy means the orchestrator is about to rely on lifecycle
+      // signals — if the hook bridge is missing, this is the moment to say so.
+      // The prompt re-checks install status itself (no-op when installed).
+      if (next !== 'off') requestHooksInstallPrompt();
+    },
+    [api, workspaceId, mode],
+  );
+
+  return { mode, pick };
 }
 
 export function AgentModeChip({
@@ -96,7 +156,7 @@ export function AgentModeChip({
   workspaceId: string;
   t: (key: string) => string;
 }): React.ReactElement | null {
-  const [mode, setMode] = useState<AgentMode | null>(null);
+  const { mode, pick: pickMode } = useAgentMode(api, workspaceId);
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   // Where the dropdown fits, measured on every open. The chip lives in a bar at
@@ -108,15 +168,6 @@ export function AgentModeChip({
   // Clamp to whichever side has more room and cap the height there, so every
   // option is always reachable (scrolling when it has to be).
   const [menuFit, setMenuFit] = useState<{ below: boolean; maxHeight: number } | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .get(workspaceId)
-      .then((r) => { if (!cancelled) setMode(r.mode ?? 'off'); })
-      .catch(() => { if (!cancelled) setMode('off'); });
-    return () => { cancelled = true; };
-  }, [api, workspaceId]);
 
   // Measure the room around the chip whenever the menu opens (and on resize,
   // since the deck rail grows/shrinks with the window).
@@ -157,27 +208,9 @@ export function AgentModeChip({
   const pick = useCallback(
     (next: AgentMode) => {
       setOpen(false);
-      const prev = mode;
-      setMode(next); // optimistic
-      api
-        .set(workspaceId, next)
-        .then((r) => {
-          if (r.ok && r.mode) setMode(r.mode);
-          else setMode(prev);
-          // Sibling surfaces re-read the mode from main: `off` disables the
-          // composer, so a flip has to reach it without a remount.
-          notifyAgentModeChanged();
-        })
-        .catch(() => {
-          setMode(prev);
-          notifyAgentModeChanged();
-        });
-      // Raising autonomy means the orchestrator is about to rely on lifecycle
-      // signals — if the hook bridge is missing, this is the moment to say so.
-      // The prompt re-checks install status itself (no-op when installed).
-      if (next !== 'off') requestHooksInstallPrompt();
+      pickMode(next);
     },
-    [api, workspaceId, mode],
+    [pickMode],
   );
 
   if (mode === null) return null; // pre-first-read; avoids a label flash
@@ -189,7 +222,7 @@ export function AgentModeChip({
         aria-haspopup="listbox"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
-        className={`ui-chip-boxless inline-flex items-center gap-1.5 px-2 py-0.5 text-[11px] ${modeText(mode)} ${FOCUS_RING}`}
+        className={`ui-chip-boxless inline-flex h-[26px] items-center gap-1 px-1.5 text-[11px] ${modeText(mode)} ${FOCUS_RING}`}
         // The dot is decorative, so without this a screen reader hears only
         // "Mode: danger" with no statement of what danger means.
         aria-label={`${t('deck.mode.label') || 'Mode'}: ${modeLabel(t, mode)}${
@@ -203,11 +236,17 @@ export function AgentModeChip({
           className={`inline-block w-2 h-2 rounded-full shrink-0 ${modeDot(mode)}`}
         />
         {t('deck.mode.label') || 'Mode'}: {modeLabel(t, mode)}
+        <span
+          aria-hidden="true"
+          className={`inline-flex shrink-0 text-[color-mix(in_srgb,var(--text-main)_50%,transparent)] transition-transform ${open ? '-rotate-90' : 'rotate-90'}`}
+        >
+          <IconChevron size={12} />
+        </span>
       </button>
       {open && (
         <div
           role="listbox"
-          className={`absolute left-0 z-50 w-64 overflow-y-auto bg-[var(--bg-overlay)] border border-[var(--bg-surface)] rounded-md shadow-lg py-1 text-xs ${
+          className={`absolute left-0 z-50 w-64 overflow-y-auto rounded-xl border border-[var(--line)] bg-[var(--bg-base)] shadow-[var(--shadow-popover)] p-1.5 ${
             menuFit?.below ? 'top-full mt-1' : 'bottom-full mb-1'
           }`}
           style={menuFit ? { maxHeight: menuFit.maxHeight } : undefined}
@@ -220,12 +259,12 @@ export function AgentModeChip({
               aria-selected={m === mode}
               data-mode-option={m}
               onClick={() => pick(m)}
-              className={`w-full text-left px-3 py-1.5 hover:bg-[var(--bg-surface)] transition-colors ${
-                m === mode ? 'text-[var(--accent-blue)]' : 'text-[var(--text-main)]'
+              className={`w-full text-left rounded-lg px-2 py-2 text-[var(--text-main)] transition-colors ${
+                m === mode ? 'bg-[var(--selection)]' : 'hover:bg-[var(--selection)]'
               }`}
             >
-              <div className="font-semibold">{modeLabel(t, m)}</div>
-              <div className="text-[var(--text-muted)] text-[10px]">{modeDesc(t, m)}</div>
+              <div className="text-[13px]">{modeLabel(t, m)}</div>
+              <div className="text-[11px] leading-4 text-[color-mix(in_srgb,var(--text-main)_45%,transparent)]">{modeDesc(t, m)}</div>
             </button>
           ))}
         </div>

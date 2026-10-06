@@ -22,3 +22,4 @@ export {
 } from './text';
 export * from './rotation';
 export * from './migrate';
+export * from './sweep';

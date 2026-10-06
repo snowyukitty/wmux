@@ -6,8 +6,10 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 // #517: tool handlers are wrapped in withAutomationLease, which issues
 // browser.lease.* RPCs around the real operation, plus a browser.lifecycle.get
-// drain before the body. Record that infrastructure traffic
-// separately so ordinary fallback assertions see only browser.evaluate calls.
+// drain before the body — and, since browser tools resolve the surface a call
+// that names none belongs to, one browser.cdp.info before that. Record that
+// infrastructure traffic separately so ordinary fallback assertions see only
+// browser.evaluate calls.
 const { mockSendRpc, mockLeaseRpc, getPage, getInstance } = vi.hoisted(() => {
   const getPage = vi.fn();
   return {
@@ -19,7 +21,13 @@ const { mockSendRpc, mockLeaseRpc, getPage, getInstance } = vi.hoisted(() => {
 });
 vi.mock('../../wmux-client', () => ({
   sendRpc: (method: string, ...args: unknown[]) =>
-    typeof method === 'string' && (method.startsWith('browser.lease.') || method === 'browser.lifecycle.get')
+    typeof method === 'string'
+    && (method.startsWith('browser.lease.')
+      || method === 'browser.lifecycle.get'
+      || method === 'browser.cdp.info'
+      || method === 'browser.tabs'
+      || method === 'browser.surface.adopt'
+      || method === 'browser.open')
       ? mockLeaseRpc(method, ...args)
       : mockSendRpc(method, ...args),
 }));
@@ -33,6 +41,7 @@ import {
   registerWaitTools,
 } from '../tools/wait';
 import type { WmuxToolProfile } from '../../toolCatalog';
+import { __resetSurfaceRoutingForTesting } from '../surfaceRouting';
 import { ActionRing } from '../../browser-replay/actionRing';
 import {
   expectCommanderCatalogLockstep,
@@ -76,6 +85,9 @@ function evalRouter(map: Record<string, unknown>, fallback: unknown = false) {
 }
 
 beforeEach(() => {
+  // Per-connection pin: no broker scope here, so it lives in the module
+  // fallback and would leak between cases.
+  __resetSurfaceRoutingForTesting();
   browserToolDeps.resolveWorkspaceId.mockClear();
   mockSendRpc.mockReset();
   mockLeaseRpc.mockReset();
@@ -264,7 +276,9 @@ describe('browser_wait RPC fallback', () => {
     getPage.mockResolvedValue({ waitForSelector });
     const res = await wait({ selector: '#app' });
     expect(waitForSelector).toHaveBeenCalledWith('#app', { timeout: 30000 });
-    expect(getPage).toHaveBeenCalledWith({ workspaceId: 'ws-test' });
+    // `noSurface` is routing's answer, carried on the scope so the page lane
+    // does not repeat the lookup that just came back empty.
+    expect(getPage).toHaveBeenCalledWith({ workspaceId: 'ws-test', noSurface: true });
     expect(mockSendRpc).not.toHaveBeenCalled();
     expect(res.content[0].text).toContain('selector "#app" found');
   });
@@ -320,5 +334,60 @@ describe('browser_wait recording (#1193)', () => {
     expect(steps[0].step.unrecordable).toBeUndefined();
     expect(steps[0].urlKey).toBe('https://example.com/pulls');
     expect(steps[0].surfaceShape).toBe('');
+  });
+});
+
+describe('browser_wait selector-scoped text (#1360)', () => {
+  it('polls the text inside the selector, not document.body, on the RPC lane', async () => {
+    mockSendRpc.mockResolvedValue({ value: true });
+
+    const res = await wait({ selector: '#main', text: 'Done', surfaceId: 's1' });
+
+    expect(res.isError).toBeUndefined();
+    expect(res.content[0].text).toContain('text "Done" found in "#main"');
+    const [method, params] = mockSendRpc.mock.calls[0] as [string, { expression: string }];
+    expect(method).toBe('browser.evaluate');
+    expect(params.expression).toContain('document.querySelector("#main")');
+    expect(params.expression).toContain('"Done"');
+    // The sidebar copy of the word lives in body.innerText; the scoped wait
+    // must not consult it at all.
+    expect(params.expression).not.toContain('document.body');
+  });
+
+  it('keeps waiting while the scope exists but does not hold the text', async () => {
+    mockSendRpc.mockResolvedValue({ value: false });
+
+    const res = await wait({ selector: '#main', text: 'Done', timeout: 120 });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('waiting for text "Done" in "#main"');
+  });
+
+  it('records the scoped wait with both the selector and the text', async () => {
+    const actionRing = new ActionRing();
+    const tools = new Map<string, ToolHandler>();
+    registerWaitTools(
+      { registerTool: (name: string, _c: unknown, h: ToolHandler) => { tools.set(name, h); } } as never,
+      { ...browserToolDeps, actionRing } as never,
+      { profile: 'full', context: { principal: { kind: 'unattributed' } } },
+    );
+    const handler = tools.get('browser_wait');
+    if (!handler) throw new Error('browser_wait failed to register');
+
+    // Recording happens on the Playwright lane only (the RPC lane has no page
+    // to key a urlKey off), so drive that lane.
+    getPage.mockResolvedValue({
+      url: () => 'https://example.com/app',
+      waitForSelector: async () => undefined,
+      // waitForIsolated goes through evaluateIsolated, which needs CDP; the
+      // fallback inside it resolves through page.evaluate on a plain double.
+      evaluate: async () => true,
+      context: () => ({ newCDPSession: async () => { throw new Error('no cdp'); } }),
+    });
+    await handler({ selector: '#main', text: 'Done', timeout: 5000 });
+
+    const steps = actionRing.all();
+    expect(steps).toHaveLength(1);
+    expect(steps[0].step.args).toEqual({ timeout: 5000, selector: '#main', text: 'Done' });
   });
 });

@@ -31,12 +31,13 @@ let savedHome: string | undefined;
 let savedKillSwitch: string | undefined;
 
 function writeDaemonToken(value = 'daemon-token'): void {
-  mkdirSync(path.join(fakeHome, '.wmux'), { recursive: true });
-  writeFileSync(path.join(fakeHome, '.wmux', 'daemon-auth-token'), `${value}\n`, 'utf8');
+  const dir = path.join(fakeHome, `.wmux${process.env.WMUX_DATA_SUFFIX || ''}`);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'daemon-auth-token'), `${value}\n`, 'utf8');
 }
 
 function writeMainToken(value = 'main-token'): void {
-  writeFileSync(path.join(fakeHome, '.wmux-auth-token'), `${value}\n`, 'utf8');
+  writeFileSync(path.join(fakeHome, `.wmux${process.env.WMUX_DATA_SUFFIX || ''}-auth-token`), `${value}\n`, 'utf8');
 }
 
 beforeAll(async () => {
@@ -113,7 +114,7 @@ describe('resolveTargets', () => {
     // The daemon renames itself on a zombie-pipe fallback, so the hint file is
     // the only place the name it ACTUALLY bound shows up.
     writeDaemonToken();
-    writeFileSync(path.join(fakeHome, '.wmux', 'daemon-pipe'), '\\\\.\\pipe\\wmux-daemon-renamed-1\n', 'utf8');
+    writeFileSync(path.join(fakeHome, `.wmux${process.env.WMUX_DATA_SUFFIX || ''}`, 'daemon-pipe'), '\\\\.\\pipe\\wmux-daemon-renamed-1\n', 'utf8');
     expect(resolveTargets()[0].pipe).toBe('\\\\.\\pipe\\wmux-daemon-renamed-1');
   });
 
@@ -127,7 +128,7 @@ describe('resolveTargets', () => {
     if (process.platform === 'win32') {
       expect(derived).toMatch(/^\\\\\.\\pipe\\wmux-daemon-/);
     } else {
-      expect(derived).toBe(path.join(fakeHome, '.wmux', 'daemon.sock'));
+      expect(derived).toBe(path.join(fakeHome, `.wmux${process.env.WMUX_DATA_SUFFIX || ''}`, 'daemon.sock'));
     }
   });
 });

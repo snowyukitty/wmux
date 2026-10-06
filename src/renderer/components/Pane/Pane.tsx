@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useState, useMemo, useRef } from 'react';
 import { Panel, Group, Separator } from 'react-resizable-panels';
 import type { PaneLeaf, Workspace } from '../../../shared/types';
 import { maybeDelegateExternalBrowser } from '../../utils/browserPaneActions';
@@ -10,19 +10,33 @@ import { useIpc } from '../../hooks/useIpc';
 import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
 import TerminalComponent from '../Terminal/Terminal';
+import { ChatV2Overlay, useChatSurfaceView } from '../ChatV2/ChatSurface';
+import { forgetChatV2Pane, usePaneChatV2Binding } from '../ChatV2/useChatV2';
 import BrowserPanel from '../Browser/BrowserPanel';
 import EditorPanel from '../Editor/EditorPanel';
 import DiffPanel from '../Diff/DiffPanel';
 import RemotePaneSurface from '../Remote/RemotePaneSurface';
 import AddRemotePaneModal from '../Remote/AddRemotePaneModal';
-import SurfaceTabs, { paneClusterWidth, paneActionsMode, type PaneActionsMode } from './SurfaceTabs';
+import SurfacePlaceholder from './SurfacePlaceholder';
+import SurfaceTabs, {
+  paneClusterWidth,
+  paneActionsMode,
+  paneHeaderExtraChromeWidth,
+  PANE_ACTIONS_MIN_PANE_WIDTH,
+  USAGE_LIMIT_CHIP_FULL_WIDTH,
+  isTerminalSurfaceType,
+  showsEnforcedModelBadge,
+  type PaneActionsMode,
+} from './SurfaceTabs';
+import { PANE_CORNER_GUTTER } from './paneChrome';
 import { useElementWidth } from '../../hooks/useElementWidth';
 import { ErrorBoundary } from '../ErrorBoundary';
 import { agentSupportsPermissionFlag, permissionFlagFor, resumeGrammarFor } from '../../../shared/agentResume';
-import { applyRoleBinding, bindingEnforcesModel, type RoleBinding } from '../../../shared/orchestratorRole';
+import { applyRoleBinding, type RoleBinding } from '../../../shared/orchestratorRole';
 import { ResumeInfoChipGate } from './ResumeInfoChip';
 import { tokenAttrs } from '../../themes';
 import PaneDecorations from '../../plugins/PaneDecorations';
+import { isRemoteMirrorVisible } from '../../stores/slices/remoteWorkspacesSlice';
 
 interface PaneProps {
   pane: PaneLeaf;
@@ -91,65 +105,6 @@ export function composePaneClassName(opts: {
   return classes.join(' ');
 }
 
-/** D2 — only a terminal surface can launch an agent, so only a terminal surface
- *  may claim a role-enforced model. An undefined `surfaceType` is a legacy
- *  terminal (the field postdates the original Surface shape). */
-export function isTerminalSurfaceType(surfaceType: string | undefined): boolean {
-  return surfaceType === undefined || surfaceType === 'terminal';
-}
-
-/**
- * D2 — may this pane display a "role-enforced launch" model badge?
- *
- * Both halves are load-bearing and neither is obvious at the call site, which is
- * why this is a named predicate rather than an inline `&&`:
- *  - the binding must REALLY inject the model (bindingEnforcesModel). A
- *    model-only binding, or one naming an agent whose `--model` grammar wmux has
- *    not verified, is stored and shown in Settings but never applied — badging it
- *    would tell the operator a pane is pinned to a model while the launch goes
- *    out on the default.
- *  - the surface must be a terminal, since nothing else launches an agent.
- */
-export function showsEnforcedModelBadge(opts: {
-  binding: RoleBinding | undefined;
-  surfaceType: string | undefined;
-}): boolean {
-  return bindingEnforcesModel(opts.binding) && isTerminalSurfaceType(opts.surfaceType);
-}
-
-/**
- * D2 — the `right` offset at which the enforced-model badge can sit without
- * covering the pane's top-right controls, which are all absolutely positioned
- * at `top: 4` with `zIndex: 20`:
- *   - cluster `full`     → SurfaceTabs owns the strip (PANE_ACTIONS_CLUSTER_WIDTH),
- *     with the supervision badge parked just left of it.
- *   - cluster `overflow` → the same, 31px wide (the ⋮ trigger alone).
- *   - cluster `none`     → the zoom (`right: 6`) or maximize button takes the
- *     corner, and the supervision badge sits at 6 (un-zoomed, pushing maximize
- *     out to 32) or 54 (zoomed).
- * The badge lands past whichever of those is rightmost. Pure so the arithmetic
- * is testable without a DOM — the same reason composePaneClassName is extracted.
- */
-export function enforcedModelBadgeOffset(opts: {
-  mode: PaneActionsMode;
-  isZoomed: boolean;
-  supervised: boolean;
-}): number {
-  const { mode, isZoomed, supervised } = opts;
-  /** Rendered width of the supervision badge (10px glyph + 6px side padding). */
-  const SUPERVISION_W = 28;
-  /** Rendered width of a corner icon button plus its 6px gutter. */
-  const CORNER_BTN_W = 26;
-  const cluster = paneClusterWidth({ mode });
-  if (cluster > 0) {
-    return cluster + 6 + (supervised ? SUPERVISION_W : 0);
-  }
-  if (!supervised) return 6 + CORNER_BTN_W;
-  // Supervised: zoom sits at 6 and supervision at 54, else supervision at 6 and
-  // maximize at 32.
-  return isZoomed ? 54 + SUPERVISION_W : 32 + CORNER_BTN_W + 4;
-}
-
 /**
  * Choose which terminal and which browser surface is SHOWN on each side of the
  * terminal+browser split (`SplitSurfaceView` hasBoth). Both sides are laid out
@@ -186,7 +141,9 @@ export function pickOverlaySurfaces<T extends { surfaceType?: string }>(
   surfaces: ReadonlyArray<T>,
 ): T[] {
   return surfaces.filter(
-    (s) => s.surfaceType === 'diff' || s.surfaceType === 'editor' || s.surfaceType === 'remote-terminal',
+    (s) =>
+      s.surfaceType === 'diff' || s.surfaceType === 'editor' || s.surfaceType === 'remote-terminal'
+      || s.surfaceType === 'placeholder',
   );
 }
 
@@ -271,8 +228,12 @@ export function planRecoveryPillType(args: {
   // Re-assert the bound model on a launcher-prefixed line. The stage-2
   // continuation is NOT launcher-prefixed, so it is typed verbatim (the model
   // already rode the stage-0 base) — matching input.send / buildPaneResumeCommand.
+  // With the skip toggle offered (Claude) and OFF, the user's explicit choice
+  // wins over the role's skipPermissions: the role's skip flag is withheld (and
+  // dropped from the role's args, #1681) so the restored mode is what runs. forceSkip is exactly `canSkip && toggle`.
+  const toggledOff = !forceSkip && agentSupportsPermissionFlag(launcher);
   const rewrite = (cmd: string): { text: string; rewritten: boolean } => {
-    const r = applyRoleBinding(cmd, roleBinding);
+    const r = applyRoleBinding(cmd, roleBinding, { suppressSkipPermissions: toggledOff });
     return { text: r.command, rewritten: r.changed };
   };
   const resumeArg = sessionId ? grammar.withId(sessionId) : grammar.fallback;
@@ -358,7 +319,14 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   const activeSurfaceStatus = useStore((s) =>
     activeSurfacePtyId ? s.surfaceAgentStatus[activeSurfacePtyId] : undefined,
   );
-  const completeBlink = !isActive && !!activeSurfaceStatus;
+  const activePendingQuestion = useStore((s) =>
+    activeSurfacePtyId ? s.surfacePendingQuestion[activeSurfacePtyId] : undefined,
+  );
+  const markSurfaceQuestionSeen = useStore((s) => s.markSurfaceQuestionSeen);
+  // A turn that died on a usage limit is waited out, not flagged: no blink
+  // while the hold stands (shared/usageLimit).
+  const activeUsageWaiting = useStore((s) => !!activeSurfacePtyId && s.usageLimitWaiting[activeSurfacePtyId] === true);
+  const completeBlink = !isActive && !!activeSurfaceStatus && !(activeUsageWaiting && activeSurfaceStatus === 'error');
 
   // Clear the attention status once the user is actually on the pane (covers
   // both "navigated to a blinking pane" and "agent finished while I was
@@ -369,6 +337,21 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
       setSurfaceAgentStatus(activeSurfacePtyId, null);
     }
   }, [isActive, activeSurfacePtyId, activeSurfaceStatus, setSurfaceAgentStatus]);
+
+  // #1176 — focusing a BLOCKED pane marks its question as seen. The question
+  // itself survives (the agent is still blocked — looking does not answer it);
+  // only the roster's animated glow drops, separating triaged from untriaged
+  // blocked agents. Same placement as the attention clear above so keyboard
+  // nav marks it seen too. Not while a REMOTE workspace is selected: that view
+  // hides the local area (WorkspaceCenter, display:none) without touching
+  // activeWorkspaceId, so this pane still reports isActive while nobody can
+  // see it — a question arriving then must stay unseen.
+  const remoteSelected = useStore(isRemoteMirrorVisible);
+  useEffect(() => {
+    if (isActive && !remoteSelected && activeSurfacePtyId && activePendingQuestion) {
+      markSurfaceQuestionSeen(activeSurfacePtyId);
+    }
+  }, [isActive, remoteSelected, activeSurfacePtyId, activePendingQuestion, markSurfaceQuestionSeen]);
 
   // Ctrl+Shift+H: flash the active pane
   useEffect(() => {
@@ -486,7 +469,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     setAddRemoteModalOpen(true);
   }, [remoteSplitBlockedAtCap]);
 
-  const handleRemoteCreated = useCallback((hostId: string, sessionId: string) => {
+  const handleRemoteCreated = useCallback((hostId: string, sessionId: string, remoteWorkspaceId: string) => {
     const direction = remoteSplitDirectionRef.current;
     remoteSplitDirectionRef.current = null;
     // splitPane (when direction is set) creates an EMPTY leaf; EmptyLeafFunnel
@@ -503,7 +486,11 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
       // owned: true — AddRemotePaneModal MINTED this session (and the one-shot
       // `remote-pane-*` workspace row derived from it), so this tab is what has
       // to destroy it on close (#1129). Nothing else on the host ever will.
-      addRemoteSurface(targetPaneId, hostId, sessionId, undefined, undefined, workspace.id, true);
+      // #1329 — the LAST argument is the workspace the session lives in ON THE
+      // HOST (not `workspace.id`, this desk's local one). It is what
+      // useRemoteAttachmentsLifecycle polls `/api/workspaces` for, and without
+      // it the pane's agent is invisible to the sidebar roster and pane_list.
+      addRemoteSurface(targetPaneId, hostId, sessionId, undefined, undefined, workspace.id, true, remoteWorkspaceId);
       // splitPane seeded an inherited cwd for the fresh leaf so a terminal
       // funnel could start a shell there; a remote leaf never goes through
       // that funnel, so the seed would sit until the pane closes — and replay
@@ -531,6 +518,9 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   // below are then redundant AND overlap the cluster, so they render only when
   // the cluster is absent. Subscribe the same way SurfaceTabs does.
   const paneActionsSetting = useStore((s) => s.paneActionsVisible);
+  const chatViewEnabled = useStore((s) => s.chatViewEnabled);
+  // Browser mirror (wmux web /app): no split/stash/zoom cluster or corner zoom.
+  const readOnly = useStore((s) => s.readOnly);
   // #977 follow-up — width-based collapse. The cluster is fixed-width and
   // shrink-0, so on a narrow pane every pixel it takes comes out of the tab
   // strip, which is flex-1 min-w-0 and therefore collapses to NOTHING: at
@@ -539,24 +529,42 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   // vertical menu — and the ⋮ persists to ANY width (the strip scrolls, and
   // the menu holds the ways out of a pane that narrow: zoom, stash). 'none'
   // is the Settings toggle's mode, never a width verdict.
+  // D2 — this pane's enforced role→model binding (if its role is bound). Threaded
+  // into the resume chip so a reconstructed resume command re-asserts the model
+  // flag (a naive resume rebuilds from the agent stem alone and would drop it).
+  const paneRoleName = useStore((s) => s.paneRole[pane.id]);
+  const paneRoleBinding = useStore((s) =>
+    paneRoleName ? s.orchestratorRoleBindings[paneRoleName] : undefined,
+  );
   const [paneRootRef, paneWidth] = useElementWidth<HTMLDivElement>();
-  const actionsMode: PaneActionsMode = paneActionsSetting
-    ? paneActionsMode(paneWidth)
+  // What the header carries BESIDES the cluster counts against the same width,
+  // so the collapse threshold has to know about it (see
+  // paneHeaderExtraChromeWidth). Both of these gate on the ACTIVE surface being
+  // a terminal, which is the same condition SurfaceTabs draws them under.
+  const activeSurfaceType = pane.surfaces.find((s) => s.id === pane.activeSurfaceId)?.surfaceType;
+  const hasUsageLimit = useStore((s) => !!activeSurfacePtyId && !!s.usageLimits[activeSurfacePtyId]);
+  const headerExtraChrome = paneHeaderExtraChromeWidth({
+    chatToggle: chatViewEnabled && isTerminalSurfaceType(activeSurfaceType),
+    enforcedModelBadge: showsEnforcedModelBadge({
+      binding: paneRoleBinding,
+      surfaceType: activeSurfaceType,
+    }),
+    usageLimitChip: hasUsageLimit,
+  });
+  const actionsMode: PaneActionsMode = paneActionsSetting && !readOnly
+    ? paneActionsMode(paneWidth, headerExtraChrome)
     : 'none';
+  // The full usage-limit chip needs room beyond the compact floor counted above.
+  const usageLimitCompact = hasUsageLimit && paneWidth != null && paneWidth > 0
+    && paneWidth < PANE_ACTIONS_MIN_PANE_WIDTH + headerExtraChrome + USAGE_LIMIT_CHIP_FULL_WIDTH;
 
-  // X8 supervision badge. Resolve the pane's active-surface ptyId → supervision
-  // slice. `⟳` when armed (auto-restarting); `⟳!` in a warning colour when the
-  // runaway guard tripped and stopped it. Absent for unsupervised panes. As
-  // light as the ZOOM badge — no extra component.
+  // X8 supervision. Resolve the pane's active-surface ptyId → supervision
+  // slice. The ⟳ badge itself is drawn by SurfaceTabs (it belongs to the header
+  // strip's layout); what is left here is the resume pill's gate — a supervised
+  // pane restarts itself, so it is never offered a manual resume.
   const supervision = useStore((s) =>
     activeSurfacePtyId ? s.supervisionByPtyId[activeSurfacePtyId] : undefined,
   );
-
-  const enforcedModelBadgeRight = enforcedModelBadgeOffset({
-    mode: actionsMode,
-    isZoomed,
-    supervised: !!supervision,
-  });
 
   // X6 ②/③ resume pill. A pane recovered-this-boot that was running an agent
   // gets a resume offer. Clickable only once the pane is interactive (first PTY
@@ -575,17 +583,11 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   const resumePtyReady = useStore((s) =>
     activeSurfacePtyId ? !!s.ptyReadyByPtyId[activeSurfacePtyId] : false,
   );
-  // D2 — this pane's enforced role→model binding (if its role is bound). Threaded
-  // into the resume chip so a reconstructed resume command re-asserts the model
-  // flag (a naive resume rebuilds from the agent stem alone and would drop it).
-  const paneRoleName = useStore((s) => s.paneRole[pane.id]);
-  const paneRoleBinding = useStore((s) =>
-    paneRoleName ? s.orchestratorRoleBindings[paneRoleName] : undefined,
-  );
-  const showsEnforcedModel = showsEnforcedModelBadge({
-    binding: paneRoleBinding,
-    surfaceType: pane.surfaces.find((s) => s.id === pane.activeSurfaceId)?.surfaceType,
-  });
+  // A chat-v2 conversation that still owns this pane (not handed off) must not
+  // be offered for resume in the anchor shell: that would put a second writer
+  // on the same conversation. Asked only for panes that offer a resume.
+  const chatV2Binding = usePaneChatV2Binding(activeSurfacePtyId || undefined, !!resumeBinding || !!resumeHint);
+  const chatV2OwnsPane = !!chatV2Binding && chatV2Binding.status !== 'handed-off';
   // The persistent resume chip's "is this pane's agent busy?" gate — and the
   // store-wide `agentClockMs` decay-clock subscription it needs — lives in the
   // <ResumeInfoChipGate> leaf below, NOT here: Pane mounts that leaf only when a
@@ -641,7 +643,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
         // shorthand and non-shorthand" dev warning firing on re-render.
         borderStyle: 'solid',
         borderColor: isActive ? 'var(--bg-overlay)' : 'var(--border-soft)',
-        // No TOP border: it sat redundantly under the 36px titlebar's own bottom
+        // No TOP border: it sat redundantly under the 40px titlebar's own bottom
         // hairline (a double line) AND pushed the tab strip down 1px, so the
         // pane's bottom-hairline seam landed 1px below the deck tabs' — the
         // "the top line doesn't connect" report. Content now starts at the
@@ -668,7 +670,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
       <ErrorBoundary name="pane">
       {/* Plugin badges (B-1 ui.pane-decoration) — host-rendered data only */}
       <PaneDecorations paneId={pane.id} />
-      {actionsMode === 'none' && isZoomed && (
+      {actionsMode === 'none' && isZoomed && !readOnly && (
         <button
           onClick={(e) => {
             e.stopPropagation();
@@ -679,7 +681,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
           style={{
             position: 'absolute',
             top: 4,
-            right: 6,
+            right: PANE_CORNER_GUTTER,
             zIndex: 20,
             padding: '0 5px',
             height: 16,
@@ -700,7 +702,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
           button (hover-revealed via .wmux-pane-maximize-btn in globals.css) so
           the zoom feature isn't keyboard-only. Clicking it zooms the pane; once
           zoomed, the always-visible ZOOM badge above takes over as the toggle. */}
-      {actionsMode === 'none' && !isZoomed && (
+      {actionsMode === 'none' && !isZoomed && !readOnly && (
         <button
           className="wmux-pane-maximize-btn"
           onClick={(e) => {
@@ -712,9 +714,9 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
           style={{
             position: 'absolute',
             top: 4,
-            // Sit left of the supervision badge when present (it owns right:6 on
-            // an un-zoomed pane); otherwise take the corner.
-            right: supervision ? 32 : 6,
+            // The corner is unconditional now: the supervision badge that used
+            // to own right:6 is laid out in the header strip (SurfaceTabs).
+            right: PANE_CORNER_GUTTER,
             zIndex: 20,
             padding: '0 5px',
             height: 16,
@@ -731,51 +733,76 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
           ⤢
         </button>
       )}
-      {supervision && (
-        <span
-          title={
-            supervision.status === 'stopped'
-              ? t('supervision.stoppedTooltip')
-              : t('supervision.armedTooltip', { count: supervision.restartCount })
-          }
-          aria-label={
-            supervision.status === 'stopped'
-              ? t('supervision.stoppedTooltip')
-              : t('supervision.armedTooltip', { count: supervision.restartCount })
-          }
+      {/* Persistent per-pane resume affordance — shown whenever this agent pane
+          carries a captured conversation binding but is NOT in the reboot-
+          recovery pill flow above (the pill takes precedence right after a
+          reboot). Reveals the conversation UUID and types the exact resume
+          command into this pane on 복구. */}
+      {resumeBinding && !resumeHint && activeSurfacePtyId && !chatV2OwnsPane && (
+        <ResumeInfoChipGate
+          ptyId={activeSurfacePtyId}
+          binding={resumeBinding}
+          roleBinding={paneRoleBinding}
+          role={paneRoleName}
+          paneCwds={[
+            pane.surfaces.find((s) => s.id === pane.activeSurfaceId)?.cwd,
+            workspace.metadata?.cwd,
+          ]}
+        />
+      )}
+      {/* #645 — drop indicator. Drawn by the pane being hovered, not by the
+          one being dragged, so it lands in the right coordinate space with no
+          overlay layer. Steel accent (navigation), a thin edge line, no wash —
+          DESIGN.md's two-accent grammar reserves amber for alive/attention. */}
+      {dropIndicator && (
+        <div
+          data-pane-drop-indicator={dropIndicator}
           style={{
             position: 'absolute',
-            top: 4,
-            // When the action cluster is shown it owns the strip's top-right, so
-            // anchor the badge just left of it (cluster width + a small gap) to
-            // avoid overlap — using the exported constant beside the cluster
-            // rather than a hardcoded pixel guess. Cluster-off keeps the prior
-            // behaviour: sit left of the ZOOM badge when both are present.
-            right: paneClusterWidth({ mode: actionsMode }) > 0
-              ? paneClusterWidth({ mode: actionsMode }) + 6
-              : isZoomed
-                ? 54
-                : 6,
-            zIndex: 20,
-            padding: '1px 6px',
-            fontSize: 10,
-            fontFamily: 'ui-monospace, monospace',
-            fontWeight: 700,
-            letterSpacing: '0.04em',
-            color: supervision.status === 'stopped' ? 'var(--bg-main)' : 'var(--text-muted)',
-            backgroundColor:
-              supervision.status === 'stopped' ? 'var(--accent-red)' : 'var(--bg-overlay)',
-            border: 'none',
-            borderRadius: 3,
-            opacity: 0.85,
+            zIndex: 30,
             pointerEvents: 'none',
-            userSelect: 'none',
+            transition: 'all 120ms ease-out',
+            ...(dropIndicator === 'swap'
+              ? {
+                  // A swap has no edge, so outline the whole pane instead.
+                  inset: 0,
+                  border: '2px solid var(--accent-blue)',
+                }
+              : dropIndicator === 'left' || dropIndicator === 'right'
+                ? { backgroundColor: 'var(--accent-blue)', top: 0, bottom: 0, width: 2, [dropIndicator]: 0 }
+                : { backgroundColor: 'var(--accent-blue)', left: 0, right: 0, height: 2, [dropIndicator]: 0 }),
           }}
-        >
-          {supervision.status === 'stopped' ? '⟳!' : '⟳'}
-        </span>
+        />
       )}
-      {resumeHint && resumePtyReady && !supervision && activeSurfacePtyId && (() => {
+
+      <SurfaceTabs
+        surfaces={pane.surfaces}
+        activeSurfaceId={pane.activeSurfaceId}
+        workspace={workspace}
+        paneId={pane.id}
+        paneActive={isActive}
+        actionsMode={actionsMode}
+        usageLimitCompact={usageLimitCompact}
+        onSelect={(surfaceId) => setActiveSurface(pane.id, surfaceId)}
+        onClose={handleCloseSurface}
+        onSplitHorizontal={handleSplitHorizontal}
+        onSplitVertical={handleSplitVertical}
+        onAddTerminal={handleAddTerminal}
+        onAddBrowser={handleAddBrowser}
+        onAddRemote={handleAddRemote}
+        onSplitHorizontalRemote={handleSplitRemoteHorizontal}
+        onSplitVerticalRemote={handleSplitRemoteVertical}
+      />
+      {/* #1464 — the reboot-recovery resume pill gets its own row under the
+          tab strip while the offer stands. It used to float over the pane
+          top-left, covering the tab title and the first terminal row (the
+          row it types the resume command into); the strip itself has no
+          room for it on a narrow pane.
+          The row is laid out from the moment the hint exists, NOT from
+          resumePtyReady: it then takes its height before the recovered pane's
+          first fit instead of shrinking the terminal (a resize, a SIGWINCH)
+          once the pane is live. Only the button waits for readiness. */}
+      {resumeHint && !supervision && activeSurfacePtyId && !chatV2OwnsPane && (() => {
         const ptyId = activeSurfacePtyId;
         const launcher = resumeHint; // slug doubles as the launcher stem ('claude'/'codex')
         const agentName = launcher.charAt(0).toUpperCase() + launcher.slice(1);
@@ -832,6 +859,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
 
         const onPrimary = (e: React.MouseEvent) => {
           e.stopPropagation();
+          if (!resumePtyReady) return; // EI6: the recovered pipe is not writable yet
           // Assemble the exact string to type — with the role's bound model
           // re-asserted on the launcher-prefixed variants (mirrors the chip and
           // the input.send path). The permission-restore (click 1) / exact-resume
@@ -872,14 +900,21 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
           <span
             onClick={(e) => e.stopPropagation()}
             style={{
-              position: 'absolute',
-              top: 4,
-              left: 6,
-              zIndex: 20,
-              display: 'inline-flex',
-              flexDirection: 'column',
-              alignItems: 'flex-start',
-              gap: 4,
+              // Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/app/shell/TitleBar.tsx), MIT License, Copyright (c) 2026 Nick
+              // A 40px chrome-module row in flow, so the terminal below gives up
+              // the height instead of being drawn over. On a narrow pane the
+              // checkbox label ellipsizes; the button never shrinks.
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              flexShrink: 0,
+              height: 40,
+              minWidth: 0,
+              padding: '0 8px',
+              overflow: 'hidden',
+              backgroundColor: 'var(--bg-mantle)',
+              borderBottom: '1px solid var(--border-soft)',
+              boxSizing: 'border-box',
               fontSize: 10,
               fontFamily: 'ui-monospace, monospace',
               fontWeight: 600,
@@ -892,6 +927,8 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
             {canSkip && (
               <label
                 onClick={(e) => e.stopPropagation()}
+                // The flag ellipsizes on a narrow pane; keep it readable on hover.
+                title="--dangerously-skip-permissions"
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -901,9 +938,11 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
                   color: 'var(--text-sub)',
                   backgroundColor: 'var(--bg-surface)',
                   border: '1px solid var(--border-soft)',
-                  borderRadius: 4,
-                  padding: '1px 6px',
-                  boxShadow: 'var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.25))',
+                  borderRadius: 6,
+                  padding: '0 6px',
+                  height: 24,
+                  boxSizing: 'border-box',
+                  minWidth: 0,
                   userSelect: 'none',
                 }}
               >
@@ -911,9 +950,9 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
                   type="checkbox"
                   checked={resumeSkipPermissions}
                   onChange={(e) => setResumeSkipPermissions(e.target.checked)}
-                  style={{ accentColor: 'var(--accent-cursor)', cursor: 'pointer', margin: 0 }}
+                  style={{ accentColor: 'var(--accent-cursor)', cursor: 'pointer', margin: 0, flexShrink: 0 }}
                 />
-                <span>--dangerously-skip-permissions</span>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>--dangerously-skip-permissions</span>
               </label>
             )}
             {/* Button pill — DESIGN.md: amber never FILLS an area — neutral surface
@@ -926,13 +965,16 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
                 color: 'var(--text-main)',
                 backgroundColor: 'var(--bg-surface)',
                 border: '1px solid color-mix(in srgb, var(--accent-cursor) 55%, transparent)',
-                borderRadius: 4,
-                boxShadow: 'var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.25))',
+                borderRadius: 6,
+                height: 24,
+                boxSizing: 'border-box',
+                flexShrink: 0,
                 overflow: 'hidden',
               }}
             >
             <button
               onClick={onPrimary}
+              disabled={!resumePtyReady}
               title={primaryTooltip}
               aria-label={primaryTooltip}
               style={{
@@ -941,7 +983,8 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
                 color: 'inherit',
                 background: 'none',
                 border: 'none',
-                cursor: 'pointer',
+                cursor: resumePtyReady ? 'pointer' : 'default',
+                opacity: resumePtyReady ? 1 : 0.5,
               }}
             >
               {primaryLabel}
@@ -969,101 +1012,6 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
           </span>
         );
       })()}
-      {/* Persistent per-pane resume affordance — shown whenever this agent pane
-          carries a captured conversation binding but is NOT in the reboot-
-          recovery pill flow above (the pill takes precedence right after a
-          reboot). Reveals the conversation UUID and types the exact resume
-          command into this pane on 복구. */}
-      {resumeBinding && !resumeHint && activeSurfacePtyId && (
-        <ResumeInfoChipGate
-          ptyId={activeSurfacePtyId}
-          binding={resumeBinding}
-          roleBinding={paneRoleBinding}
-          role={paneRoleName}
-          paneCwds={[
-            pane.surfaces.find((s) => s.id === pane.activeSurfaceId)?.cwd,
-            workspace.metadata?.cwd,
-          ]}
-        />
-      )}
-      {/* D2 — muted enforced-model badge on a role-bound TERMINAL pane. Amber
-          stays reserved for alive+focus (DESIGN.md), so this rides the sub
-          tones. A browser/diff/editor surface never launches an agent, so the
-          badge would be a lie there — hence the surface-type gate, and the
-          enforceability gate beside it (see showsEnforcedModel). */}
-      {showsEnforcedModel && paneRoleBinding && (
-        <span
-          data-pane-enforced-model
-          title={t('pane.enforcedLaunch', {
-            binding: [paneRoleBinding.agent, paneRoleBinding.model].filter(Boolean).join(' · '),
-          })}
-          style={{
-            position: 'absolute',
-            top: 4,
-            // The pane's top-right is a stack of absolutely-positioned controls
-            // (zoom/maximize, the supervision badge, or SurfaceTabs' own action
-            // cluster). Anchor past whatever is present — the same approach the
-            // supervision badge above uses — so this never covers a button.
-            right: enforcedModelBadgeRight,
-            zIndex: 20,
-            padding: '0 5px',
-            fontSize: 10,
-            lineHeight: '16px',
-            fontFamily: 'ui-monospace, monospace',
-            letterSpacing: '0.02em',
-            color: 'var(--text-muted)',
-            backgroundColor: 'var(--bg-surface)',
-            border: '1px solid var(--border-soft)',
-            borderRadius: 3,
-            pointerEvents: 'none',
-            userSelect: 'none',
-          }}
-        >
-          {paneRoleBinding.model}
-        </span>
-      )}
-      {/* #645 — drop indicator. Drawn by the pane being hovered, not by the
-          one being dragged, so it lands in the right coordinate space with no
-          overlay layer. Steel accent (navigation), a thin edge line, no wash —
-          DESIGN.md's two-accent grammar reserves amber for alive/attention. */}
-      {dropIndicator && (
-        <div
-          data-pane-drop-indicator={dropIndicator}
-          style={{
-            position: 'absolute',
-            zIndex: 30,
-            pointerEvents: 'none',
-            transition: 'all 120ms ease-out',
-            ...(dropIndicator === 'swap'
-              ? {
-                  // A swap has no edge, so outline the whole pane instead.
-                  inset: 0,
-                  border: '2px solid var(--accent-blue)',
-                }
-              : dropIndicator === 'left' || dropIndicator === 'right'
-                ? { backgroundColor: 'var(--accent-blue)', top: 0, bottom: 0, width: 2, [dropIndicator]: 0 }
-                : { backgroundColor: 'var(--accent-blue)', left: 0, right: 0, height: 2, [dropIndicator]: 0 }),
-          }}
-        />
-      )}
-
-      <SurfaceTabs
-        surfaces={pane.surfaces}
-        activeSurfaceId={pane.activeSurfaceId}
-        workspace={workspace}
-        paneId={pane.id}
-        paneActive={isActive}
-        actionsMode={actionsMode}
-        onSelect={(surfaceId) => setActiveSurface(pane.id, surfaceId)}
-        onClose={handleCloseSurface}
-        onSplitHorizontal={handleSplitHorizontal}
-        onSplitVertical={handleSplitVertical}
-        onAddTerminal={handleAddTerminal}
-        onAddBrowser={handleAddBrowser}
-        onAddRemote={handleAddRemote}
-        onSplitHorizontalRemote={handleSplitRemoteHorizontal}
-        onSplitVerticalRemote={handleSplitRemoteVertical}
-      />
       {addRemoteModalOpen && (
         <AddRemotePaneModal
           onClose={() => setAddRemoteModalOpen(false)}
@@ -1100,6 +1048,56 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   );
 }
 
+/**
+ * A terminal surface and, in Chat view, the chat it shows. Chat v2 lays its
+ * view over the anchor terminal and makes the terminal inert, so keys typed
+ * into the chat never reach the shell; the terminal-projection chat stays
+ * inside Terminal. Choosing a view never creates a PTY.
+ */
+function TerminalSurface({ surface, paneId, chatViewEnabled, isActive, visible, isWorkspaceVisible, onPtyCreated, workspaceId }: {
+  surface: PaneLeaf['surfaces'][number];
+  paneId: string;
+  chatViewEnabled: boolean;
+  isActive: boolean;
+  visible?: boolean;
+  isWorkspaceVisible: boolean;
+  onPtyCreated: (ptyId: string) => void;
+  workspaceId: string;
+}) {
+  const view = useChatSurfaceView(surface.ptyId || undefined, chatViewEnabled, surface.viewMode);
+  const chatV2 = view === 'chatv2';
+  const shown = visible ?? isActive;
+  // The covered terminal still renders its own search bar (above the chat) when
+  // the global find chord fires in this pane; chat v2 has its own find.
+  const coveredSearch = useStore((s) => chatV2 && isActive && s.searchBarVisible
+    && s.workspaces.find((w) => w.id === workspaceId)?.activePaneId === paneId);
+  useLayoutEffect(() => {
+    if (coveredSearch) useStore.getState().setSearchBarVisible(false);
+  }, [coveredSearch]);
+  // The surface closed (or its PTY was replaced): forget its chat drafts and binding.
+  const ptyId = surface.ptyId;
+  useEffect(() => () => { if (ptyId) forgetChatV2Pane(ptyId); }, [ptyId]);
+  return (
+    <>
+      <div style={{ display: 'contents' }} inert={chatV2 || undefined}>
+        <TerminalComponent
+          chatView={view === 'projection'}
+          ptyId={surface.ptyId || undefined}
+          cwd={surface.cwd || undefined}
+          isActive={isActive}
+          visible={visible}
+          isWorkspaceVisible={isWorkspaceVisible}
+          onPtyCreated={onPtyCreated}
+          scrollbackFile={surface.scrollbackFile}
+          workspaceId={workspaceId}
+          surfaceId={surface.id}
+        />
+      </div>
+      {chatV2 && shown && isWorkspaceVisible && surface.ptyId && <ChatV2Overlay ptyId={surface.ptyId} surfaceId={surface.id} cwd={surface.cwd} />}
+    </>
+  );
+}
+
 /** Renders surfaces with a resizable split when both terminals and browsers coexist */
 function SplitSurfaceView({
   pane,
@@ -1122,6 +1120,7 @@ function SplitSurfaceView({
   onPtyCreated: (surfaceId: string, ptyId: string) => void;
   emptyMessage: string;
 }) {
+  const chatViewEnabled = useStore((s) => s.chatViewEnabled);
   const terminals = useMemo(
     () => pane.surfaces.filter((s) => !s.surfaceType || s.surfaceType === 'terminal'),
     [pane.surfaces],
@@ -1187,6 +1186,13 @@ function SplitSurfaceView({
               surfaceId={surface.id}
               verifiedWorkspaceId={surface.diffOwnerWorkspaceId || workspaceId}
             />
+          ) : surface.surfaceType === 'placeholder' ? (
+            <SurfacePlaceholder
+              key={surface.id}
+              title={surface.title}
+              isActive={surface.id === activeSurfaceId}
+              surfaceId={surface.id}
+            />
           ) : surface.surfaceType === 'remote-terminal' ? (
             // #1086/#1091 — a remote session mirrored as an ordinary tab in a
             // LOCAL workspace's pane, not a whole separate "attached remote
@@ -1204,16 +1210,15 @@ function SplitSurfaceView({
               onTitleChange={updateRemoteSurfaceTitle}
             />
           ) : (
-            <TerminalComponent
+            <TerminalSurface
               key={surface.id}
-              ptyId={surface.ptyId || undefined}
-              cwd={surface.cwd || undefined}
+              surface={surface}
+              paneId={pane.id}
+              chatViewEnabled={chatViewEnabled}
               isActive={surface.id === activeSurfaceId}
               isWorkspaceVisible={isWorkspaceVisible}
               onPtyCreated={(ptyId) => onPtyCreated(surface.id, ptyId)}
-              scrollbackFile={surface.scrollbackFile}
               workspaceId={workspaceId}
-              surfaceId={surface.id}
             />
           ),
         )}
@@ -1237,17 +1242,16 @@ function SplitSurfaceView({
         <Panel defaultSize={50} minSize={20}>
           <div className="h-full w-full relative overflow-hidden">
             {terminals.map((surface) => (
-              <TerminalComponent
+              <TerminalSurface
                 key={surface.id}
-                ptyId={surface.ptyId || undefined}
-                cwd={surface.cwd || undefined}
+                surface={surface}
+                paneId={pane.id}
+                chatViewEnabled={chatViewEnabled}
                 isActive={surface.id === activeSurfaceId}
                 visible={surface.id === shownTerminalId}
                 isWorkspaceVisible={isWorkspaceVisible}
                 onPtyCreated={(ptyId) => onPtyCreated(surface.id, ptyId)}
-                scrollbackFile={surface.scrollbackFile}
                 workspaceId={workspaceId}
-                surfaceId={surface.id}
               />
             ))}
           </div>
@@ -1290,6 +1294,13 @@ function SplitSurfaceView({
             isActive={surface.id === activeSurfaceId}
             surfaceId={surface.id}
             verifiedWorkspaceId={surface.diffOwnerWorkspaceId || workspaceId}
+          />
+        ) : surface.surfaceType === 'placeholder' ? (
+          <SurfacePlaceholder
+            key={surface.id}
+            title={surface.title}
+            isActive={surface.id === activeSurfaceId}
+            surfaceId={surface.id}
           />
         ) : surface.surfaceType === 'remote-terminal' ? (
           // #1086/#1091, CodeRabbit round 1 — the hasBoth split previously

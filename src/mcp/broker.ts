@@ -48,6 +48,8 @@ interface ShimHandshake {
   /** Optional `--core` surface selection. Absent from a pre-core shim, which
    *  then gets the `full` default — a wider surface, never a narrower one. */
   coreMode?: boolean;
+  /** Optional `--role=<Role>` value; absent from an older shim (full surface). */
+  roleSurface?: string;
 }
 
 function readAuthToken(): string | undefined {
@@ -86,6 +88,7 @@ async function hostConnection(socket: net.Socket, handshake: ShimHandshake): Pro
       // on this path, not the agent host's, so record the requested flags here
       // too — otherwise a contradictory launch is invisible to the operator.
       `core=${handshake.coreMode ? 'yes' : 'no'} ` +
+      (typeof handshake.roleSurface === 'string' ? `role=${handshake.roleSurface.slice(0, 32)} ` : '') +
       `envHints=${handshake.envWorkspaceHint ? 'ws' : ''}${handshake.envPtyHint ? '+pty' : ''}`,
   );
 
@@ -104,6 +107,7 @@ async function hostConnection(socket: net.Socket, handshake: ShimHandshake): Pro
       commanderToken: handshake.commanderToken,
       commanderMode: handshake.commanderMode === true,
       coreMode: handshake.coreMode === true,
+      roleSurface: typeof handshake.roleSurface === 'string' ? handshake.roleSurface.slice(0, 32) : undefined,
       // Identity walks start at the SHIM's pid — it sits in the agent's
       // process tree exactly where the old full child sat, so both the
       // server-side walk (a2a.resolve.identity { callerPid }) and the

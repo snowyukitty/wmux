@@ -38,10 +38,14 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { checkTranscriptPath, claudeProjectRoots } from '../hooks/transcriptPathGuard';
+import { claudeProjectRoots } from '../hooks/transcriptPathGuard';
+import { watchTarget } from '../../shared/watchTarget';
 
 /** Only Claude Code publishes a transcript wmux can discover today. */
 export const DISCOVERABLE_AGENT = 'claude';
+export type DiscoverableAgent = 'claude' | 'codex';
+import { checkNativeTranscriptPath, codexSessionRoot } from './providers';
+const rootsFor = (agent: DiscoverableAgent, env?: Record<string, string>) => agent === 'codex' ? [codexSessionRoot(env)] : claudeProjectRoots(env);
 
 /**
  * Immediate subdirectories examined per root, per scan. A projects root holds
@@ -81,6 +85,7 @@ export interface TranscriptDiscoveryDeps {
    * it through the normal resume-binding path; this module never writes state.
    */
   onFound: (found: {
+    agent?: DiscoverableAgent;
     sessionId: string;
     agentSessionId: string;
     transcriptPath: string;
@@ -93,6 +98,7 @@ export interface TranscriptDiscoveryDeps {
 }
 
 interface SearchState {
+  agent: DiscoverableAgent;
   /** The id whose `<id>.jsonl` we are looking for. */
   agentSessionId: string;
   /** The pane cwd the SessionStart carried, replayed into the found binding. */
@@ -101,6 +107,8 @@ interface SearchState {
   poller: ReturnType<typeof setInterval> | null;
   debounce: ReturnType<typeof setTimeout> | null;
   deadline: ReturnType<typeof setTimeout> | null;
+  /** Per-search override of the default deadline. */
+  deadlineMs?: number;
 }
 
 /**
@@ -174,20 +182,22 @@ export class TranscriptDiscovery {
    * DIFFERENT id supersedes: that is a `/clear` or a fresh claude in the same
    * pane, and the previous session's file is no longer the one to adopt.
    */
-  start(sessionId: string, agentSessionId: string, cwd: string): void {
+  start(sessionId: string, agentSessionId: string, cwd: string, agent: DiscoverableAgent = 'claude', deadlineMs?: number): void {
     if (this.disposed || !sessionId || !agentSessionId) return;
     const existing = this.searches.get(sessionId);
     if (existing) {
-      if (existing.agentSessionId === agentSessionId) return;
+      if (existing.agentSessionId === agentSessionId && existing.agent === agent) return;
       this.stop(existing);
     }
     const state: SearchState = {
+      agent,
       agentSessionId,
       cwd,
       watchers: [],
       poller: null,
       debounce: null,
       deadline: null,
+      ...(deadlineMs !== undefined ? { deadlineMs } : {}),
     };
     this.searches.set(sessionId, state);
     // Usually a miss (SessionStart fires before the file exists), but a resumed
@@ -214,6 +224,12 @@ export class TranscriptDiscovery {
     this.searches.clear();
   }
 
+  /** The search still running for this pane, if any. */
+  pendingFor(sessionId: string): { agent: DiscoverableAgent; agentSessionId: string } | undefined {
+    const state = this.searches.get(sessionId);
+    return state ? { agent: state.agent, agentSessionId: state.agentSessionId } : undefined;
+  }
+
   /** Live search count — observability / tests only. */
   get activeCount(): number {
     return this.searches.size;
@@ -226,8 +242,8 @@ export class TranscriptDiscovery {
   /** Scan, validate, and (on success) finish the search. Returns true if done. */
   private tryAdopt(sessionId: string, state: SearchState): boolean {
     const env = this.deps.getSessionEnv?.(sessionId);
-    for (const candidate of scanForTranscript(state.agentSessionId, env)) {
-      const check = checkTranscriptPath(candidate, state.agentSessionId, env);
+    for (const candidate of (state.agent === 'codex' ? findCodexTranscriptCandidates(state.agentSessionId, env) : scanForTranscript(state.agentSessionId, env))) {
+      const check = checkNativeTranscriptPath(state.agent, candidate, state.agentSessionId, env);
       if (!check.ok) {
         // A same-named file reachable through the root but resolving OUTSIDE it
         // (a symlinked project directory). Refused exactly as a forged hook path
@@ -242,6 +258,7 @@ export class TranscriptDiscovery {
       this.searches.delete(sessionId);
       try {
         this.deps.onFound({
+          ...(state.agent === 'codex' ? { agent: state.agent } : {}),
           sessionId,
           agentSessionId: state.agentSessionId,
           transcriptPath: candidate,
@@ -262,9 +279,10 @@ export class TranscriptDiscovery {
    */
   private arm(sessionId: string, state: SearchState): void {
     if (this.disposed) return;
-    for (const root of claudeProjectRoots(this.deps.getSessionEnv?.(sessionId))) {
+    for (const root of rootsFor(state.agent, this.deps.getSessionEnv?.(sessionId))) {
       try {
-        const watcher = fs.watch(root, { persistent: false }, () => {
+        // Long spelling: libuv 1.52 mishandles an 8.3 short dir (watchTarget, #984).
+        const watcher = fs.watch(watchTarget(root), { persistent: false }, () => {
           this.schedule(sessionId, state);
         });
         // A vanished root just leaves the poll as the only trigger.
@@ -293,7 +311,7 @@ export class TranscriptDiscovery {
       // Give up quietly. The first `agent.stop` still delivers the real path,
       // so this costs the early availability, never the feature.
       this.cancel(sessionId);
-    }, this.deadlineMs);
+    }, state.deadlineMs ?? this.deadlineMs);
     deadline.unref?.();
     state.deadline = deadline;
   }
@@ -339,4 +357,60 @@ export class TranscriptDiscovery {
     this.warned.add(key);
     this.deps.log?.('warn', message);
   }
+}
+
+/** Exact UUID lookup, never latest-by-cwd. Bound directory depth, total entries
+ * and directory reads; no symlinks are followed while searching. */
+export function scanForCodexTranscript(id: string, env?: Record<string, string>): string[] {
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) return [];
+  const queue = [{ directory: codexSessionRoot(env), depth: 0 }];
+  const found: string[] = [];
+  let examined = 0;
+  let directories = 0;
+  while (queue.length && directories++ < 512 && examined < 16000) {
+    const next = queue.pop()!;
+    let dir: fs.Dir | undefined;
+    try {
+      dir = fs.opendirSync(next.directory);
+      let entry: fs.Dirent | null;
+      while (examined++ < 16000 && (entry = dir.readSync())) {
+        const file = path.join(next.directory, entry.name);
+        if (entry.isDirectory() && next.depth < 3 && queue.length < 512) queue.push({ directory: file, depth: next.depth + 1 });
+        else if (entry.isFile() && entry.name.endsWith(`-${id}.jsonl`)) {
+          found.push(file);
+          if (found.length >= 2) return [];
+        }
+      }
+    } catch { /* Missing/unreadable account: no candidate. */ }
+    finally { dir?.closeSync(); }
+  }
+  // Ambiguous duplicate copies must not choose a conversation by directory order.
+  return found.length === 1 ? found : [];
+}
+
+/**
+ * Exact-id lookup bounded to the day folders the id names. Codex thread ids are
+ * UUIDv7, so their first 48 bits are the creation time, and a rollout lives in
+ * the local-date folder of that time; the day either side covers a timezone or
+ * midnight edge. A non-v7 id falls back to the full bounded walk. Cheap enough
+ * for a hot path, and immune to the walk's entry cap missing a new rollout.
+ */
+export function findCodexTranscriptCandidates(id: string, env?: Record<string, string>): string[] {
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) return [];
+  const hex = id.replace(/-/g, '');
+  if (hex[12] !== '7') return scanForCodexTranscript(id, env);
+  const createdAt = parseInt(hex.slice(0, 12), 16);
+  const root = codexSessionRoot(env);
+  const found: string[] = [];
+  for (const offset of [0, -1, 1]) {
+    const day = new Date(createdAt);
+    const date = new Date(day.getFullYear(), day.getMonth(), day.getDate() + offset);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const dir = path.join(root, String(date.getFullYear()), pad(date.getMonth() + 1), pad(date.getDate()));
+    let names: string[];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const name of names) if (name.endsWith(`-${id}.jsonl`)) found.push(path.join(dir, name));
+  }
+  // Ambiguous duplicate copies must not choose a conversation by directory order.
+  return found.length === 1 ? found : [];
 }

@@ -47,6 +47,29 @@ export function IconCheck({ size = 14 }: { size?: number }) {
   return <Icon size={size}><polyline points="2.5,7.4 5.8,10.5 11.5,3.5" /></Icon>;
 }
 
+/** Triangle with an exclamation mark — a warning that needs a decision. */
+export function IconWarning({ size = 14 }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M7 1.8 L12.6 11.8 H1.4 Z" />
+      <line x1="7" y1="5.4" x2="7" y2="8.2" />
+      <line x1="7" y1="10" x2="7" y2="10.1" />
+    </Icon>
+  );
+}
+
+/** Four equal quadrants — layout templates / snap-to-layout verbs. */
+export function IconGrid({ size = 14 }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <rect x="1" y="1" width="5" height="5" rx="0.8" />
+      <rect x="8" y="1" width="5" height="5" rx="0.8" />
+      <rect x="1" y="8" width="5" height="5" rx="0.8" />
+      <rect x="8" y="8" width="5" height="5" rx="0.8" />
+    </Icon>
+  );
+}
+
 /** A friendly little robot — the agent panel toggle. Antenna + rounded head +
  *  two dot eyes + a small smile; ears nudge it toward "cute" over "clinical". */
 export function IconRobot({ size = 14 }: { size?: number }) {
@@ -176,12 +199,27 @@ export function IconChevronDir({ dir, size = 12 }: { dir: 'left' | 'right'; size
   );
 }
 
-/** Gear — workspace profile / project config badges. */
+/** Gear — settings entry point and workspace profile / project config badges.
+ *  An eight-tooth cog outline around a hub. The previous glyph (hub + eight
+ *  detached rays) read as a sun / brightness control, not as settings.
+ *  At 10px and below (the 9px workspace badges) eight teeth and a hub blur
+ *  into a smudge, so small sizes draw a ring with six short teeth on a
+ *  heavier stroke instead. */
 export function IconGear({ size = 14 }: { size?: number }) {
+  if (size <= 10) {
+    return (
+      <Icon size={size}>
+        <g strokeWidth="1.8">
+          <circle cx="7" cy="7" r="3.2" />
+          <path d="M7 1.4v2.4M7 10.2v2.4M2.15 4.2l2.08 1.2M9.77 8.6l2.08 1.2M2.15 9.8l2.08-1.2M9.77 5.4l2.08-1.2" />
+        </g>
+      </Icon>
+    );
+  }
   return (
     <Icon size={size}>
-      <circle cx="7" cy="7" r="2" />
-      <path d="M7 1.8v1.6M7 10.6v1.6M1.8 7h1.6M10.6 7h1.6M3.3 3.3l1.1 1.1M9.6 9.6l1.1 1.1M3.3 10.7l1.1-1.1M9.6 4.4l1.1-1.1" />
+      <path d="M5.86 2.75 L6.11 1.37 A5.7 5.7 0 0 1 7.89 1.37 L8.14 2.75 A4.4 4.4 0 0 1 9.2 3.19 L10.35 2.39 A5.7 5.7 0 0 1 11.61 3.65 L10.81 4.8 A4.4 4.4 0 0 1 11.25 5.86 L12.63 6.11 A5.7 5.7 0 0 1 12.63 7.89 L11.25 8.14 A4.4 4.4 0 0 1 10.81 9.2 L11.61 10.35 A5.7 5.7 0 0 1 10.35 11.61 L9.2 10.81 A4.4 4.4 0 0 1 8.14 11.25 L7.89 12.63 A5.7 5.7 0 0 1 6.11 12.63 L5.86 11.25 A4.4 4.4 0 0 1 4.8 10.81 L3.65 11.61 A5.7 5.7 0 0 1 2.39 10.35 L3.19 9.2 A4.4 4.4 0 0 1 2.75 8.14 L1.37 7.89 A5.7 5.7 0 0 1 1.37 6.11 L2.75 5.86 A4.4 4.4 0 0 1 3.19 4.8 L2.39 3.65 A5.7 5.7 0 0 1 3.65 2.39 L4.8 3.19 A4.4 4.4 0 0 1 5.86 2.75 Z" />
+      <circle cx="7" cy="7" r="1.9" />
     </Icon>
   );
 }
@@ -230,6 +268,15 @@ export function IconFolder({ size = 14 }: { size?: number }) {
   return (
     <Icon size={size}>
       <path d="M2 3.6 h3.1 l1.1 1.4 H12 v6 a0.6 0.6 0 0 1 -0.6 0.6 H2.6 a0.6 0.6 0 0 1 -0.6 -0.6 Z" />
+    </Icon>
+  );
+}
+
+/** Sort — the sidebar's order menu: two arrows, down and up. */
+export function IconSort({ size = 14 }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M4.5 2.5 v9 M2.5 9.5 l2 2 l2 -2 M9.5 11.5 v-9 M7.5 4.5 l2 -2 l2 2" />
     </Icon>
   );
 }
@@ -354,6 +401,99 @@ export function IconSparkles({ size = 14 }: { size?: number }) {
     <Icon size={size}>
       <path d="M6 2 L6.9 4.6 L9.5 5.5 L6.9 6.4 L6 9 L5.1 6.4 L2.5 5.5 L5.1 4.6 Z" />
       <path d="M10 8 L10.5 9.5 L12 10 L10.5 10.5 L10 12 L9.5 10.5 L8 10 L9.5 9.5 Z" />
+    </Icon>
+  );
+}
+
+/** Remote access across a desktop and a phone. */
+export function IconRemoteDevices({ size = 14 }: { size?: number }) {
+  return <Icon size={size}>
+    <path d="M7.5 9H2a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h8a1 1 0 0 1 1 1v1M5 9v3m-2 0h4" />
+    <rect x="9" y="5.5" width="4" height="7" rx=".8" />
+    <path d="M10.7 10.8h.6" />
+  </Icon>;
+}
+
+/** Phone — a paired handheld device (roster kind). Own glyph, no brand shape. */
+export function IconPhone({ size = 14 }: { size?: number }) {
+  return <Icon size={size}>
+    <rect x="4" y="1.5" width="6" height="11" rx="1.2" />
+    <path d="M6.4 10.6h1.2" />
+  </Icon>;
+}
+
+/** Computer — a paired desktop or laptop (roster kind). */
+export function IconComputer({ size = 14 }: { size?: number }) {
+  return <Icon size={size}>
+    <rect x="1.5" y="2.5" width="11" height="7" rx="1" />
+    <path d="M5 12h4M7 9.5V12" />
+  </Icon>;
+}
+
+/** Server — two stacked rack units: a workspace that lives on another machine. */
+export function IconServer({ size = 14 }: { size?: number }) {
+  return <Icon size={size}>
+    <rect x="2" y="2" width="10" height="4" rx="1" />
+    <rect x="2" y="8" width="10" height="4" rx="1" />
+    <path d="M4.5 4h.01M4.5 10h.01" />
+  </Icon>;
+}
+
+/** Worktree — a branch that lives in its own checkout: the branch glyph's
+ *  side node boxed. Replaces the ⊕ text mark on the sidebar's git line. */
+export function IconWorktree({ size = 14 }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <circle cx="4" cy="3.4" r="1.5" />
+      <circle cx="4" cy="10.6" r="1.5" />
+      <line x1="4" y1="4.9" x2="4" y2="9.1" />
+      <rect x="8.2" y="3.4" width="3.8" height="3.8" rx="0.8" />
+      <path d="M8.2 5.3 H6.8 a2 2 0 0 0 -2 2 V9" />
+    </Icon>
+  );
+}
+
+/** Fan-out — one node splitting into three. Marks a workspace a fan-out
+ *  created (sidebar task rows, provenance). */
+export function IconFanOut({ size = 14 }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <circle cx="2.8" cy="7" r="1.3" />
+      <path d="M4.1 7 H6 L10.6 3" />
+      <line x1="6" y1="7" x2="10.6" y2="7" />
+      <path d="M6 7 L10.6 11" />
+    </Icon>
+  );
+}
+
+/** Corner up-left — "go up to the parent". The task workspace's link back to
+ *  the workspace that fanned it out. */
+export function IconCornerUpLeft({ size = 14 }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <polyline points="5.4,2.8 2.6,5.6 5.4,8.4" />
+      <path d="M2.6 5.6 H8.4 a2.8 2.8 0 0 1 2.8 2.8 V11.4" />
+    </Icon>
+  );
+}
+
+/** Vertical ellipsis — an overflow menu trigger. */
+export function IconMoreVertical({ size = 14 }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <line x1="7" y1="3" x2="7" y2="3.1" />
+      <line x1="7" y1="7" x2="7" y2="7.1" />
+      <line x1="7" y1="11" x2="7" y2="11.1" />
+    </Icon>
+  );
+}
+
+/** Pin — a row that keeps its place in the sidebar's Attention order. */
+export function IconPin({ size = 14 }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M5 2.2 H9 L8.4 5.6 L10.4 7.6 H3.6 L5.6 5.6 Z" />
+      <line x1="7" y1="7.6" x2="7" y2="11.8" />
     </Icon>
   );
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,10 +17,20 @@ import {
 
 let dir: string;
 
+// Every roster write arms DeviceStore's 5 s debounced DACL re-harden timer
+// (unref'd, fire-and-forget). With real timers it fired after its test had
+// already deleted `dir`, so the re-harden failed and logged, sometimes after
+// the file's last test, and vitest then closed the worker RPC while those
+// console calls were still pending (EnvironmentTeardownError on windows-latest).
+// No test here asserts on the re-harden, so setTimeout is faked for the file
+// and whatever a test left scheduled is dropped when it ends.
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-devices-'));
 });
 afterEach(() => {
+  vi.clearAllTimers();
+  vi.useRealTimers();
   try {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch {
@@ -335,7 +345,7 @@ describe('DeviceStore — roster housekeeping', () => {
   it('names the device, bounding and cleaning what the operator typed', async () => {
     const s = store();
     expect((await s.mint({ name: '  Living room  ' })).name).toBe('Living room');
-    expect((await s.mint({ name: 'a b\nc' })).name).toBe('a b c');
+    expect((await s.mint({ name: 'a\u0000b\nc' })).name).toBe('a b c');
     expect((await s.mint({ name: 'x'.repeat(200) })).name).toHaveLength(64);
     // Pairing must not fail over a label, so an empty one gets a placeholder
     // that reads as the anomaly it is in the roster.
@@ -349,8 +359,9 @@ describe('DeviceStore — roster housekeeping', () => {
     const [row] = s.list();
     // `allowInput` is a capability flag, not secret material — it is what the
     // roster UI renders the grant from. The guard stays exact so anything that
-    // is NOT on this list has to be argued for.
-    expect(Object.keys(row).sort()).toEqual(['allowInput', 'createdAt', 'deviceId', 'lastSeenAt', 'name']);
+    // is NOT on this list has to be argued for. `kind` is the display-only
+    // phone/computer label the roster picks an icon from.
+    expect(Object.keys(row).sort()).toEqual(['allowInput', 'createdAt', 'deviceId', 'kind', 'lastSeenAt', 'name']);
   });
 
   it('throttles lastSeenAt writes but always updates in memory', async () => {
@@ -489,7 +500,11 @@ describe('DeviceStore — revocation durability', () => {
     // First attempt: blocked in memory, honest about the disk.
     expect(s.revoke(d.deviceId)).toEqual({ ok: false, reason: 'persist-failed' });
     expect(s.resolve(d.deviceId, d.deviceSecret)).toMatchObject({ ok: false, reason: 'revoked' });
-    expect(new DeviceAuditLog(dir).read().filter((entry) => entry.event === 'revoke')).toEqual([]);
+    // Audited at once, not deferred: a daemon that dies before the next good
+    // write must still know who revoked the device.
+    expect(new DeviceAuditLog(dir).read().filter((entry) => entry.event === 'revoke')).toMatchObject([
+      { deviceId: d.deviceId, reason: 'persist-failed' },
+    ]);
 
     // The retry used to take the "already revoked" shortcut and answer ok:true
     // about a tombstone that only existed in memory.

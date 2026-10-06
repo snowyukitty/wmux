@@ -38,6 +38,10 @@
 //      only inside the service) so the wire gets a wire-shaped rejection and an
 //      oversized array is bounded before any per-element work.
 //   R7 approval — see below.
+//   R8 runaway brakes — depth-1 (a fan-out task cannot fan out), the app-wide
+//      live / hourly caps, and the audit record written before anything
+//      spawns (worktask/fanoutGuards.ts). With approval off by default these
+//      are what stop a loop.
 //
 // Asynchrony is forced, not chosen: the MCP client's RPC deadline is 10s
 // (wmux-client.ts) and one task's renderer spawn alone is allowed 30s. So the
@@ -45,7 +49,11 @@
 // awaiting_approval / running / completed / denied. The poll answer comes from
 // FanOutService's existing G1 bookkeeping plus the gate map below.
 //
-// R7 — fan-out DOES ask the user, and the ask is NOT the a2a execute gate:
+// R7 — by default fan-out does NOT ask (owner decision 2026-09-24): the
+// renderer answers `fanout.requestApproval` with outcome 'auto', shows one
+// toast, and R8's brakes carry the load. The Settings switch (main-side,
+// fanoutWorkerPolicy.ts — main decides and passes `requireApproval`) turns the
+// ask back on, and then it is NOT the a2a execute gate:
 //
 //   * It reuses the execute approval queue and dialog (one inbox, one timer),
 //     but it goes through requestFanOutApproval, which does NOT consult
@@ -86,7 +94,22 @@ import { sendToRenderer } from './_bridge';
 import { resolvePtyOwnerWorkspace } from '../../workspace/ptyOwnership';
 import { git as runGit } from '../../git/git';
 import { loadWorkspaceDecision } from '../../deck/deckDecisionStore';
-import type { FanOutRequest, FanOutService } from '../../worktask/FanOutService';
+import type { FanOutRequest, FanOutService, FanOutTaskResult } from '../../worktask/FanOutService';
+import { getFanOutGuards, promptDigest, type FanOutGuards } from '../../worktask/fanoutGuards';
+import { loadFanoutRequireApproval, loadFanoutWorkerPermissionMode } from '../../worktask/fanoutWorkerPolicy';
+import { workerLaunchFlags, type FanoutWorkerPermissionMode } from '../../../shared/workerLaunch';
+import { loadFanoutPresets } from '../../worktask/fanoutPresets';
+import { sanitizeFanoutOrigin, type FanoutOrigin } from '../../../shared/fanoutOrigin';
+import {
+  describeFanoutAgentChoice,
+  fanoutEffortIgnored,
+  fanoutPresetKey,
+  fanoutPresetOutputFolder,
+  validateFanoutAgentChoice,
+  type FanoutAgentChoice,
+  type FanoutPreset,
+} from '../../../shared/fanoutPreset';
+import { validateFanoutTaskGraph, type FanoutTaskGraph } from '../../../shared/fanoutTaskGraph';
 
 type GetWindow = () => BrowserWindow | null;
 
@@ -150,7 +173,7 @@ const FANOUT_PREVIEW_MIN_TASK_BYTES = 256;
 
 /** Why a fan-out never started. Reported on the poll so an unattended fleet
  *  learns WHY instead of watching a key go quiet. */
-export type FanOutDenyReason = 'declined' | 'timeout' | 'unavailable' | 'repo-moved';
+export type FanOutDenyReason = 'declined' | 'timeout' | 'unavailable' | 'repo-moved' | 'audit-unavailable';
 
 const DENY_MESSAGE: Record<FanOutDenyReason, string> = {
   declined: 'the user denied the fan-out approval prompt',
@@ -158,6 +181,7 @@ const DENY_MESSAGE: Record<FanOutDenyReason, string> = {
   unavailable: 'the fan-out approval prompt could not be shown (the wmux window is unavailable)',
   'repo-moved':
     "the calling terminal's repository changed between the request and the approval, so the approved repository is no longer the one that would be modified",
+  'audit-unavailable': 'the fan-out audit log could not be written, and a fan-out that leaves no record does not run',
 };
 
 /**
@@ -193,6 +217,8 @@ export function buildFanOutPreview(
   titles: string[],
   taskPrompts: string[],
   roles: string[] = [],
+  agents: string[] = [],
+  graph?: FanoutTaskGraph,
 ): string {
   const perTask = Math.max(
     FANOUT_PREVIEW_MIN_TASK_BYTES,
@@ -211,7 +237,15 @@ export function buildFanOutPreview(
       // consenting to run it on whatever the caller picked. Roles come from the
       // closed ORCH_ROLES vocabulary, so there is nothing to neutralize here.
       const role = typeof roles[k] === 'string' && roles[k].length > 0 ? ` [role: ${roles[k]}]` : '';
-      return `── task ${k + 1}/${titles.length}: ${title}${role}\n${body}`;
+      // A preset row / agents[k] is already concrete (CLI + model), so it is
+      // printed as what runs, not as a name that resolves elsewhere.
+      const agent = typeof agents[k] === 'string' && agents[k].length > 0 ? ` [agent: ${agents[k]}]` : '';
+      // Scope and ordering change what the task is allowed to do and when it
+      // runs, so they are part of what is approved. Dependencies are printed
+      // 1-based, like the task headers they refer to.
+      const files = graph?.files[k]?.length ? ` [files: ${graph.files[k].join(', ')}]` : '';
+      const after = graph?.dependsOn[k]?.length ? ` [after: ${graph.dependsOn[k].map((j) => `task ${j + 1}`).join(', ')}]` : '';
+      return `── task ${k + 1}/${titles.length}: ${title}${role}${agent}${files}${after}\n${body}`;
     })
     .join('\n\n');
 }
@@ -287,6 +321,36 @@ async function resolveCallerWorkspace(getWindow: GetWindow, senderPtyId: string)
 }
 
 /**
+ * Which pane asked (#1575): the caller's ptyId turned into the pane's stable
+ * ids and a snapshot of its name, by the renderer that owns the layout,
+ * scoped to the fan-out's owning workspace. Resolved ONCE per fan-out, at
+ * request time, and carried unchanged to every task's spawn — so a pane that
+ * closes (or whose ptyId is reused) before the tasks spawn cannot split the
+ * fan-out or hand its tasks to another pane. Display data only: any failure
+ * records no requester rather than refusing the fan-out.
+ *
+ * Trust: the ptyId is the caller-supplied senderPtyId — the same basis the
+ * fan-out's ownership rests on, no more.
+ */
+async function resolveCallerOrigin(
+  getWindow: GetWindow,
+  senderPtyId: string,
+  ownerWorkspaceId: string,
+): Promise<FanoutOrigin | undefined> {
+  if (!senderPtyId || !ownerWorkspaceId) return undefined;
+  try {
+    const res = await sendToRenderer(getWindow, 'fanout.resolveOrigin', {
+      ptyId: senderPtyId,
+      workspaceId: ownerWorkspaceId,
+    });
+    const origin = sanitizeFanoutOrigin((res as { origin?: unknown } | null)?.origin);
+    return origin?.kind === 'pane' ? origin : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * R3 — the cwd of the CALLER'S OWN SURFACE: the pane whose ptyId is the
  * senderPtyId we just verified, and that surface's live cwd (OSC 7 / prompt
  * scrape), via `surface.list`.
@@ -345,9 +409,9 @@ async function resolveSenderSurfaceCwd(
  * workspace already has a pane in — and a pane that reports no cwd of its own
  * still reads the workspace-level one (the residual R3 already documents).
  * Neither escapes the workspace: ctx.commanderWorkspace is bound to exactly one
- * and every path here is scoped to it. What holds the line inside the workspace
- * is the approval prompt, which prints the resolved repository and is never
- * auto-approved — the operator sees the path before anything spawns.
+ * and every path here is scoped to it. Inside the workspace, the resolved
+ * repository is printed in the approval prompt when approval is on, and is
+ * always written to the audit record before anything spawns.
  */
 async function resolveCommanderAnchorPtyId(
   getWindow: GetWindow,
@@ -377,6 +441,7 @@ async function deriveCallerRepoRoot(
   getWindow: GetWindow,
   workspaceId: string,
   senderPtyId: string,
+  opts: { requireRepo: boolean } = { requireRepo: true },
 ): Promise<{ root: string } | { code: string; message: string }> {
   const cwd = await resolveSenderSurfaceCwd(getWindow, workspaceId, senderPtyId);
   if (!cwd) {
@@ -391,6 +456,17 @@ async function deriveCallerRepoRoot(
     return { code: 'FAILED_PRECONDITION', message: `the calling terminal has an unusable working directory` };
   }
   const root = await repoRootOf(resolved);
+  if (!root && !opts.requireRepo) {
+    // worktree:false needs no repository: the tasks write into their own
+    // folders under the wmux data dir. The anchor is still the caller's own
+    // directory (realpath'd), so the audit names where the request came from
+    // and the post-approval check still catches a terminal that moved.
+    try {
+      return { root: fs.realpathSync(resolved) };
+    } catch {
+      return { root: resolved };
+    }
+  }
   if (!root) {
     return {
       code: 'FAILED_PRECONDITION',
@@ -492,11 +568,95 @@ function parseTasks(
   };
 }
 
+export interface FanOutRpcDeps {
+  /** Injected in tests; defaults to the hosted lineage/caps/audit store. */
+  guards?: FanOutGuards;
+  /** Injected in tests; defaults to the main-side Settings store. */
+  workerPermissionMode?: () => FanoutWorkerPermissionMode;
+  /** Injected in tests; defaults to the main-side Settings store. */
+  requireApproval?: () => boolean;
+  /** Injected in tests; defaults to the main-side preset store. */
+  presets?: () => FanoutPreset[];
+}
+
+
+/**
+ * The per-task agent selection: `preset` (operator data), `agents` (caller,
+ * closed vocabulary), or neither. Each is a list aligned with the parsed titles.
+ */
+type AgentSelection =
+  | { kind: 'none' }
+  | { kind: 'preset'; preset: FanoutPreset; agents: FanoutAgentChoice[] }
+  | { kind: 'agents'; agents: FanoutAgentChoice[]; warnings: string[] };
+
+function resolveAgentSelection(
+  params: Record<string, unknown>,
+  titleCount: number,
+  presets: () => FanoutPreset[],
+): AgentSelection | { error: string } {
+  // An empty array is "not given": a caller that always sends `roles: []`
+  // alongside a preset has asked for nothing that conflicts with it.
+  const has = (k: string): boolean =>
+    params[k] !== undefined && params[k] !== null && !(Array.isArray(params[k]) && (params[k] as unknown[]).length === 0);
+  const given = ['roles', 'preset', 'agents'].filter(has);
+  if (given.length > 1) {
+    return { error: `${given.join(' and ')} cannot be combined — pass one of roles, preset or agents` };
+  }
+  if (has('preset')) {
+    const name = typeof params['preset'] === 'string' ? params['preset'].trim() : '';
+    const list = presets();
+    const names = list.map((p) => p.name);
+    const available = names.length > 0 ? names.join(', ') : '(none — add one in Settings → Roles & fan-out → Fan-out presets)';
+    if (!name) return { error: `preset must be a preset name; available presets: ${available}` };
+    const preset = list.find((p) => fanoutPresetKey(p.name) === fanoutPresetKey(name));
+    if (!preset) return { error: `unknown preset "${name.slice(0, 64)}"; available presets: ${available}` };
+    // Task k runs on row k. More tasks than rows is a caller that miscounted,
+    // and cycling the rows would put tasks on agents nobody chose for them.
+    if (titleCount > preset.items.length) {
+      return {
+        error: `preset "${preset.name}" has ${preset.items.length} agent row(s) but ${titleCount} titles were given — pass at most ${preset.items.length}`,
+      };
+    }
+    return { kind: 'preset', preset, agents: preset.items.slice(0, titleCount) };
+  }
+  if (has('agents')) {
+    const raw = params['agents'];
+    if (!Array.isArray(raw)) return { error: 'agents must be an array of { agent, model?, effort? }' };
+    if (raw.length !== titleCount) {
+      return { error: `agents has ${raw.length} entries but there are ${titleCount} titles — one agent per title` };
+    }
+    const agents: FanoutAgentChoice[] = [];
+    const warnings: string[] = [];
+    for (const [k, entry] of raw.entries()) {
+      // No `unattended` from the wire: an approval-free non-claude worker is
+      // an operator decision, made in a preset.
+      const v = validateFanoutAgentChoice(entry, { allowEffort: true });
+      if (!v.ok) return { error: `agents[${k}]: ${v.error}` };
+      // An effort the agent cannot take is dropped, not refused: the task
+      // still runs, and the preview no longer names a flag the line lacks.
+      const ignored = fanoutEffortIgnored(v.choice);
+      if (ignored) {
+        warnings.push(`agents[${k}]: ${ignored}`);
+        delete v.choice.effort;
+      }
+      agents.push(v.choice);
+    }
+    return { kind: 'agents', agents, warnings };
+  }
+  return { kind: 'none' };
+}
+
 /**
  * Register `task.fanout.start`. `service` MUST be the same instance the
  * renderer IPC handler uses — see worktask/createFanOutService.ts.
  */
-export function registerFanOutRpc(router: RpcRouter, service: FanOutService, getWindow: GetWindow): void {
+export function registerFanOutRpc(
+  router: RpcRouter,
+  service: FanOutService,
+  getWindow: GetWindow,
+  deps: FanOutRpcDeps = {},
+): void {
+  const guardsOf = (): FanOutGuards => deps.guards ?? getFanOutGuards();
   // Gate bookkeeping lives in this closure rather than at module scope: it is
   // per-router state, and a fresh map per registration keeps tests isolated.
   //
@@ -610,6 +770,28 @@ export function registerFanOutRpc(router: RpcRouter, service: FanOutService, get
         `'${HUMAN_WORKSPACE_ID}' is the reserved human workspace and cannot fan out from the pipe`,
       );
     }
+    // ── Depth-1: a fan-out task cannot fan out ───────────────────────────
+    // The caller's workspace carries the lineage stamp FanOutService wrote
+    // before its agent launched (or the one a workspace it created inherited),
+    // or the ledger knows it as a task workspace. Both reads ignore the ledger
+    // STATUS: a worker that marks itself `failed` is still a worker. A store
+    // that cannot be read refuses — "maybe a task" is not "not a task".
+    let fanoutOwner: string | null;
+    try {
+      fanoutOwner = guardsOf().fanoutOwnerOf(callerWorkspaceId);
+    } catch (err) {
+      return deny(
+        'FAILED_PRECONDITION',
+        `task.fanout.start could not read the fan-out lineage store, so it cannot rule out that the caller is itself a fan-out task (${(err as Error).message})`,
+      );
+    }
+    if (fanoutOwner !== null) {
+      return deny(
+        'NOT_AUTHORIZED',
+        `task.fanout.start refused: workspace ${callerWorkspaceId} is a fan-out task of ${fanoutOwner}, and fan-out is one level deep — ` +
+          'record your result with ledger_update and let the owner fan out instead',
+      );
+    }
     /** Per-workspace key space (see above). The GUI mints uuid keys of its own,
      *  so a wire caller also cannot collide with an in-flight GUI fan-out.
      *
@@ -633,6 +815,16 @@ export function registerFanOutRpc(router: RpcRouter, service: FanOutService, get
     // approval prompt — two visually identical dialogs carrying different
     // payloads. Reading the gate and claiming it in one tick makes the second
     // caller a poll instead.
+    // The owner's way to stop tasks that are still waiting on dependencies.
+    // The key is already scoped to the calling workspace, so only the fan-out's
+    // owner can reach its waiting tasks.
+    if (params['cancelPending'] === true) {
+      const dropped = service.cancelDependents(key, 'cancelled by the fan-out owner');
+      if (dropped === null) {
+        return deny('NOT_FOUND', 'no task of this fan-out is waiting on its dependencies');
+      }
+      return { ok: true as const, status: 'pending_cancelled' as const, idempotencyKey: callerKey, dropped };
+    }
     const known = service.statusOf(key);
     if (known.state === 'running') {
       return { ok: true as const, status: 'running' as const, idempotencyKey: callerKey };
@@ -643,6 +835,8 @@ export function registerFanOutRpc(router: RpcRouter, service: FanOutService, get
         status: 'completed' as const,
         idempotencyKey: callerKey,
         result: known.result,
+        // Lifted to the envelope so the MCP tool prints each as a WARNING line.
+        ...(known.result.warnings?.length ? { warnings: known.result.warnings } : {}),
       };
     }
     if (pending.get(key)?.phase === 'awaiting') {
@@ -685,7 +879,7 @@ export function registerFanOutRpc(router: RpcRouter, service: FanOutService, get
     if (params['agentCmd'] !== undefined) {
       return deny(
         'INVALID_ARGUMENT',
-        'task.fanout.start does not accept agentCmd — the pipe surface always uses the default agent command',
+        'task.fanout.start does not accept agentCmd — pick the CLI with `agents` ([{agent, model?, effort?}]) or an operator `preset`',
       );
     }
     if (params['memberId'] !== undefined) {
@@ -710,13 +904,63 @@ export function registerFanOutRpc(router: RpcRouter, service: FanOutService, get
     if (Buffer.byteLength(sharedPrompt, 'utf8') > FANOUT_PROMPT_MAX_BYTES) {
       return deny('INVALID_ARGUMENT', `prompt exceeds ${FANOUT_PROMPT_MAX_BYTES} bytes`);
     }
+    // With preset/agents every title must be non-empty: parseTasks drops empty
+    // titles, and agents[k] / preset row k are aligned with the titles AS SENT,
+    // so a dropped title would silently shift every later task onto its
+    // neighbour's agent. Refused rather than guessed.
+    if (
+      (params['preset'] !== undefined || params['agents'] !== undefined) &&
+      Array.isArray(params['titles']) &&
+      (params['titles'] as unknown[]).some((t) => typeof t !== 'string' || t.trim().length === 0)
+    ) {
+      return deny(
+        'INVALID_ARGUMENT',
+        'with preset or agents every title must be a non-empty string — task k runs on agent k, so an empty title would shift the others',
+      );
+    }
+    // Same reason for files / dependsOn: both are indexed by the titles as sent.
+    const hasGraph = params['files'] !== undefined || params['dependsOn'] !== undefined;
+    if (
+      hasGraph &&
+      Array.isArray(params['titles']) &&
+      (params['titles'] as unknown[]).some((t) => typeof t !== 'string' || t.trim().length === 0)
+    ) {
+      return deny(
+        'INVALID_ARGUMENT',
+        'with files or dependsOn every title must be a non-empty string — they are indexed by title, so an empty title would shift the others',
+      );
+    }
     const parsed = parseTasks(params, sharedPrompt);
     if ('error' in parsed) return deny('INVALID_ARGUMENT', parsed.error);
+    const graph = validateFanoutTaskGraph(params['files'], params['dependsOn'], parsed.titles.length);
+    if ('error' in graph) return deny('INVALID_ARGUMENT', graph.error);
+    // Titles are counted AFTER parseTasks drops empty ones, so a preset row
+    // lines up with the task that actually spawns.
+    const selection = resolveAgentSelection(params, parsed.titles.length, deps.presets ?? (() => loadFanoutPresets()));
+    if ('error' in selection) return deny('INVALID_ARGUMENT', selection.error);
+    const agentChoices = selection.kind === 'none' ? [] : selection.agents;
+    const agentLabels = agentChoices.map(describeFanoutAgentChoice);
+    const worktree = !(selection.kind === 'preset' && selection.preset.worktree === false);
+
+    // ── Global caps (live + rolling hour), reserved in this same tick ────
+    // Over a cap is a refusal, never a queued prompt: with approval off by
+    // default there is nobody to drain a queue, and with it on a loop would
+    // bury the operator in dialogs.
+    const guards = guardsOf();
+    const reservation = guards.reserve(key, parsed.titles.length);
+    if (!reservation.ok) return deny('RESOURCE_EXHAUSTED', reservation.message);
 
     // ── Claim the key ────────────────────────────────────────────────────
     // Last synchronous statement of the tick that read the gate above: from
     // here on a concurrent call on this key is a poll, not a second prompt.
     claim(key);
+
+    // ── Requester: resolved once, before approval / git / worktree work ──
+    // A brain is the orchestrator; a pane caller is looked up now, while the
+    // pane that asked is certainly still there (see resolveCallerOrigin).
+    const callerOrigin: FanoutOrigin | undefined = commanderWorkspaceId
+      ? { kind: 'orchestrator' }
+      : await resolveCallerOrigin(getWindow, senderPtyId, callerWorkspaceId);
 
     // ── R3: repo confinement ─────────────────────────────────────────────
     // A pane agent anchors on its OWN surface; a brain has none, so it anchors
@@ -724,11 +968,12 @@ export function registerFanOutRpc(router: RpcRouter, service: FanOutService, get
     const anchorPtyId = commanderWorkspaceId
       ? await resolveCommanderAnchorPtyId(getWindow, commanderWorkspaceId)
       : senderPtyId;
-    const preflight = await deriveCallerRepoRoot(getWindow, callerWorkspaceId, anchorPtyId);
+    const preflight = await deriveCallerRepoRoot(getWindow, callerWorkspaceId, anchorPtyId, { requireRepo: worktree });
     if (!('root' in preflight)) {
       // Nothing was started and nothing was asked, so the key must go back —
       // otherwise a transient renderer miss would brick it until eviction.
       pending.delete(key);
+      guards.release(key);
       return deny(preflight.code, preflight.message);
     }
     const callerRepoRoot = preflight.root;
@@ -738,6 +983,10 @@ export function registerFanOutRpc(router: RpcRouter, service: FanOutService, get
     // (R2), repoPath (R3). The request is constructed field by field — params
     // is never spread — so a field added to the wire later cannot leak through
     // by accident.
+    // Both policy reads happen ONCE, here: the approval decision, the preview,
+    // the audit record and every task's launch all use these same values.
+    const workerMode = (deps.workerPermissionMode ?? loadFanoutWorkerPermissionMode)();
+    const requireApproval = (deps.requireApproval ?? loadFanoutRequireApproval)();
     const req: FanOutRequest = {
       idempotencyKey: key,
       prompt: sharedPrompt,
@@ -751,8 +1000,21 @@ export function registerFanOutRpc(router: RpcRouter, service: FanOutService, get
       // different agent/model than its builders without the wire ever carrying
       // a command string.
       roles: parsed.roles,
+      // A preset row / agents[k] per task. Validated data from the closed
+      // table, never a command: the renderer re-validates it and turns it into
+      // a RoleBinding on the same rewrite path a role uses.
+      ...(agentChoices.length > 0 ? { agents: agentChoices } : {}),
+      ...(worktree
+        ? {}
+        : { worktree: false, outputFolder: fanoutPresetOutputFolder((selection as { preset: FanoutPreset }).preset) }),
       verifiedWorkspaceId: callerWorkspaceId,
+      workerPermissionMode: workerMode,
+      // Who asked, for each task's lineage stamp — resolved above, the same
+      // origin for every task. An unresolvable pane records no requester.
+      ...(callerOrigin ? { caller: callerOrigin } : {}),
+      ...(hasGraph ? { files: graph.files, dependsOn: graph.dependsOn } : {}),
     };
+    const presetName = selection.kind === 'preset' ? selection.preset.name : undefined;
 
     // ── R7: approval, then the detached run ──────────────────────────────
     // The key is already claimed (above), so a poll that arrives while the
@@ -769,72 +1031,207 @@ export function registerFanOutRpc(router: RpcRouter, service: FanOutService, get
     // is re-derived and compared below. A canonical hash would restate a
     // property the closure already guarantees.
     void (async () => {
-      let verdict: { approved?: unknown; outcome?: unknown } | null = null;
       try {
-        verdict = (await sendToRenderer(
-          getWindow,
-          'fanout.requestApproval',
-          {
-            workspaceId: callerWorkspaceId,
+        let verdict: { approved?: unknown; outcome?: unknown; roleCommands?: unknown } | null = null;
+        try {
+          verdict = (await sendToRenderer(
+            getWindow,
+            'fanout.requestApproval',
+            {
+              workspaceId: callerWorkspaceId,
+              repoPath: callerRepoRoot,
+              taskCount: parsed.titles.length,
+              // Main decides whether anyone is asked (see fanoutWorkerPolicy.ts);
+              // the renderer only carries it out.
+              requireApproval,
+              // What a claude worker's line gets appended, so an approval covers
+              // the permission mode and tool rules, not just the prompt.
+              promptPreview:
+                buildFanOutPreview(sharedPrompt, parsed.titles, parsed.taskPrompts, parsed.roles, agentLabels, graph) +
+                (worktree ? '' : '\n\nno worktree: each task writes into its own folder under the wmux outputs directory') +
+                // Only when a task can actually run claude: the flags are claude-only.
+                (agentChoices.length === 0 || agentChoices.some((c) => c.agent === 'claude')
+                  ? `\n\nclaude workers launch with: ${workerLaunchFlags(workerMode)}`
+                  : ''),
+              // The roles again, as data. The preview prints the role NAME, but
+              // what a role resolves to — agent, model, extra args — lives in the
+              // renderer's bindings, and approving "[role: Reviewer]" without
+              // seeing that it means `codex --model o3 --some-flag` is approving
+              // a string that is not what runs. The renderer expands them.
+              roles: parsed.roles,
+            },
+            { timeoutMs: APPROVAL_TIMEOUT_MS },
+          )) as { approved?: unknown; outcome?: unknown; roleCommands?: unknown } | null;
+        } catch {
+          // Renderer unavailable / bridge timeout. Fail closed — an unattended
+          // spawn is exactly what the gate exists to prevent — but record WHY.
+          verdict = null;
+        }
+
+        if (!verdict || verdict.approved !== true) {
+          const reason: FanOutDenyReason =
+            !verdict ? 'unavailable' : verdict.outcome === 'timeout' ? 'timeout' : 'declined';
+          settle(key, { phase: 'denied', reason });
+          guards.release(key);
+          console.warn(`[fanout.rpc] fan-out ${key} denied (${reason})`);
+          return;
+        }
+
+        // R3, second half. The prompt named a repository and the user approved
+        // THAT repository; the call is asynchronous now, so between the preflight
+        // and this line the calling terminal may have moved (its own `cd`, or a
+        // sibling pane's if the surface reports no cwd of its own). Re-derive and
+        // require the same root, or the approval was given for one repo and spent
+        // on another.
+        const atApproval = await deriveCallerRepoRoot(getWindow, callerWorkspaceId, anchorPtyId, { requireRepo: worktree });
+        if (!('root' in atApproval) || atApproval.root !== callerRepoRoot) {
+          settle(key, { phase: 'denied', reason: 'repo-moved' });
+          guards.release(key);
+          console.warn(`[fanout.rpc] fan-out ${key} denied (repo-moved)`);
+          return;
+        }
+
+        // The audit record goes down BEFORE anything spawns, and a fan-out that
+        // cannot leave one does not run: with no human in the loop by default,
+        // this line is the only after-the-fact account of what was launched.
+        try {
+          guards.appendAudit({
+            at: Date.now(),
+            idempotencyKey: callerKey,
+            ownerWorkspaceId: callerWorkspaceId,
+            callerIdentity: commanderWorkspaceId ? 'commander' : 'pty',
+            // #1481 — which pane asked, for the sidebar's provenance tooltip.
+            ...(commanderWorkspaceId || !senderPtyId ? {} : { callerPtyId: senderPtyId }),
             repoPath: callerRepoRoot,
-            taskCount: parsed.titles.length,
-            promptPreview: buildFanOutPreview(sharedPrompt, parsed.titles, parsed.taskPrompts, parsed.roles),
-            // The roles again, as data. The preview prints the role NAME, but
-            // what a role resolves to — agent, model, extra args — lives in the
-            // renderer's bindings, and approving "[role: Reviewer]" without
-            // seeing that it means `codex --model o3 --some-flag` is approving
-            // a string that is not what runs. The renderer expands them.
+            titles: parsed.titles,
             roles: parsed.roles,
-          },
-          { timeoutMs: APPROVAL_TIMEOUT_MS },
-        )) as { approved?: unknown; outcome?: unknown } | null;
-      } catch {
-        // Renderer unavailable / bridge timeout. Fail closed — an unattended
-        // spawn is exactly what the gate exists to prevent — but record WHY.
-        verdict = null;
-      }
+            roleCommands: Array.isArray(verdict.roleCommands)
+              ? verdict.roleCommands.filter((c): c is string => typeof c === 'string')
+              : [],
+            promptSha256: parsed.taskPrompts.map((own) =>
+              promptDigest([sharedPrompt, own].filter((p) => p.length > 0).join('\n\n')),
+            ),
+            approvedBy: verdict.outcome === 'auto' ? 'auto' : 'human',
+            workerPermissionMode: workerMode,
+            ...(presetName ? { preset: presetName } : {}),
+            ...(agentLabels.length > 0 ? { agents: agentLabels } : {}),
+          });
+        } catch (err) {
+          settle(key, { phase: 'denied', reason: 'audit-unavailable' });
+          guards.release(key);
+          console.warn(`[fanout.rpc] fan-out ${key} denied (audit-unavailable): ${String(err)}`);
+          return;
+        }
 
-      if (!verdict || verdict.approved !== true) {
-        const reason: FanOutDenyReason =
-          !verdict ? 'unavailable' : verdict.outcome === 'timeout' ? 'timeout' : 'declined';
-        settle(key, { phase: 'denied', reason });
-        console.warn(`[fanout.rpc] fan-out ${key} denied (${reason})`);
-        return;
-      }
-
-      // R3, second half. The prompt named a repository and the user approved
-      // THAT repository; the call is asynchronous now, so between the preflight
-      // and this line the calling terminal may have moved (its own `cd`, or a
-      // sibling pane's if the surface reports no cwd of its own). Re-derive and
-      // require the same root, or the approval was given for one repo and spent
-      // on another.
-      const atApproval = await deriveCallerRepoRoot(getWindow, callerWorkspaceId, anchorPtyId);
-      if (!('root' in atApproval) || atApproval.root !== callerRepoRoot) {
-        settle(key, { phase: 'denied', reason: 'repo-moved' });
-        console.warn(`[fanout.rpc] fan-out ${key} denied (repo-moved)`);
-        return;
-      }
-
-      // start() registers the key in-flight synchronously, before its first
-      // await, so there is no window in which the gate says 'started' and the
-      // service still says 'unknown'.
-      settle(key, { phase: 'started' });
-      try {
-        await service.start(req);
+        // start() registers the key in-flight synchronously, before its first
+        // await, so there is no window in which the gate says 'started' and the
+        // service still says 'unknown'.
+        settle(key, { phase: 'started' });
+        // A task with dependencies is stamped on the hour when it starts, not
+        // now (see stampDeferredStart); its live slot is booked from here on.
+        const isDeferred = (index: number): boolean => (graph.dependsOn[index]?.length ?? 0) > 0;
+        const deferredCount = parsed.titles.filter((_, k) => isDeferred(k)).length;
+        guards.commitStart(key, deferredCount);
+        /** Dependent tasks that passed their start-time cap check (and so hold a stamp). */
+        const stamped = new Set<number>();
+        // The second half of the record: the line each task was ACTUALLY
+        // launched with (after the role rewrite and the worker flags). Written
+        // once for the first wave, then once per dependent task as it launches.
+        const appendLaunched = (tasks: FanOutTaskResult[], outputBatchDir?: string): void => {
+          try {
+            guards.appendAudit({
+              at: Date.now(),
+              kind: 'launched',
+              idempotencyKey: callerKey,
+              ownerWorkspaceId: callerWorkspaceId,
+              callerIdentity: commanderWorkspaceId ? 'commander' : 'pty',
+              ...(commanderWorkspaceId || !senderPtyId ? {} : { callerPtyId: senderPtyId }),
+              repoPath: callerRepoRoot,
+              titles: parsed.titles,
+              roles: parsed.roles,
+              roleCommands: [],
+              promptSha256: [],
+              approvedBy: verdict.outcome === 'auto' ? 'auto' : 'human',
+              workerPermissionMode: workerMode,
+              ...(presetName ? { preset: presetName } : {}),
+              ...(agentLabels.length > 0 ? { agents: agentLabels } : {}),
+              ...(outputBatchDir ? { outputBatchDir } : {}),
+              launched: tasks.map((t) => ({
+                title: t.title,
+                ...(t.workspaceId ? { workspaceId: t.workspaceId } : {}),
+                ...(t.initialCommand ? { command: t.initialCommand } : {}),
+                ...(t.error ? { error: t.error } : {}),
+              })),
+            });
+          } catch (err) {
+            console.warn(`[fanout.rpc] could not append the launch record for ${key}: ${String(err)}`);
+          }
+        };
+        let holdsDependents = false;
+        try {
+          const result = await service.start({
+            ...req,
+            beforeDeferredLaunch: (index) => {
+              const r = guards.stampDeferredStart(key);
+              if (r.ok) stamped.add(index);
+              return r;
+            },
+            // Settled once per task by the service. Only a task that was
+            // stamped and still got no workspace is refunded; one dropped
+            // before its start was never charged.
+            onDeferredLaunch: (t, info) => {
+              if (stamped.delete(t.index) && !t.workspaceId) guards.refundStart(key, 1);
+              appendLaunched([t], info.outputBatchDir);
+              if (info.remaining === 0) guards.settleStarted(key);
+            },
+          });
+          holdsDependents = result.tasks.some((t) => t.pending);
+          // Tasks that never got a workspace (the output folder could not be
+          // created, a worktree preflight failed) launched nothing, so they
+          // must not keep counting against the rolling hour. Dependent tasks
+          // are settled through onDeferredLaunch instead, never here.
+          const unspawned =
+            result.tasks.length === 0
+              ? parsed.titles.length - deferredCount
+              : result.tasks.filter((t) => !t.workspaceId && !isDeferred(t.index)).length;
+          if (unspawned > 0) guards.refundStart(key, unspawned);
+          appendLaunched(
+            result.tasks.filter((t) => !isDeferred(t.index)),
+            result.outputBatchDir,
+          );
+        } catch (err) {
+          // start() records a throw as a failed result rather than releasing the
+          // key, so this is belt-and-braces.
+          console.error(`[fanout.rpc] fan-out ${key} failed:`, err);
+        } finally {
+          // Whatever of it is still booked as spawning stops counting; the
+          // tasks that did start are counted by their open workspaces. Tasks
+          // waiting on dependencies keep their booking: the service settles
+          // each one as it launches or is dropped.
+          if (!holdsDependents) guards.settleStarted(key);
+        }
       } catch (err) {
-        // start() records a throw as a failed result rather than releasing the
-        // key, so this is belt-and-braces.
-        console.error(`[fanout.rpc] fan-out ${key} failed:`, err);
+        // Anything that throws before the spawn (a renderer round-trip, a git
+        // call in the repo re-derivation) must not leave the key awaiting and
+        // its cap reservation held until the app restarts.
+        if (!terminal.has(key)) settle(key, { phase: 'denied', reason: 'unavailable' });
+        guards.release(key);
+        console.error(`[fanout.rpc] fan-out ${key} aborted:`, err);
       }
     })();
 
-    const warnings = acceptWarnings(callerWorkspaceId);
+    const warnings = [...(selection.kind === 'agents' ? selection.warnings : []), ...acceptWarnings(callerWorkspaceId)];
     return {
       ok: true as const,
       status: 'accepted' as const,
       idempotencyKey: callerKey,
       taskCount: parsed.titles.length,
       repoPath: callerRepoRoot,
+      // The OWNER's workspace — the caller's own, never a task's (no task has
+      // a workspace yet; each task's is in the completed poll's result.tasks[]).
+      // `workspaceId` is the deprecated alias kept for older callers: an agent
+      // read it as a task workspace and closed its own.
+      ownerWorkspaceId: callerWorkspaceId,
       workspaceId: callerWorkspaceId,
       ...(warnings.length > 0 ? { warnings } : {}),
     };

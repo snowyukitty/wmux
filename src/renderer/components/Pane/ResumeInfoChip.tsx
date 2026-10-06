@@ -38,6 +38,12 @@ import { applyRoleBinding, type RoleBinding } from '../../../shared/orchestrator
  * it rides EITHER grammar branch (exact `--resume` and fallback `--continue`).
  * Codex takes no permission flag, so the toggle is inert there.
  *
+ * A role binding's `skipPermissions` does NOT override an explicit OFF: when the
+ * toggle is offered (Claude) and off, the role's skip flag is withheld (and
+ * dropped from the role's args, #1681), so the restored mode is what runs (`--dangerously-skip-permissions` beats
+ * `--permission-mode` on the same line). The role's model, effort and args still
+ * apply. Where the toggle is inert (Codex) the role's skip flag applies as usual.
+ *
  * Returns `null` for a non-resumable agent (no grammar). Pure + exported so the
  * exact-vs-fallback decision is unit-testable without rendering.
  */
@@ -46,6 +52,7 @@ export function buildPaneResumeCommand(
   paneCwds: ReadonlyArray<string | undefined>,
   skipPermissions: boolean,
   roleBinding?: RoleBinding,
+  exactOverride?: boolean,
 ): { command: string; exact: boolean; roleRewritten: boolean } | null {
   const grammar = resumeGrammarFor(binding.agent);
   if (!grammar) return null;
@@ -56,7 +63,10 @@ export function buildPaneResumeCommand(
     return out;
   };
   const target = normCwd(binding.cwd);
-  const exact = paneCwds.some((c) => !!c && normCwd(c) === target);
+  // #1342 — a REMOTE pane's cwds live on another machine, so the desktop cannot
+  // run this comparison at all; the host answers the question instead and the
+  // caller passes its verdict through. Local callers leave it undefined.
+  const exact = exactOverride ?? paneCwds.some((c) => !!c && normCwd(c) === target);
   // Explicit toggle (default on) → force --dangerously-skip-permissions on
   // EITHER branch (a launch preference, not conversation-scoped). Toggle off →
   // restore the captured permission mode, but only on an EXACT resume (that
@@ -75,7 +85,8 @@ export function buildPaneResumeCommand(
   // `roleRewritten` is reported rather than logged here so this stays a pure
   // function (it runs on every render of the chip); the caller emits the audit
   // line once, from an effect.
-  const rewrite = applyRoleBinding(base, roleBinding);
+  const toggledOff = agentSupportsPermissionFlag(binding.agent) && !skipPermissions;
+  const rewrite = applyRoleBinding(base, roleBinding, { suppressSkipPermissions: toggledOff });
   return { command: rewrite.command, exact, roleRewritten: rewrite.changed };
 }
 
@@ -94,6 +105,13 @@ export function buildPaneResumeCommand(
 export default function ResumeInfoChip(props: {
   ptyId: string;
   binding: ResumeBinding;
+  /** #1342 — host verdict for a remote pane's cwd match (see
+   *  buildPaneResumeCommand). Undefined for a local pane. */
+  exactOverride?: boolean;
+  /** #1342 — where the assembled command goes. Undefined = this pane's local
+   *  PTY. A remote-terminal surface has no local PTY, so it supplies the
+   *  remote input path instead. */
+  onSend?: (command: string) => void;
   /** Live cwd candidates for the cwd-match re-guard, in trust order:
    *  surface.cwd (OSC 7-tracked shell cwd), then the workspace's hook-reported
    *  agent cwd (metadata.cwd) — see buildPaneResumeCommand. */
@@ -103,7 +121,7 @@ export default function ResumeInfoChip(props: {
   /** D2 — the role name that supplied `roleBinding`, for the audit log. */
   role?: string;
 }): React.ReactElement | null {
-  const { ptyId, binding, paneCwds, roleBinding, role } = props;
+  const { ptyId, binding, paneCwds, roleBinding, role, exactOverride, onSend } = props;
   const t = useT();
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -112,7 +130,7 @@ export default function ResumeInfoChip(props: {
   const canSkipPermissions = agentSupportsPermissionFlag(binding.agent);
   const [skipPermissions, setSkipPermissions] = useState(true);
 
-  const built = buildPaneResumeCommand(binding, paneCwds, skipPermissions, roleBinding);
+  const built = buildPaneResumeCommand(binding, paneCwds, skipPermissions, roleBinding, exactOverride);
   if (!built) return null; // not a resumable agent — nothing to offer
   const { command } = built;
 
@@ -131,7 +149,8 @@ export default function ResumeInfoChip(props: {
     }
     // No trailing \r — the user presses Enter to run (D6: bypass is re-granted
     // only by an explicit keystroke, never automatically).
-    window.electronAPI.pty.write(ptyId, command);
+    if (onSend) onSend(command);
+    else window.electronAPI.pty.write(ptyId, command);
     setOpen(false);
   };
 

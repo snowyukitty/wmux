@@ -12,8 +12,9 @@ import { describe, it, expect, vi } from 'vitest';
 import { createElement, isValidElement, type ReactElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { RoleBindingsView, roleBindingHint, type RoleBindingsViewProps } from '../SettingsPanel';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { t as translate } from '../../../i18n';
-import { FOCUS_RING } from '../../focusRing';
 
 describe('roleBindingHint — a row never lies about what it enforces (P2-4)', () => {
   it('flags a model with no agent', () => {
@@ -28,6 +29,23 @@ describe('roleBindingHint — a row never lies about what it enforces (P2-4)', (
 
   it('flags an inert row — an agent with nothing to enforce', () => {
     expect(roleBindingHint({ agent: 'claude' })?.key).toBe('settings.roleBindingHintInert');
+  });
+
+  it('counts an effort or skip permissions as something enforced', () => {
+    expect(roleBindingHint({ agent: 'claude', effort: 'low' })).toBeUndefined();
+    expect(roleBindingHint({ agent: 'codex', skipPermissions: true })).toBeUndefined();
+  });
+
+  // #1680 — fresh context counts as enforced only where it can run.
+  it('counts fresh context as enforced for claude/codex, and flags it anywhere else', () => {
+    expect(roleBindingHint({ agent: 'claude', freshContext: true })).toBeUndefined();
+    expect(roleBindingHint({ agent: 'codex', freshContext: true })).toBeUndefined();
+    expect(roleBindingHint({ agent: 'opencode', freshContext: true })?.key).toBe(
+      'settings.roleBindingHintFreshContextInert',
+    );
+    expect(roleBindingHint({ freshContext: true })?.key).toBe('settings.roleBindingHintFreshContextInert');
+    // The other hints keep their precedence.
+    expect(roleBindingHint({ model: 'haiku', freshContext: true })?.key).toBe('settings.roleBindingHintNoAgent');
   });
 
   it('is silent for a fully valid binding', () => {
@@ -48,32 +66,107 @@ describe('RoleBindingsView render', () => {
     );
 
   // P2-9 — the 12 new controls had `outline-none` and no ring, so keyboard
-  // focus vanished inside this block.
+  // focus vanished inside this block. They are now the shared ui/Select and
+  // ui/Input; the ring comes from the `.ui-surface` focus rules in ui.css
+  // (Settings' root carries `.ui-surface`). jsdom does not resolve :focus
+  // against the cascade, so the ring is pinned in the source: every control
+  // is one of those recipes, nothing on it or in settings.css strips the ring,
+  // and the focus rules paint it after the flat surface rule.
   it('gives every control a focus ring', () => {
     const html = render();
-    const ringToken = 'focus-visible:ring-2';
-    expect(FOCUS_RING).toContain(ringToken);
-    // 4 roles × (agent select + model input + args input).
-    expect(html.split(ringToken).length - 1).toBe(12);
+    // 4 roles × agent select, and 4 roles × (model input + args input).
+    expect(html.split('class="ui-select').length - 1).toBe(4);
+    expect(html.split('class="ui-input').length - 1).toBe(8);
+    // A bare `outline-none` strips the ring; the shared Button's own
+    // `focus-visible:outline-none` swaps it for a ring-2 and is fine.
+    expect(html).not.toMatch(/(^|[\s"])outline-none/);
+    expect(html).not.toMatch(/style="[^"]*(box-shadow|border)[^"]*"/);
+
+    const read = (...p: string[]) => readFileSync(join(__dirname, ...p), 'utf8').replace(/\r\n/g, '\n');
+    const ui = read('..', '..', '..', 'styles', 'ui.css');
+    const flat = ui.indexOf('.ui-surface .ui-input,\n.ui-surface .ui-select > select {');
+    expect(flat).toBeGreaterThan(-1);
+    for (const selector of ['.ui-surface .ui-input:focus-visible', '.ui-surface .ui-select > select:focus-visible']) {
+      const at = ui.indexOf(selector, flat);
+      expect(at, `${selector} after the flat surface rule`).toBeGreaterThan(flat);
+      const open = ui.indexOf('{', at);
+      const body = ui.slice(open, ui.indexOf('}', open));
+      expect(body).toContain('border-color: var(--accent-blue)');
+      expect(body).toMatch(/box-shadow:[^;]*var\(--accent-blue\)/);
+    }
+    // settings.css must not undo it for the role fields.
+    const settings = read('..', 'settings.css');
+    expect(settings).not.toMatch(/:focus[^{]*\{[^}]*(outline:\s*none|box-shadow:\s*none)/);
   });
 
-  // P2-9 — --bg-overlay is a BACKGROUND token; borders use the hairline token.
+  // P2-9 — --bg-overlay is a BACKGROUND token; borders use the hairline token
+  // (the ui recipes draw it from the surface hairline, never --bg-overlay).
   it('uses the border token, not a background token, for the field hairline', () => {
     const html = render();
-    expect(html).toContain('border-[color:var(--border-soft)]');
-    expect(html).not.toContain('1px solid var(--bg-overlay)');
+    expect(html).not.toContain('var(--bg-overlay)');
   });
 
   // P2-4 — a <select> of Claude aliases could not express a valid codex model.
-  it('renders the model field as a free-text combobox with a datalist', () => {
+  it('renders the model field as a free-text combobox', () => {
     const html = render();
-    expect(html).toContain('<datalist id="role-binding-models-Builder">');
-    expect(html).toContain('list="role-binding-models-Builder"');
+    expect(html).toContain('role="combobox"');
+    expect(html).toContain('aria-label="Builder model"');
+    expect(html).not.toContain('<datalist');
   });
 
-  it('suggests claude aliases only when the row is bound to claude', () => {
-    expect(render({ Builder: { agent: 'claude' } })).toContain('Haiku 4.5');
-    expect(render({ Builder: { agent: 'codex' } })).not.toContain('Haiku 4.5');
+  it('offers agy as a role-binding agent', () => {
+    expect(render()).toContain('<option value="agy">');
+  });
+
+  it('offers the agent\'s own launch options once an agent is bound', () => {
+    const claude = render({ Builder: { agent: 'claude' } });
+    expect(claude).toContain('data-role-binding-options="Builder"');
+    expect(claude).toContain('Skip permissions');
+    expect(claude).toContain('aria-label="Builder effort"');
+    const agy = render({ Builder: { agent: 'agy' } });
+    expect(agy).toContain('Skip permissions');
+    expect(render()).not.toContain('data-role-binding-options');
+  });
+
+  // #1680 — the checkbox appears only for an agent with a verified command, and
+  // its tooltip names that command.
+  it('offers fresh context per task for claude and codex only', () => {
+    const claude = render({ Builder: { agent: 'claude' } });
+    expect(claude).toContain('data-role-binding-fresh-context="Builder"');
+    expect(claude).toContain('Fresh context per task');
+    expect(claude).toContain('first types /clear');
+    expect(render({ Builder: { agent: 'codex' } })).toContain('first types /new');
+    for (const agent of ['opencode', 'gemini', 'agy']) {
+      expect(render({ Builder: { agent } })).not.toContain('data-role-binding-fresh-context');
+    }
+  });
+
+  it('a stale fresh-context flag on an agent without the command shows its hint', () => {
+    const html = render({ Tester: { agent: 'gemini', args: '--x', freshContext: true } });
+    expect(html).toContain('data-role-binding-hint="Tester"');
+    expect(html).toContain('works only with claude or codex');
+  });
+
+  it('toggling fresh context merges onto the binding', () => {
+    const onChange = vi.fn();
+    const tree = RoleBindingsView({ bindings: { Builder: { agent: 'claude', model: 'haiku' } }, onChange, t: translate });
+    const box = findByAriaLabel(tree, 'Fresh context per task') as unknown as
+      | { props: { onCheckedChange: (v: boolean) => void } }
+      | undefined;
+    expect(box).toBeDefined();
+    box?.props.onCheckedChange(true);
+    expect(onChange).toHaveBeenLastCalledWith('Builder', { agent: 'claude', model: 'haiku', freshContext: true });
+    box?.props.onCheckedChange(false);
+    expect(onChange).toHaveBeenLastCalledWith('Builder', { agent: 'claude', model: 'haiku', freshContext: undefined });
+  });
+
+  it('previews the launch the binding produces', () => {
+    const html = render({
+      Reviewer: { agent: 'codex', model: 'gpt-6-sol', effort: 'low', skipPermissions: true },
+    });
+    expect(html).toContain(
+      'codex --model gpt-6-sol -c model_reasoning_effort=low --dangerously-bypass-approvals-and-sandbox',
+    );
   });
 
   it('keeps a typed codex model id in the field (free text, not a fixed list)', () => {
@@ -120,7 +213,7 @@ describe('RoleBindingsView render', () => {
     });
     const modelInput = findByAriaLabel(tree, 'Builder model');
     expect(modelInput).toBeDefined();
-    modelInput?.props.onChange({ target: { value: 'haiku' } });
+    (modelInput?.props.onChange as unknown as (v: string) => void)('haiku');
     expect(onChange).toHaveBeenCalledWith('Builder', {
       agent: 'claude',
       args: '--verbose',
@@ -128,6 +221,80 @@ describe('RoleBindingsView render', () => {
     });
   });
 });
+
+describe('agy reads ignored files (owner decision C)', () => {
+  const html = (agent: string) =>
+    renderToStaticMarkup(createElement(RoleBindingsView, { bindings: { Builder: { agent } }, onChange: () => undefined, t: translate }));
+
+  it('warns on a row bound to agy, and only there', () => {
+    expect(html('agy')).toContain('data-role-binding-agy-warning="Builder"');
+    expect(html('agy')).toContain('.geminiignore');
+    expect(html('claude')).not.toContain('data-role-binding-agy-warning');
+  });
+});
+
+describe('role preset button (owner decision B)', () => {
+  type Btn = ReactElement<{ onClick: () => void; children?: unknown; title?: string; 'data-role-preset-bypass'?: string }>;
+  const presetButton = (bindings: RoleBindingsViewProps['bindings'], role: string, extra: Partial<RoleBindingsViewProps> = {}) => {
+    const onChange = vi.fn();
+    const tree = RoleBindingsView({ bindings, onChange, t: translate, ...extra });
+    const row = findByProp(tree, 'data-role-binding-preset', role);
+    const button = row ? (findByProp(row.props.children, 'onClick') as Btn | undefined) : undefined;
+    return { onChange, button };
+  };
+
+  it('names the bypass in the label and the tooltip', () => {
+    const html = renderToStaticMarkup(
+      createElement(RoleBindingsView, { bindings: { Builder: { agent: 'claude' } }, onChange: () => undefined, t: translate }),
+    );
+    expect(html).toContain('Apply Builder preset (skips permission prompts)');
+    expect(html).toContain('turns on skip permissions');
+  });
+
+  it('asks first, and applies nothing when the operator declines', () => {
+    const confirm = vi.fn(() => false);
+    const { onChange, button } = presetButton({ Builder: { agent: 'claude', model: 'claude-opus-5-5' } }, 'Builder', { confirm });
+    expect(button).toBeDefined();
+    button?.props.onClick();
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('skip permissions'));
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('applies the preset after a yes, keeping the chosen model', () => {
+    const confirm = vi.fn(() => true);
+    const { onChange, button } = presetButton({ Builder: { agent: 'claude', model: 'claude-opus-5-5' } }, 'Builder', { confirm });
+    button?.props.onClick();
+    expect(onChange).toHaveBeenCalledWith('Builder', expect.objectContaining({
+      agent: 'claude', model: 'claude-opus-5-5', effort: 'high', skipPermissions: true,
+    }));
+  });
+
+  it('does not ask, nor claim a bypass, for an agent without a verified skip flag', () => {
+    const confirm = vi.fn(() => false);
+    const { onChange, button } = presetButton({ Tester: { agent: 'gemini' } }, 'Tester', { confirm });
+    expect(button?.props['data-role-preset-bypass']).toBeUndefined();
+    button?.props.onClick();
+    expect(confirm).not.toHaveBeenCalled();
+    expect(onChange).toHaveBeenCalled();
+  });
+});
+
+/** Depth-first search for an element carrying `prop` (optionally equal to `value`). */
+function findByProp(node: unknown, prop: string, value?: unknown): ReactElement<Record<string, unknown> & { children?: unknown }> | undefined {
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findByProp(child, prop, value);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!isValidElement(node)) return undefined;
+  const props = node.props as Record<string, unknown> & { children?: unknown };
+  if (prop in props && (value === undefined || props[prop] === value)) {
+    return node as ReactElement<Record<string, unknown> & { children?: unknown }>;
+  }
+  return findByProp(props.children, prop, value);
+}
 
 type Handled = ReactElement<{
   'aria-label'?: string;

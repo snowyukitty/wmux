@@ -1,3 +1,11 @@
+import { randomUUID as phoneBrowserRequestId } from 'node:crypto';
+import { webContents as phoneWebContents } from 'electron';
+import { withPhoneBrowserInputFocus, dispatchPhoneBrowserScroll, phoneBrowserNativeBounds } from './phone/PhoneBrowserInput';
+import { handlePhoneBrowser } from './phone/PhoneBrowser';
+import { handlePhoneWorkspaces } from './phone/PhoneWorkspaces';
+import { handlePhoneQuickCommands } from './quickCommands/QuickCommandStore';
+import { installPhoneBridge } from './phone/installPhoneBridge';
+import { handlePhoneAccounts } from './phone/PhoneAccounts';
 // #582: Suppress Electron's dev-only "Insecure Content-Security-Policy"
 // warning at the earliest possible point — before `app` ready and before any
 // BrowserWindow is created. Vite's HMR requires `unsafe-eval`, so the warning
@@ -32,8 +40,8 @@ process.on('uncaughtException', (err) => {
 // the main process runs). Moving it below another import skews every boot
 // phase measurement by that import's eval cost.
 import { markBoot, emitBootSummary } from './util/bootTrace';
-import * as crypto from 'crypto';
 import * as path from 'path';
+import * as os from 'os';
 import { app, BrowserWindow, dialog, ipcMain, powerMonitor } from 'electron';
 import { checkUserDataIsolation } from './dataIsolation';
 import { createWindow, loadMainRenderer } from './window/createWindow';
@@ -48,17 +56,28 @@ import { registerWorkspaceRpc } from './pipe/handlers/workspace.rpc';
 import { registerSurfaceRpc } from './pipe/handlers/surface.rpc';
 import { registerPaneRpc } from './pipe/handlers/pane.rpc';
 import { registerInputRpc, makeRoleBindingResolver } from './pipe/handlers/input.rpc';
+import { gatedSubmitTaskContext } from './pipe/handlers/a2aOpenTasks';
+import { registerGitHandoffHandlers } from './ipc/handlers/gitHandoff.handler';
 import { registerApprovalsRpc } from './pipe/handlers/approvals.rpc';
 import { registerDeckRpc } from './pipe/handlers/deck.rpc';
 import { registerNotifyRpc } from './pipe/handlers/notify.rpc';
 import { registerMetaRpc } from './pipe/handlers/meta.rpc';
 import { registerSystemRpc } from './pipe/handlers/system.rpc';
 import { registerPerfRpc } from './pipe/handlers/perf.rpc';
+import { registerComputerRpc } from './pipe/handlers/computer.rpc';
+import { resolvePtyOwnerWorkspace } from './workspace/ptyOwnership';
+import { createFanoutCallerSubmit } from './deck/fanoutCallerSubmit';
+import { COMPUTER_ABORT_ACCELERATOR, createComputerService, disposeComputerUse, registerComputerUseIpc } from './computer';
+import { createComputerConsentRequester } from './computer/computerConsent';
+import type { ComputerService } from './computer/ComputerService';
 import { revealStatsAggregator } from './perf/revealStatsAggregator';
 import { registerHooksRpc } from './pipe/handlers/hooks.rpc';
+import { registerUsageRpc } from './pipe/handlers/usage.rpc';
 import { CompletionAlarm } from '../shared/hooks/CompletionAlarm';
 import { UsagePoller } from './claude/UsagePoller';
+import { setUsageClientVersion } from './claude/UsageApi';
 import { AccountUsageService } from './account/AccountUsageService';
+import { getAccountRotationService } from './account/AccountRotationService';
 import { getAccountStore } from './account/accountStore';
 import { IPC, getWmuxHomeDir } from '../shared/constants';
 import { HookSignalRouter } from './hooks/HookSignalRouter';
@@ -76,19 +95,32 @@ import { registerChannelLocalHandlers } from './ipc/handlers/channelLocal.handle
 import { registerRemoteHandlers } from './ipc/handlers/remote.handler';
 import { RemoteHostsStore } from './remote/RemoteHostsStore';
 import { RemoteAttachmentsStore } from './remote/RemoteAttachmentsStore';
-import { registerFanOutHandler } from './ipc/handlers/fanout.handler';
+import { registerFanOutHandler, startGuiFanOut } from './ipc/handlers/fanout.handler';
+import { initQuickLaunch } from './quickLaunch';
+import { focusedPrimaryWindow } from './window/auxiliaryWindows';
 import { createFanOutService } from './worktask/createFanOutService';
+import { getWorkerTempDirSweeper, liveTempDirsFromSessions } from './worktask/fanoutTempDir';
 import { registerFanOutRpc } from './pipe/handlers/fanout.rpc';
 import { registerLedgerRpc } from './pipe/handlers/ledger.rpc';
+import { registerAutomationRpc } from './pipe/handlers/automation.rpc';
 import { registerWorktaskHandlers, type WorktaskServices } from './ipc/handlers/worktask.handler';
 import { registerWorktaskRpc } from './pipe/handlers/worktask.rpc';
 import { TaskAdoptService } from './worktask/TaskAdoptService';
 import { TaskGateRunner } from './worktask/TaskGateRunner';
 import { createHostedLedgerPort } from './worktask/ledgerPort';
 import { getProjectConfigStore } from './project/ProjectConfigStore';
-import { createWorkspaceFactsPublisher, invalidateAutonomyCache } from './workspace/workspaceFactsFeed';
+import { createWorkspaceFactsPublisher, invalidateAutonomyCache, registerWorkspaceFactsPublisher } from './workspace/workspaceFactsFeed';
+import { publishMoaPane, setMoaPanePush } from './deck/moaPaneFeed';
+import { reconcileOwnerDowngrades } from './worktask/taskAutonomy';
+import { createHqAutoPress, setHqAutoPress } from './deck/hqApprovalLane';
 import { getTaskLedger } from './deck/taskLedgerHost';
-import { onAutonomyWritten } from './deck/deckAutonomyStore';
+import { createTrackRecordFeed, setTrackRecordFeed, type TrackApprovalRecord } from './deck/trackRecordFeed';
+import { getTrackRecordStore } from './deck/trackRecordStore';
+import { loadDeckDecisions, onDecisionsChanged } from './deck/deckDecisionStore';
+import { getWorkLinkStore } from './workLink/workLinkStore';
+import { agentSlug } from '../shared/trackRecord';
+import { onAutonomyWritten, loadWorkspaceMode } from './deck/deckAutonomyStore';
+import { getHqWorkspaceId, hqPresence, isHqApprovalPressEnabled, isMoaEnabled, onHqStoreWritten } from './deck/deckHqStore';
 import { registerDeckHandler } from './ipc/handlers/deck.handler';
 import { registerWorkspaceMirrorHandler } from './ipc/handlers/workspaceMirror.handler';
 import { getWorkspaceMirror } from './workspace/WorkspaceMirror';
@@ -98,6 +130,8 @@ import { getPluginTrustStore } from './mcp/PluginTrustStore';
 import { ShadowRejectionLogger } from './audit/shadowRejectionLog';
 import { LegacyTrafficCounter } from './audit/legacyTrafficCounter';
 import { ApprovalQueue } from './mcp/ApprovalQueue';
+import { createBorrowApprovalRequester } from './browser-session/liveBorrowApproval';
+import type { BorrowApprovalRequester } from '../shared/liveWriteScope';
 import { resolveEnforcementMode } from './mcp/enforcementMode';
 import { setConfiguredFirstPartyClients } from './mcp/firstParty';
 import { readConfiguredFirstPartyClients } from './mcp/firstPartyConfig';
@@ -108,12 +142,14 @@ import { readDaemonPid } from './updater/installTeardown';
 import { McpRegistrar } from './mcp/McpRegistrar';
 import { BrokerSupervisor, isMcpBrokerEnabled } from './mcp/BrokerSupervisor';
 import { WebviewCdpManager } from './browser-session/WebviewCdpManager';
+import { claimCdpPort, probeCdpEndpointWithRetry } from './browser-session/cdpPort';
 import { BrowserBackendStore } from './browser-session/BrowserBackendStore';
 import { ChromeLauncherRegistry } from './browser-session/ChromeLauncher';
 import { ChromeProfileStore } from './browser-session/ChromeProfileStore';
 import { ChromeSurfaceStore } from './browser-session/ChromeSurfaceStore';
 import { getActionCacheStore } from './browser-session/ActionCacheStore';
 import { getPromotedSkillStore } from './browser-session/PromotedSkillStore';
+import { getSiteMemoryStore } from './browser-session/SiteMemoryStore';
 import { isBrowserBackend } from '../shared/browserBackend';
 import { DaemonClient, getDaemonPipeName, readDaemonAuthToken } from './DaemonClient';
 import { raceDaemonShutdown } from './daemonShutdownRace';
@@ -121,8 +157,11 @@ import { migrateScrollbackOnce } from './scrollback/legacyMigration';
 import { DaemonNotificationRouter } from './notification/DaemonNotificationRouter';
 import { markRendererNotificationListenerNotReady } from './notification/rendererNotificationReadiness';
 import { RemoteInboxBridge } from './lanlink/RemoteInboxBridge';
+import { AutomationBridge } from './automation/AutomationBridge';
+import { AutomationClient } from './automation/AutomationClient';
+import { toastManager } from './notification/ToastManager';
 import { WorkspaceContextRouter } from './metadata/WorkspaceContextRouter';
-import { ensureDaemon, killDaemonByPidFile, killVerifiedDaemonPid, checkProcessLiveness, isDaemonPipeGone } from './daemon/launcher';
+import { ensureDaemon, killDaemonByPidFile, describeDaemonKillOutcome, killVerifiedDaemonPid, checkProcessLiveness, isDaemonPipeGone } from './daemon/launcher';
 import { DaemonRespawnController } from './daemon/DaemonRespawnController';
 import { loadConfig, getWmuxDir } from '../daemon/config';
 import { CHANNELS_EPOCH } from '../shared/channels';
@@ -141,6 +180,7 @@ import { terminateRunningAppInstances } from './squirrelTeardown';
 import * as autostart from './autostart';
 import * as cliShim from './cliShim';
 import * as shortcutHygiene from './shortcutHygiene';
+import { isFreshProfile, runPostInstallReconcile } from './postInstallReconcile';
 import {
   refreshStatuslineScript,
   defaultPaths as defaultStatuslinePaths,
@@ -155,7 +195,7 @@ import { metadataStore } from './metadata/MetadataStore';
 import { collectLegacyMetadata } from './metadata/legacyMigration';
 import { sessionManager, registerSessionHandlers } from './ipc/handlers/session.handler';
 import { eventBus } from './events/EventBus';
-import { broadcastMetadataUpdate } from './ipc/handlers/metadata.handler';
+import { broadcastMetadataUpdate, currentPrOfPty, resetPollCacheOnRendererLoad } from './ipc/handlers/metadata.handler';
 import { broadcastSettledIdle } from './notification/turnSettle';
 import { readOrchRole } from '../shared/orchestratorRole';
 import { initLogSink, isBrokenPipeError, logLine, stdioErrorsConsumed } from './util/logSink';
@@ -379,12 +419,23 @@ const cdpEnabled =
   loadConfig().browser?.cdp?.enabled !== false;
 let cdpPort = 0;
 if (cdpEnabled) {
-  // Randomize port within range to prevent predictable scanning
-  const basePort = 18800;
-  const range = 100;
-  cdpPort = basePort + crypto.randomInt(range);
+  // The port is still drawn at random within the range, to keep it
+  // unpredictable to a scanner — but it is CLAIMED rather than merely drawn
+  // (#1331). A bare draw collided with a second wmux instance about once in a
+  // hundred launches; Chromium then failed to bind, came up with no listening
+  // CDP port at all, and the line below still said "enabled". Every browser
+  // tool was dead with nothing anywhere to say why.
+  const claim = claimCdpPort();
+  cdpPort = claim.port;
   app.commandLine.appendSwitch('remote-debugging-port', cdpPort.toString());
-  console.log(`[WinMux] CDP enabled on port ${cdpPort}`);
+  // REQUESTED, not enabled. Whether it is enabled is not knowable yet: the
+  // switch is a request to Chromium, which has not started. The truth is
+  // logged by the probe below, once there is a fact to log.
+  console.log(
+    `[WinMux] CDP requested on port ${cdpPort}` +
+      (claim.claimed ? '' : ' (port not claimed exclusively — every port in the range is held)'),
+  );
+
 } else {
   console.log('[WinMux] CDP disabled — browser automation will be unavailable (enable via ~/.wmux/config.json browser.cdp.enabled)');
 }
@@ -445,6 +496,12 @@ const autoUpdater = new AutoUpdater(() => mainWindow, {
   // before-quit takes the daemon.shutdown branch instead of detaching.
   onInstallRequiresFullShutdown: () => { fullShutdownRequested = true; },
   getDaemonPid: () => readDaemonPid(getWmuxDir()),
+  // #1250: seed the updater's enabled flag from session.json. The renderer
+  // sends the toggle during loadSession, but that send races this module's
+  // own ready sequence; a locked session.json can stop it from ever arriving.
+  // The disk read fills the silence; the renderer's IPC still wins when it
+  // lands (AutoUpdater.start applies the read only if nothing arrived).
+  readAutoUpdateEnabled: () => sessionManager.readAutoUpdateEnabled(),
 });
 
 // #1046: a Squirrel install can half-complete (an AV lock race inside the
@@ -474,6 +531,24 @@ void app.whenReady().then(() => { try { warnOnInstallIntegrityGap(); } catch { /
 // lastRunAt, so a missed sweep only ever postpones a decision.
 const PROMOTED_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Per-site memory expires on its own ladder, and this timer is the ONLY thing
+ * that carries it out.
+ *
+ * The store's read paths drop stale ENTRIES in memory, which is enough to stop
+ * serving them but never removes the file. Without this registration the
+ * 180-day delete would simply never happen and an abandoned domain's record
+ * would sit on disk forever.
+ */
+function sweepSiteMemory(): void {
+  void getSiteMemoryStore()
+    .sweep()
+    .then(({ removed }) => {
+      if (removed > 0) console.log(`[Main] site memory swept: ${removed} record(s) deleted`);
+    })
+    .catch((err) => console.warn('[Main] site memory sweep failed:', err));
+}
+
 function sweepPromotedSkills(): void {
   void getPromotedSkillStore()
     .sweep()
@@ -492,6 +567,12 @@ void app.whenReady().then(() => {
   const timer = setInterval(sweepPromotedSkills, PROMOTED_SWEEP_INTERVAL_MS);
   // Housekeeping must never be the reason the process stays alive.
   timer.unref?.();
+  // Same boot-plus-timer shape, for the same reason: a machine that is quit
+  // every evening would never reach a timer-only sweep, and one left up for
+  // months would never reach a boot-only one.
+  sweepSiteMemory();
+  const siteTimer = setInterval(sweepSiteMemory, PROMOTED_SWEEP_INTERVAL_MS);
+  siteTimer.unref?.();
 });
 
 const rpcRouter = new RpcRouter();
@@ -513,10 +594,12 @@ const mcpRegistrar = new McpRegistrar();
 // be) listening when the first shim spawns — the shim retries connect with
 // backoff, so start order is a latency nicety, not a correctness gate.
 const mcpBrokerSupervisor = new BrokerSupervisor();
-const webviewCdpManager = new WebviewCdpManager(cdpPort);
+const webviewCdpManager = new WebviewCdpManager(0);
+webviewCdpManager.setCdpFailureReason(cdpEnabled ? 'CDP ownership verification pending' : 'CDP disabled by configuration');
 
 // Daemon client — initialized on app ready, used if daemon is available
 let daemonClient: DaemonClient | null = null;
+let disposePhoneBridge: (() => void) | null = null;
 
 // envelope PR4 C12: 워커 전이는 데몬 A2aTaskService(정본 로그)에 먼저 커밋된다 —
 // getter 주입이라 앱-레디 이후 연결되는 daemonClient를 자연 추적한다.
@@ -557,6 +640,11 @@ async function refreshTraySessionCount(): Promise<void> {
 // the notification pipeline 100% inert (Codex 2nd review #1).
 let daemonNotificationRouter: DaemonNotificationRouter | null = null;
 let remoteInboxBridge: RemoteInboxBridge | null = null;
+// Scheduled runs: daemon automation events → renderer + OS toasts.
+const automationBridge = new AutomationBridge(
+  () => mainWindow,
+  (text, onClick, opts) => toastManager.showDirect(text, '', undefined, { ...opts, onClick }),
+);
 // X1 — folds daemon context.git/context.ports broadcasts into the sidebar
 // metadata channel (and drives the gh PR cache). Same lifecycle as the
 // notification router above.
@@ -649,7 +737,7 @@ registerSessionHandlers(() => daemonClient?.isConnected === true);
 // holding notifications after the user locked up and left.
 attachDesktopPresenceReporter(app, () => daemonClient, {
   powerMonitor,
-  isFocused: () => BrowserWindow.getFocusedWindow() !== null,
+  isFocused: () => focusedPrimaryWindow() !== null,
 });
 
 // Bridge the in-renderer `__wmuxEventsPoll` / `__wmuxChannelsRpc` globals
@@ -783,20 +871,87 @@ localCompletionAlarm = new CompletionAlarm({
 registerWorkspaceRpc(rpcRouter, () => mainWindow);
 registerSurfaceRpc(rpcRouter, () => mainWindow);
 registerPaneRpc(rpcRouter, () => mainWindow, {}, () => daemonClient);
-registerInputRpc(
+const inputRpc = registerInputRpc(
   rpcRouter,
   ptyManager,
   () => mainWindow,
   () => daemonClient,
   makeRoleBindingResolver(() => mainWindow),
   (ptyId, data) => ptyBridge.noteInterruptInput(ptyId, data),
+  {
+    readTurnStartedAt: (ptyId) => hookSignalRouter?.promptSubmitAtFor(ptyId),
+    readSessionStart: (ptyId) => hookSignalRouter?.sessionStartFor(ptyId),
+  },
 );
+// Non-operator deliveries (A2A, company, channel mention nudges) are pasted
+// and submitted here, behind the same approval guard as `input.send`, checked
+// again right before the Enter. Registered once, beside the router, so
+// crash-recovery handler reloads do not double-register it.
+// `opts.newTask` (#1680): only the a2a new-task branch sets it, so the pane's
+// role may get its fresh-context command before the text.
+ipcMain.handle(IPC.GATED_SUBMIT, async (_e, ptyId: unknown, text: unknown, agent: unknown, opts: unknown) =>
+  typeof ptyId === 'string' && ptyId && typeof text === 'string'
+    ? inputRpc.gatedSubmit(ptyId, text, typeof agent === 'string' ? agent : null, {
+        newTask: typeof opts === 'object' && opts !== null && (opts as { newTask?: unknown }).newTask === true,
+        ...(typeof opts === 'object' && opts !== null && (opts as { keepContext?: unknown }).keepContext === 'open_a2a_task'
+          ? { keepContext: 'open_a2a_task' as const }
+          : {}),
+        ...(typeof opts === 'object' && opts !== null && (opts as { waitQuiet?: unknown }).waitQuiet === true
+          ? {
+              waitQuiet: true,
+              ...(typeof (opts as { expectAgent?: unknown }).expectAgent === 'string'
+                ? { expectAgent: ((opts as { expectAgent: string }).expectAgent).slice(0, 80) }
+                : {}),
+              ...(typeof (opts as { deadlineAt?: unknown }).deadlineAt === 'number' &&
+              Number.isFinite((opts as { deadlineAt: number }).deadlineAt)
+                ? { deadlineAt: (opts as { deadlineAt: number }).deadlineAt }
+                : {}),
+              ...(typeof (opts as { guardKey?: unknown }).guardKey === 'string'
+                ? { guardKey: ((opts as { guardKey: string }).guardKey).slice(0, 128) }
+                : {}),
+            }
+          : {}),
+        ...gatedSubmitTaskContext(opts),
+      })
+    : { ok: false, reason: 'write_failed', detail: 'delivery: missing target pty or text' },
+);
+// The fan-out caller nudge (main/deck/fanoutCallerSubmit.ts): the same
+// delivery gate, then a daemon-owned write that waits while a person types.
+const fanoutCallerSubmit = createFanoutCallerSubmit({
+  deliveryGate: (ptyId) => inputRpc.deliveryGate(ptyId),
+  ownerOf: (ptyId) => resolvePtyOwnerWorkspace(() => mainWindow, ptyId),
+  prOf: (ptyId) => currentPrOfPty(ptyId),
+  agentState: async (ptyId) => (daemonClient?.isConnected ? daemonClient.getAgentState(ptyId) : null),
+  deliver: async (args) =>
+    daemonClient ? daemonClient.deliverCallerNudge(args) : { result: 'unavailable', pasted: false },
+});
+ipcMain.handle(IPC.DECK_FANOUT_CALLER_SESSION, (_e, ptyId: unknown) => fanoutCallerSubmit.session(ptyId));
+ipcMain.handle(IPC.DECK_FANOUT_CALLER_SUBMIT, (_e, payload: unknown) => fanoutCallerSubmit.submit(payload));
 registerApprovalsRpc(rpcRouter, () => daemonClient);
 registerDeckRpc(rpcRouter, () => mainWindow);
 registerNotifyRpc(rpcRouter, () => mainWindow);
 registerMetaRpc(rpcRouter, () => mainWindow);
 registerSystemRpc(rpcRouter);
 registerPerfRpc(rpcRouter);
+// Desktop computer use. Built on first call, so an install that never opts in
+// (Settings › Computer use) never constructs it or spawns a helper. Consent rides
+// the approval queue, which is created further down — hence the late binding.
+let computerService: ComputerService | null = null;
+let computerConsentQueue: ApprovalQueue | null = null;
+registerComputerRpc(
+  rpcRouter,
+  () => {
+    computerService ??= createComputerService({
+      requestConsent: createComputerConsentRequester({ queue: () => computerConsentQueue }),
+    });
+    return computerService;
+  },
+  (ptyId) => resolvePtyOwnerWorkspace(() => mainWindow, ptyId),
+  // The consent prompt names the asking session's workspace the way the
+  // person named it; the renderer's mirror is the only place main knows it.
+  (workspaceId) => getWorkspaceMirror().getEntries()?.find((e) => e.id === workspaceId)?.name,
+);
+registerComputerUseIpc(() => computerService);
 // #517 backend choice: main owns the setting (sync read at boot — an RPC can
 // arrive before the renderer has pushed anything, so renderer-push authority
 // would race and fail open to builtin).
@@ -829,7 +984,7 @@ const enforcementMode = resolveEnforcementMode({ isDev: isDevEnvironment });
 // Shared bounded audit sink for permission rejections, legacy milestones, and
 // #810's browser caller-scope decisions.
 const shadowRejectionLogger = new ShadowRejectionLogger();
-registerBrowserRpc(
+const browserHelpRequests = registerBrowserRpc(
   rpcRouter,
   () => mainWindow,
   webviewCdpManager,
@@ -840,7 +995,44 @@ registerBrowserRpc(
   // lazy so registration does not depend on where the mode is resolved.
   () => enforcementMode,
   chromeRegistry,
+  // Per-site memory's on/off switch, judged in the RPC handler because the
+  // MCP process cannot read session settings. Targeted read, lazy per call.
+  () => sessionManager.readSiteMemoryEnabled(),
+  // Site guide pointers' switch (default OFF), judged in the same place.
+  () => sessionManager.readSiteGuidesEnabled(),
+  // Live Chrome: asking the human to lend the agent one of THEIR tabs. The
+  // requester needs the approval queue, which is built further down, so the read
+  // is deferred to call time — the same lazy-getter posture the enforcement mode
+  // above uses. Fail-closed while it is unset: a borrow nobody can be asked
+  // about is a borrow that does not happen.
+  (request) => (liveBorrowRequester ? liveBorrowRequester(request) : Promise.resolve('denied')),
 );
+// browser_request_help — the renderer's Done / Cancel. Mirrors
+// PERMISSION_PROMPT_RESOLVE: a shape-validated invoke, and the AUTHORITATIVE
+// removal is the BROWSER_HELP_CLOSED push HelpRequests emits from inside its own
+// settle, so an optimistic local removal racing this is harmless. A stale or
+// already-settled id resolves `{ ok: false }` rather than throwing — the row may
+// have timed out under the operator's click.
+ipcMain.handle(
+  IPC.BROWSER_HELP_RESOLVE,
+  async (_event, payload: { requestId?: unknown; outcome?: unknown }) => {
+    if (
+      !payload ||
+      typeof payload.requestId !== 'string' ||
+      (payload.outcome !== 'continued' && payload.outcome !== 'cancelled')
+    ) {
+      return { ok: false, error: 'invalid browser help payload' };
+    }
+    const settled = await browserHelpRequests.resolveFromRenderer(
+      payload.requestId,
+      payload.outcome,
+    );
+    return { ok: settled };
+  },
+);
+
+/** Set once the ApprovalQueue exists (below). Read lazily by browser.rpc. */
+let liveBorrowRequester: BorrowApprovalRequester | null = null;
 registerA2aRpc(rpcRouter, () => mainWindow, claudeWorker, { getDaemonClient: () => daemonClient });
 registerA2aChannelRpc(rpcRouter, () => daemonClient, () => mainWindow);
 registerCompanyRpc(rpcRouter, () => mainWindow);
@@ -879,9 +1071,32 @@ registerRemoteHandlers({
 // identity + repo server-side and adds its own approval gate — see
 // pipe/handlers/fanout.rpc.ts.
 const fanOutService = createFanOutService(() => daemonClient, () => mainWindow);
+// Fan-out worker temp dirs are only swept once the daemon confirms no live
+// session still uses them; no daemon answer means nothing is removed.
+getWorkerTempDirSweeper().setLiveTempDirs(async () => {
+  if (!daemonClient?.isConnected) return null;
+  const sessions = (await daemonClient.rpc('daemon.listSessions', { includeSuspended: true })) as Array<{
+    state?: string;
+    env?: Record<string, string> | null;
+  }>;
+  return Array.isArray(sessions) ? liveTempDirsFromSessions(sessions) : null;
+});
+let quickLaunch: ReturnType<typeof initQuickLaunch> | null = null;
 registerFanOutHandler(fanOutService);
+// The Git page's hand-off (issue / PR → agent pane or new worktree): the
+// operator RPC lane for the A2A send (so the task joins its work link) and
+// the fan-out service for a new worktree.
+registerGitHandoffHandlers({
+  invoke: (method, params) => invokeRendererRpc(method, params),
+  startFanOut: (req) => startGuiFanOut(fanOutService, req),
+});
 registerFanOutRpc(rpcRouter, fanOutService, () => mainWindow);
 registerLedgerRpc(rpcRouter, () => mainWindow);
+// Scheduled runs for agents: draft-only propose + redacted reads, relayed to
+// the daemon over main's first-party connection (pipe/handlers/automation.rpc.ts).
+registerAutomationRpc(rpcRouter, {
+  getClient: () => (daemonClient && daemonClient.isConnected ? new AutomationClient(daemonClient) : null),
+});
 // J3 태스크 수명주기 — close(remove→close 순서)·1클릭 PR(gh 4중 게이트)·정리 스캔
 // (디스크 정본)·미발사 재발사(prompt.md 읽기). 물질화 필드는 데몬 projection에서
 // 역참조하므로 렌더러는 taskId만 싣는다(단일 정본). 파이프 미노출(renderer-trusted).
@@ -922,20 +1137,94 @@ registerWorktaskHandlers(() => daemonClient, (services: WorktaskServices) => {
 // cancelled) and an autonomy write. Until the first push lands the daemon
 // answers `scope-unavailable` and refuses, which is the safe direction.
 // See workspace/workspaceFactsFeed.ts.
+// The HQ approval lane (deck/hqApprovalLane.ts) presses by the facts this feed
+// publishes, so a lane pass runs right after each push lands — never before
+// the daemon holds the table it will judge by.
+// The HQ lane's policy as main sees it now; published beside the table.
+const hqLanePolicyNow = (): { open: boolean; hq: string | null } => {
+  const hq = getHqWorkspaceId();
+  return {
+    open: hq !== null && isMoaEnabled() && isHqApprovalPressEnabled() && hqPresence(hq) === 'present',
+    hq,
+  };
+};
+const hqAutoPress = createHqAutoPress({
+  facts: {
+    settled: () => workspaceFactsPublisher.settled(),
+    ackedSeq: () => workspaceFactsPublisher.ackedSeq(),
+    ackedLaneGeneration: () => workspaceFactsPublisher.ackedLaneGeneration(),
+  },
+  getHq: () => getHqWorkspaceId(),
+  isMoaEnabled: () => isMoaEnabled(),
+  presence: (hq) => hqPresence(hq),
+  isOptedIn: () => isHqApprovalPressEnabled(),
+  ledger: () => getTaskLedger(),
+  modeOf: (ws) => loadWorkspaceMode(ws),
+  nameOf: (ws) => getWorkspaceMirror().getEntries()?.find((e) => e.id === ws)?.name,
+  getDaemonClient: () => daemonClient,
+});
+setHqAutoPress(hqAutoPress);
 const workspaceFactsPublisher = createWorkspaceFactsPublisher({
-  push: async (facts, seq) => {
+  push: async (facts, seq, lane) => {
     if (!daemonClient) throw new Error('Daemon not connected');
-    return daemonClient.rpc('daemon.workspaceFacts.set', { facts, seq });
+    const result = (await daemonClient.rpc('daemon.workspaceFacts.set', { facts, seq, lane })) as
+      | { ok?: boolean; error?: string }
+      | undefined;
+    // Refused outright (not merely raced by a newer table): the daemon does
+    // not hold this, so the publisher must not count it as acknowledged.
+    if (result?.ok === false) throw new Error(result.error ?? 'workspace fact table refused');
+    void hqAutoPress.run();
+    return result;
+  },
+  lanePolicy: hqLanePolicyNow,
+});
+registerWorkspaceFactsPublisher(workspaceFactsPublisher);
+// Any change to the lane's own inputs reaches the daemon at once.
+onHqStoreWritten(() => workspaceFactsPublisher.publishIfLaneChanged());
+// Moa's track record (deck/trackRecordFeed.ts): counts from wmux's own task
+// data, running only while Moa is on — the switch starts and stops it.
+const trackRecordFeed = createTrackRecordFeed({
+  store: getTrackRecordStore(),
+  isMoaEnabled: () => isMoaEnabled(),
+  workLinks: getWorkLinkStore(),
+  decisions: { load: () => loadDeckDecisions(), onChanged: onDecisionsChanged },
+  ledger: getTaskLedger(),
+  listResolvedApprovals: async () => {
+    if (!daemonClient?.isConnected) return null;
+    const listed = (await daemonClient.rpc('daemon.approvals.list', {})) as
+      | { recentlyResolved?: TrackApprovalRecord[] }
+      | undefined;
+    return listed?.recentlyResolved ?? [];
+  },
+  agentOf: (ws) => agentSlug(getWorkspaceMirror().getEntries()?.find((e) => e.id === ws)?.metadata?.agentName),
+  ownerOfTaskWorkspace: (ws) =>
+    getTaskLedger().list({}).find((e) => e.taskWorkspaceId === ws)?.ownerWorkspaceId ?? null,
+  onRetroChanged: () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(IPC.TRACK_RECORD_CHANGED);
   },
 });
+setTrackRecordFeed(trackRecordFeed);
+onHqStoreWritten(() => trackRecordFeed.sync());
+getWorkspaceMirror().onSnapshot(() => workspaceFactsPublisher.publishIfLaneChanged());
 getTaskLedger().onTransition(() => {
   workspaceFactsPublisher.schedule();
+});
+// The phone's Moa pane (main → daemon): which daemon session is the HQ brain's
+// TUI, or null. The deck handler re-publishes on every change; see
+// deck/moaPaneFeed.ts.
+setMoaPanePush(async (pane, seq) => {
+  if (!daemonClient) throw new Error('Daemon not connected');
+  return daemonClient.rpc('daemon.moa.set', { pane, seq });
 });
 onAutonomyWritten(() => {
   // The store this feed reads was just rewritten, so the cached copy is stale
   // before the debounce fires — invalidate first, then schedule.
   invalidateAutonomyCache();
-  workspaceFactsPublisher.schedule();
+  // Not debounced: a lowered mode must reach the daemon before the next
+  // automated approve is judged (and the publisher reads unsettled until it has).
+  void workspaceFactsPublisher.publishNow();
+  // An owner lowered after a fan-out lowers its open tasks too (taskAutonomy.ts).
+  void reconcileOwnerDowngrades(() => getTaskLedger().list({ openOnly: true }));
 });
 
 // Command Deck Phase 2 — the Commander brain. Renderer-only surface (same
@@ -945,9 +1234,15 @@ onAutonomyWritten(() => {
 // getDaemonClient: the `claude-pty` brain vendor spawns its interactive TUI as
 // a daemon session, so it needs the live client (a getter, because the deck
 // handler registers before the daemon connects).
+// WMX-06: registerDeckHandler sweeps orphaned atomic-write temp files in the
+// data dir before the Deck stores are first read (once per registration).
 const disposeDeckHandler = registerDeckHandler(() => mainWindow, {
   getDaemonClient: () => daemonClient,
+  invokeOperatorRpc: (method, params) => invokeRendererRpc(method, params),
 });
+// The track record's first start waits for the deck handler: it decides Moa's
+// switch for a new install (ensureMoaDefault), which reads as on until then.
+trackRecordFeed.sync();
 // WorkspaceMirror — renderer push (fire-and-forget) keeps a main-process cache
 // of the workspace tree + per-pane agent status warm, so routing / hook
 // resolution is served locally instead of via the workspace.list renderer
@@ -955,10 +1250,12 @@ const disposeDeckHandler = registerDeckHandler(() => mainWindow, {
 const disposeWorkspaceMirrorHandler = registerWorkspaceMirrorHandler();
 // Returns an unsubscribe for the signal-health push subscription. Called from
 // before-quit so HMR reload / shutdown does not leak the listener.
-// ─── M2 — per-account usage service (hook-gated, opt-in) ─────────────────────
+// ─── M2 — per-account usage service (opt-in) ─────────────────────────────────
 // Shares the opt-in USAGE_TOGGLE with the default-account poller below. Probes
 // fire on the `agent.stop` hook for the pane's bound claude account (main
-// resolves workspace → account here so hooks.rpc stays account-agnostic).
+// resolves workspace → account here so hooks.rpc stays account-agnostic) and on
+// the service's own staggered 15-min refresh of every account.
+setUsageClientVersion(app.getVersion());
 const accountUsageService = new AccountUsageService();
 const disposeAccountUsageListener = accountUsageService.onChange((entry) => {
   const win = mainWindow;
@@ -982,7 +1279,12 @@ const onClaudeTurnEnd = (workspaceId: string): void => {
   // the hook's ptyId instead of the workspace binding.
   const accountId = getAccountStore().getBinding(workspaceId, 'claude');
   if (accountId) void accountUsageService.maybeProbe(accountId);
+  // Panes that quota rotation moved to other accounts: refresh those too.
+  for (const rotated of getAccountRotationService().launchedAccounts(workspaceId, 'claude')) {
+    if (rotated !== accountId) void accountUsageService.maybeProbe(rotated);
+  }
 };
+getAccountRotationService().setClaudeUsage(accountUsageService);
 const disposeHooksRpc = registerHooksRpc(rpcRouter, () => mainWindow, hookSignalRouter, () => daemonClient, onClaudeTurnEnd, getWorkspaceMirror, localCompletionAlarm);
 
 // ─── Phase 2 — Anthropic 5h/7d usage meter ──────────────────────────────────
@@ -1002,6 +1304,20 @@ const disposeUsagePollerListener = usagePoller.onStateChange((state) => {
 // will deliver once it connects).
 ipcMain.on(IPC.LANLINK_RESYNC, () => {
   remoteInboxBridge?.resync();
+});
+
+// Live `rate_limits` pushed by the wmux statusline script. The account is the
+// one the pane actually runs on (its CLAUDE_CONFIG_DIR), not the workspace's
+// current binding, so this path is not subject to the routing limitation noted
+// at onClaudeTurnEnd above.
+registerUsageRpc(rpcRouter, {
+  listClaudeAccounts: () => getAccountStore().listAccounts()
+    .filter((a) => a.vendor === 'claude')
+    .map((a) => ({ id: a.id, configDir: a.configDir })),
+  defaultConfigDir: () => path.join(os.homedir(), '.claude'),
+  ingestDefault: (update) => usagePoller.ingestLive(update),
+  ingestAccount: (accountId, update) => accountUsageService.ingestLive(accountId, update),
+  log: (line) => console.warn(line),
 });
 
 ipcMain.on(IPC.USAGE_TOGGLE, (_event, enabled: unknown) => {
@@ -1120,6 +1436,17 @@ const approvalQueue = new ApprovalQueue(getPluginTrustStore(), {
   },
 });
 rpcRouter.setApprovalQueue(approvalQueue);
+computerConsentQueue = approvalQueue;
+// Live-Chrome tab borrowing asks through that same queue, so the prompt appears
+// in both of its renditions (the modal and the Fleet approvals inbox) with no new
+// UI. The workspace NAME comes from the renderer's mirror, which is the only
+// place main knows it; an unpopulated mirror falls back to the id, because a
+// prompt that says which workspace by id is still answerable.
+liveBorrowRequester = createBorrowApprovalRequester({
+  queue: approvalQueue,
+  workspaceName: (workspaceId) =>
+    getWorkspaceMirror().getEntries()?.find((e) => e.id === workspaceId)?.name ?? workspaceId,
+});
 
 ipcMain.handle(
   IPC.PERMISSION_PROMPT_RESOLVE,
@@ -1206,6 +1533,10 @@ ipcMain.handle(
     if (!workspaceId || profileName === undefined) return { ok: false, error: 'invalid payload' };
     try {
       await chromeProfileStore.setBinding(workspaceId, profileName);
+      // Any binding change ends the consent that lent this workspace tabs in the
+      // user's own Chrome — including a re-bind to live, which is a new decision
+      // and not a resumption of the old one.
+      chromeRegistry.clearLiveBorrows(workspaceId);
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -1278,6 +1609,27 @@ app.on('ready', async () => {
       }
     }, 3000);
     shimTimer.unref();
+  }
+
+  // Windows: redo whatever a cancelled Squirrel install hook left undone (CLI
+  // shim, autostart, shortcuts). See postInstallReconcile.ts. `freshInstall`
+  // must be read here, before this boot's first session save creates the file.
+  if (process.platform === 'win32' && app.isPackaged) {
+    const firstRun = process.argv.includes('--squirrel-firstrun');
+    const freshInstall = isFreshProfile(app.getPath('userData'));
+    // getPath throws when the shell folder cannot be resolved; unknown means
+    // "do not create a Desktop shortcut", never "stop booting".
+    let desktopDir: string | undefined;
+    try { desktopDir = app.getPath('desktop'); } catch { desktopDir = undefined; }
+    const reconcileTimer = setTimeout(() => {
+      void runPostInstallReconcile({
+        execPath: process.execPath,
+        firstRun,
+        freshInstall,
+        desktopDir,
+      });
+    }, 5000);
+    reconcileTimer.unref();
   }
 
   // ~/.wmux/hooks/의 설치본 스크립트(statusline·hook bridge)를 번들 버전에 맞춘다.
@@ -1401,6 +1753,60 @@ app.on('ready', async () => {
   markBoot('plugins-loaded');
 
   mainWindow = createWindow({ deferLoad: true });
+  // Global quick launch: needs `ready` for globalShortcut, and registers from
+  // its own settings file so the chord works before the renderer has loaded.
+  quickLaunch = initQuickLaunch({
+    getMainWindow: () => mainWindow,
+    fanOutService,
+    isQuitting: () => isQuitting,
+    otherGlobalShortcuts: [COMPUTER_ABORT_ACCELERATOR],
+  });
+  if (cdpEnabled) {
+    const localContents = mainWindow.webContents;
+    let retryDelayMs = 2_000;
+    let reportedPending = false;
+    const verifyOwnership = async (): Promise<void> => {
+      if (localContents.isDestroyed()) return;
+      const localDebugger = localContents.debugger;
+      let attachedByUs = false;
+      const detached = (): void => { attachedByUs = false; };
+      localDebugger.on('detach', detached);
+      let retry = true;
+      try {
+        if (!localDebugger.isAttached()) {
+          localDebugger.attach('1.3');
+          attachedByUs = true;
+        }
+        const { targetInfo } = await localDebugger.sendCommand('Target.getTargetInfo');
+        const probe = await probeCdpEndpointWithRetry(cdpPort, targetInfo?.targetId ?? '');
+        if (probe.ok) {
+          await webviewCdpManager.setCdpPort(cdpPort);
+          console.log(`[WinMux] CDP listening on port ${cdpPort} (${probe.browser})`);
+          retry = false;
+        } else {
+          webviewCdpManager.setCdpFailureReason(`CDP ownership unverified: ${probe.reason}; retrying`);
+          if (!reportedPending) {
+            console.warn(`[WinMux] CDP port ${cdpPort} is unverified; remote automation remains unavailable while ownership verification retries.`);
+            reportedPending = true;
+          }
+        }
+      } catch (err) {
+        webviewCdpManager.setCdpFailureReason(`CDP verification pending: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        localDebugger.removeListener('detach', detached);
+        if (attachedByUs && localDebugger.isAttached()) {
+          try { localDebugger.detach(); } catch { /* Contents may close during verification. */ }
+        }
+      }
+      // A slow boot or timeout is pending, not a permanent policy disable.
+      if (retry && !localContents.isDestroyed()) {
+        const timer = setTimeout(() => { void verifyOwnership(); }, retryDelayMs);
+        retryDelayMs = Math.min(retryDelayMs * 2, 30_000);
+        timer.unref();
+      }
+    };
+    void verifyOwnership();
+  }
   markBoot('window-created');
   console.log(`[Main] Window created (renderer load deferred): ${!!mainWindow}`);
   logLine('info', 'main', `window created (deferred): present=${!!mainWindow}`);
@@ -1487,7 +1893,36 @@ app.on('ready', async () => {
       void client
         .rpc('daemon.client.identify', { role: 'main' })
         .then(() => {
-          reportDesktopPresence(() => client, BrowserWindow.getFocusedWindow() !== null);
+          reportDesktopPresence(() => client, focusedPrimaryWindow() !== null);
+          disposePhoneBridge?.();
+          disposePhoneBridge = installPhoneBridge(client,(command,payload) => command.startsWith('browser.') ? handlePhoneBrowser(command,payload,{
+            backend: () => browserBackendStore.get(),
+            clearViewport: async id => {
+              const wc = phoneWebContents.fromId(id);
+              if (!wc || wc.isDestroyed()) throw new Error('Browser unavailable');
+              await wc.debugger.sendCommand('Emulation.clearDeviceMetricsOverride');
+            },
+            nativeBounds: async id => {
+              const wc = phoneWebContents.fromId(id);
+              if (!wc || wc.isDestroyed()) throw new Error('Browser unavailable');
+              return phoneBrowserNativeBounds(wc);
+            },
+            scroll: async (id,event) => {
+              const wc = phoneWebContents.fromId(id);
+              if (!wc || wc.isDestroyed()) throw new Error('Browser unavailable');
+              await dispatchPhoneBrowserScroll(wc,event);
+            },
+            targets: () => webviewCdpManager.listTargets(),
+            input: (id, operation) => {
+              const wc = phoneWebContents.fromId(id);
+              if (!wc || wc.isDestroyed()) return Promise.reject(new Error('Browser unavailable'));
+              return withPhoneBrowserInputFocus(wc,operation);
+            },
+            page: id => { const wc = phoneWebContents.fromId(id); return wc && !wc.isDestroyed() ? {title:wc.getTitle(),url:wc.getURL()} : null; },
+            invoke: (method,params) => rpcRouter.dispatch({id: `phone-browser-${phoneBrowserRequestId()}`,method:method as RpcMethod,params},{operator:true}),
+          }) : command.startsWith('workspaces.') ? handlePhoneWorkspaces(command,payload,() => mainWindow) : command.startsWith('prompts.') ? handlePhoneQuickCommands(command,payload) : handlePhoneAccounts(command,payload,{
+            store:getAccountStore(),usage:accountUsageService,
+          }));
         })
         .catch(() => {
           // Old daemon: no identify, therefore no presence, therefore pushes.
@@ -1502,6 +1937,12 @@ app.on('ready', async () => {
       // process, so read it fresh.
       invalidateAutonomyCache();
       void workspaceFactsPublisher.publishNow();
+      // Same for the Moa pane: the daemon drops it with its publisher, so a
+      // fresh connection holds none until main says so again.
+      void publishMoaPane({ force: true });
+      // A new approval, or one settled elsewhere: the lane re-lists.
+      client.on('approvals:changed', () => { void hqAutoPress.run(); });
+      client.on('approvals:changed', () => { void trackRecordFeed.onApprovalsChanged(); });
       // Handler swap to daemon-routed mode. The microsecond window where
       // pty/* handlers are torn down and re-registered is the same
       // surface the original code used; the swap is logged for the
@@ -1540,6 +1981,7 @@ app.on('ready', async () => {
       remoteInboxBridge?.stop();
       remoteInboxBridge = new RemoteInboxBridge(() => mainWindow);
       remoteInboxBridge.start(client);
+      automationBridge.start(client);
       // X1 — context fold (git branch / worktree / ports / PR badge).
       workspaceContextRouter?.stop();
       workspaceContextRouter = new WorkspaceContextRouter(client, () => mainWindow);
@@ -1575,6 +2017,7 @@ app.on('ready', async () => {
       daemonNotificationRouter = null;
       remoteInboxBridge?.stop();
       remoteInboxBridge = null;
+      automationBridge.stop();
       workspaceContextRouter?.stop();
       workspaceContextRouter = null;
       daemonClient = null;
@@ -1996,6 +2439,7 @@ app.on('window-all-closed', () => {
 // either of the other two destroyed itself on close instead of hiding.
 function adoptMainWindow(win: BrowserWindow): void {
   attachWindowRecovery(win);
+  resetPollCacheOnRendererLoad(win);
 
   win.on('closed', () => {
     // Guarded: a recovery window may be adopted while the old reference is
@@ -2171,6 +2615,21 @@ app.on('before-quit', async (e) => {
   // same visible behavior as the old per-agent child dying with wmux.
   mcpBrokerSupervisor.stop();
 
+  // Quick launch: give the global chord back and drop the composer window.
+  try {
+    quickLaunch?.dispose();
+  } catch (err) {
+    console.error('[Main] before-quit quick-launch dispose failed:', err);
+  }
+
+  // Computer use: stop the helper, take down consent prompts, release the
+  // global stop key. Synchronous, before anything below can stall.
+  try {
+    disposeComputerUse(computerService);
+  } catch (err) {
+    console.error('[Main] before-quit computer-use dispose failed:', err);
+  }
+
   // macOS 로그아웃/재시작/종료 대응(P4): win32의 'session-end' flushSync와 동등한
   // 동기 세션 flush. macOS는 WM_ENDSESSION 대신 Apple Event로 quit을 보내고
   // 이 async 핸들러가 끝까지 못 돌 수 있으므로, 어떤 await보다도 먼저 pending
@@ -2243,7 +2702,9 @@ app.on('before-quit', async (e) => {
   safeStep('disposeHooksRpc', () => disposeHooksRpc());
   safeStep('disposeUsagePollerListener', () => disposeUsagePollerListener());
   safeStep('usagePoller.dispose', () => usagePoller.dispose());
+  safeStep('disposePhoneBridge', () => { disposePhoneBridge?.(); disposePhoneBridge = null; });
   safeStep('disposeAccountUsageListener', () => disposeAccountUsageListener());
+  safeStep('accountUsageService.dispose', () => accountUsageService.dispose());
   safeStep('cleanupAccountUsageIpc', () => {
     ipcMain.removeHandler(IPC.ACCOUNT_USAGE_LIST);
     ipcMain.removeAllListeners(IPC.ACCOUNT_USAGE_REFRESH);
@@ -2271,8 +2732,8 @@ app.on('before-quit', async (e) => {
   // Only an explicit "Shut down wmux (close all sessions)" from the tray flips
   // fullShutdownRequested → the teardown branch: ask the daemon to shut down
   // gracefully (it dumps RingBuffers + saves state), and if that RPC doesn't
-  // land in time, pid-kill it so a wedged daemon can't survive a teardown the
-  // user explicitly asked for.
+  // land in time, attempt a verified pid-kill. Unavailable script identity
+  // refuses that backstop and can leave the daemon running for recovery.
   //
   // `clientAtQuit` captures the reference BEFORE any await: the daemon may
   // close its socket mid-teardown, firing the module-level 'disconnected'
@@ -2300,16 +2761,17 @@ app.on('before-quit', async (e) => {
             `[Main] daemon.shutdown did not complete (elapsed=${elapsed}ms): ${race.error} — pid-kill backstop`,
           );
           logLine('warn', 'main', `full-shutdown: daemon.shutdown timed out (${race.error}); invoking pid-kill backstop`);
-          const killed = killDaemonByPidFile();
-          logLine('warn', 'main', `full-shutdown: pid-kill backstop ${killed ? 'killed the daemon' : 'found no verified daemon to kill'}`);
+          const outcome = killDaemonByPidFile();
+          logLine('warn', 'main', `full-shutdown: pid-kill backstop ${describeDaemonKillOutcome(outcome)}`);
         }
       } else {
         console.log('[Main] Quit — detaching from daemon; live sessions stay alive (tmux-style persistence)');
         logLine('info', 'main', 'quit: detaching from daemon, sessions remain live (persistence)');
       }
       // Detach our half of the control pipe in BOTH branches. In full-shutdown
-      // the daemon is already gone (RPC ack) or killed (backstop), so this just
-      // cleans up our socket; in the detach branch it is the whole operation.
+      // the daemon is already gone (RPC ack), killed (backstop), or, when its
+      // script identity could not be verified, left running; either way this
+      // just cleans up our socket. In the detach branch it is the whole operation.
       // Best-effort — if the 'disconnected' handler already tore the socket
       // down, disconnect() may throw; swallow it so the quit sequence proceeds.
       try {
@@ -2328,25 +2790,24 @@ app.on('before-quit', async (e) => {
       // client to it — the daemon dropped/respawn-exhausted into local mode while
       // daemon.pid still points at a live daemon. Without this the user's
       // close-all request silently leaves that daemon and its PTYs running. The
-      // pid-kill is verify-before-kill (image + cmdline), so a recycled PID is
-      // never signalled. A normal Quit (fullShutdownRequested=false) still leaves
+      // pid-kill requires script identity; an unavailable probe refuses rather
+      // than guessing from the persisted PID. A normal Quit still leaves
       // any such daemon alone — that is the persistence promise.
       if (fullShutdownRequested) {
-        const killed = killDaemonByPidFile();
-        logLine('warn', 'main', `full-shutdown (no live client): pid-kill backstop ${killed ? 'killed the daemon' : 'found no verified daemon to kill'}`);
+        const outcome = killDaemonByPidFile();
+        logLine('warn', 'main', `full-shutdown (no live client): pid-kill backstop ${describeDaemonKillOutcome(outcome)}`);
       }
     }
   } catch (err) {
     console.error('[Main] before-quit daemon teardown threw — continuing to quit:', err);
     logLine('error', 'main', `before-quit daemon teardown threw: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
-    // Close-all must still complete even if the graceful path above threw: a
-    // verified pid-kill is the last-resort backstop so an explicit shutdown
-    // can't leave the daemon + PTYs running. verify-before-kill (image +
-    // cmdline), and a normal Quit skips this entirely.
+    // Try the verified pid-kill even if the graceful path threw. Missing
+    // script identity refuses the backstop and can leave the daemon + PTYs
+    // running; a normal Quit skips this entirely.
     if (fullShutdownRequested) {
       safeStep('full-shutdown pid-kill (post-throw backstop)', () => {
-        const killed = killDaemonByPidFile();
-        logLine('warn', 'main', `full-shutdown: post-throw pid-kill backstop ${killed ? 'killed the daemon' : 'found no verified daemon to kill'}`);
+        const outcome = killDaemonByPidFile();
+        logLine('warn', 'main', `full-shutdown: post-throw pid-kill backstop ${describeDaemonKillOutcome(outcome)}`);
       });
     }
   }
@@ -2446,8 +2907,10 @@ if (process.platform === 'win32') {
 
 app.on('activate', () => {
   if (isQuitting) return;
-  const windows = BrowserWindow.getAllWindows();
-  if (windows.length === 0) {
+  // The main window itself, not "any window": the quick-launch composer is a
+  // hidden window too, and must neither count as the app window nor be the
+  // one a Dock click brings back.
+  if (!mainWindow || mainWindow.isDestroyed()) {
     mainWindow = createWindow();
     adoptMainWindow(mainWindow);
     return;
@@ -2458,8 +2921,7 @@ app.on('activate', () => {
   // 2026-07-19). Windows/Linux는 트레이 컨텍스트 메뉴가 이미 이 경로를
   // 담당하므로 이 핸들러는 mac에서만 의미 있지만, 숨겨진 창이 있으면
   // 어느 OS에서든 보여주는 편이 안전하다.
-  const hidden = windows.find((w) => !w.isVisible());
-  if (hidden) hidden.show();
+  if (!mainWindow.isVisible()) mainWindow.show();
 });
 
 } // end appInit()

@@ -92,6 +92,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { chromium } from 'playwright-core';
 import { accumulateBreakdown, classifyProcess, RAM_CATEGORIES } from './perf-process-classify.mjs';
 import { collectProcessTree, looksLikeDaemonRow } from './perf-process-tree.mjs';
+import { sampleRafDeltas, sampleFrameBudget } from './perf-frame-sample.mjs';
 import { summarizeSamples, compareImeEcho, judgeFrameStall } from './perf-scenarios.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -300,9 +301,62 @@ function pidAlive(pid) {
 }
 
 // === Raw newline-delimited JSON-RPC over a named pipe (one-shot client) ===
-// No clientName → recorded 'legacy' and grandfathered by RpcRouter, so
-// mutating calls (pane.split) run against the production enforce-mode app
-// without an approval dialog (same model as substrate-bench.mjs).
+// The bench identifies as 'wmux-bench' and the sandbox's trust DB is seeded
+// with a `trusted` row declaring exactly the capabilities the scenarios below
+// need (seedBenchTrust). It used to send NO clientName and ride the `legacy`
+// grandfather; #1111 closes that lane in the first release on or after
+// 2026-09-30.
+//
+// Why not 'wmux-cli': that lane's allowlist does not cover `pane.close` or
+// `mcp.claimWorkspace`, and widening it is not an option — 'wmux-cli' is a
+// NON_IDENTIFYING name anyone may send, so every method added there is granted
+// to every caller who claims it. The bench owns its sandbox HOME, so it can
+// simply be a properly declared plugin instead: least privilege, no approval
+// dialog, works headlessly.
+const BENCH_CLIENT_NAME = 'wmux-bench';
+
+// Exactly the capabilities the main-pipe calls in this file require
+// (methodCapabilityMap.ts): pane.list -> pane.read; pane.split / pane.close ->
+// pane.create; input.send / input.sendKey -> terminal.send;
+// mcp.claimWorkspace -> workspace.claim. `daemon.*` is dispatched by the daemon
+// control pipe, which has no enforcer, so it needs nothing here.
+const BENCH_CAPABILITIES = ['pane.read', 'pane.create', 'terminal.send', 'workspace.claim'];
+
+// Seed <home>/.wmux<suffix>/plugin-trust.json with a trusted row for
+// BENCH_CLIENT_NAME BEFORE the app boots, so the very first RPC is already
+// past the gate with no approval dialog. Same schema PluginTrustStore writes
+// ({ schemaVersion, plugins: { <name>: PluginIdentityRecord } }); a bare
+// capability with no `:glob` is an unrestricted grant for that capability.
+// Also pins mcp.mode=enforce so the bench measures the production gate rather
+// than whatever the build's default happens to be.
+function seedBenchTrust(wmuxDir) {
+  fs.mkdirSync(wmuxDir, { recursive: true });
+  const now = Date.now();
+  fs.writeFileSync(
+    path.join(wmuxDir, 'plugin-trust.json'),
+    JSON.stringify({
+      schemaVersion: 1,
+      plugins: {
+        [BENCH_CLIENT_NAME]: {
+          name: BENCH_CLIENT_NAME,
+          version: '0.0.0-bench',
+          status: 'trusted',
+          declaredCapabilities: BENCH_CAPABILITIES,
+          rationale: 'perf-bench.mjs sandbox instance (scripts/perf-bench.mjs)',
+          firstSeen: now,
+          lastSeen: now,
+        },
+      },
+    }, null, 2),
+    'utf8',
+  );
+  const cfgPath = path.join(wmuxDir, 'config.json');
+  let cfg = {};
+  try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')); } catch { /* fresh sandbox */ }
+  cfg.mcp = { ...(cfg.mcp ?? {}), mode: 'enforce' };
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), 'utf8');
+}
+
 class PipeClient {
   constructor(pipeName, token) {
     this.pipeName = pipeName;
@@ -348,7 +402,7 @@ class PipeClient {
       const id = randomUUID();
       const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`rpc timeout: ${method}`)); }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.sock.write(JSON.stringify({ id, method, params, token: this.token }) + '\n');
+      this.sock.write(JSON.stringify({ id, method, params, token: this.token, clientName: BENCH_CLIENT_NAME, clientVersion: '0.0.0-bench' }) + '\n');
     });
   }
   close() { try { this.sock?.destroy(); } catch { /* noop */ } }
@@ -444,6 +498,9 @@ function makeInstance() {
       'utf8',
     );
   }
+  // Identity for the enforce-mode permission gate (#1111) — must exist before
+  // the app boots, since the first RPC is already gated.
+  seedBenchTrust(path.join(home, `.wmux${suffix}`));
   return {
     seq, suffix, home, env,
     proc: null, cdpPort: null, browser: null, page: null,
@@ -470,7 +527,11 @@ function spawnInstance(inst) {
     const onChunk = (b) => {
       if (inst.cdpPort !== null) return; // already matched — don't re-stamp on later chunks
       stdoutBuf += b.toString('utf8');
-      const m = stdoutBuf.match(/CDP enabled on port (\d+)/);
+      // "requested" since #1331: the boot line no longer claims the port is
+      // enabled before Chromium has had a chance to bind it (a second wmux
+      // instance could be holding it). "enabled" stays matchable so this
+      // harness still drives a pre-#1331 build.
+      const m = stdoutBuf.match(/CDP (?:requested|listening|enabled) on port (\d+)/);
       if (m) {
         inst.cdpPort = Number(m[1]);
         // NOTE: the app prints this line BEFORE Chromium binds the port, so
@@ -1243,22 +1304,6 @@ async function listPanePtyIds(client) {
   return ids;
 }
 
-// Sample `frames` rAF deltas (ms) inside the renderer — the same cadence probe
-// measureInputLatency uses, but WITHOUT any keystroke: it measures the compositor
-// cadence while whatever workload is currently running streams. Returns raw
-// deltas so the caller can summarize + detect throttling.
-async function sampleRafDeltas(page, frames) {
-  return page.evaluate((n) => new Promise((resolve) => {
-    const deltas = []; let last = null; let i = 0;
-    const tick = (ts) => {
-      if (last !== null) deltas.push(ts - last);
-      last = ts;
-      if (++i < n) requestAnimationFrame(tick); else resolve(deltas);
-    };
-    requestAnimationFrame(tick);
-  }), frames);
-}
-
 // A deterministic, unbounded text flood for one PTY. The packaged bench target
 // is Windows (powershell default shell): an infinite loop that writes a fixed
 // 80-char line per iteration is a platform-consistent, decision-free workload.
@@ -1293,6 +1338,10 @@ async function measureFrameBudget(inst, paneCounts) {
   const page = inst.page;
   const client = await openMainClient(inst);
   const byN = {};
+  let baseline = null;
+  try {
+    baseline = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'bench', `baseline-${ARGS.mode}.json`), 'utf8'));
+  } catch { /* No blessed baseline: record one sample without confirmation. */ }
   try {
     const sorted = [...paneCounts].sort((a, b) => a - b);
     for (const n of sorted) {
@@ -1304,16 +1353,16 @@ async function measureFrameBudget(inst, paneCounts) {
       // Give the flood a beat to actually be streaming, then sample the cadence
       // while all panes are hot.
       await sleep(800);
-      const deltas = await sampleRafDeltas(page, 60);
+      const { stats, samples } = await sampleFrameBudget(page, n, baseline);
       await stopFlood(client, targets);
       await sleep(600); // let Ctrl+C drain before the next split
-      const stats = summarizeSamples(deltas);
       const throttled = (stats.p50 ?? 999) > 50;
       byN[`N${n}`] = {
         paneCount: mounted,
         flooded: targets.length,
         throttled,
         frameDeltaMs: stats,
+        frameDeltaSamples: samples,
       };
       console.log(`[frameBudget N${n}] panes=${mounted} flooded=${targets.length} frame p50=${stats.p50}ms p95=${stats.p95}ms${throttled ? ' (THROTTLED — untrustworthy)' : ''}`);
     }

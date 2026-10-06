@@ -104,6 +104,13 @@ export interface WakeSessionView {
    */
   deferred?: boolean;
   /**
+   * True for a RECOVERED session whose agent has not been seen running since
+   * the recovery. A viewer can activate the pane's output long before that,
+   * and `lastDetectedAgent` still names the agent that ran before the restart,
+   * while the pane now holds a fresh shell. Excluded like `deferred`.
+   */
+  recoveredAgentUnconfirmed?: boolean;
+  /**
    * True when a renderer is attached to this session (GUI alive). Claude
    * panes are excluded ONLY while attached — the renderer's Stop-hook
    * mention path owns them there. Detached = headless: no renderer path
@@ -138,6 +145,26 @@ export interface ChannelWakeWorkerDeps {
   now(): number;
   /** Test seam: ms between the text write and the Enter write. */
   enterDelayMs?: number;
+  /**
+   * Is an approval in front of this session right now: a pending approval
+   * record for it, or the pane blocked on a human? A nudge is committed with
+   * an Enter, and an Enter into an approval dialog answers it — quiet output
+   * does not rule that out, a dialog waiting on a human is quiet. Optional
+   * (test / legacy compatible).
+   */
+  approvalBlocked?(sessionId: string): boolean;
+  /**
+   * Is this session held at a provider usage limit (shared/usageLimit)? The
+   * agent cannot take a turn until the reset, so a nudge would only queue a
+   * dead prompt. Optional.
+   */
+  usageLimited?(sessionId: string): boolean;
+  /**
+   * Does the pane's visible screen show an approval or select dialog? Null
+   * when it cannot be read, which holds the nudge like a dialog would.
+   * Checked before the text write and again before the Enter. Optional.
+   */
+  screenShowsApproval?(sessionId: string): Promise<boolean | null>;
 }
 
 // Conservative defaults (Step 3b tunes with field data).
@@ -235,6 +262,7 @@ const BODY_PREVIEW_AGENTS: ReadonlySet<string> = new Set([
   'claude',
   'codex',
   'gemini',
+  'agy',
   'aider',
   'opencode',
   'copilot',
@@ -245,12 +273,40 @@ export function mayCarryBody(detectedAgent: string | undefined): boolean {
   return !!detectedAgent && BODY_PREVIEW_AGENTS.has(detectedAgent);
 }
 
+/**
+ * The agent slug a wake target may be judged by. `lastDetectedAgent` has no
+ * death edge — the agent exits, the pane keeps its shell, and the slug stays,
+ * so the worker typed a hint + body preview + Enter into zsh (an unbalanced
+ * `(` in the preview left a continuation prompt that swallowed the next nudge
+ * too). Same precedence as readDaemonAgentState (#1392/#1400):
+ *   1. a verified live process of that slug keeps it — a wrapper or nested
+ *      shell can emit a prompt marker while the agent still runs;
+ *   2. an agent process observed to DIE drops it — the foreground command may
+ *      now be vim, ssh or a REPL, where the nudge would land as input;
+ *   3. an OSC 133 prompt (`commandRunning === false`) drops it;
+ *   4. otherwise (no shell integration, no process attribution) keep the
+ *      sticky slug — dropping it would silence live agent panes.
+ * Every picker declines a pane with no slug; the pull path still delivers.
+ */
+export function wakeAgentSlug(
+  lastDetectedAgent: string | undefined,
+  commandRunning: boolean | undefined,
+  process?: { slug?: string; alive: boolean },
+): string | undefined {
+  if (!lastDetectedAgent) return undefined;
+  if (process?.alive === true && process.slug === lastDetectedAgent) return lastDetectedAgent;
+  if (process?.alive === false) return undefined;
+  return commandRunning === false ? undefined : lastDetectedAgent;
+}
+
 export class ChannelWakeWorker {
   private readonly deps: ChannelWakeWorkerDeps;
   private readonly tracker = new Map<string, NudgeTrackerEntry>();
   private interval: ReturnType<typeof setInterval> | null = null;
   private kickTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly pendingEnter = new Set<ReturnType<typeof setTimeout>>();
+  /** Keys whose screen check is in flight: one pending nudge per key. */
+  private readonly screenChecks = new Set<string>();
 
   constructor(deps: ChannelWakeWorkerDeps) {
     this.deps = deps;
@@ -404,19 +460,78 @@ export class ChannelWakeWorker {
         }
         if (this.deps.now() - target.lastActivityMs < WAKE_QUIET_MS) continue; // busy — retry next tick
 
+        // An approval in front of the pane: the nudge's Enter would answer it.
+        // Hold without spending budget; the next tick looks again.
+        if (this.approvalHold(target.id, key)) continue;
+        if (this.deps.screenShowsApproval) {
+          if (this.screenChecks.has(key)) continue;
+          this.screenChecks.add(key);
+          void this.injectAfterScreenCheck(key, ws, entry, target, wantMention, state)
+            .catch((err: unknown) => this.deps.log('warn', `[wake] screen-checked nudge for ${key} failed: ${String(err)}`))
+            .finally(() => this.screenChecks.delete(key));
+          continue;
+        }
+
         // A failed write must not burn the nudge budget (G5 spirit: never
         // spend nudges into a void) — retry on a later tick instead.
         if (!this.inject(target.id, ws, entry, target)) continue;
-
-        if (wantMention) {
-          state.mentionNudges += 1;
-          state.lastMentionNudgeAt = this.deps.now();
-        } else {
-          state.plainNudgedAtSeq = entry.headSeq;
-        }
-        this.tracker.set(key, state);
+        this.spend(key, state, entry, wantMention);
       }
     }
+  }
+
+  /** Record one nudge against the (channel, member) budget. */
+  private spend(key: string, state: NudgeTrackerEntry, entry: WakeUnreadEntry, wantMention: boolean): void {
+    if (wantMention) {
+      state.mentionNudges += 1;
+      state.lastMentionNudgeAt = this.deps.now();
+    } else {
+      state.plainNudgedAtSeq = entry.headSeq;
+    }
+    this.tracker.set(key, state);
+  }
+
+  /** True (and logged) when an approval record or a human-blocked pane holds the nudge. */
+  private approvalHold(sessionId: string, key: string): boolean {
+    if (this.deps.approvalBlocked?.(sessionId) !== true) return false;
+    this.deps.log('debug', `[wake] holding nudge for ${key}: an approval is in front of ${sessionId}`);
+    return true;
+  }
+
+  /** Whether the screen is free of a dialog; false (and logged) when it shows one or cannot be read. */
+  private async screenIsFree(sessionId: string, key: string): Promise<boolean> {
+    if (!this.deps.screenShowsApproval) return true;
+    let shown: boolean | null;
+    try {
+      shown = await this.deps.screenShowsApproval(sessionId);
+    } catch {
+      shown = null;
+    }
+    if (shown === false) return true;
+    this.deps.log(
+      'debug',
+      `[wake] holding nudge for ${key}: ${shown === null ? 'screen unreadable' : 'dialog on screen'} in ${sessionId}`,
+    );
+    return false;
+  }
+
+  private async injectAfterScreenCheck(
+    key: string,
+    ws: string,
+    entry: WakeUnreadEntry,
+    target: WakeSessionView,
+    wantMention: boolean,
+    state: NudgeTrackerEntry,
+  ): Promise<void> {
+    if (this.deps.usageLimited?.(target.id) === true) {
+      this.deps.log('debug', `[wake] holding nudge for ${key}: ${target.id} is held at a usage limit`);
+      return;
+    }
+    if (!(await this.screenIsFree(target.id, key))) return;
+    // The render took time: the pane may have raised an approval since.
+    if (this.approvalHold(target.id, key)) return;
+    if (!this.inject(target.id, ws, entry, target)) return;
+    this.spend(key, this.tracker.get(key) ?? state, entry, wantMention);
   }
 
   /**
@@ -460,8 +575,7 @@ export class ChannelWakeWorker {
       report(false);
       return false;
     }
-    const t = setTimeout(() => {
-      this.pendingEnter.delete(t);
+    const commit = (): void => {
       try {
         this.deps.write(sessionId, '\r');
       } catch {
@@ -474,6 +588,24 @@ export class ChannelWakeWorker {
       // Committed. This is the only point at which the nudge actually reached
       // the agent, so it is the only point that may report success.
       report(true);
+    };
+    const t = setTimeout(() => {
+      this.pendingEnter.delete(t);
+      // Re-check right before the Enter: a dialog raised since the text write
+      // would take it. Withheld, the hint stays uncommitted in the composer.
+      const key = keyOf(workspaceId, entry);
+      if (this.approvalHold(sessionId, key)) {
+        report(false);
+        return;
+      }
+      if (!this.deps.screenShowsApproval) {
+        commit();
+        return;
+      }
+      void this.screenIsFree(sessionId, key).then((free) => {
+        if (free && !this.approvalHold(sessionId, key)) commit();
+        else report(false);
+      });
     }, this.deps.enterDelayMs ?? ENTER_DELAY_MS);
     t.unref?.();
     this.pendingEnter.add(t);
@@ -481,10 +613,16 @@ export class ChannelWakeWorker {
   }
 }
 
+/** G5: a recovered pane is no target until its agent is seen running again. */
+function recoveredWithoutAgent(s: WakeSessionView): boolean {
+  return s.deferred === true || s.recoveredAgentUnconfirmed === true;
+}
+
 /**
  * Injection target discipline: never guess.
- *  0. deferred (recovered-not-yet-activated) sessions are excluded outright —
- *     no agent lives there and nothing renders (dogfood G5 finding);
+ *  0. deferred (recovered-not-yet-activated) sessions, and recovered sessions
+ *     whose agent has not been seen since, are excluded outright — no agent
+ *     lives there (dogfood G5 finding);
  *  1. ATTACHED claude panes are excluded — the renderer's Stop-hook mention
  *     path owns them while a GUI is alive; a DETACHED claude pane is
  *     eligible like any agent (headless has no other delivery path —
@@ -523,7 +661,7 @@ export function pickTargetWithPrincipal(
   const ptyId = principalPtyIdOf(principalId);
   if (!ptyId) return null;
 
-  const session = sessions.find((candidate) => candidate.id === ptyId && candidate.deferred !== true);
+  const session = sessions.find((candidate) => candidate.id === ptyId && !recoveredWithoutAgent(candidate));
   if (!session || session.workspaceId !== workspaceId) return null;
   if (session.lastDetectedAgent === 'claude' && session.attached === true) return null;
 
@@ -538,7 +676,7 @@ export function pickTarget(
   workspaceId: string,
   memberId: string,
 ): WakeSessionView | null {
-  const inWs = sessions.filter((s) => s.workspaceId === workspaceId && s.deferred !== true);
+  const inWs = sessions.filter((s) => s.workspaceId === workspaceId && !recoveredWithoutAgent(s));
   const eligible = inWs.filter((s) => s.lastDetectedAgent !== 'claude' || s.attached !== true);
   const slugMatch = eligible.filter((s) => s.lastDetectedAgent === memberId);
   if (slugMatch.length === 1) return slugMatch[0];

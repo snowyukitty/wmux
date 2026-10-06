@@ -7,30 +7,12 @@ for this repository. New code comments are written in English; do not mass-rewri
 existing Korean comments (respect the "don't improve adjacent code" rule), just
 stop adding new Korean ones. Chat/reports with the owner may stay Korean.
 
-## Skill routing
-
-When the user's request matches an available skill, ALWAYS invoke it using the Skill
-tool as your FIRST action. Do NOT answer directly, do NOT use other tools first.
-The skill has specialized workflows that produce better results than ad-hoc answers.
-
-Key routing rules:
-- Product ideas, "is this worth building", brainstorming → invoke office-hours
-- Bugs, errors, "why is this broken", 500 errors → invoke investigate
-- Ship, deploy, push, create PR → invoke ship
-- QA, test the site, find bugs → invoke qa
-- Code review, check my diff → invoke review
-- Update docs after shipping → invoke document-release
-- Weekly retro → invoke retro
-- Design system, brand → invoke design-consultation
-- Visual audit, design polish → invoke design-review
-- Architecture review → invoke plan-eng-review
-
 ## Design System
 
 Always read DESIGN.md before making any visual or UI decisions.
-All chrome/layout contracts, color grammar (amber = alive + focus, 5±2
-points per screen, no washes), typography, and aesthetic direction are
-defined there. Do not deviate without explicit user approval.
+All chrome/layout contracts (frame and sheet, rail pages, titlebar, the
+one-boundary rule), the theme tokens and color grammar (colour carries state
+only, no washes), typography, and aesthetic direction are defined there. Do not deviate without explicit user approval.
 In QA/design-review mode, flag any code that doesn't match DESIGN.md.
 
 ## Versioning & release (owner decision, 2026-07-05)
@@ -54,3 +36,26 @@ In QA/design-review mode, flag any code that doesn't match DESIGN.md.
   distinguishable by semver, so the stale-daemon auto-replacement triggers
   only on (a) pre-B′ daemons (missing version field) and (b) release-to-
   release upgrades and (c) `CHANNELS_EPOCH` bumps — not on every dev rebuild.
+
+### Pre-releases
+
+- Same steps, with a semver prerelease version: `package.json` →
+  `4.0.0-beta.1`, CHANGELOG heading `[4.0.0-beta.1] — YYYY-MM-DD`, tag
+  `v4.0.0-beta.1`. Fragments are folded as usual, so the final `[4.0.0]`
+  section lists only what changed after the last beta.
+- `release.yml` treats a run as a prerelease when the tag **or** the
+  `package.json` version contains `-`. It then publishes a GitHub prerelease
+  that is never marked latest, and skips Chocolatey and WinGet. macOS and
+  Linux assets append to that same prerelease.
+- Existing users are never offered it: update.electronjs.org skips
+  prereleases, and the updater's side-car manifests are read through
+  `releases/latest/download/`, which never points at one. Beta testers install
+  by hand from the release page. They are not auto-updated from one beta to
+  the next either (betas are never served); they are offered the final
+  `X.Y.Z` once it ships, since `X.Y.Z` > `X.Y.Z-beta.N`.
+- Label shape: `X.Y.Z-<label>.<n>` with at most one dot in the label
+  (`beta.1`, `rc.2`). Packager stamps the Windows exe version by splitting on
+  `.` and allows at most four parts, so `-beta.1.2` fails the Windows build.
+- A beta-to-beta upgrade on one machine does not replace the running daemon
+  (same version core, both prereleases) unless `CHANNELS_EPOCH` moved — the
+  same trade-off as same-version dev builds above.

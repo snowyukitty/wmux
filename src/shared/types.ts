@@ -52,12 +52,16 @@ export const MAX_INBOX_SIZE = _MAX_INBOX_SIZE;
 
 // === Surface: a single terminal instance within a Pane ===
 export interface Surface {
+  /** Presentation only: both views share the same live PTY. */
+  viewMode?: 'terminal' | 'chat';
   id: string;
   ptyId: string;
   title: string;
   shell: string;
   cwd: string;
-  surfaceType?: 'terminal' | 'browser' | 'editor' | 'diff' | 'git' | 'review' | 'remote-terminal';
+  /** `placeholder` is minted only by the browser build (wmux web `/app`) for a
+   *  tab it cannot show; the desktop never creates or persists one. */
+  surfaceType?: 'terminal' | 'browser' | 'editor' | 'diff' | 'git' | 'review' | 'remote-terminal' | 'placeholder';
   browserUrl?: string;
   browserPartition?: string;
   editorFilePath?: string;
@@ -73,6 +77,23 @@ export interface Surface {
    */
   remoteHostId?: string;
   remoteSessionId?: string;
+  /**
+   * #1329 — which workspace on the remote host `remoteSessionId` belongs to.
+   *
+   * The remote daemon groups its live sessions into `/api/workspaces` rows by
+   * each session's `WMUX_WORKSPACE_ID`, and that listing is the ONLY channel
+   * carrying per-session agent metadata (`agentName`/`agentStatus`) to this
+   * desktop. Without the workspace id there is nothing to ask the host about,
+   * so a split-remote pane's agent stayed invisible to both the sidebar roster
+   * and `pane_list` no matter how long it ran (#1322).
+   *
+   * Persisted with the pane tree on purpose: a restored remote-terminal
+   * surface re-registers its own liveness feed on the next app start with no
+   * extra plumbing. Absent on surfaces minted before #1329 and on any future
+   * "attach to a session somebody else started" flow that does not know the
+   * host's workspace id — both simply get no agent metadata, never an error.
+   */
+  remoteWorkspaceId?: string;
   /**
    * #1129 — did THIS desktop mint `remoteSessionId`, or is the tab merely a
    * view onto a session that already existed on the host?
@@ -365,6 +386,13 @@ export interface WorkspaceMetadata {
   // them, and the listener (T7) skips toast/sound/ring/flashFrame.
   // undefined === false === not muted.
   notificationsMuted?: boolean;
+  // "Wake the agent on PR events": when a PR event (CI failed, checks passed,
+  // a review comment, a merge conflict) arrives for this workspace and no
+  // brain hears it, write one pointer line into the agent pane that owns the
+  // PR (renderer/hooks/fanoutCallerNudge.ts). undefined === true === on.
+  wakeOnPrEvents?: boolean;
+  // "Checks passed" is its own, lower-priority switch: undefined === false.
+  wakeOnPrChecksPassed?: boolean;
   // ── X1 workspace-context sidebar (schema-freeze §2, additive) ──
   /** True when gitBranch comes from a linked worktree, not the main checkout. */
   gitIsWorktree?: boolean;
@@ -384,6 +412,12 @@ export interface PrStatus {
   state: 'open' | 'draft' | 'merged' | 'closed';
   checks: 'pending' | 'passing' | 'failing' | null;
   url: string;
+  /** Set (true) only when GitHub reports the PR as conflicting with its base;
+   *  absent otherwise (additive, read in the same `gh pr view` call). */
+  conflicting?: true;
+  /** The PR head commit (`headRefOid`), read in the same `gh pr view` call.
+   *  Keys the PR owner nudge dedup (one line per PR, kind and head). */
+  headSha?: string;
 }
 
 /** Sidebar git sync badge — dirty count + ahead/behind vs upstream
@@ -395,6 +429,10 @@ export interface GitSyncStatus {
   ahead: number;
   behind: number;
   hasUpstream: boolean;
+  /** Lines added / removed in tracked files vs HEAD (`git diff HEAD
+   *  --shortstat`). Absent when the count could not be read. */
+  added?: number;
+  removed?: number;
 }
 
 /** X1 — latest terminal notification summary (schema-freeze §2). */
@@ -447,6 +485,22 @@ export interface MetadataUpdatePayload {
    * Empty string clears (same convention as `activity`).
    */
   pendingQuestion?: string;
+  /**
+   * Tail of the agent's closing message for the turn that just ended, question
+   * or not, cut to at most 140 graphemes (`LAST_ASSISTANT_GRAPHEMES`, shared
+   * with the phone list). Per-ptyId only, like `activity`: the renderer must
+   * destructure it out before applying the payload to workspace metadata.
+   * Empty string clears. Claude only today — other agents and failed turns
+   * send ''.
+   */
+  lastMessage?: string;
+  /**
+   * The retained last activity line (the renderer's `surfaceLastActivity`)
+   * outlives a Stop, so a finished row can say what it did. Only a session
+   * start sends it, as '' — a fresh session (startup, `/clear`, a restarted
+   * agent) must not inherit the previous session's line.
+   */
+  lastActivity?: '';
   // External RPC channels (meta.setStatus / meta.setProgress) write through
   // the same payload. Renderer applies these to the active workspace when no
   // ptyId/workspaceId is provided.
@@ -705,9 +759,33 @@ export const DEFAULT_PREFIX_CONFIG: PrefixConfig = {
 };
 
 // === Session: serialized app state ===
+
+/**
+ * #1011 — an archived workspace: the CONFIGURATION snapshot of a workspace
+ * the user put away. Sessions do not survive archiving (closing them is part
+ * of the point — the sidebar goes quiet); what persists is everything it
+ * takes to bring the workspace back: name, color tag, profile, and the pane
+ * arrangement. Restore mints a FRESH workspace id, fresh pane ids and a
+ * fresh ordinal (the LayoutNode snapshot carries none), so a restored
+ * workspace can never collide with live A2A addresses or auto-names — the
+ * name is what the user recognizes, not the w<N> coordinate.
+ */
+export interface ArchivedWorkspace {
+  id: string;                // archived-entry id (NOT the live workspace id restore mints)
+  name: string;
+  color?: string;            // WorkspaceColorId — string-typed like the persisted tag
+  profile?: WorkspaceProfile;
+  tree: LayoutNode;
+  archivedAt: number;        // epoch ms, for the "3d ago" trailer
+}
+
 export interface SessionData {
   workspaces: Workspace[];
   activeWorkspaceId: string;
+  /** #1011 — archived workspace snapshots, oldest first. */
+  archivedWorkspaces?: ArchivedWorkspace[];
+  /** Issued phone creation identities, retained after close/archive. */
+  phoneWorkspaceRequestIds?: string[];
   /** P2 — persisted global high-water for Workspace.wsOrdinal (stable
    *  workspace numbers across restart). Optional for pre-P2 sessions. */
   nextWorkspaceOrdinal?: number;
@@ -727,9 +805,13 @@ export interface SessionData {
   /** Image-only clipboard paste route. Absent = 'auto' (#1196). */
   imagePasteMode?: 'auto' | 'native' | 'path';
   defaultShell?: string;
+  /** #1103 — WSL distro for the WSL default terminal. Absent = system default. */
+  defaultWslDistro?: string;
   /** Orchestrator (deck brain) model override — '' / absent = the
    *  subscription's default model. A claude model alias or full id. */
   deckBrainModel?: string;
+  /** Orchestrator effort (claude --effort level). Absent = the CLI default. */
+  deckBrainEffort?: string;
   /** D2 — global operator role→model enforcement map. Absent = no bindings.
    *  Keyed by role name; re-normalized on load (session.json is hand-editable). */
   orchestratorRoleBindings?: OrchestratorRoleBindings;
@@ -770,6 +852,9 @@ export interface SessionData {
    *  terminal / split right / split down / new browser). Default true —
    *  hideable for minimal-chrome setups. */
   paneActionsVisible?: boolean;
+  /** Chat presentation for local Claude Code sessions. Default false while
+   *  experimental; persisted so an opt-in survives restarts. */
+  chatViewEnabled?: boolean;
   // Titlebar wall-clock (2026-09-05). Default off; persisted so the people who
   // turn it on keep it across restarts.
   titlebarClockVisible?: boolean;
@@ -799,6 +884,8 @@ export interface SessionData {
    * snapshot). Default true; this persists an explicit opt-out.
    */
   coldParkEnabled?: boolean;
+  /** #1641: draw sixel / iTerm2 inline images (default true). */
+  inlineImagesEnabled?: boolean;
   /**
    * #517 browser lightweight mode: CPU-throttle effectively-invisible embedded
    * browser guests (automation-leased guests stay full-speed). Default false.
@@ -810,6 +897,25 @@ export interface SessionData {
    * Effective only alongside browserLightweightMode. Default false.
    */
   browserDiscardHidden?: boolean;
+  /**
+   * Per-site procedural memory ("browser.siteMemory.enabled" in the UI).
+   *
+   * Default ON, so absent is read as enabled (`!== false`) and only an
+   * explicit false opts out. Flat and camelCase because that is what this
+   * interface is — the dotted name exists only as a label.
+   */
+  siteMemoryEnabled?: boolean;
+  /**
+   * Site guide pointers: on a landing, name local notes under
+   * `<wmuxDir>/site-guides/` whose frontmatter matches the page.
+   * Default OFF — absent is read as disabled, only an explicit true opts in.
+   */
+  siteGuidesEnabled?: boolean;
+  /**
+   * Site guides were already turned on automatically once because the Chrome
+   * agent browser was chosen. Set, it stops that from ever happening again.
+   */
+  siteGuidesAutoEnabled?: boolean;
   /**
    * Issue #175: global default starting directory for new terminals.
    * Empty/unset → os.homedir(). Per-workspace profile.startupCwd overrides.
@@ -833,6 +939,21 @@ export interface SessionData {
   sidebarPosition?: 'left' | 'right';
   /** Whether the sidebar lifts needs-you workspaces to the top. Default false. */
   sidebarAttentionFirst?: boolean;
+  /** #1326 — whether the agent roster's muted trailer shows the auto `w<ws>-<pane>`
+   *  coordinate for unlabeled panes. Default true. */
+  sidebarShowPaneCoordinates?: boolean;
+  /** #1481 — workspace list order ('manual' | 'attention' | 'recent'). Absent in
+   *  older sessions; `sidebarAttentionFirst` then decides. Whitelisted on load. */
+  sidebarSortMode?: string;
+  /** The sort mode was chosen by the user (kept across the 2026-09-25 default flip). */
+  sidebarSortModeChosen?: boolean;
+  /** Workspaces pinned to the top of the sidebar (2026-09-26; before that a pin
+   *  held a manual slot in the Attention order — same shape, loaded as pinned-to-top). */
+  sidebarPinnedIds?: string[];
+  /** #1481 — expanded sidebar width in px. Clamped on load. */
+  sidebarWidth?: number;
+  /** #1481 — owner workspace id → user-chosen expansion of its fan-out task group. */
+  sidebarTaskGroupExpanded?: Record<string, boolean>;
   /** How the multiview grid arranges its tiles (#746). Whitelisted on load. */
   multiviewArrangement?: 'auto' | 'columns' | 'rows';
   notificationSoundEnabled?: boolean;
@@ -840,11 +961,18 @@ export interface SessionData {
   notificationRingEnabled?: boolean;
   /** Whether the user opted in to Anthropic usage polling (#896). No credentials are persisted. */
   anthropicUsageEnabled?: boolean;
+  /** Arm a pane held at a usage limit to continue after the reset, unless the pane decided otherwise. */
+  usageLimitAutoResume?: boolean;
   /** Categories whose surface actions are suppressed (#516). */
   mutedNotificationCategories?: NotificationCategory[];
   customKeybindings?: CustomKeybinding[];
-  /** #1152 — built-in combos (WMUX_KEYMAP storage form) the user disabled. */
+  /**
+   * #1152 — built-in combos (WMUX_KEYMAP storage form) the user disabled.
+   * Read-only legacy: loaded into `shortcutOverrides` when that is absent.
+   */
   disabledShortcuts?: string[];
+  /** #1455 — per-action changes to the built-in shortcuts (combo, or null = off). */
+  shortcutOverrides?: Partial<Record<string, string | null>>;
   autoUpdateEnabled?: boolean;
   customThemeColors?: CustomThemeColors;
   sidebarMode?: 'workspaces' | 'company';
@@ -1181,6 +1309,10 @@ export function createRemoteSurface(
    *  false so a future attach-to-existing caller is non-destructive unless it
    *  says otherwise. */
   owned = false,
+  /** #1329 — the host-side workspace `sessionId` lives in, when the caller
+   *  knows it (the mint flows do: they chose the id). Omitted leaves the
+   *  surface without a liveness feed, exactly as before this field existed. */
+  remoteWorkspaceId?: string,
 ): Surface {
   return {
     id: generateId('surface'),
@@ -1191,6 +1323,7 @@ export function createRemoteSurface(
     surfaceType: 'remote-terminal',
     remoteHostId: hostId,
     remoteSessionId: sessionId,
+    ...(remoteWorkspaceId ? { remoteWorkspaceId } : {}),
     ...(owned ? { remoteOwned: true } : {}),
   };
 }
@@ -1275,6 +1408,10 @@ export function clonePaneTreeFresh(pane: Pane): Pane {
       // fresh on mount" contract a local terminal's reset ptyId gets).
       delete next.remoteHostId;
       delete next.remoteSessionId;
+      // #1329 — the host-side workspace id is part of that same session
+      // pointer: keeping it would make the clone register a liveness feed for
+      // a workspace it holds no session in.
+      delete next.remoteWorkspaceId;
       // …and with the session pointer gone, the ownership claim over it must
       // go too (#1129): a clone that kept `remoteOwned` would offer to
       // destroy a session it does not point at.
@@ -1309,6 +1446,48 @@ export function clonePaneTreeFresh(pane: Pane): Pane {
 
 type UrlValidationResult = { valid: boolean; reason?: string };
 
+/**
+ * The one opt-in that widens the navigation policy: RFC1918 private ranges
+ * (10/8, 172.16/12, 192.168/16 and their IPv6 ULA analogue fc00::/7).
+ *
+ * #1359: every entry point that loads a URL — browser_navigate, browser_tabs
+ * new, browser_open, replay — must reach the same verdict for the same URL, so
+ * the switch is read here, inside the single policy function, and never
+ * duplicated at a call site.
+ *
+ * Link-local (169.254.0.0/16, fe80::/10), the null address and non-127.0.0.1
+ * loopback stay blocked even with the opt-in: the SSRF hardening this policy
+ * exists for is aimed at cloud metadata (169.254.169.254), which an intranet
+ * user has no reason to reach through an agent.
+ */
+export const ALLOW_PRIVATE_NETWORK_ENV = 'WMUX_ALLOW_PRIVATE_NETWORK';
+
+/**
+ * How a caller turns the private ranges on. Appended to every block reason the
+ * opt-in would lift, so a refusal carries its own remedy.
+ *
+ * Both processes are named because they both run this check: the MCP server
+ * (preflight, in the agent's process) and wmux main (after DNS resolution).
+ */
+const ALLOW_PRIVATE_NETWORK_HINT =
+  `set ${ALLOW_PRIVATE_NETWORK_ENV}=1 in the environment that launches wmux and the agent to allow private ranges`;
+
+function privateNetworkAllowed(): boolean {
+  // `process` is absent in the renderer bundle; an absent switch means off.
+  const value =
+    typeof process !== 'undefined' ? process.env?.[ALLOW_PRIVATE_NETWORK_ENV] : undefined;
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
+function blockedPrivate(range: string): UrlValidationResult {
+  return {
+    valid: false,
+    reason: `Blocked private IP address (${range}) — ${ALLOW_PRIVATE_NETWORK_HINT}`,
+  };
+}
+
 function parseIpv4Octets(address: string): number[] | null {
   const parts = address.split('.');
   if (parts.length !== 4) return null;
@@ -1334,17 +1513,17 @@ function validateIpv4NavigationAddress(address: string): UrlValidationResult {
 
   // Block 10.0.0.0/8
   if (octets[0] === 10) {
-    return { valid: false, reason: 'Blocked private IP address (10.0.0.0/8)' };
+    return privateNetworkAllowed() ? { valid: true } : blockedPrivate('10.0.0.0/8');
   }
 
   // Block 172.16.0.0/12 (172.16.x.x – 172.31.x.x)
   if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) {
-    return { valid: false, reason: 'Blocked private IP address (172.16.0.0/12)' };
+    return privateNetworkAllowed() ? { valid: true } : blockedPrivate('172.16.0.0/12');
   }
 
   // Block 192.168.0.0/16
   if (octets[0] === 192 && octets[1] === 168) {
-    return { valid: false, reason: 'Blocked private IP address (192.168.0.0/16)' };
+    return privateNetworkAllowed() ? { valid: true } : blockedPrivate('192.168.0.0/16');
   }
 
   // Block 169.254.0.0/16 (link-local, includes cloud metadata 169.254.169.254)
@@ -1429,13 +1608,30 @@ function validateIpv6NavigationAddress(address: string): UrlValidationResult {
 
   const firstGroup = Number.parseInt(expanded[0], 16);
   if ((firstGroup & 0xfe00) === 0xfc00) {
-    return { valid: false, reason: 'Blocked private IPv6 address (fc00::/7)' };
+    return privateNetworkAllowed()
+      ? { valid: true }
+      : {
+          valid: false,
+          reason: `Blocked private IPv6 address (fc00::/7) — ${ALLOW_PRIVATE_NETWORK_HINT}`,
+        };
   }
   if ((firstGroup & 0xffc0) === 0xfe80) {
     return { valid: false, reason: 'Blocked link-local IPv6 address (fe80::/10)' };
   }
 
   return { valid: true };
+}
+
+/**
+ * The address-level half of the navigation policy, for callers that already
+ * hold a literal IP — notably the main-process guard, which re-checks every
+ * address a hostname resolved to (#1359: it used to carry its own copy of
+ * these ranges, which had drifted from this one).
+ */
+export function validateNavigationAddress(address: string): UrlValidationResult {
+  return address.includes(':')
+    ? validateIpv6NavigationAddress(address)
+    : validateIpv4NavigationAddress(address);
 }
 
 /**

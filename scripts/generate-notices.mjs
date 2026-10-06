@@ -284,6 +284,9 @@ const BUNDLED_FONTS = [
   { name: 'JetBrains Mono', file: 'LICENSE-JetBrainsMono.txt', repo: 'https://github.com/JetBrains/JetBrainsMono' },
   { name: 'Fira Code', file: 'LICENSE-FiraCode.txt', repo: 'https://github.com/tonsky/FiraCode' },
   { name: 'JetBrainsMonoHangul', file: 'LICENSE-JetBrainsMonoHangul.txt', repo: 'https://github.com/Jhyub/JetBrainsMonoHangul' },
+  { name: 'Geist', file: 'LICENSE-Geist.txt', repo: 'https://github.com/vercel/geist-font' },
+  { name: 'Figtree', file: 'LICENSE-Figtree.txt', repo: 'https://github.com/erikdkennedy/figtree' },
+  { name: 'IBM Plex Sans', file: 'LICENSE-IBMPlexSans.txt', repo: 'https://github.com/IBM/plex' },
 ];
 lines.push('BUNDLED FONTS');
 lines.push('');
@@ -311,11 +314,12 @@ for (const f of BUNDLED_FONTS) {
   lines.push('');
 }
 
-// --- Step 5: emit borrowed-technique attributions ---------------------------
-// Projects whose CODE is not bundled, but whose implementation approach was
-// reimplemented in wmux from reading their source. No npm dependency exists to
-// enumerate, so the notice is listed here and the borrow sites carry a
-// `mirrors <project> <file> <symbol>` comment.
+// --- Step 5: emit borrowed-source attributions ------------------------------
+// Projects that are not npm dependencies but whose code or implementation
+// approach was adapted into wmux. No package exists to enumerate, so the notice
+// is listed here; each entry's `what` says whether code was taken, and the
+// borrow sites carry a `mirrors <project> ...` or `Adapted from <project> ...`
+// comment.
 const BORROWED_SOURCES = [
   {
     name: 'browser-use',
@@ -376,12 +380,65 @@ const BORROWED_SOURCES = [
       'hint on navigation rather than as a file on disk, and derives every\n' +
       'field from its own records. No code or prose was taken.',
   },
+  {
+    name: 'MonoCode',
+    license: 'MIT License',
+    repo: 'https://github.com/hardbeat920/monocode',
+    copyright: 'Copyright (c) 2026 Nick',
+    what:
+      'Portions copied or adapted from its source at commit\n' +
+      '6bd432cada0f492f076cc93f7ccb3027f4ff7102. Each copied or adapted file or\n' +
+      'block carries a header comment naming the MonoCode file it came from.\n' +
+      'Chat v2 model and fold (src/shared/chatv2) from:\n' +
+      '  src/integrations/harness/core/apply.ts, preview.ts, shellIntent.ts,\n' +
+      '    streamText.ts, types.ts and their tests (apply, applyBatch, preview,\n' +
+      '    shellIntent, streamText)\n' +
+      '  src/features/sessions/model/session.ts, contextUsage.ts, taskList.ts,\n' +
+      '    userQuestion.ts and their tests (contextUsage, taskList, userQuestion)\n' +
+      '  src/shared/lib/paths.ts\n' +
+      'Usage-limit pause (src/shared/usageLimit.ts, src/daemon/usageLimit,\n' +
+      'src/renderer/components/Pane/UsageLimitChip.tsx) from:\n' +
+      '  src/features/sessions/model/usageLimit.ts\n' +
+      '  src/features/providers/model/rateLimits.ts\n' +
+      '  src/features/sessions/ui/UsageLimitNotice.tsx\n' +
+      '  src/app/App.tsx (the usage-limit resume scheduler)\n' +
+      'Fan-out worker temp dirs and checkout ownership (src/main/worktask,\n' +
+      'src/shared/checkoutOwnership.ts) from:\n' +
+      '  src-tauri/src/control.rs\n' +
+      '  src/features/orchestration/model/orchestration.ts (worker prompt wording)\n' +
+      'Global quick launch (src/main/quickLaunch, src/renderer/launcher,\n' +
+      'src/shared/quickLaunch.ts) from:\n' +
+      '  src-tauri/src/quick_composer.rs\n' +
+      '  src/features/quick-composer/ui/QuickComposer.tsx\n' +
+      '  src/features/quick-composer/model/quickComposer.ts\n' +
+      '  src/features/quick-composer/model/quickComposerShortcut.ts\n' +
+      'Chat v2 Claude driver (src/daemon/chat/v2/claude) from:\n' +
+      '  src/integrations/harness/providers/claude/claude.ts, claudeProtocol.ts\n' +
+      'Chat v2 view (src/renderer/components/ChatV2) from:\n' +
+      '  src/features/sessions/ui/AgentTranscript.tsx (turn footer wording),\n' +
+      '    TranscriptFind.tsx\n' +
+      '  src/features/sessions/model/transcriptFind.ts\n' +
+      'The new look (theme tokens and terminal palettes in src/renderer/themes.ts,\n' +
+      '  the stylesheet rules in src/renderer/styles and Chat/chatMono.css, the\n' +
+      '  sidebar, titlebar, tab, Fleet and Deck component styles, the window\n' +
+      '  frame and glass in src/main/window) from:\n' +
+      '  src/styles/index.css\n' +
+      '  src/app/shell/Sidebar.tsx, TitleBar.tsx\n' +
+      '  src/features/sessions/ui/AgentTranscript.tsx, Composer.tsx,\n' +
+      '    AccessPicker.tsx, ModelPicker.tsx\n' +
+      '  src/features/settings/model/appearance.ts\n' +
+      '  src/features/settings/ui/SettingsView.tsx\n' +
+      '  src/features/terminal/ui/TerminalView.tsx\n' +
+      '  src/shared/ui/Modal.tsx, Popover.tsx, SecondaryButton.tsx\n' +
+      '  src-tauri/src/macos.rs\n' +
+      '  Icons are not taken.',
+  },
 ];
-lines.push('BORROWED IMPLEMENTATION TECHNIQUES');
+lines.push('ADAPTED SOURCES AND IMPLEMENTATION TECHNIQUES');
 lines.push('');
-lines.push('No code from the projects below is bundled with wmux. Their approach was');
-lines.push('reimplemented from the source named at each borrow site, and their license');
-lines.push('terms are reproduced here.');
+lines.push('No package from the projects below is bundled with wmux. Their approach was');
+lines.push('reimplemented, or portions copied or adapted, from the source named at each');
+lines.push('borrow site, and their license terms are reproduced here.');
 lines.push('');
 lines.push(SEP);
 lines.push('');

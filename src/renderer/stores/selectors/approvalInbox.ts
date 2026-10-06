@@ -32,12 +32,33 @@ export type InboxItem =
       declaredCapabilities: string[];
       rationale?: string;
       isCritical: boolean;
+      /** What the prompt is asking for. Absent reads as a plugin declaring
+       *  capabilities — every prompt before the live-Chrome tab borrow. */
+      kind?: 'plugin' | 'browser-borrow' | 'computer-app';
+      /** The question, when the generic plugin headline would be wrong. */
+      title?: string;
+    }
+  | {
+      source: 'browserHelp';
+      key: string;
+      requestId: string;
+      /** Agent-authored and untrusted. Render as TEXT, never as markup. */
+      prompt: string;
+      /** The browser surface to jump to; absent when none resolved. */
+      surfaceId?: string;
+      /** Main's deadline, for the row's countdown. */
+      deadlineAt: number;
     };
 
 /** Minimal store surface the selector reads — keeps the subscription narrow. */
 export type ApprovalInboxState = Pick<
   StoreState,
-  'mcpPrompts' | 'mcpPromptOrder' | 'pendingExecuteApprovals' | 'pendingExecuteApprovalOrder'
+  | 'mcpPrompts'
+  | 'mcpPromptOrder'
+  | 'pendingExecuteApprovals'
+  | 'pendingExecuteApprovalOrder'
+  | 'browserHelpRequests'
+  | 'browserHelpOrder'
 >;
 
 export function selectApprovalInbox(state: ApprovalInboxState): InboxItem[] {
@@ -60,6 +81,23 @@ export function selectApprovalInbox(state: ApprovalInboxState): InboxItem[] {
     });
   }
 
+  // Browser help requests SECOND, ahead of the MCP prompts: a human is the only
+  // thing that can finish one (an MCP prompt at least has an auto-deny deadline
+  // that unblocks the caller), and the flow behind it is frozen mid-login until
+  // someone answers. Insertion order within the group.
+  for (const requestId of state.browserHelpOrder) {
+    const help = state.browserHelpRequests[requestId];
+    if (!help) continue;
+    items.push({
+      source: 'browserHelp',
+      key: `help:${help.requestId}`,
+      requestId: help.requestId,
+      prompt: help.prompt,
+      ...(help.surfaceId !== undefined && { surfaceId: help.surfaceId }),
+      deadlineAt: help.deadlineAt,
+    });
+  }
+
   // MCP in insertion order. Skip any id missing from the record (defensive —
   // order and record are written together, but a torn intermediate state must
   // never crash the cockpit).
@@ -68,10 +106,13 @@ export function selectApprovalInbox(state: ApprovalInboxState): InboxItem[] {
     if (!info) continue;
     // isCritical drives keyboard safety (guard #5): Enter approves non-critical
     // only. Reuses the dialog's pure grouping fn so the classification matches
-    // exactly what the prompt would render.
-    const isCritical = groupCapabilities(info.declaredCapabilities).some(
-      (g) => g.copy.severity === 'critical',
-    );
+    // exactly what the prompt would render. A computer-use consent prompt
+    // ("let this agent see and control Outlook", risk class `computer`) is
+    // critical by kind: it declares no capabilities, so the grouping alone
+    // would read it as benign and let a stray Enter approve it.
+    const isCritical =
+      info.kind === 'computer-app' ||
+      groupCapabilities(info.declaredCapabilities).some((g) => g.copy.severity === 'critical');
     items.push({
       source: 'mcp',
       key: `mcp:${info.promptId}`,
@@ -80,6 +121,8 @@ export function selectApprovalInbox(state: ApprovalInboxState): InboxItem[] {
       declaredCapabilities: info.declaredCapabilities,
       rationale: info.rationale,
       isCritical,
+      ...(info.kind !== undefined && { kind: info.kind }),
+      ...(info.title !== undefined && { title: info.title }),
     });
   }
 

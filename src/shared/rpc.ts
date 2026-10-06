@@ -1,3 +1,4 @@
+import type { WslTarget } from './wslTarget';
 // === JSON-RPC Protocol Types ===
 
 import type { ResumeBinding } from './agentResume';
@@ -63,6 +64,46 @@ export interface RpcRequest {
 export const WMUX_CLI_CLIENT_NAME = 'wmux-cli';
 
 /**
+ * Stable `clientName` reported by the agent lifecycle hook bridges under
+ * `integrations/<agent>/bin/` so the permission enforcer can grant them a
+ * curated one-method allowlist (src/main/mcp/hookBridge.ts) instead of the
+ * envelope-less legacy grandfather that #1111 closes.
+ *
+ * These bridges send `hooks.signal` and nothing else. `hooks.signal` is
+ * `wmux.internal`, which `permissionGrammar` forbids from ever appearing in a
+ * declaration, so the declare/approve flow can never grant it — a
+ * source-qualified, name-recognised lane is the only path, exactly as for the
+ * bundled MCP server (firstParty.ts) and the CLI (internalCli.ts).
+ *
+ * Defined in shared for the same reason as WMUX_CLI_CLIENT_NAME: the bridges
+ * are standalone .mjs scripts, not part of the main build, and must agree on
+ * the exact string without a cross-build import.
+ */
+export const WMUX_HOOK_BRIDGE_CLIENT_NAME = 'wmux-hook-bridge';
+
+/**
+ * Stable `clientName` reported by the Claude Code statusline script
+ * (`integrations/claude/bin/wmux-statusline.mjs`) when it pushes live rate
+ * limits over the main pipe, so the permission enforcer can grant it a
+ * curated one-method allowlist (src/main/mcp/statuslinePush.ts) instead of
+ * the envelope-less legacy grandfather that #1111 closes.
+ *
+ * The script sends `usage.rateLimits` and nothing else on the main pipe. Like
+ * `hooks.signal` it is `wmux.internal`, so no declaration can ever grant it.
+ * Its own name rather than WMUX_HOOK_BRIDGE_CLIENT_NAME so neither caller
+ * widens what the other's name reaches.
+ */
+export const WMUX_STATUSLINE_CLIENT_NAME = 'wmux-statusline';
+
+/**
+ * Stable `clientName` reported by Moa's read gate (the PreToolUse hook main
+ * generates for the HQ brain, src/main/deck/moaReadGate.ts) when it asks the
+ * MAIN pipe which repositories Moa may read without a prompt
+ * (`deck.moaReadRoots`). Its own one-method lane, like the statusline's.
+ */
+export const WMUX_READ_GATE_CLIENT_NAME = 'wmux-read-gate';
+
+/**
  * `clientName` values that must NEVER be promoted to first-party recognition
  * through `mcp.firstPartyClients` in `~/.wmux/config.json` (issue #636).
  * Compared case-insensitively. Enforced by `setConfiguredFirstPartyClients`
@@ -90,6 +131,9 @@ export const NON_IDENTIFYING_CLIENT_NAMES: ReadonlySet<string> = new Set<string>
   'client',
   'default',
   WMUX_CLI_CLIENT_NAME,
+  WMUX_HOOK_BRIDGE_CLIENT_NAME,
+  WMUX_STATUSLINE_CLIENT_NAME,
+  WMUX_READ_GATE_CLIENT_NAME,
 ]);
 
 /**
@@ -319,7 +363,12 @@ export type RpcRejection =
       reason: 'identity-status';
       method: RpcMethod;
       capability: string;
-      status: 'denied' | 'unconfirmed';
+      // 'legacy' (#1111 Stage 3): the caller sent no clientName envelope, or
+      // its trust row is still the grandfathered `legacy` status. The lane
+      // that used to allow this closes in the first release on or after
+      // 2026-09-30; there is no approval path back into it — the caller must
+      // send a clientName and declare permissions.
+      status: 'denied' | 'unconfirmed' | 'legacy';
       pendingApproval?: { promptId: string };
     };
 
@@ -335,6 +384,8 @@ export type RpcMethod =
   | 'surface.focus'
   | 'surface.close'
   | 'pane.list'
+  // The Fleet attention board (needs you / running / idle) as data.
+  | 'fleet.triage'
   | 'pane.focus'
   | 'pane.split'
   | 'pane.close'
@@ -364,13 +415,23 @@ export type RpcMethod =
   // Performance diagnostics (P0-5c) — aggregate reveal-mechanism counters
   // for `wmux doctor --performance`. Read-only, no terminal content.
   | 'perf.status'
+  // Desktop computer use (docs/computer-use-design.md). Off unless the user
+  // turns it on in Settings › Computer use; `act` is the only input-injecting method.
+  | 'computer.capabilities'
+  | 'computer.listApps'
+  | 'computer.listWindows'
+  | 'computer.getAppState'
+  | 'computer.act'
   | 'deck.resolvePaneRoute'
   | 'deck.resolveCommanderWorkspace'
   | 'deck.completeWork'
   | 'deck.requestDecision'
   | 'deck.resolveDecision'
+  | 'deck.proposeHandoff'
+  | 'deck.state.prune'
   | 'browser.tabs'
   | 'browser.open'
+  | 'browser.surface.adopt'
   | 'browser.navigate'
   | 'browser.goBack'
   | 'browser.close'
@@ -403,9 +464,19 @@ export type RpcMethod =
   | 'browser.actionCache.promote'
   | 'browser.actionCache.demote'
   | 'browser.actionCache.promoted'
+  | 'browser.siteMemory.list'
+  | 'browser.siteMemory.record'
+  | 'browser.siteMemory.forget'
+  | 'browser.siteGuides.match'
   | 'browser.lease.acquire'
   | 'browser.lease.renew'
   | 'browser.lease.release'
+  // browser_request_help — hand one blocked step (login / CAPTCHA / OTP /
+  // payment confirmation) to the operator and wait. `request` opens; `status`
+  // is what the tool polls on its ~1s cadence; `cancel` withdraws.
+  | 'browser.help.request'
+  | 'browser.help.status'
+  | 'browser.help.cancel'
   | 'daemon.createSession'
   | 'daemon.destroySession'
   | 'daemon.attachSession'
@@ -423,7 +494,12 @@ export type RpcMethod =
   // the approval registry but cannot see whether a workspace is a WorkTask
   // task workspace or what its deck autonomy mode is — both live in main. Main
   // pushes the whole table on every change; the daemon holds the last one.
+  | 'daemon.phone.register'
+  | 'daemon.phone.complete'
   | 'daemon.workspaceFacts.set'
+  // Main → daemon: which daemon session is the Moa (HQ brain) pane, or null.
+  // The phone's access to that one brain pane stands only while it does.
+  | 'daemon.moa.set'
   | 'daemon.inbox.poll'
   | 'lanlink.status'
   | 'lanlink.configure'
@@ -469,6 +545,8 @@ export type RpcMethod =
   | 'company.provisionAll'
   | 'company.provisionCeo'
   | 'hooks.signal'
+  | 'usage.rateLimits'
+  | 'deck.moaReadRoots'
   | 'a2a.channel.list'
   | 'a2a.channel.get'
   | 'a2a.channel.getMessages'
@@ -540,7 +618,14 @@ export type RpcMethod =
   // Approval press (pipe/handlers/approvals.rpc.ts) — the brain answers a
   // worker's prompt through the approval registry instead of typing a digit.
   // Authorization is the daemon's press scope (decideApprovalPress).
-  | 'approval.press';
+  | 'approval.press'
+  // Scheduled runs on the pipe (pipe/handlers/automation.rpc.ts). An agent may
+  // only DRAFT a schedule (stored disabled, approval mode, surfaced to the
+  // human) and read a redacted list / run states; every other automation.*
+  // mutation stays on the renderer IPC surface.
+  | 'automation.propose'
+  | 'automation.list'
+  | 'automation.runs';
 
 // All available methods as array (for system.capabilities)
 export const ALL_RPC_METHODS = [
@@ -554,6 +639,7 @@ export const ALL_RPC_METHODS = [
   'surface.focus',
   'surface.close',
   'pane.list',
+  'fleet.triage',
   'pane.focus',
   'pane.split',
   'pane.close',
@@ -578,13 +664,21 @@ export const ALL_RPC_METHODS = [
   'system.identify',
   'system.capabilities',
   'perf.status',
+  'computer.capabilities',
+  'computer.listApps',
+  'computer.listWindows',
+  'computer.getAppState',
+  'computer.act',
   'deck.resolvePaneRoute',
   'deck.resolveCommanderWorkspace',
   'deck.completeWork',
   'deck.requestDecision',
   'deck.resolveDecision',
+  'deck.proposeHandoff',
+  'deck.state.prune',
   'browser.tabs',
   'browser.open',
+  'browser.surface.adopt',
   'browser.navigate',
   'browser.goBack',
   'browser.close',
@@ -617,9 +711,16 @@ export const ALL_RPC_METHODS = [
   'browser.actionCache.promote',
   'browser.actionCache.demote',
   'browser.actionCache.promoted',
+  'browser.siteMemory.list',
+  'browser.siteMemory.record',
+  'browser.siteMemory.forget',
+  'browser.siteGuides.match',
   'browser.lease.acquire',
   'browser.lease.renew',
   'browser.lease.release',
+  'browser.help.request',
+  'browser.help.status',
+  'browser.help.cancel',
   'daemon.createSession',
   'daemon.destroySession',
   'daemon.attachSession',
@@ -633,7 +734,10 @@ export const ALL_RPC_METHODS = [
   'daemon.superviseRearm',
   'daemon.superviseStop',
   'daemon.setResumeBinding',
+  'daemon.phone.register',
+  'daemon.phone.complete',
   'daemon.workspaceFacts.set',
+  'daemon.moa.set',
   'daemon.inbox.poll',
   'lanlink.status',
   'lanlink.configure',
@@ -679,6 +783,8 @@ export const ALL_RPC_METHODS = [
   'company.provisionAll',
   'company.provisionCeo',
   'hooks.signal',
+  'usage.rateLimits',
+  'deck.moaReadRoots',
   'a2a.channel.list',
   'a2a.channel.get',
   'a2a.channel.getMessages',
@@ -720,6 +826,9 @@ export const ALL_RPC_METHODS = [
   'task.git.log',
   'task.gh.prView',
   'approval.press',
+  'automation.propose',
+  'automation.list',
+  'automation.runs',
 ] as const satisfies readonly RpcMethod[];
 
 // === RPC Parameter Types ===
@@ -752,7 +861,19 @@ export interface DaemonEvent {
     //                           restartCount, consecutiveFailures }
     | 'session.restarted'
     | 'supervision.changed'
+    // A pane's usage-limit hold changed (shared/usageLimit).
+    //   usage.limit.changed → { limit: PaneUsageLimit | null }  (null = cleared)
+    | 'usage.limit.changed'
+    // An approval record was created, resolved or expired. A RE-LIST NUDGE
+    // only — nothing from the record rides along (main reads
+    // daemon.approvals.list). Drives the HQ approval lane.
+    //   approvals.changed → { change: 'create' | 'resolve' | 'expire' | ... }
+    | 'approvals.changed'
+    // A key (not a mouse report) reached the pane by any input path; at most
+    // once per 30 s per pane. Workspace settle activity. No data.
+    | 'input.typed'
     | 'session.output'
+    | 'phone.request'
     | 'agent.event'
     | 'agent.critical'
     | 'activity.idle'
@@ -765,6 +886,11 @@ export interface DaemonEvent {
     // watching, or null when it could not attribute one.
     //   agent.processExit → { slug: string | null }
     | 'agent.processExit'
+    // The last tool an agent with no per-tool hook ran, read from its own
+    // transcript (TranscriptActivityWatcher). Same meaning as a PostToolUse
+    // activity line; '' clears it.
+    //   agent.transcriptActivity → { activity: string }
+    | 'agent.transcriptActivity'
     | 'prompt.event'
     | 'notification.event'
     | 'cwd.changed'
@@ -814,7 +940,15 @@ export interface DaemonEvent {
     // to the sockets that called `daemon.transcript.subscribe` (see
     // DaemonPipeServer.sendTo). `data.reset` means the file rotated or a new
     // session started and the consumer must REPLACE its rows, not append them.
-    | 'transcript.appended';
+    | 'transcript.appended'
+    // Scheduled runs — `data` is an AutomationEvent (src/shared/automation.ts),
+    // `sessionId` is ''. Carries names and states only, never prompts or output.
+    | 'automation.event'
+    // Chat v2 — stamped events of one pane's driver conversation. UNICAST to
+    // the sockets that called `daemon.chatv2.subscribe`, like
+    // transcript.appended. `sessionId` is the anchor pane id; `data` is
+    // ChatV2EventsPush (src/shared/chatv2/ipc.ts).
+    | 'chatv2.events';
   sessionId: string;
   data: unknown;
 }
@@ -826,6 +960,7 @@ export interface DaemonEvent {
 // observed depending on the caller path.
 
 export interface DaemonCreateSessionParams {
+  wslTarget?: WslTarget;
   id: string;
   /** Absent means the home directory. */
   cwd?: string;
@@ -834,6 +969,13 @@ export interface DaemonCreateSessionParams {
    * default; do not send `''`, which only works by accident.
    */
   cmd?: string;
+  /**
+   * #1103 — spawn arguments for `cmd`, exactly `['-d', '<distro>']` and only
+   * when `cmd` is wsl.exe (validated by isWslDistroSpawnArgs at this boundary:
+   * the daemon's spawn surface is not a shell parser). Absent → no extra
+   * arguments, today's behaviour.
+   */
+  args?: string[];
   /**
    * The fully-resolved child environment. Main builds this (resolveSpawnEnv:
    * buildSafeChildEnv + workspace-profile overlay + forced WMUX identity) and

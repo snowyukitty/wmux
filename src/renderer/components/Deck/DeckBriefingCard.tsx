@@ -1,3 +1,4 @@
+// Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/features/sessions/ui/AgentTranscript.tsx), MIT License, Copyright (c) 2026 Nick
 // ─── Command Deck — "welcome home" briefing card (D1) ────────────────────────
 //
 // Presents the deterministic briefing (deckBriefing.ts) at the top of the deck
@@ -47,7 +48,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { tokenAttrs } from '../../themes';
 import { FOCUS_RING } from '../focusRing';
+import { IconChevron } from '../icons';
 import { onBriefingConfigChanged } from './deckBriefingConfigBus';
+import { MoaRetroCard } from '../Moa/MoaRetroCard';
 import {
   briefingHasContent,
   briefingSignal,
@@ -217,7 +220,23 @@ export function briefingDeltaLine(changed: BriefingChange, t: T): string {
   );
 }
 
-export function DeckBriefingCard({
+/** The briefing, with Moa's weekly retro on top when main has one for this
+ *  workspace (MoaRetroCard renders nothing otherwise). */
+/** The briefing with its decision facts removed (Moa's Waiting on you owns them). */
+export function withoutDecision(b: WorkspaceBriefing): WorkspaceBriefing {
+  return { ...b, pendingDecision: null, changed: b.changed ? { ...b.changed, newDecision: false } : b.changed };
+}
+
+export function DeckBriefingCard(props: Parameters<typeof DeckBriefingBody>[0]): React.ReactElement {
+  return (
+    <>
+      <MoaRetroCard workspaceId={props.workspaceId} t={props.t ?? (() => '')} />
+      <DeckBriefingBody {...props} />
+    </>
+  );
+}
+
+function DeckBriefingBody({
   api,
   onStream,
   workspaceId,
@@ -227,7 +246,12 @@ export function DeckBriefingCard({
   channelsUnread = 0,
   onJumpToChannels,
   fleetSignature,
+  omitDecision = false,
 }: {
+  /** Moa's panel lists every pending decision in Waiting on you, right above:
+   *  the briefing says nothing about decisions there, and renders nothing when
+   *  that was all it had to say. */
+  omitDecision?: boolean;
   api?: DeckBriefingApi;
   onStream?: DeckBriefingStream;
   workspaceId?: string;
@@ -257,12 +281,12 @@ export function DeckBriefingCard({
     (window.electronAPI as unknown as { deck?: { onStream?: DeckBriefingStream } } | undefined)
       ?.deck?.onStream;
 
-  const [briefing, setBriefing] = useState<WorkspaceBriefing | null>(null);
+  const [rawBriefing, setBriefing] = useState<WorkspaceBriefing | null>(null);
   const [expanded, setExpanded] = useState(false);
   // The delta STAYS once shown. Acknowledging it clears the delta in main, so
   // without this the "2 finished, 1 now blocked" line the operator is reading
   // would vanish on the very next stream tick.
-  const [shownChange, setShownChange] = useState<BriefingChange | null>(null);
+  const [rawShownChange, setShownChange] = useState<BriefingChange | null>(null);
   // Monotonic request id: ignore a slow get() whose response lands after the
   // workspace changed (or after a newer get), so a stale response can't overwrite
   // the active workspace's card (workspace-switch race — DeckDecisionCard pattern).
@@ -464,12 +488,14 @@ export function DeckBriefingCard({
   // brought back to the front — acknowledges then rather than never.
   const seen = resolvedApi?.seen;
   useEffect(() => {
-    if (!expanded || !briefing || !workspaceId || !seen) return;
+    if (!expanded || !rawBriefing || !workspaceId || !seen) return;
     if (!onScreen || !docVisible) return;
-    void seen(workspaceId, briefing.builtAt).catch(() => undefined);
-  }, [expanded, briefing, workspaceId, seen, onScreen, docVisible]);
+    void seen(workspaceId, rawBriefing.builtAt).catch(() => undefined);
+  }, [expanded, rawBriefing, workspaceId, seen, onScreen, docVisible]);
 
-  if (!resolvedApi || !briefing) return null;
+  if (!resolvedApi || !rawBriefing) return null;
+  const briefing = omitDecision ? withoutDecision(rawBriefing) : rawBriefing;
+  const shownChange = omitDecision && rawShownChange ? { ...rawShownChange, newDecision: false } : rawShownChange;
   // Nothing to say ⇒ no card at all (DESIGN.md: no dead gauges). The sticky delta
   // counts as content so an acknowledged "2 finished" doesn't yank the card away
   // mid-read on an otherwise-empty workspace.
@@ -493,8 +519,7 @@ export function DeckBriefingCard({
     <div
       ref={setCardEl}
       data-deck-briefing
-      className="rounded-[7px] px-4 py-2.5 bg-[rgba(var(--bg-surface-rgb),0.55)]"
-      {...tokenAttrs('bgSurface', 'bg')}
+      className="px-4 py-2.5"
     >
       {/* Header row — the collapsed one-line affordance; click toggles expand.
           The jump sits OUTSIDE the toggle button (a button cannot nest a
@@ -517,7 +542,7 @@ export function DeckBriefingCard({
         }}
         className={`group flex-1 min-w-0 flex items-center gap-2 text-left ${FOCUS_RING}`}
       >
-        <span className="text-[11px] font-mono uppercase tracking-wider text-[var(--text-muted)] shrink-0">
+        <span className="text-[11px] font-mono uppercase tracking-wider text-[color-mix(in_srgb,var(--text-main)_45%,transparent)] shrink-0">
           {t('deck.briefing.eyebrow') || 'Briefing'}
         </span>
         <span
@@ -528,9 +553,9 @@ export function DeckBriefingCard({
         </span>
         <span
           aria-hidden="true"
-          className="text-[10px] font-mono opacity-70 text-[var(--text-muted)] shrink-0 group-hover:text-[var(--accent-blue)] transition-colors"
+          className={`inline-flex shrink-0 text-[color-mix(in_srgb,var(--text-main)_50%,transparent)] group-hover:text-[color-mix(in_srgb,var(--text-main)_70%,transparent)] transition-[color,transform] ${expanded ? '-rotate-90' : 'rotate-90'}`}
         >
-          {expanded ? '▴' : '▾'}
+          <IconChevron size={12} />
         </span>
       </button>
 
@@ -540,7 +565,7 @@ export function DeckBriefingCard({
           data-briefing-jump
           onClick={() => jumpTo(top.ptyId)}
           aria-label={tf(t, 'deck.briefing.jumpTo', 'Jump to {name}').replace('{name}', topName)}
-          className={`shrink-0 flex items-center gap-1 font-mono text-[11px] text-[var(--text-muted)] hover:text-[var(--accent-blue)] transition-colors ${FOCUS_RING}`}
+          className={`shrink-0 flex items-center gap-1 font-mono text-[11px] text-[color-mix(in_srgb,var(--text-main)_45%,transparent)] hover:text-[var(--text-main)] transition-colors ${FOCUS_RING}`}
         >
           <span className="truncate max-w-[120px]">{topName}</span>
           <span aria-hidden="true">→</span>
@@ -566,8 +591,8 @@ export function DeckBriefingCard({
           {showDelta && delta && (
             <div
               data-briefing-delta
-              className="text-[11px] font-mono text-[var(--text-sub)] leading-relaxed"
-              {...tokenAttrs('textSub', 'text')}
+              className="text-[11px] font-mono text-[color-mix(in_srgb,var(--text-main)_70%,transparent)] leading-relaxed"
+              {...tokenAttrs('textMain', 'text')}
             >
               {briefingDeltaLine(delta, t)}
             </div>
@@ -576,8 +601,8 @@ export function DeckBriefingCard({
           {briefing.loop && (
             <div
               data-briefing-loop
-              className="text-[11px] font-mono text-[var(--text-sub)] leading-relaxed truncate"
-              {...tokenAttrs('textSub', 'text')}
+              className="text-[11px] font-mono text-[color-mix(in_srgb,var(--text-main)_70%,transparent)] leading-relaxed truncate"
+              {...tokenAttrs('textMain', 'text')}
             >
               {t('deck.briefing.loopLabel') || 'Loop:'} {briefing.loop.objective}
               {briefing.loop.taskCount > 0
@@ -591,7 +616,7 @@ export function DeckBriefingCard({
               type="button"
               data-briefing-channels
               onClick={onJumpToChannels}
-              className={`block text-left text-[11px] font-mono text-[var(--text-muted)] hover:text-[var(--accent-blue)] transition-colors ${FOCUS_RING}`}
+              className={`block text-left text-[11px] font-mono text-[color-mix(in_srgb,var(--text-main)_45%,transparent)] hover:text-[var(--text-main)] transition-colors ${FOCUS_RING}`}
             >
               {tc(t, 'deck.briefing.channelsUnread', '{count} unread in channels', channelsUnread)}
             </button>

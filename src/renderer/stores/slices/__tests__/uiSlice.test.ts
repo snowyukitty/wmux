@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
-import { createUISlice, type UISlice } from '../uiSlice';
+import { createUISlice, siteGuidesAutoEnablePatch, fleetChangedSinceSeen, type UISlice } from '../uiSlice';
+import { createSchedulesSlice, type SchedulesSlice } from '../schedulesSlice';
 
 // Mock browser APIs that uiSlice touches
 vi.mock('../../../i18n', () => ({
@@ -648,21 +649,20 @@ describe('UISlice — Fleet View overlay (S-C1)', () => {
     expect(store.getState().commandPaletteVisible).toBe(true);
   });
 
-  it('opening a competing overlay closes Fleet View (mutual exclusivity)', () => {
-    store.getState().setFleetViewVisible(true);
-    store.getState().toggleCommandPalette();
-    expect(store.getState().commandPaletteVisible).toBe(true);
-    expect(store.getState().fleetViewVisible).toBe(false);
-
+  it('opening another page closes Fleet View; the palette and notifications float over it', () => {
     store.getState().setFleetViewVisible(true);
     store.getState().toggleSettingsPanel();
     expect(store.getState().settingsPanelVisible).toBe(true);
     expect(store.getState().fleetViewVisible).toBe(false);
 
     store.getState().setFleetViewVisible(true);
+    store.getState().toggleCommandPalette();
+    expect(store.getState().commandPaletteVisible).toBe(true);
+    expect(store.getState().fleetViewVisible).toBe(true);
+
     store.getState().toggleNotificationPanel();
     expect(store.getState().notificationPanelVisible).toBe(true);
-    expect(store.getState().fleetViewVisible).toBe(false);
+    expect(store.getState().fleetViewVisible).toBe(true);
   });
 
   it('opening Fleet View tears down inspect mode', () => {
@@ -737,21 +737,77 @@ describe('UISlice — browser backend mirror (#517)', () => {
   });
 });
 
-describe('UISlice — #1152 disabled built-in shortcuts', () => {
+describe('UISlice — site guides auto-enable with the Chrome backend', () => {
+  let store: ReturnType<typeof createTestStore>;
+
+  beforeEach(() => {
+    store = createTestStore();
+    // A settings change after boot: the saved session has already landed.
+    store.getState().markSessionSettingsLoaded();
+  });
+
+  it('siteGuidesAutoEnablePatch only fires for chrome without the marker', () => {
+    expect(siteGuidesAutoEnablePatch({ browserBackend: 'chrome', siteGuidesAutoEnabled: false }))
+      .toEqual({ siteGuidesEnabled: true, siteGuidesAutoEnabled: true });
+    expect(siteGuidesAutoEnablePatch({ browserBackend: 'chrome', siteGuidesAutoEnabled: true })).toBeNull();
+    expect(siteGuidesAutoEnablePatch({ browserBackend: 'builtin', siteGuidesAutoEnabled: false })).toBeNull();
+    expect(siteGuidesAutoEnablePatch({ browserBackend: 'external', siteGuidesAutoEnabled: false })).toBeNull();
+  });
+
+  it('choosing chrome turns guides on once and sets the marker', () => {
+    expect(store.getState().siteGuidesEnabled).toBe(false);
+    expect(store.getState().siteGuidesAutoEnabled).toBe(false);
+    store.getState().setBrowserBackend('chrome');
+    expect(store.getState().siteGuidesEnabled).toBe(true);
+    expect(store.getState().siteGuidesAutoEnabled).toBe(true);
+  });
+
+  it('choosing builtin or external does not turn guides on', () => {
+    store.getState().setBrowserBackend('external');
+    store.getState().setBrowserBackend('builtin');
+    expect(store.getState().siteGuidesEnabled).toBe(false);
+    expect(store.getState().siteGuidesAutoEnabled).toBe(false);
+  });
+
+  it('guides turned off after the auto-enable stay off when chrome is chosen again', () => {
+    store.getState().setBrowserBackend('chrome');
+    store.getState().setSiteGuidesEnabled(false);
+    store.getState().setBrowserBackend('builtin');
+    store.getState().setBrowserBackend('chrome');
+    expect(store.getState().siteGuidesEnabled).toBe(false);
+    expect(store.getState().siteGuidesAutoEnabled).toBe(true);
+  });
+
+  it('switching away from chrome does not turn guides off', () => {
+    store.getState().setBrowserBackend('chrome');
+    store.getState().setBrowserBackend('external');
+    expect(store.getState().siteGuidesEnabled).toBe(true);
+    store.getState().setBrowserBackend('builtin');
+    expect(store.getState().siteGuidesEnabled).toBe(true);
+  });
+});
+
+describe('UISlice — built-in shortcut overrides (#1152, #1455)', () => {
   let store: ReturnType<typeof createTestStore>;
   beforeEach(() => { store = createTestStore(); });
 
-  it('starts with nothing disabled', () => {
-    expect(store.getState().disabledShortcuts).toEqual([]);
+  it('starts on the defaults', () => {
+    expect(store.getState().shortcutOverrides).toEqual({});
   });
 
-  it('toggleShortcutDisabled adds, then removes, a combo', () => {
-    store.getState().toggleShortcutDisabled('Ctrl+T');
-    expect(store.getState().disabledShortcuts).toEqual(['Ctrl+T']);
-    store.getState().toggleShortcutDisabled('Ctrl+D');
-    expect(store.getState().disabledShortcuts).toEqual(['Ctrl+T', 'Ctrl+D']);
-    store.getState().toggleShortcutDisabled('Ctrl+T');
-    expect(store.getState().disabledShortcuts).toEqual(['Ctrl+D']);
+  it('switches an action off, moves one, and resets each', () => {
+    store.getState().setShortcutOverride('prevWorkspace', null);
+    store.getState().setShortcutOverride('nextWorkspace', 'Ctrl+Alt+J');
+    expect(store.getState().shortcutOverrides).toEqual({ prevWorkspace: null, nextWorkspace: 'Ctrl+Alt+J' });
+    store.getState().resetShortcut('prevWorkspace');
+    expect(store.getState().shortcutOverrides).toEqual({ nextWorkspace: 'Ctrl+Alt+J' });
+    store.getState().resetShortcut('nextWorkspace');
+    expect(store.getState().shortcutOverrides).toEqual({});
+  });
+
+  it('refuses a combo nobody can press without eating a typed key', () => {
+    store.getState().setShortcutOverride('newSurface', 'T');
+    expect(store.getState().shortcutOverrides).toEqual({});
   });
 });
 
@@ -759,8 +815,9 @@ describe('UISlice — sidebar attention-first ordering', () => {
   let store: ReturnType<typeof createTestStore>;
   beforeEach(() => { store = createTestStore(); });
 
-  it('defaults to off — the list must not reorder itself unasked', () => {
-    expect(store.getState().sidebarAttentionFirst).toBe(false);
+  it('defaults to on — Attention is the default order (owner decision 2026-09-25)', () => {
+    expect(store.getState().sidebarAttentionFirst).toBe(true);
+    expect(store.getState().sidebarSortMode).toBe('attention');
   });
 
   it('setSidebarAttentionFirst flips the flag both ways', () => {
@@ -768,5 +825,126 @@ describe('UISlice — sidebar attention-first ordering', () => {
     expect(store.getState().sidebarAttentionFirst).toBe(true);
     store.getState().setSidebarAttentionFirst(false);
     expect(store.getState().sidebarAttentionFirst).toBe(false);
+  });
+});
+
+describe('UISlice — Fleet "changed since you last looked" snapshot', () => {
+  let store: ReturnType<typeof createTestStore>;
+
+  beforeEach(() => {
+    store = createTestStore();
+  });
+
+  it('starts with no snapshot, so nothing reads as changed', () => {
+    expect(store.getState().fleetLastSeen).toBeNull();
+    expect(fleetChangedSinceSeen(store.getState().fleetLastSeen, 'pty-1', 'awaiting_input', 'Deploy?')).toBe(false);
+  });
+
+  it('flags a pane whose status differs from the snapshot, or that the snapshot never saw', () => {
+    store.getState().setFleetLastSeen({ 'pty-1': { status: 'running' } }, 1_000);
+    const seen = store.getState().fleetLastSeen;
+    expect(seen).toEqual({ statuses: { 'pty-1': { status: 'running' } }, at: 1_000 });
+    expect(fleetChangedSinceSeen(seen, 'pty-1', 'awaiting_input')).toBe(true);
+    expect(fleetChangedSinceSeen(seen, 'pty-2', 'error')).toBe(true);
+  });
+
+  it('flags a new question asked in the same status', () => {
+    store.getState().setFleetLastSeen({ 'pty-1': { status: 'awaiting_input', question: 'Deploy to staging?' } });
+    const seen = store.getState().fleetLastSeen;
+    expect(fleetChangedSinceSeen(seen, 'pty-1', 'awaiting_input', 'Deploy to prod?')).toBe(true);
+    expect(fleetChangedSinceSeen(seen, 'pty-1', 'awaiting_input', 'Deploy to staging?')).toBe(false);
+  });
+
+  it('does not flag a pane whose status and question are unchanged', () => {
+    store.getState().setFleetLastSeen({ 'pty-1': { status: 'error' } });
+    expect(fleetChangedSinceSeen(store.getState().fleetLastSeen, 'pty-1', 'error')).toBe(false);
+    expect(fleetChangedSinceSeen(store.getState().fleetLastSeen, 'pty-1', 'error', '')).toBe(false);
+  });
+
+  it('copies the entries, so later edits to the caller map do not leak in', () => {
+    const statuses: Record<string, { status: 'running' | 'error' }> = { 'pty-1': { status: 'running' } };
+    store.getState().setFleetLastSeen(statuses);
+    statuses['pty-1'].status = 'error';
+    expect(store.getState().fleetLastSeen?.statuses['pty-1'].status).toBe('running');
+  });
+});
+
+// The rail swaps the whole sheet to one page at a time; the old per-overlay
+// flags are mirrors of that one route.
+describe('UISlice — rail route', () => {
+  const createRouteStore = () => create<UISlice & SchedulesSlice>()(
+    immer((...args) => ({
+      // @ts-expect-error — minimal test store doesn't match full StoreState
+      ...createUISlice(...args),
+      // @ts-expect-error — same
+      ...createSchedulesSlice(...args),
+    })),
+  );
+  let store: ReturnType<typeof createRouteStore>;
+
+  beforeEach(() => {
+    store = createRouteStore();
+  });
+
+  const mirrors = () => {
+    const s = store.getState();
+    return { fleet: s.fleetViewVisible, schedules: s.schedulesViewOpen, settings: s.settingsPanelVisible };
+  };
+
+  it('starts on Workspaces with every page closed', () => {
+    expect(store.getState().appRoute).toBe('workspaces');
+    expect(mirrors()).toEqual({ fleet: false, schedules: false, settings: false });
+  });
+
+  it('shows exactly one page and writes the mirrors from it', () => {
+    store.getState().setAppRoute('fleet');
+    expect(mirrors()).toEqual({ fleet: true, schedules: false, settings: false });
+    store.getState().setAppRoute('schedules');
+    expect(mirrors()).toEqual({ fleet: false, schedules: true, settings: false });
+    store.getState().setAppRoute('remote');
+    expect(mirrors()).toEqual({ fleet: false, schedules: false, settings: false });
+    store.getState().setAppRoute('settings');
+    expect(mirrors()).toEqual({ fleet: false, schedules: false, settings: true });
+    store.getState().setAppRoute('workspaces');
+    expect(mirrors()).toEqual({ fleet: false, schedules: false, settings: false });
+  });
+
+  it('closing a page that is not shown leaves the current page alone', () => {
+    store.getState().setAppRoute('remote');
+    store.getState().setFleetViewVisible(false);
+    store.getState().setSettingsPanelVisible(false);
+    store.getState().closeSchedulesView();
+    expect(store.getState().appRoute).toBe('remote');
+  });
+
+  it('routes the legacy openers and closers through the route', () => {
+    store.getState().openSchedulesView('auto-1');
+    expect(store.getState().appRoute).toBe('schedules');
+    expect(store.getState().schedulesSelectedId).toBe('auto-1');
+    store.getState().toggleSchedulesView();
+    expect(store.getState().appRoute).toBe('workspaces');
+    store.getState().toggleSettingsPanel();
+    expect(store.getState().appRoute).toBe('settings');
+    store.getState().toggleSettingsPanel();
+    expect(store.getState().appRoute).toBe('workspaces');
+  });
+
+  it('a new page closes the palette and notifications; the same page does not', () => {
+    store.getState().setAppRoute('fleet');
+    store.setState({ commandPaletteVisible: true, notificationPanelVisible: true });
+    store.getState().setAppRoute('fleet');
+    expect(store.getState().commandPaletteVisible).toBe(true);
+    store.getState().setAppRoute('settings');
+    expect(store.getState().commandPaletteVisible).toBe(false);
+    expect(store.getState().notificationPanelVisible).toBe(false);
+  });
+
+  it('leaving Settings tears inspect down; staying keeps it', () => {
+    store.getState().setAppRoute('settings');
+    store.setState({ inspectModeActive: true, inspectMinimized: true });
+    store.getState().setAppRoute('settings');
+    expect(store.getState().inspectModeActive).toBe(true);
+    store.getState().setAppRoute('workspaces');
+    expect(store.getState().inspectModeActive).toBe(false);
   });
 });

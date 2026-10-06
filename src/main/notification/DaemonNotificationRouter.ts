@@ -1,8 +1,10 @@
+import { HOOK_ACTIVITY_KINDS } from '../../shared/hooks/hookActivityKinds';
 import type { BrowserWindow } from 'electron';
 import type { DaemonClient } from '../DaemonClient';
 import type { AgentStatus } from '../../shared/types';
 import type { HookSignalRouter } from '../hooks/HookSignalRouter';
 import { dispatchNotification } from './dispatchNotification';
+import { toastManager } from './ToastManager';
 import {
   clearPty as clearSuppression,
   recentlySettled,
@@ -13,10 +15,11 @@ import {
   getLastBroadcastAgentStatus,
   clearLastBroadcastAgentStatus,
 } from '../ipc/handlers/metadata.handler';
-import { settleHookTurnToIdle, broadcastSettledIdle } from './turnSettle';
+import { settleHookTurnToIdle, broadcastSettledIdle, holdsUnreadResult, holdsUnsettledRunningClaim } from './turnSettle';
 import { eventBus } from '../events/EventBus';
 import {
   findWorkspaceIdForPty,
+  isUnambiguousPromptTarget,
   STALE_TRUST_MS,
   ACTIVITY_THROTTLE_MS,
   activityFromSignalPayload,
@@ -25,7 +28,7 @@ import {
   VETO_TRACE_THROTTLE_MS,
   readStopMessage,
 } from '../pipe/handlers/hooks.rpc';
-import type { AgentSignal } from '../../shared/hooks/signal-types';
+import { isFreshSessionSource, type AgentSignal } from '../../shared/hooks/signal-types';
 import type { AgentLastMessage } from '../../shared/events';
 import { getWorkspaceMirror, type WorkspaceMirror } from '../workspace/WorkspaceMirror';
 import { sendToRenderer } from '../pipe/handlers/_bridge';
@@ -195,6 +198,7 @@ const WORKSPACE_LIST_CACHE_TTL_MS = 2_000;
 export class DaemonNotificationRouter {
   private cleanups: Array<() => void> = [];
   private lastAgentEventAt = new Map<string, number>();
+  private warnedMissingReceiptRouter = false;
   /**
    * Per-PTY last-known agent display name. Populated on every
    * `session:agent` event so the `session:prompt` (OSC 133) handler can
@@ -215,6 +219,13 @@ export class DaemonNotificationRouter {
    * throttled identically whichever path serves it. Cleared wholesale in stop().
    */
   private activityThrottle = createLeadingEdgeThrottle(ACTIVITY_THROTTLE_MS);
+  /**
+   * Panes whose activity line comes from a PostToolUse hook in their current
+   * agent session. The daemon's transcript watcher already stands down for
+   * them; this is the second guard, so the two sources never alternate on one
+   * row even when a transcript line was already on the wire.
+   */
+  private readonly hookActivityPanes = new Set<string>();
   /** Rate limit for the vetoed-turn-end trace — see VETO_TRACE_THROTTLE_MS. */
   private vetoTraceThrottle = createLeadingEdgeThrottle(VETO_TRACE_THROTTLE_MS);
 
@@ -697,6 +708,7 @@ export class DaemonNotificationRouter {
 
   start(): void {
     const onAgent = (payload: { sessionId: string; event: unknown }) => {
+      const receivedAt = this.now();
       try {
         const win = this.getWindow();
         const ev = payload.event as AgentEventPayload;
@@ -721,6 +733,8 @@ export class DaemonNotificationRouter {
           // fallback for an event that ships one but not the other.
           const metadataKind = ev.hookKind ?? ev.signal?.kind;
           if (metadataKind === 'agent.session_start') {
+            // A new agent session starts unclaimed: its transcript may report.
+            this.hookActivityPanes.delete(payload.sessionId);
             // A CLEAR, not an activity line — exact parity with main's local
             // session_start handling: a fresh session on this ptyId must inherit
             // neither the previous session's tool label nor its unanswered
@@ -729,6 +743,8 @@ export class DaemonNotificationRouter {
             //     on a live pane, and a session start is rare enough that it can
             //     never contribute to the flood the throttle guards against.
             //   - clears pendingQuestion, which no summarized string expresses.
+            //   - clears lastMessage too, so the previous session's closing
+            //     message does not read as this session's.
             // It also does not STAMP the window: the throttle keeps running off
             // the previous session's last tool call, so a new session's first
             // activity line can wait out the remainder of that window. The gap
@@ -739,8 +755,33 @@ export class DaemonNotificationRouter {
               ptyId: payload.sessionId,
               activity: '',
               pendingQuestion: '',
+              lastMessage: '',
+              lastActivity: '',
             });
+            // #1680 — the receipt a fresh-context step waits on after typing
+            // `/clear` (Claude) or `/new` (Codex): both bridges reach the daemon
+            // and are replayed here. Exact pane only; the engine filters sources.
+            if (ev.signal) this.getHookRouter?.()?.noteSessionStart(payload.sessionId, ev.signal, receivedAt);
+            // #1463 — a fresh session (startup, resume, `/clear`) means the
+            // turn before it is over. `/clear` typed mid-turn runs right after
+            // the Stop, and its SessionStart cancels the Stop still held in the
+            // daemon's verdict window, so no turn end ever arrives: the prompt
+            // submit's latch held the pane Running until its 30-minute expiry.
+            // Never on `compact` (mid-turn auto-compaction) or an unknown source.
+            if (isFreshSessionSource(ev.signal?.payload?.['source'])) {
+              settleHookTurnToIdle(payload.sessionId, this.getHookRouter?.() ?? null, win, this.now());
+            }
           } else if (metadataKind === 'agent.user_prompt_submit') {
+            const hookRouter = this.getHookRouter?.();
+            if (ev.signal && hookRouter) {
+              const mirrored = this.getMirror().peek();
+              const uniqueFallback = mirrored !== null && mirrored.ageMs < STALE_TRUST_MS
+                && isUnambiguousPromptTarget(payload.sessionId, ev.signal, mirrored.entries);
+              hookRouter.notePromptSubmit(payload.sessionId, ev.signal, receivedAt, uniqueFallback);
+            } else if (ev.signal && !this.warnedMissingReceiptRouter) {
+              this.warnedMissingReceiptRouter = true;
+              console.warn('[DaemonNotificationRouter] Prompt-submit receipt evidence unavailable: hook router is not initialized.');
+            }
             // The TURN START, and the whole point of the hook: the pane goes
             // 'running' the instant a prompt is submitted, instead of once the
             // byte-rate heuristic has seen enough output to guess. Like the
@@ -773,14 +814,19 @@ export class DaemonNotificationRouter {
               // overwrite erases a legitimate label the renderer already has.
               ...(ev.agent ? { agentName: ev.agent, agentSlug: promptSlug ?? null } : {}),
             });
-          } else if (ev.signal && this.activityThrottle.allow(payload.sessionId)) {
+          } else if (ev.signal) {
             // agent.activity, or a kind this build does not know yet: the
             // throttled Fleet View line. Unknown kinds are safe here — the
-            // branch can only ever write the activity metadata field.
-            broadcastMetadataUpdate(win, {
-              ptyId: payload.sessionId,
-              activity: activityFromSignalPayload(ev.signal.payload),
-            });
+            // branch can only ever write the activity metadata field. A tool
+            // hook (the same set the daemon's watcher reads) owns the pane's
+            // line for this agent session.
+            if (metadataKind && HOOK_ACTIVITY_KINDS.has(metadataKind)) this.hookActivityPanes.add(payload.sessionId);
+            if (this.activityThrottle.allow(payload.sessionId)) {
+              broadcastMetadataUpdate(win, {
+                ptyId: payload.sessionId,
+                activity: activityFromSignalPayload(ev.signal.payload),
+              });
+            }
           }
           return;
         }
@@ -873,9 +919,10 @@ export class DaemonNotificationRouter {
           // 'awaiting_input'. Claude's hooks.json wires PreToolUse ONLY for
           // the AskUserQuestion tool — the far more common approval
           // prompts ("Do you want to proceed?", "Allow tool use for X",
-          // Claude's default permission-mode Y/N gate) have NO hook at
-          // all; AgentDetector's regex patterns are the ONLY signal source
-          // for those. Vetoing 'awaiting_input' here would leave an agent
+          // Claude's default permission-mode Y/N gate) have a hook only
+          // where the PermissionRequest hook was installed by hand;
+          // elsewhere AgentDetector's regex patterns are the ONLY signal
+          // source for those. Vetoing 'awaiting_input' here would leave an agent
           // blocked on a real approval prompt completely silent for the
           // full authority TTL (up to 30 minutes) — worse than any bug
           // this PR set out to fix.
@@ -1097,9 +1144,18 @@ export class DaemonNotificationRouter {
       try {
         const ev = payload.event as { source?: string; title?: string | null; body?: string } | null;
         if (!ev || typeof ev !== 'object') return;
-        if (ev.source !== 'osc9' && ev.source !== 'osc777' && ev.source !== 'osc99') return;
         if (typeof ev.body !== 'string' || ev.body.length === 0) return;
         const title = typeof ev.title === 'string' && ev.title.length > 0 ? ev.title : null;
+        // Daemon-originated security notice (a phone started an agent with
+        // approvals or the sandbox off). The daemon's OSC parser only yields
+        // osc9/777/99, so no pane output can forge this source. It skips the
+        // renderer policy on purpose: a watched pane, a muted workspace or
+        // category, window focus and the toast toggle must not hide it.
+        if (ev.source === 'security') {
+          toastManager.showDirect(title ?? 'wmux', ev.body, { ptyId: payload.sessionId }, { ignoreToastSetting: true });
+          return;
+        }
+        if (ev.source !== 'osc9' && ev.source !== 'osc777' && ev.source !== 'osc99') return;
         const win = this.getWindow();
         dispatchNotification(
           win,
@@ -1160,13 +1216,31 @@ export class DaemonNotificationRouter {
       }
     };
 
-    const onIdle = (payload: { sessionId: string }) => {
+    const onIdle = (payload: { sessionId: string; preTurn?: boolean }) => {
       const now = Date.now();
       // Daemon-mode twin of the PTYBridge.onActiveToIdle gate: byte silence on
       // a hook-governed pane is not a turn end (quiet reasoning, a long tool
       // call), so the clear would only make the dot flicker. The hook's Stop
       // settles it; the process-death edge covers an agent that never sent one.
       if (this.getHookRouter?.()?.governsRunningState(payload.sessionId, now)) return;
+      // #1463 — the daemon saw no turn since the agent's SessionStart: this is
+      // a TUI boot (or `/clear`) settling at its prompt, not a quiet turn. A
+      // SETTLE, so the renderer drops the boot burst's running stamp instead
+      // of holding it 120 s. It skips the deference window below: the recent
+      // "precise" event there is the detector's withheld idle-prompt `waiting`,
+      // which never reached the renderer. An unread result still stands.
+      // Status only: no agentName (it is the live agent's identity), and no
+      // redraw guard — the byte cycle already ended, and the guard would
+      // swallow the one `running` edge of a turn submitted right after.
+      if (payload.preTurn === true) {
+        if (holdsUnreadResult(payload.sessionId)) return;
+        broadcastMetadataUpdate(this.getWindow(), {
+          ptyId: payload.sessionId,
+          agentStatus: 'idle',
+          settled: true,
+        });
+        return;
+      }
       const lastAgentAt = this.lastAgentEventAt.get(payload.sessionId) ?? 0;
       // #935 direction 3: the suppression window defers to a recent precise
       // status ONLY while that status is still what is actually showing.
@@ -1242,7 +1316,22 @@ export class DaemonNotificationRouter {
      * The order matters — the hook's claim is released FIRST, so the clear
      * below is not vetoed by the very gate it exists to escape.
      */
+    // The daemon read the last tool from the agent's own transcript (a pane
+    // with no per-tool hook). Same metadata a PostToolUse hook writes; a pane
+    // whose hook reports wins.
+    const onTranscriptActivity = (payload: { sessionId: string; activity: string }) => {
+      if (this.hookActivityPanes.has(payload.sessionId)) return;
+      try {
+        broadcastMetadataUpdate(this.getWindow(), { ptyId: payload.sessionId, activity: payload.activity });
+      } catch (err) {
+        console.warn('[DaemonNotificationRouter] transcript activity error:', err);
+      }
+    };
+
     const onAgentProcessExit = (payload: { sessionId: string; slug?: string | null }) => {
+      // The agent whose hooks owned the line is gone; the next one (a hookless
+      // Codex in the same pane) may report from its transcript.
+      this.hookActivityPanes.delete(payload.sessionId);
       try {
         if (!payload.slug) return;
         const paneName = this.lastAgentNameByPty.get(payload.sessionId);
@@ -1252,7 +1341,9 @@ export class DaemonNotificationRouter {
         if (paneSlug && paneSlug !== payload.slug) return;
         const router = this.getHookRouter?.() ?? null;
         const latchOpen = router?.governsRunningState(payload.sessionId, this.now()) === true;
-        if (!latchOpen && getLastBroadcastAgentStatus(payload.sessionId) !== 'running') return;
+        // #1463 — also a pane already byte-idle whose running stamp the
+        // renderer still holds (an unmarked idle does not withdraw it).
+        if (!latchOpen && !holdsUnsettledRunningClaim(payload.sessionId)) return;
         router?.releaseHookTurnStart(payload.sessionId);
         broadcastSettledIdle(payload.sessionId, this.getWindow(), this.now());
       } catch (err) {
@@ -1264,6 +1355,7 @@ export class DaemonNotificationRouter {
     // both clear agentStatus. Only listening to session:died left a stale
     // sidebar dot when the user closed a terminal intentionally (Codex P2).
     const onSessionEnd = (payload: { sessionId: string }) => {
+      this.hookActivityPanes.delete(payload.sessionId);
       try {
         broadcastMetadataUpdate(this.getWindow(), {
           ptyId: payload.sessionId,
@@ -1358,6 +1450,7 @@ export class DaemonNotificationRouter {
     this.daemonClient.on('session:died', onSessionEnd);
     this.daemonClient.on('session:destroyed', onSessionEnd);
     this.daemonClient.on('session:agentProcessExit', onAgentProcessExit);
+    this.daemonClient.on('session:transcriptActivity', onTranscriptActivity);
     this.daemonClient.on('session:restarted', onRestarted);
     this.daemonClient.on('supervision:changed', onSupervisionChanged);
     // A2A channels (a2a-channels U4) — project daemon-broadcast channel
@@ -1391,6 +1484,7 @@ export class DaemonNotificationRouter {
       () => this.daemonClient.off('session:died', onSessionEnd),
       () => this.daemonClient.off('session:destroyed', onSessionEnd),
       () => this.daemonClient.off('session:agentProcessExit', onAgentProcessExit),
+      () => this.daemonClient.off('session:transcriptActivity', onTranscriptActivity),
       () => this.daemonClient.off('session:restarted', onRestarted),
       () => this.daemonClient.off('supervision:changed', onSupervisionChanged),
       () => this.daemonClient.off('channel:message', onChannelMessage),
@@ -1415,6 +1509,7 @@ export class DaemonNotificationRouter {
     // `clearLastBroadcastAgentStatus` above); there is nothing of this
     // router's own left to clear here.
     this.activityThrottle.clear();
+    this.hookActivityPanes.clear();
     this.vetoTraceThrottle.clear();
     this.workspaceCache = null;
   }

@@ -168,11 +168,13 @@ export const FIRST_PARTY_METHODS: ReadonlySet<RpcMethod> = new Set<RpcMethod>([
   // appear in ALLOWED_RESERVED_FIRST_PARTY (firstParty.test.ts). Granted to the
   // bundled supervisor per the security review in
   // plans/issue-285-pane-lifecycle-mcp-tools.md §6 (same-user ceiling; already
-  // reachable via the CLI tier + the still-open legacy grandfather).
+  // reachable via the CLI tier, and via the legacy grandfather until #1111
+  // closed it).
   'surface.new',
   'surface.close',
   // panes + metadata
   'pane.list',
+  'fleet.triage',
   'pane.search',
   'pane.getMetadata',
   'pane.setMetadata',
@@ -207,11 +209,16 @@ export const FIRST_PARTY_METHODS: ReadonlySet<RpcMethod> = new Set<RpcMethod>([
   // WP3). Same per-spawn-token auth; the handler server-enforces auto-mode +
   // staleness + substance, so a non-commander or premature caller fails closed.
   'deck.resolveDecision',
+  // Moa (HQ brain) hand-off proposal (moa_propose_handoff tool). Same
+  // per-spawn-token auth; the handler refuses any caller that is not the HQ
+  // brain, and delivery waits for the operator's card answer.
+  'deck.proposeHandoff',
   // events
   'events.poll',
   // browser (Playwright + packaged CDP/RPC fallbacks)
   'browser.tabs',
   'browser.open',
+  'browser.surface.adopt',
   'browser.navigate',
   'browser.goBack',
   'browser.close',
@@ -221,6 +228,13 @@ export const FIRST_PARTY_METHODS: ReadonlySet<RpcMethod> = new Set<RpcMethod>([
   'browser.session.list',
   'browser.screenshot',
   'browser.evaluate',
+  // Desktop computer use (the `computer` MCP tool, registered only when the
+  // user opts in). Per-app consent is enforced in ComputerService.
+  'computer.capabilities',
+  'computer.listApps',
+  'computer.listWindows',
+  'computer.getAppState',
+  'computer.act',
   'browser.cdp.info',
   'browser.console.get',
   'browser.network.get',
@@ -253,6 +267,22 @@ export const FIRST_PARTY_METHODS: ReadonlySet<RpcMethod> = new Set<RpcMethod>([
   'browser.actionCache.promote',
   'browser.actionCache.demote',
   'browser.actionCache.promoted',
+  // Per-site memory. Registered here for the same reason the actionCache
+  // methods are: missing from this list, every call would be refused as an
+  // unconfirmed plugin in a packaged build while every dev build looked fine.
+  'browser.siteMemory.list',
+  'browser.siteMemory.record',
+  'browser.siteMemory.forget',
+  // Site guide pointers, registered for the same packaged-build reason.
+  'browser.siteGuides.match',
+  // browser_request_help. Same packaged-build reason as the two stores above:
+  // absent from this list, every call would be refused as an unconfirmed plugin
+  // in a packaged build while every dev build (enforcement off) looked fine —
+  // and the whole point of the tool is to work on the machine where a human is
+  // sitting in front of the browser.
+  'browser.help.request',
+  'browser.help.status',
+  'browser.help.cancel',
   // agent-to-agent
   'a2a.resolve.identity',
   'a2a.whoami',
@@ -313,6 +343,11 @@ export const FIRST_PARTY_METHODS: ReadonlySet<RpcMethod> = new Set<RpcMethod>([
   'task.gh.prView',
   // Approval press — the commander-only approval_press tool.
   'approval.press',
+  // Scheduled runs — automation_propose (disabled draft only) and the
+  // redacted automation_list / automation_runs reads.
+  'automation.propose',
+  'automation.list',
+  'automation.runs',
   // `company.a2a.*` used to be granted here for the six company_a2a_* tools.
   // Those tools are gone, so the grants went with them (least privilege — a
   // reserved wmux.internal method must not stay reachable by a clientName
@@ -325,7 +360,8 @@ export const FIRST_PARTY_METHODS: ReadonlySet<RpcMethod> = new Set<RpcMethod>([
 /**
  * True when `clientName` identifies the bundled first-party wmux MCP server.
  * `undefined` / unknown names are NOT first-party — envelope-less callers are
- * already handled by the enforcer's `legacy` grandfather branch.
+ * refused by the enforcer's closed-lane branch before this is consulted
+ * (#1111).
  *
  * Matches the compiled defaults plus any operator-configured additions
  * (`setConfiguredFirstPartyClients`). Exact match either way — `clientName` is

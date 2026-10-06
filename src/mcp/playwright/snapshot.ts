@@ -1,16 +1,39 @@
 import type { Page, Frame, Locator, ElementHandle } from 'playwright-core';
-import { buildDomSnapshotExpression } from './dom-intelligence';
+import { buildDomSnapshotExpression, readDomSnapshotPayload } from './dom-intelligence';
+import {
+  describeRetiredRef,
+  nextRefFor,
+  priorRefDescriptors,
+  recordRefGeneration,
+  recoveredRefNote,
+  uniqueDescriptorMatch,
+} from './refDescriptors';
 import {
   REDACTED_PASSWORD,
   getPasswordFieldBackendIds,
   redactPasswordParams,
 } from './redact';
 import { collectOcclusion, occlusionNote, type OcclusionInfo } from './occlusion';
+import {
+  HAS_SUBMENU_MARKER,
+  collectHoverTriggers,
+  countHasSubmenuMarkers,
+  formatHoverItems,
+  hoverMenusNote,
+  hoverProbeShortfallNote,
+  phaseOneMark,
+  probeHoverSurfaces,
+  type HoverCandidate,
+  type HoverSurfaceMarks,
+} from './hoverSurfaces';
 import { collectPageFacts, formatPageFactsFooter } from './pageFacts';
+import { getLastPointer, setLastPointer } from './pointer-path';
+import { defaultStartPoint } from '../../shared/pointerPath';
 import { peekRecentPendingRequests } from './pageCapture';
 import { evaluateIsolated, isolatedProbeTarget } from './isolated-eval';
 import { ancestorContext } from '../../shared/browserReplay/actionTrace';
 import { emptyDomFacts, getDomFacts } from './ownAttributes';
+import { getConnectionScope } from '../connectionScope';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,6 +51,28 @@ export interface SnapshotOptions {
   filter?: 'interactive';
   /** Keep only nodes matching this text, plus their ancestors. See queryMatcher. */
   q?: string;
+  /**
+   * Also hover the top hover triggers and list what each one reveals (phase 2
+   * in hoverSurfaces.ts). Off by default: it moves the real pointer and costs
+   * up to HOVER_PROBE_LIMITS.TOTAL_BUDGET_MS. Phase 1 — the `has-submenu`
+   * marker itself — runs either way and never touches the page.
+   */
+  probeHover?: boolean;
+  /**
+   * Hand back the whole assembled text instead of cutting it at `maxLength`.
+   *
+   * Set only by the snapshot TOOLS, which store an overflowing result as a
+   * continuation capture and then serve it in `maxLength`-sized line windows
+   * themselves (snapshotCursor.ts). The cut has to happen once, after assembly,
+   * where the window offsets are counted — two cuts would mean the capture a
+   * cursor pages through is already missing the tail it exists to reach. Every
+   * other caller keeps the hard cut and the `... (truncated)` marker.
+   *
+   * The text is not unbounded: the capture store cuts it at MAX_CAPTURE_CHARS
+   * (snapshotCache.ts) and says so in the last window, and the whole a11y tree
+   * this is serialized from was already in memory to produce it.
+   */
+  deferTruncation?: boolean;
 }
 
 /**
@@ -38,6 +83,19 @@ export interface SnapshotOptions {
  * notes below already follow (#1082).
  */
 const ARIA_FILTER_NOTE = '(note: filter ignored for aria format — returning the full tree)';
+
+/**
+ * Said when the overflow retry below replaced the tree with its interactive-only
+ * strip, and ONLY for a `deferTruncation` caller.
+ *
+ * The strip has always been silent, and for the hard-cut callers it can stay
+ * that way: their result ends in `... (truncated)`, which claims nothing about
+ * completeness. A continuation cursor does claim it — the agent pages to "(end
+ * of capture)" and is entitled to read that as "that was the tree" — so on that
+ * lane the caveat has to travel with the capture.
+ */
+const OVERFLOW_STRIP_NOTE =
+  '(note: page over the size budget — non-interactive nodes dropped, so this capture is the interactive tree, not the whole one)';
 
 /**
  * Said on every `q` result. A snapshot that silently dropped most of the page
@@ -57,6 +115,17 @@ function queryFilterNote(q: string): string {
  */
 export const DOM_LISTING_Q_NOTE =
   '(note: q ignored — the a11y tree was unavailable, returning the unfiltered DOM interactive listing)';
+
+/**
+ * Said when `probeHover` reaches a route that cannot honor it.
+ *
+ * The DOM listing still MARKS its triggers (the phase-1 scan runs in-page), but
+ * the probe needs remote handles and a CDP Input lane, which this route has
+ * neither of. Same honesty rule as DOM_LISTING_Q_NOTE: a caller who spent the
+ * flag and sees no items would otherwise read that as "these menus are empty".
+ */
+export const DOM_LISTING_PROBE_HOVER_NOTE =
+  '(note: probeHover ignored — the a11y tree was unavailable; triggers are still marked [has-submenu], but listing their items needs the a11y route)';
 
 /** CDP Accessibility.AXNode shape (subset of fields we use) */
 interface CdpAXNode {
@@ -775,9 +844,46 @@ const pageRefMaps = new WeakMap<Page, RefEntry[]>();
  */
 const pageRefScopes = new WeakMap<Page, string>();
 
+/**
+ * Stable per-Page number, so a descriptor history can name the page it belongs
+ * to. Two tabs showing the same URL are different ref spaces, so the URL alone
+ * cannot key the history.
+ */
+const snapshotPageIds = new WeakMap<Page, number>();
+let nextSnapshotPageId = 1;
+
+function snapshotPageId(page: Page): number {
+  const existing = snapshotPageIds.get(page);
+  if (existing !== undefined) return existing;
+  const id = nextSnapshotPageId++;
+  snapshotPageIds.set(page, id);
+  return id;
+}
+
+/**
+ * Descriptor-history key for one page's ref space (#1355).
+ *
+ * The document is part of the key: a ref from the page before a navigation must
+ * not be recoverable against the page after it. The selector scope is too — a
+ * scoped snapshot numbers refs inside one subtree, so its descriptors describe
+ * a different listing from the unscoped one's.
+ */
+function axDescriptorKey(page: Page, scopeSelector: string | undefined): string {
+  return `ax:p${snapshotPageId(page)}:${pageDocumentKey(page) ?? ''}:${scopeSelector ?? ''}`;
+}
+
+/** The same, for the DOM interactive listing this page falls through to. */
+function domDescriptorKey(page: Page): string {
+  return `ax-dom:p${snapshotPageId(page)}:${pageDocumentKey(page) ?? ''}`;
+}
+
 function setPageRefs(page: Page, refs: RefEntry[], scopeSelector?: string): void {
   finalizeRefs(refs);
   pageRefMaps.set(page, refs);
+  // What this generation's numbers meant, so a ref the next snapshot no longer
+  // lists can still be resolved through its descriptor (#1355). An empty map is
+  // the DOM-fallthrough case, which keeps its own history keyed separately.
+  if (refs.length > 0) recordRefGeneration(axDescriptorKey(page, scopeSelector), 0, refs);
   const generation = pageRefIdentity.get(page)?.generation ?? 0;
   const stamps = new Map<string, SnapshotStamp>();
   stamps.set(MAIN_FRAME.key, { generation, url: pageDocumentKey(page) });
@@ -845,9 +951,28 @@ export function browserScopeKey(scope: {
  * Entries are replaced on every snapshot of that scope and deleted the moment
  * one mints no frame refs, so the map holds at most one entry per live browser
  * surface; the cap is a backstop for a session that churns surfaces.
+ *
+ * Stored per connection (broker) with a module fallback (single child), the
+ * snapshotCache idiom: the guard answers "did MY last snapshot mint this ref
+ * inside an iframe", and two agents can be on one surface — one having
+ * snapshotted frames, the other having tagged the main document — where a
+ * shared map refuses the second agent's perfectly good DOM ref.
  */
 const FRAME_REF_SCOPE_CAP = 64;
-const frameRefsByScope = new Map<string, Set<number>>();
+let moduleFrameRefs: Map<string, Set<number>> | undefined;
+
+function frameRefStore(): Map<string, Set<number>> {
+  const scope = getConnectionScope();
+  if (scope) {
+    const existing = scope.frameRefs as Map<string, Set<number>> | undefined;
+    if (existing) return existing;
+    const fresh = new Map<string, Set<number>>();
+    scope.frameRefs = fresh;
+    return fresh;
+  }
+  if (!moduleFrameRefs) moduleFrameRefs = new Map();
+  return moduleFrameRefs;
+}
 
 /**
  * Record what the snapshot just taken for `scopeKey` minted, so the RPC lane
@@ -858,17 +983,18 @@ const frameRefsByScope = new Map<string, Set<number>>();
  * data-wmux-ref tags ARE the current truth and must stay resolvable.
  */
 export function noteFrameRefsForScope(scopeKey: string, page: Page | null): void {
+  const store = frameRefStore();
   const numbers = new Set<number>();
   for (const entry of (page && pageRefMaps.get(page)) || []) {
     if (entry.frameKey !== MAIN_FRAME.key) numbers.add(entry.ref);
   }
-  frameRefsByScope.delete(scopeKey);
+  store.delete(scopeKey);
   if (numbers.size === 0) return;
-  frameRefsByScope.set(scopeKey, numbers);
-  while (frameRefsByScope.size > FRAME_REF_SCOPE_CAP) {
-    const oldest = frameRefsByScope.keys().next().value;
+  store.set(scopeKey, numbers);
+  while (store.size > FRAME_REF_SCOPE_CAP) {
+    const oldest = store.keys().next().value;
     if (oldest === undefined) break;
-    frameRefsByScope.delete(oldest);
+    store.delete(oldest);
   }
 }
 
@@ -917,7 +1043,7 @@ function refNumber(ref: string): number | null {
 export function isOutstandingFrameRef(scopeKey: string, ref: string): boolean {
   const wanted = refNumber(ref);
   if (wanted === null) return false;
-  return frameRefsByScope.get(scopeKey)?.has(wanted) === true;
+  return frameRefStore().get(scopeKey)?.has(wanted) === true;
 }
 
 /** The message both guards raise, so the agent reads one explanation. */
@@ -989,6 +1115,11 @@ interface SerializeCtx {
   identity: RefIdentity;
   /** Null when nothing is covering the page, which is the normal case. */
   occlusion: OcclusionInfo | null;
+  /**
+   * backendDOMNodeId → the hover trigger it is. Null when the scan found
+   * nothing, which is the normal case on a page with no hover-only menus.
+   */
+  hoverSurfaces: HoverSurfaceMarks | null;
   /**
    * backendDOMNodeId → the element's own `attr=value` label, for the page
    * target's document. Empty when the DOM pass could not run, or when the
@@ -1115,15 +1246,30 @@ function serializeNode(
   ) {
     attrs.push('clickable');
   }
+  // A menu the page only shows on :hover is not in the tree, so a snapshot
+  // that lists the nav item and nothing under it reads as "this site has no
+  // such menu" — see hoverSurfaces.ts. `expanded="true"` above already says
+  // the surface is OPEN and its items are in the tree; adding `has-submenu`
+  // there would tell the agent to hover for what it can already see.
+  const hoverMark =
+    node.backendDOMNodeId !== undefined && node.expanded !== true
+      ? ctx.hoverSurfaces?.get(node.backendDOMNodeId)
+      : undefined;
+  if (hoverMark) attrs.push(HAS_SUBMENU_MARKER);
 
   const attrStr = attrs.length > 0 ? ' ' + attrs.join(' ') : '';
   const nameStr = name ? ` "${name}"` : '';
+  // The probe's findings, outside the attribute list: it is a list of names
+  // with its own separators, not an `attr=value` pair. Gated on the same
+  // `expanded` test as the marker — the items of an OPEN surface are already
+  // this node's children.
+  const hoverStr = formatHoverItems(hoverMark);
   // Only when the node really is a dead end. Chrome 141 always stops at the
   // iframe element, but a version or engine that inlines the child document
   // would turn this note into a lie.
   const frameStr = frameBoundaryNote(node);
 
-  let line = `${pad}- ${role}${nameStr}${attrStr}${frameStr}`;
+  let line = `${pad}- ${role}${nameStr}${attrStr}${hoverStr}${frameStr}`;
 
   // Recurse into children. In 'ai' format an InlineTextBox under one of the
   // parents it was measured to be a fragment of never gets that far — see
@@ -1217,7 +1363,21 @@ function stripNonInteractive(
   // crosses grafted out-of-process frames, whose ids collide with the main
   // frame's (editableRootsFor).
   const frame = frameOf(node, inheritedFrame);
-  if (isInteractive(node, editableRootsFor(frame, editableRoots))) return node;
+  if (isInteractive(node, editableRootsFor(frame, editableRoots))) {
+    // Kept — but its SUBTREE is filtered too (#1360). Returning the node whole
+    // was what still put `StaticText "Log in"` and `image` lines in a listing
+    // the caller had asked to be interactive-only: a link wrapping an icon and
+    // a label carries both, and the link's own `name` already says what they
+    // say. Nested controls (a listbox's options, a toolbar's buttons) are
+    // interactive themselves and survive this walk unchanged.
+    if (!node.children) return node;
+    const kept = node.children
+      .map((child) => stripNonInteractive(child, editableRoots, frame))
+      .filter((c): c is AXNode => c !== null);
+    return kept.length === node.children.length
+      ? node
+      : { ...node, ...(kept.length > 0 ? { children: kept } : { children: undefined }) };
+  }
   // An iframe ALWAYS survives the interactive filter. It is not interactive, so
   // it would otherwise vanish — and its disappearance is exactly the wrong
   // signal in both directions. For a frame that was never read, the controls
@@ -1423,6 +1583,258 @@ type CdpClient = {
   detach: () => Promise<void>;
 };
 
+// ---------------------------------------------------------------------------
+// `q` fast path
+// ---------------------------------------------------------------------------
+//
+// Profiled on a 35 000-node fixture (Chrome 141, 2026-09-17):
+//
+//   Accessibility.getFullAXTree            9872 ms   (35006 nodes)
+//   DOM.performSearch + getSearchResults    119 ms   (3 hits)
+//   Accessibility.getPartialAXTree           12 ms   (6 nodes)
+//
+// Everything downstream — buildTree, the `q` prune, serialisation — measured
+// under 30 ms together. So `q` was never slow because it filters late; it was
+// slow because it asks Chrome to compute and marshal the WHOLE accessibility
+// tree before there is anything to filter, which is the one stage that is 75x
+// the rest put together and the stage `selector` does not have to pay when it
+// degrades to the DOM listing (#1356).
+//
+// The fast path asks Chrome to find the text instead: one DOM search, then one
+// partial tree per hit, which arrives with the hit's ancestor chain already in
+// it. Everything after that is the code the slow path runs, unchanged — the
+// same buildTree, the same pruneChildrenToQuery, the same ref numbering off
+// backendDOMNodeId — so the ancestors and the ref numbers are what they were.
+//
+// It is deliberately narrow, and every condition it refuses falls back to the
+// full tree rather than returning a smaller answer:
+//
+//  - `/regex/` queries. DOM search takes literal text only.
+//  - A document with an `<iframe>`. Frame contents reach the tree through the
+//    graft, which needs the full fetch; a partial tree stops at the boundary.
+//  - Zero hits. A `q` naming a ROLE ("button") is invisible to a DOM text
+//    search, and that is exactly the query whose answer must not silently
+//    shrink — so no hits means the slow path runs and decides.
+//  - More hits, or more fetched nodes, than the budgets below: past them the
+//    round trips cost more than the one big fetch they replace.
+const MIN_Q_SEARCH_LENGTH = 2;
+const MAX_Q_SEARCH_HITS = 200;
+const MAX_Q_FETCHED_NODES = 2000;
+
+/** The four fields `queryMatcher` reads, from a raw CDP node. */
+function cdpSearchable(node: CdpAXNode): AXNode {
+  return {
+    role: node.role?.value ?? 'none',
+    name: node.name?.value ?? '',
+    ...(node.value?.value ? { value: String(node.value.value) } : {}),
+    ...(node.description?.value ? { description: String(node.description.value) } : {}),
+  };
+}
+
+/**
+ * Build the tree `q` needs out of partial fetches, or null to use the full one.
+ *
+ * Null is always safe: it means "this route cannot prove it would return what
+ * the full tree returns", and the caller then fetches the full tree exactly as
+ * before.
+ */
+async function fetchQueryMatchedTree(
+  client: CdpClient,
+  q: string,
+  passwordBackendIds: Set<number>,
+): Promise<BuiltTree | null> {
+  if (/^\/(.+)\/([gimsuy]*)$/.test(q)) return null;
+  if (q.trim().length < MIN_Q_SEARCH_LENGTH) return null;
+
+  try {
+    const doc = (await client.send('DOM.getDocument', { depth: 0 })) as {
+      root?: { nodeId?: number };
+    };
+    const rootNodeId = doc?.root?.nodeId;
+    if (!rootNodeId) return null;
+
+    // A frame's nodes only reach the tree through graftChildFrames, which needs
+    // the whole-page fetch. Refusing here is what keeps a framed page's `q`
+    // answer identical to what it was.
+    const frames = (await client.send('DOM.querySelectorAll', {
+      nodeId: rootNodeId,
+      selector: FRAME_ELEMENT_SELECTOR,
+    })) as { nodeIds?: number[] };
+    if ((frames?.nodeIds?.length ?? 0) > 0) return null;
+
+    const search = (await client.send('DOM.performSearch', {
+      query: q,
+      includeUserAgentShadowDOM: false,
+    })) as { searchId?: string; resultCount?: number };
+    const searchId = search?.searchId;
+    if (!searchId) return null;
+    const resultCount = search?.resultCount ?? 0;
+    let nodeIds: number[] = [];
+    if (resultCount > 0 && resultCount <= MAX_Q_SEARCH_HITS) {
+      const found = (await client.send('DOM.getSearchResults', {
+        searchId,
+        fromIndex: 0,
+        toIndex: resultCount,
+      })) as { nodeIds?: number[] };
+      nodeIds = found?.nodeIds ?? [];
+    }
+    await client.send('DOM.discardSearchResults', { searchId }).catch(() => { /* best-effort */ });
+    if (nodeIds.length === 0) return null;
+
+    // nodeId → backendNodeId, then the hit's own AX node with its ancestors.
+    const collected = new Map<string, CdpAXNode>();
+    const hits: CdpAXNode[] = [];
+    const seenBackend = new Set<number>();
+    for (const nodeId of nodeIds) {
+      const described = (await client.send('DOM.describeNode', { nodeId })) as {
+        node?: { backendNodeId?: number };
+      };
+      const backendNodeId = described?.node?.backendNodeId;
+      if (backendNodeId === undefined || seenBackend.has(backendNodeId)) continue;
+      seenBackend.add(backendNodeId);
+      const partial = (await client.send('Accessibility.getPartialAXTree', {
+        backendNodeId,
+        fetchRelatives: true,
+      })) as { nodes?: CdpAXNode[] };
+      for (const node of partial?.nodes ?? []) {
+        if (!collected.has(node.nodeId)) collected.set(node.nodeId, node);
+        if (node.backendDOMNodeId === backendNodeId) hits.push(node);
+      }
+      if (collected.size > MAX_Q_FETCHED_NODES) return null;
+    }
+    if (collected.size === 0) return null;
+
+    // A matched node keeps its whole subtree in the pruned output, so the
+    // subtree has to be here. Expanded from the MATCHING nodes only —
+    // `fetchRelatives` also hands back the ancestors' other children, and
+    // expanding those would walk back to the full tree one round trip at a
+    // time. Unmatched siblings that came along are dropped by the same prune
+    // that drops them on the slow path.
+    const plan = queryMatcher(q);
+    const frontier = [
+      ...hits,
+      ...[...collected.values()].filter((n) => plan.matches(cdpSearchable(n))),
+    ];
+    const expanded = new Set<string>();
+    while (frontier.length > 0) {
+      const node = frontier.pop()!;
+      if (expanded.has(node.nodeId)) continue;
+      expanded.add(node.nodeId);
+      const missing = (node.childIds ?? []).some((id) => !collected.has(id));
+      if (!missing) {
+        for (const id of node.childIds ?? []) {
+          const child = collected.get(id);
+          if (child) frontier.push(child);
+        }
+        continue;
+      }
+      const kids = (await client.send('Accessibility.getChildAXNodes', {
+        id: node.nodeId,
+      })) as { nodes?: CdpAXNode[] };
+      for (const child of kids?.nodes ?? []) {
+        if (!collected.has(child.nodeId)) collected.set(child.nodeId, child);
+        frontier.push(collected.get(child.nodeId)!);
+      }
+      if (collected.size > MAX_Q_FETCHED_NODES) return null;
+    }
+
+    // buildTree reads nodes[0] as the document root, so the root has to lead —
+    // a partial tree lists the requested node first and its ancestors after it.
+    const nodes = [...collected.values()];
+    const rootIndex = nodes.findIndex((n) => n.parentId === undefined || !collected.has(n.parentId));
+    if (rootIndex === -1) return null;
+    const [root] = nodes.splice(rootIndex, 1);
+    return buildTree([root, ...nodes], passwordBackendIds);
+  } catch {
+    // performSearch unavailable (an older target, the RPC lane's stand-in), a
+    // detached session, a refused domain — the full tree is the answer.
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// `selector` fast path
+// ---------------------------------------------------------------------------
+//
+// The same trade the `q` fast path above makes, for the same reason: a scoped
+// snapshot is a small subtree by construction, but it used to pay for the whole
+// document first — 3.3 s of `getFullAXTree` on the 35 000-node fixture — only to
+// index one element out of it and throw the rest away (#1371).
+//
+// `Accessibility.getPartialAXTree` fetches the matched element, then one
+// `getChildAXNodes` per internal node walks its subtree. Everything after that
+// is the code the slow path ran, unchanged: the same buildTree over the same CDP
+// nodes, so the same AXNode forest comes out under the same backendDOMNodeId,
+// and the refs and lines are byte-identical.
+//
+// Null — "use the full tree" — whenever the subtree route cannot prove it would
+// answer the same: the element is absent from the a11y tree, the subtree is
+// bigger than the budget below (past it the round trips cost more than the one
+// big fetch they replace), or CDP refuses.
+const MAX_SCOPE_FETCHED_NODES = 2000;
+
+/**
+ * The nodeId of the synthetic parent the matched element is fetched under.
+ *
+ * buildTree materialises `nodes[0]` as the document root even when it is
+ * `ignored`, and indexes it as itself. Handing it the matched element directly
+ * would therefore give an IGNORED element a materialised node where the full
+ * tree gives the forest its children were spliced into. A synthetic parent that
+ * no DOM element backs takes that role instead, so the matched element is
+ * converted as a child exactly as it is on the slow path. Chrome mints numeric
+ * nodeIds, so this cannot collide.
+ */
+const SCOPE_ROOT_NODE_ID = 'wmux-scope-root';
+
+/** Build the tree a `selector` scope needs out of partial fetches, or null. */
+async function fetchScopedTree(
+  client: CdpClient,
+  backendNodeId: number,
+): Promise<BuiltTree | null> {
+  try {
+    // Same reason the full fetch enables it: the domain computes the tree
+    // lazily, and querying it unenabled is racy on a heavy page.
+    await client.send('Accessibility.enable').catch(() => { /* best-effort */ });
+    const passwordBackendIds = await getPasswordFieldBackendIds(client);
+    const partial = (await client.send('Accessibility.getPartialAXTree', {
+      backendNodeId,
+      fetchRelatives: false,
+    })) as { nodes?: CdpAXNode[] };
+    const target = (partial?.nodes ?? []).find((n) => n.backendDOMNodeId === backendNodeId);
+    if (!target) return null;
+
+    const collected = new Map<string, CdpAXNode>([[target.nodeId, target]]);
+    const expanded = new Set<string>();
+    const frontier: CdpAXNode[] = [target];
+    while (frontier.length > 0) {
+      const node = frontier.pop()!;
+      if (expanded.has(node.nodeId)) continue;
+      expanded.add(node.nodeId);
+      if ((node.childIds ?? []).length === 0) continue;
+      const kids = (await client.send('Accessibility.getChildAXNodes', {
+        id: node.nodeId,
+      })) as { nodes?: CdpAXNode[] };
+      for (const child of kids?.nodes ?? []) {
+        if (!collected.has(child.nodeId)) collected.set(child.nodeId, child);
+        frontier.push(collected.get(child.nodeId)!);
+      }
+      if (collected.size > MAX_SCOPE_FETCHED_NODES) return null;
+    }
+
+    const root: CdpAXNode = { nodeId: SCOPE_ROOT_NODE_ID, childIds: [target.nodeId] };
+    const built = buildTree([root, ...collected.values()], passwordBackendIds);
+    // An element with no a11y presence contributes nothing, and "nothing" is a
+    // claim only the full tree is allowed to make here — the caller reads it as
+    // "fall back to the DOM listing", which is a different snapshot entirely.
+    if (!built || (built.byBackendId.get(backendNodeId)?.length ?? 0) === 0) return null;
+    return built;
+  } catch {
+    // A detached session, a refused domain, an older target whose stand-in does
+    // not implement the partial calls — the full tree is the answer.
+    return null;
+  }
+}
+
 /** Fetch and build the full a11y tree over an already-open CDP session. */
 async function fetchAccessibilityTree(
   client: CdpClient,
@@ -1432,6 +1844,13 @@ async function fetchAccessibilityTree(
    * a selector scope cannot be combined with a frame route (see resolveRef).
    */
   graftInto?: { page: Page; extraSessions: CdpClient[] },
+  /**
+   * The caller's `q`, when there is one. Lets the fetch itself be narrowed to
+   * the text the caller asked about instead of the whole document — see
+   * fetchQueryMatchedTree, which returns null whenever it cannot guarantee the
+   * full tree's answer, leaving the fetch below exactly as it was (#1356).
+   */
+  query?: string,
 ): Promise<BuiltTree | null> {
   // Enable the Accessibility domain before querying. Without it, getFullAXTree
   // is racy on heavy pages — the domain computes the tree lazily on enable.
@@ -1442,6 +1861,13 @@ async function fetchAccessibilityTree(
   // id space both domains share. Reused across the retry below — the document
   // does not change identity in 250 ms.
   const passwordBackendIds = await getPasswordFieldBackendIds(client);
+
+  if (query) {
+    const searched = await fetchQueryMatchedTree(client, query, passwordBackendIds);
+    // No graft: the fast path only serves a document with no frames in it, so
+    // there is nothing for graftChildFrames to find.
+    if (searched && !isRootOnly(searched.root)) return searched;
+  }
 
   let built = buildTree(
     (await client.send('Accessibility.getFullAXTree') as { nodes: CdpAXNode[] }).nodes,
@@ -1899,10 +2325,86 @@ async function occlusionFor(page: Page, fallback: CdpClient): Promise<OcclusionI
   ).catch(() => null);
 }
 
+/**
+ * Collect the hover triggers, and optionally hover them.
+ *
+ * Same session choice as occlusionFor, and for the same reason: the scan runs
+ * in the page's isolated world when there is one, so the page can neither see
+ * it nor hook the DOM methods it uses.
+ *
+ * Returns null — not an empty map — when there is nothing to mark, so the
+ * common case allocates nothing and serialisation skips the lookup entirely.
+ */
+/** What phase 1 marked, and what phase 2 could not answer for. */
+interface HoverSurfaces {
+  /** Null when nothing was marked, so serialisation skips the lookup entirely. */
+  marks: HoverSurfaceMarks | null;
+  /** Marked triggers the probe has no items for. Always 0 without `probe`. */
+  unanswered: number;
+}
+
+const NO_HOVER_SURFACES: HoverSurfaces = { marks: null, unanswered: 0 };
+
+async function hoverSurfacesFor(
+  page: Page,
+  fallback: CdpClient,
+  occlusion: OcclusionInfo | null,
+  probe: boolean,
+): Promise<HoverSurfaces> {
+  const isolated = await isolatedProbeTarget(page).catch(() => null);
+  const client = isolated?.client ?? fallback;
+  const collection = await collectHoverTriggers(client, isolated?.contextId).catch(() => null);
+  if (!collection) return NO_HOVER_SURFACES;
+  let unanswered = 0;
+  try {
+    // An overlay covers the page by the occlusion gate's own definition, so a
+    // trigger behind it cannot be hovered and its menu cannot be reached. The
+    // reachable set is reused rather than re-probed: it is the answer to
+    // exactly this question, already paid for.
+    const eligible: HoverCandidate[] = occlusion
+      ? collection.candidates.filter(
+          (c) => c.backendNodeId !== undefined && occlusion.reachable.has(c.backendNodeId),
+        )
+      : collection.candidates.filter((c) => c.backendNodeId !== undefined);
+    if (eligible.length === 0) return NO_HOVER_SURFACES;
+
+    const marks: HoverSurfaceMarks = new Map();
+    for (const candidate of eligible) {
+      marks.set(candidate.backendNodeId as number, phaseOneMark());
+    }
+
+    // Never while an overlay is up: the pointer would land on the layer, and
+    // the "did it close again?" check would be measuring the wrong thing.
+    if (probe && !occlusion) {
+      const viewport =
+        typeof (page as { viewportSize?: () => unknown }).viewportSize === 'function'
+          ? page.viewportSize() ?? undefined
+          : undefined;
+      const outcome = await probeHoverSurfaces(client, eligible, {
+        currentUrl: () =>
+          typeof (page as { url?: () => string }).url === 'function' ? page.url() : undefined,
+        pointerStart: getLastPointer(page) ?? defaultStartPoint(viewport),
+        onPointerMoved: (point) => setLastPointer(page, point),
+      }).catch(() => null);
+      for (const [backendNodeId, mark] of outcome?.revealed ?? []) {
+        marks.set(backendNodeId, mark);
+      }
+      // A trigger the probe could not answer for reads exactly like one whose
+      // menu is empty. Carry the count so the snapshot can say which it was.
+      unanswered = outcome?.unanswered ?? eligible.length;
+    }
+    return { marks, unanswered };
+  } finally {
+    await collection.release().catch(() => undefined);
+  }
+}
+
 /** The a11y tree plus the annotations that only a live CDP session can supply. */
 interface SnapshotSource {
   tree: AXNode | null;
   occlusion: OcclusionInfo | null;
+  /** Phase-1 marks plus the probe's shortfall. See HoverSurfaces. */
+  hover: HoverSurfaces;
   /** See SerializeCtx.ownLabels / editableRoots. Empty when `wantDomFacts` was false. */
   ownLabels: Map<number, string>;
   editableRoots: Set<number>;
@@ -1916,6 +2418,10 @@ interface SnapshotSource {
 async function getAccessibilityTree(
   page: Page,
   wantDomFacts: boolean,
+  /** The caller's `q`. See fetchAccessibilityTree's own `query` parameter. */
+  query?: string,
+  /** The caller's `probeHover`. See SnapshotOptions.probeHover. */
+  probeHover = false,
 ): Promise<SnapshotSource> {
   // Sessions opened for out-of-process frames during the graft. Detached here
   // rather than inside the walk so one frame's cleanup cannot abort the rest.
@@ -1924,11 +2430,15 @@ async function getAccessibilityTree(
     return await withCdpSession<SnapshotSource>(
       page,
       async (client) => {
-        const tree = (await fetchAccessibilityTree(client, { page, extraSessions }))?.root ?? null;
+        const tree =
+          (await fetchAccessibilityTree(client, { page, extraSessions }, query))?.root ?? null;
         // On the same session as the tree, so the DOM the attributes are read
         // from is the DOM the a11y nodes were computed against. Its own
         // failures are swallowed inside — a missing label abstains.
         const domFacts = wantDomFacts ? await getDomFacts(client) : emptyDomFacts();
+        // Occlusion first, because the hover scan reads its verdict: a trigger
+        // behind an overlay is neither marked nor hovered.
+        const occlusion = await occlusionFor(page, client);
         return {
           tree,
           ownLabels: domFacts.ownLabels,
@@ -1942,10 +2452,14 @@ async function getAccessibilityTree(
           // frame, name), so minting one per snapshot would pile them up in the
           // renderer of a long-lived SPA. Falls back to this session, main
           // world, exactly as before, when there is no isolated world.
-          occlusion: await occlusionFor(page, client),
+          occlusion,
+          // Phase 1 is always on: it never touches the page, and a nav item
+          // whose submenu only exists on :hover reads as a nav item with
+          // nothing behind it (hoverSurfaces.ts).
+          hover: await hoverSurfacesFor(page, client, occlusion, probeHover),
         };
       },
-      { tree: null, occlusion: null, ...emptyDomFacts() },
+      { tree: null, occlusion: null, hover: NO_HOVER_SURFACES, ...emptyDomFacts() },
     );
   } finally {
     for (const extra of extraSessions) {
@@ -1981,9 +2495,11 @@ export async function generateSnapshot(
   // fallthroughs below — stamps the same generation onto the page.
   const identity = beginRefGeneration(page);
 
-  const { tree, occlusion, ownLabels, editableRoots } = await getAccessibilityTree(
+  const { tree, occlusion, hover, ownLabels, editableRoots } = await getAccessibilityTree(
     page,
     format === 'ai',
+    options?.q,
+    options?.probeHover === true,
   );
 
   // A null tree (no CDP session / getFullAXTree threw / zero nodes) OR a root-only
@@ -1999,12 +2515,20 @@ export async function generateSnapshot(
       // The listing carries the page URL and every link href verbatim, so it
       // gets the same URL redaction the network listing does (inspection.ts
       // applies it to its own two DOM-listing branches).
-      let domSnapshot = redactPasswordParams(
-        (await evaluateIsolated<string>(
-          page,
-          buildDomSnapshotExpression(undefined, { filter: options?.filter }),
-        )),
-      );
+      // Stable numbering on this lane too (#1355): an element still on the page
+      // keeps the number the last listing gave it, so a ref the agent is
+      // holding survives a re-snapshot that added elements above it.
+      const domKey = domDescriptorKey(page);
+      const payload = readDomSnapshotPayload(await evaluateIsolated<unknown>(
+        page,
+        buildDomSnapshotExpression(undefined, {
+          ...(options?.filter && { filter: options.filter }),
+          stable: { prior: priorRefDescriptors(domKey, 0), nextRef: nextRefFor(domKey, 0) },
+          withEntries: true,
+        }),
+      ));
+      if (payload.entries.length > 0) recordRefGeneration(domKey, 0, payload.entries);
+      let domSnapshot = redactPasswordParams(payload.text);
       // aria has no DOM-listing equivalent — say so instead of silently
       // returning the ai-style listing (same honesty rule as the selector
       // path in inspection.ts). 'ai' needs no note: the listing IS ai-style.
@@ -2016,6 +2540,10 @@ export async function generateSnapshot(
       // on its own two DOM-listing branches: a full listing returned to a
       // caller who asked a question reads as the answer to that question.
       if (options?.q) domSnapshot = `${DOM_LISTING_Q_NOTE}\n${domSnapshot}`;
+      // Same reason, for the flag that costs the caller ~5 s of budget.
+      if (options?.probeHover) {
+        domSnapshot = `${DOM_LISTING_PROBE_HOVER_NOTE}\n${domSnapshot}`;
+      }
       // Leave the refMap empty so resolveRef falls through to the data-wmux-ref
       // locator the DOM expression just tagged.
       setPageRefs(page, []);
@@ -2075,6 +2603,7 @@ export async function generateSnapshot(
     refs,
     identity,
     occlusion,
+    hoverSurfaces: hover.marks,
     ownLabels,
     editableRoots,
     frameBudgetRemaining: Math.floor(maxLength * FRAME_BUDGET_SHARE),
@@ -2107,6 +2636,7 @@ export async function generateSnapshot(
 
   // If the output exceeds the budget AND we are in 'ai' mode, strip
   // non-interactive nodes and regenerate.
+  let stripNote = '';
   if (output.length > budget && format === 'ai') {
     const trimmed = stripNonInteractive(searched, editableRoots);
     if (trimmed) {
@@ -2115,11 +2645,13 @@ export async function generateSnapshot(
       // a retry that starts empty would truncate every frame at once.
       ctx.frameBudgetRemaining = Math.floor(maxLength * FRAME_BUDGET_SHARE);
       output = serializeTree(trimmed, ctx);
+      if (options?.deferTruncation) stripNote = OVERFLOW_STRIP_NOTE;
     }
   }
 
-  // Hard-truncate as a last resort
-  if (output.length > budget) {
+  // Hard-truncate as a last resort — unless the caller owns the cut (see
+  // deferTruncation), in which case it gets the whole text and windows it.
+  if (output.length > budget && !options?.deferTruncation) {
     output = output.slice(0, budget) + '\n... (truncated)';
   }
 
@@ -2128,7 +2660,22 @@ export async function generateSnapshot(
   // Store the refMap for this page so resolveRef can use it without re-querying
   setPageRefs(page, refs);
 
-  const notes = [queryNote, filterNote].filter((n) => n.length > 0);
+  // Counted from the RENDERED tree, not from the mark map: serialisation
+  // suppresses the marker on an already-expanded node and the length cap can
+  // strip marked lines, so the map's size would promise triggers the tree does
+  // not show. Joined with the other leading notes rather than appended, so it
+  // survives windowing on a long page — see hoverMenusNote.
+  //
+  // With the probe requested the offer would be noise — the items are on the
+  // lines below — but a trigger it could not answer for is exactly the case the
+  // agent cannot see: a marked line with nothing after it reads as an empty
+  // menu. So that lane says what it does not know instead.
+  const hoverNote =
+    options?.probeHover === true
+      ? hoverProbeShortfallNote(hover.unanswered)
+      : hoverMenusNote(countHasSubmenuMarkers(output));
+
+  const notes = [queryNote, filterNote, stripNote, hoverNote].filter((n) => n.length > 0);
   return notes.length > 0 ? `${notes.join('\n')}\n${output}` : output;
 }
 
@@ -2144,11 +2691,11 @@ export async function generateSnapshot(
  * so scope through it instead and keep the DOM listing as the fallback.
  *
  * Scoping resolves DOM → a11y through `backendNodeId`, the id space both CDP
- * domains share: `DOM.querySelector` for the element, then the tree's
- * backendDOMNodeId index. Chosen over `Accessibility.getPartialAXTree`, which
- * returns a node with its ancestors and immediate children only — a deep
- * subtree would cost one round-trip per node, whereas the full tree is a single
- * call we already make for every unscoped snapshot and can index for free.
+ * domains share: `DOM.querySelector` for the element, then only that element's
+ * subtree, fetched with `Accessibility.getPartialAXTree` +
+ * `Accessibility.getChildAXNodes` (see fetchScopedTree). The full tree stays the
+ * fallback for everything the subtree fetch will not answer for, and is indexed
+ * by backendDOMNodeId exactly as it was — the output is the same either way.
  *
  * Returns null (never a partial or wrong-scope result) when the a11y route
  * cannot serve the request — no CDP session, collapsed tree, selector miss, or
@@ -2163,6 +2710,7 @@ export async function generateScopedSnapshot(
   const format = options?.format ?? 'ai';
   const depth = options?.depth ?? 10;
   const maxLength = options?.maxLength ?? 50_000;
+  const probeHover = options?.probeHover === true;
   // The number space is per document, not per scope: a node keeps the ref it
   // was given whether it was reached through a selector or the whole page.
   const identity = beginRefGeneration(page);
@@ -2170,6 +2718,7 @@ export async function generateScopedSnapshot(
   const found = await withCdpSession<{
     forest: AXNode[] | null;
     occlusion: OcclusionInfo | null;
+    hover: HoverSurfaces;
     ownLabels: Map<number, string>;
     editableRoots: Set<number>;
   }>(
@@ -2179,12 +2728,16 @@ export async function generateScopedSnapshot(
       // listing, which owns the user-facing "No element matches selector:" error.
       const backendId = await resolveSelectorBackendId(client, selector);
       if (backendId === null) {
-        return { forest: null, occlusion: null, ...emptyDomFacts() };
+        return { forest: null, occlusion: null, hover: NO_HOVER_SURFACES, ...emptyDomFacts() };
       }
 
-      const built = await fetchAccessibilityTree(client);
+      // The subtree first, the whole document only if that route abstains
+      // (#1371). Both produce the same forest under `backendId`, so nothing
+      // downstream can tell which one ran.
+      const built =
+        (await fetchScopedTree(client, backendId)) ?? (await fetchAccessibilityTree(client));
       if (!built || isRootOnly(built.root)) {
-        return { forest: null, occlusion: null, ...emptyDomFacts() };
+        return { forest: null, occlusion: null, hover: NO_HOVER_SURFACES, ...emptyDomFacts() };
       }
 
       // Same DOM facts the page-level path reads, and for the same reason: a
@@ -2193,20 +2746,26 @@ export async function generateScopedSnapshot(
       // whatever the interactive test lets through (dogfood 2026-09-04).
       const domFacts = format === 'ai' ? await getDomFacts(client) : emptyDomFacts();
 
+      // Occlusion is a whole-page fact, so it is worth just as much inside a
+      // scope — a selector aimed at the page behind an overlay is exactly the
+      // case where the agent is about to click something inert.
+      const occlusion = await occlusionFor(page, client);
+
       return {
         forest: built.byBackendId.get(backendId) ?? null,
         ownLabels: domFacts.ownLabels,
         editableRoots: domFacts.editableRoots,
-        // Occlusion is a whole-page fact, so it is worth just as much inside a
-        // scope — a selector aimed at the page behind an overlay is exactly the
-        // case where the agent is about to click something inert.
-        occlusion: await occlusionFor(page, client),
+        occlusion,
+        // Same reasoning as occlusion: a `selector: "nav"` snapshot is exactly
+        // where a hover-only submenu is what the caller came for. The marks are
+        // keyed by backendDOMNodeId, so only the ones inside the scope render.
+        hover: await hoverSurfacesFor(page, client, occlusion, probeHover),
       };
     },
-    { forest: null, occlusion: null, ...emptyDomFacts() },
+    { forest: null, occlusion: null, hover: NO_HOVER_SURFACES, ...emptyDomFacts() },
   );
 
-  const { forest, occlusion, ownLabels, editableRoots } = found;
+  const { forest, occlusion, hover, ownLabels, editableRoots } = found;
   if (!forest || forest.length === 0) return null;
 
   // Same order as the page-level path: the caller's question narrows the tree
@@ -2249,6 +2808,7 @@ export async function generateScopedSnapshot(
     refs,
     identity,
     occlusion,
+    hoverSurfaces: hover.marks,
     ownLabels,
     editableRoots,
     frameBudgetRemaining: Math.floor(maxLength * FRAME_BUDGET_SHARE),
@@ -2263,6 +2823,7 @@ export async function generateScopedSnapshot(
   const note = occlusion ? `${occlusionNote(occlusion)}\n` : '';
   const budget = Math.max(0, maxLength - note.length);
 
+  let stripNote = '';
   if (output.length > budget && format === 'ai') {
     const trimmed = searched
       .map((n) => stripNonInteractive(n, editableRoots))
@@ -2271,10 +2832,14 @@ export async function generateScopedSnapshot(
       refs.length = 0;
       ctx.frameBudgetRemaining = Math.floor(maxLength * FRAME_BUDGET_SHARE);
       output = serializeForest(trimmed, ctx);
+      // Same reason as the page-level path: only a capture claims completeness.
+      if (options?.deferTruncation) stripNote = OVERFLOW_STRIP_NOTE;
     }
   }
 
-  if (output.length > budget) {
+  // Same deferral as the page-level path: the tool layer stores the overflow as
+  // a continuation capture rather than dropping it.
+  if (output.length > budget && !options?.deferTruncation) {
     output = output.slice(0, budget) + '\n... (truncated)';
   }
 
@@ -2284,7 +2849,7 @@ export async function generateScopedSnapshot(
   // so resolveRef must count matches inside the same element.
   setPageRefs(page, refs, selector);
 
-  const notes = [queryNote, filterNote].filter((n) => n.length > 0);
+  const notes = [queryNote, filterNote, stripNote].filter((n) => n.length > 0);
   return notes.length > 0 ? `${notes.join('\n')}\n${output}` : output;
 }
 
@@ -2305,6 +2870,26 @@ export interface ResolveRefOptions {
    * that lane takes the false rejections in exchange.
    */
   strictCount?: boolean;
+  /**
+   * Upper bound, in ms, on each element-handle wait. Omitted = Playwright's
+   * default. A caller measuring many refs under one budget passes what is left
+   * of it, so a detached node cannot hold a CDP wait open after the call.
+   */
+  timeout?: number;
+  /**
+   * Sink for anything the caller should pass on to the agent — today only the
+   * "this ref came from an earlier snapshot" note (#1355). A sink rather than a
+   * return value because the resolver's contract is an ElementHandle, and every
+   * caller that does not care keeps its one-line call.
+   */
+  notes?: string[];
+  /**
+   * Let a text-entry ref follow a field the page replaced under a sibling
+   * text-entry role with the same name (#1466). Only the typing tools opt in:
+   * for them the replacement is the field the agent meant; a click, hover or
+   * replayed step keeps refusing rather than acting on a different element.
+   */
+  allowTextEntrySwap?: boolean;
 }
 
 /**
@@ -2328,7 +2913,14 @@ export async function resolveRef(
   options?: ResolveRefOptions,
 ): Promise<ElementHandle | null> {
   // Primary: the a11y refMap from the last generateSnapshot() on this page.
-  const primary = await resolveRefViaAxMap(page, ref, options?.strictCount === true);
+  const primary = await resolveRefViaAxMap(
+    page,
+    ref,
+    options?.strictCount === true,
+    options?.timeout,
+    options?.notes,
+    options?.allowTextEntrySwap === true,
+  );
   if (primary) return primary;
 
   // Fallback: DOM snapshots (the RPC fallback + the root-only fallthrough) tag
@@ -2346,7 +2938,7 @@ export async function resolveRef(
   // outcome that resolves to a confidently wrong element, so it is named and
   // refused rather than left to depend on that branch staying as it is.
   if (isFrameRef(page, ref)) throw new StaleRefError(frameRefFallbackMessage(ref));
-  return resolveRefViaDataAttr(page, ref);
+  return resolveRefViaDataAttr(page, ref, options?.timeout);
 }
 
 /**
@@ -2381,6 +2973,7 @@ async function resolveFrameRoot(
   page: Page,
   path: FrameHop[],
   ref: string,
+  timeout?: number,
 ): Promise<Page | Frame> {
   if (path.length === 0) return page;
 
@@ -2404,7 +2997,7 @@ async function resolveFrameRoot(
     // URL re-read below is the whole point of the hop.
     const handle: ElementHandle | null = await frames
       .nth(hop.hostIndex)
-      .elementHandle()
+      .elementHandle(timeout === undefined ? undefined : { timeout })
       .catch(() => null);
     const child: Frame | null = handle
       ? await handle.contentFrame().catch(() => null)
@@ -2449,6 +3042,9 @@ async function resolveRefViaAxMap(
   page: Page,
   ref: string,
   strictCount = false,
+  timeout?: number,
+  notes?: string[],
+  allowTextEntrySwap = false,
 ): Promise<ElementHandle | null> {
   const wanted = refNumber(ref);
   if (wanted === null) return null;
@@ -2467,7 +3063,25 @@ async function resolveRefViaAxMap(
     );
   }
 
-  const target = refs.find((entry) => entry.ref === wanted);
+  // The scope the latest snapshot numbered inside, which is also what its
+  // descriptors were recorded against.
+  const scopeSelector = pageRefScopes.get(page);
+
+  let target = refs.find((entry) => entry.ref === wanted);
+  let recovered = '';
+  if (!target) {
+    // A ref the latest snapshot does not carry is not automatically a dead one
+    // (#1355). Look the number up in this page's descriptor history: if the
+    // current refMap holds exactly one element the stored role+name can name,
+    // it is the same element under a listing that was re-cut around it. Zero or
+    // several stay stale — a guess between look-alikes is worse than refusing.
+    const descriptor = describeRetiredRef(axDescriptorKey(page, scopeSelector), wanted);
+    const match = descriptor ? uniqueDescriptorMatch(descriptor, refs) : null;
+    if (match) {
+      target = match;
+      recovered = recoveredRefNote(wanted);
+    }
+  }
   if (!target) {
     const identity = pageRefIdentity.get(page);
     // The number was handed out on this document but the latest snapshot does
@@ -2482,11 +3096,11 @@ async function resolveRefViaAxMap(
     return null;
   }
 
-  // Use Playwright's getByRole to locate the element. A scoped snapshot numbered
-  // its refs inside one element, so search inside that same element — otherwise
-  // the nth-match count below is taken over the whole page and can land on an
-  // identical role+name that the caller deliberately scoped out.
-  const scopeSelector = pageRefScopes.get(page);
+  // Playwright's getByRole locates the element. A scoped snapshot numbered its
+  // refs inside one element, so the search runs inside that same element
+  // (`scopeSelector`, read above) — otherwise the nth-match count below is
+  // taken over the whole page and can land on an identical role+name that the
+  // caller deliberately scoped out.
 
   // A selector scope and a frame route are two different answers to "where do
   // I count from", and there is no sound way to combine them: the selector was
@@ -2504,12 +3118,13 @@ async function resolveRefViaAxMap(
     );
   }
 
-  const frameRoot = await resolveFrameRoot(page, target.framePath, ref);
+  const frameRoot = await resolveFrameRoot(page, target.framePath, ref, timeout);
 
   let count: number;
   let locator: ReturnType<Page['getByRole']>;
+  let root: Page | Frame | Locator;
   try {
-    const root = scopeSelector ? page.locator(scopeSelector).first() : frameRoot;
+    root = scopeSelector ? page.locator(scopeSelector).first() : frameRoot;
     locator = root.getByRole(target.role as any, {
       name: target.name || undefined,
       exact: true,
@@ -2519,7 +3134,16 @@ async function resolveRefViaAxMap(
     return null;
   }
 
-  if (count === 0) return null;
+  if (count === 0) {
+    // Never on the replay lane: strictCount exists to refuse a stand-in there.
+    if (!allowTextEntrySwap || strictCount) return null;
+    const swapped = await resolveSwappedTextEntry(root, target, refs, timeout);
+    if (swapped) {
+      if (recovered) notes?.push(recovered);
+      notes?.push(swappedTextEntryNote(wanted, target.role, swapped.role, target.name));
+    }
+    return swapped?.handle ?? null;
+  }
 
   // The nth-match below is only sound while the page still holds the elements
   // the snapshot numbered against. It used to clamp with Math.min(), which
@@ -2553,10 +3177,92 @@ async function resolveRefViaAxMap(
 
   try {
     const nth = Math.min(target.sameNameIndex, count - 1);
-    return await locator.nth(nth).elementHandle();
+    const handle = await locator
+      .nth(nth)
+      .elementHandle(timeout === undefined ? undefined : { timeout });
+    if (handle && recovered) notes?.push(recovered);
+    return handle;
   } catch {
     return null;
   }
+}
+
+/**
+ * Roles a page swaps between when it upgrades a text field in place.
+ *
+ * Wikipedia's header search is a plain `<input type=search>` (searchbox) until
+ * it is focused; focus mounts the typeahead, which replaces it with a new
+ * `<input role=combobox>` carrying the same accessible name (#1466). The
+ * snapshot's ref still says `searchbox "Search Wikipedia"`, so a click on the
+ * ref followed by a fill on the same ref found nothing and the agent fell back
+ * to guessing a search URL.
+ */
+const TEXT_ENTRY_ROLES: readonly string[] = ['textbox', 'searchbox', 'combobox'];
+
+/**
+ * Find the field that replaced a text-entry ref under a sibling role.
+ *
+ * Only for a ref the snapshot saw ONE of (a named singleton), and only when
+ * exactly one element across the other text-entry roles carries that exact
+ * name: two candidates is a guess, and a guess is worse than a stale error.
+ * The candidate must also take typed text: a native `<select>` is a combobox
+ * too, and filling one is not what a search-box ref asked for.
+ *
+ * And it must be NEW: if the snapshot already listed a sibling-role field with
+ * that name in the same frame, that field existed alongside the ref's element,
+ * so it is a different field that survived — not the replacement — and typing
+ * into it would overwrite something the agent never named.
+ */
+async function resolveSwappedTextEntry(
+  root: Page | Frame | Locator,
+  target: RefEntry,
+  refs: readonly RefEntry[],
+  timeout?: number,
+): Promise<{ handle: ElementHandle; role: string } | null> {
+  if (!target.name || target.sameNameTotal !== 1 || !TEXT_ENTRY_ROLES.includes(target.role)) {
+    return null;
+  }
+  const coexisted = refs.some(
+    (entry) =>
+      entry !== target &&
+      entry.name === target.name &&
+      entry.frameKey === target.frameKey &&
+      TEXT_ENTRY_ROLES.includes(entry.role),
+  );
+  if (coexisted) return null;
+  try {
+    let found: { locator: Locator; role: string } | null = null;
+    for (const role of TEXT_ENTRY_ROLES) {
+      if (role === target.role) continue;
+      const locator = root.getByRole(role as any, { name: target.name, exact: true });
+      const count = await locator.count();
+      if (count === 0) continue;
+      if (count > 1 || found) return null;
+      found = { locator, role };
+    }
+    if (!found) return null;
+    const candidate = found.locator.nth(0);
+    const wait = timeout === undefined ? undefined : { timeout };
+    const editable = await candidate.evaluate(
+      (el) =>
+        el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || (el as HTMLElement).isContentEditable,
+      undefined,
+      wait,
+    );
+    if (!editable) return null;
+    const handle = await candidate.elementHandle(wait);
+    return handle ? { handle, role: found.role } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The note a ref resolved through a text-field swap is reported with. */
+export function swappedTextEntryNote(ref: number, was: string, now: string, name: string): string {
+  return (
+    `note=ref ${ref} was a ${was} "${name}"; the page replaced it with a ${now} of the same ` +
+    'name — resolved to that element'
+  );
 }
 
 // data-wmux-ref values are always non-negative integer strings, so anything
@@ -2568,12 +3274,13 @@ const REF_ATTR_PATTERN = /^\d+$/;
 async function resolveRefViaDataAttr(
   page: Page,
   ref: string,
+  timeout?: number,
 ): Promise<ElementHandle | null> {
   if (!REF_ATTR_PATTERN.test(ref)) return null;
   try {
     const locator = page.locator(`[data-wmux-ref="${ref}"]`);
     if ((await locator.count()) === 0) return null;
-    return await locator.first().elementHandle();
+    return await locator.first().elementHandle(timeout === undefined ? undefined : { timeout });
   } catch {
     return null;
   }

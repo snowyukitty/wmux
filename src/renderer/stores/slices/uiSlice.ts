@@ -1,12 +1,20 @@
 import type { StateCreator } from 'zustand';
 import type { StoreState } from '../index';
+import { sanitizeClaudeEffort } from '../../../shared/claudeModels';
 import { setLocale as i18nSetLocale, t, type Locale } from '../../i18n';
-import { collectLeafIds, getWorkspaceLeafPanes } from '../../../shared/paneUtils';
+import { collectLeafIds, findPane, getLeafPanes, getWorkspaceLeafPanes } from '../../../shared/paneUtils';
+import { canStashPaneSurfaces } from '../../../shared/paneStash';
+import { isDaemonModeActive } from '../../daemon/daemonMode';
+import { computePaneAutoName, paneDisplayName } from '../../utils/paneNaming';
 import { MAX_PANES_PER_WORKSPACE } from './paneSlice';
+import { clearRemoteSelection } from './workspaceSlice';
+import { publishPaneStashed, publishPaneFocused } from '../../events/publisher';
+import { saveSessionNow } from '../../utils/sessionSaveBridge';
 import { markRetentionMigrationDone } from '../retentionMigration';
 import { DEFAULT_BROWSER_BACKEND, isBrowserBackend, type BrowserBackend } from '../../../shared/browserBackend';
 import { CHROME_PRESET_VALUES } from '../../../shared/chromePresets';
-import { ADVERTISED_SHORTCUTS } from '../../../shared/keymap';
+import { sanitizeShortcutOverrides, type ShortcutActionId, type ShortcutOverrides } from '../../../shared/keymap';
+import { SIDEBAR_DEFAULT_WIDTH, clampSidebarWidth, isNestedTask, togglePinned, type SidebarSortMode } from '../../utils/sidebarLayout';
 
 /**
  * #517: read main's authoritative browser backend synchronously at store-module
@@ -25,7 +33,61 @@ function readInitialBrowserBackend(): { backend: BrowserBackend; hydrated: boole
   return { backend: DEFAULT_BROWSER_BACKEND, hydrated: false };
 }
 const INITIAL_BROWSER_BACKEND = readInitialBrowserBackend();
+
+/** One pane as Fleet showed it: its status and pending question, if any. */
+export interface FleetSeenEntry {
+  status: AgentStatus;
+  question?: string;
+}
+
+/** Glance board — one agent tab's "changed since you last looked" record
+ *  (see stores/selectors/sidebarSeen.ts). */
+export interface SidebarSeenRecord {
+  entry: FleetSeenEntry;
+  rev: number;
+  seenRev: number;
+}
+
+/** What Fleet showed when it was last closed, per ptyId. Same pane/status
+ *  pairs the Deck briefing diffs (plus the question text, so a new question
+ *  in the same status still counts), kept in memory for the session. */
+export interface FleetSeenSnapshot {
+  statuses: Record<string, FleetSeenEntry>;
+  at: number;
+}
+
+/** True when a row's status or pending question differs from the last-closed
+ *  snapshot (a pane the snapshot never saw counts as changed). No snapshot →
+ *  nothing is "changed". */
+export function fleetChangedSinceSeen(
+  seen: FleetSeenSnapshot | null,
+  ptyId: string,
+  agentStatus: AgentStatus,
+  question?: string,
+): boolean {
+  if (!seen || !ptyId) return false;
+  const prior = seen.statuses[ptyId];
+  if (!prior) return true;
+  return prior.status !== agentStatus || (prior.question || '') !== (question || '');
+}
+
+/**
+ * One-time auto-enable of site guides for the Chrome agent browser. Returns the
+ * fields to write, or null when nothing changes. It only ever turns guides ON,
+ * and only while the marker is unset — the saved default cannot tell "never
+ * touched" from "turned off", so the marker is what lets a user who switches
+ * guides off afterwards stay off, even when they pick Chrome again later.
+ */
+export function siteGuidesAutoEnablePatch(input: {
+  browserBackend: BrowserBackend;
+  siteGuidesAutoEnabled: boolean;
+}): { siteGuidesEnabled: true; siteGuidesAutoEnabled: true } | null {
+  if (input.browserBackend !== 'chrome' || input.siteGuidesAutoEnabled) return null;
+  return { siteGuidesEnabled: true, siteGuidesAutoEnabled: true };
+}
 import type { FleetSortMode } from '../selectors/fleet';
+import { EMPTY_FILTER, type WorkspaceFilter } from '../../components/Sidebar/workspaceFilter';
+import { initialGitPageState, type GitDragContext, type GitHandoffOpen, type GitPageState } from '../../components/Git/gitPageState';
 import { multiviewColumnCount, type MultiviewArrangement } from '../../utils/multiviewGrid';
 import {
   normalizeRoleBinding,
@@ -46,6 +108,7 @@ import {
   type PaneBranch,
   type PrefixConfig,
   type NotificationCategory,
+  type AgentStatus,
   BUILTIN_TEMPLATES,
   DEFAULT_PREFIX_CONFIG,
   buildDefaultCustomKeybindings,
@@ -83,6 +146,13 @@ type XtermColorKey = keyof XtermThemeColors;
 // inbox (off-machine messages, rendered as text — never PTY-pasted).
 export type FleetTab = 'fleet' | 'approvals' | 'remote';
 
+/**
+ * The page the rail has swapped into the sheet. Workspaces (the sidebar,
+ * panes and tools dock) is home; every other page covers it while the
+ * terminals stay mounted underneath. Session-only, never persisted.
+ */
+export type AppRoute = 'workspaces' | 'fleet' | 'schedules' | 'remote' | 'git' | 'settings';
+
 export interface UISlice {
   // ─── Startup gate (Fix 0) ─────────────────────────────────────────────
   // Lifecycle marker promoted from local AppLayout state so RPC handlers
@@ -92,6 +162,14 @@ export interface UISlice {
   // AppLayout's mount effect finally block.
   paneGate: 'pending' | 'ready';
   setPaneGate: (state: 'pending' | 'ready') => void;
+
+  /**
+   * The browser build (wmux web `/app`) mirrors the desktop's layout without
+   * owning it: structure-changing chrome (close, rename, reorder, split,
+   * presets, account menus, divider drag) is hidden while this is true. Never
+   * set by the desktop app, so every desktop render path is unchanged.
+   */
+  readOnly: boolean;
 
   sidebarVisible: boolean;
   toggleSidebar: () => void;
@@ -110,6 +188,34 @@ export interface UISlice {
   commandPaletteVisible: boolean;
   toggleCommandPalette: () => void;
   setCommandPaletteVisible: (visible: boolean) => void;
+
+  // The rail's current page. `fleetViewVisible`, `schedulesViewOpen` and
+  // `settingsPanelVisible` mirror it (applyAppRoute), so their readers keep
+  // working; write the route, never the mirrors.
+  appRoute: AppRoute;
+  setAppRoute: (route: AppRoute) => void;
+
+  // The sidebar's workspace filter (facet checks). Session-only: not
+  // persisted, so a reload starts unfiltered.
+  sidebarFilter: WorkspaceFilter;
+  setSidebarFilter: (filter: WorkspaceFilter) => void;
+
+  // The Git page's scope, tab, filter, selection and list scroll, kept here
+  // so they survive leaving the page. Session-only.
+  gitPage: GitPageState;
+  setGitPage: (patch: Partial<GitPageState>) => void;
+  // Whether a merge session runs, per repo (its main worktree, normalized):
+  // the Worktrees tab starts / lands / discards it, the branch bar's ship
+  // button waits on it. Session-only.
+  gitMerge: Record<string, boolean>;
+  setGitMerge: (repoKey: string, active: boolean) => void;
+  // An issue / PR drag from the Git page: its repo, set at dragstart and
+  // cleared at dragend (never exposed through DataTransfer).
+  gitDragContext: GitDragContext | null;
+  setGitDragContext: (ctx: GitDragContext | null) => void;
+  // The open hand-off confirm popover, or null.
+  gitHandoff: GitHandoffOpen | null;
+  setGitHandoff: (open: GitHandoffOpen | null) => void;
 
   // S-C1 Fleet View — full-screen cockpit overlay (Ctrl+Shift+A). Transient
   // UI state; never persisted (buildSessionData allowlist excludes it, like the
@@ -140,9 +246,39 @@ export interface UISlice {
   fleetSortMode: FleetSortMode;
   setFleetSortMode: (mode: FleetSortMode) => void;
 
+
+  // Fleet attention board — whether the Idle section shows its rows or stays
+  // collapsed to one summary row. Session-only: not in buildSessionData.
+  fleetIdleExpanded: boolean;
+  setFleetIdleExpanded: (expanded: boolean) => void;
+  // The same for the Finished section (turns that ended, not yet looked at).
+  fleetFinishedExpanded: boolean;
+  setFleetFinishedExpanded: (expanded: boolean) => void;
+  // One-shot request from the sidebar's `N to review` link: Fleet consumes it
+  // (focuses the first Ready to review row) and clears it. Session-only.
+  fleetFocusReview: boolean;
+  setFleetFocusReview: (focus: boolean) => void;
+  // One-shot request from an "Open conversation" link (Moa's task cards and
+  // Waiting on you, the deck ledger): a WorkTask id. Fleet consumes it — it
+  // selects that task and shows its conversation — and clears it. Session-only.
+  fleetFocusTask: string | null;
+  setFleetFocusTask: (taskId: string | null) => void;
+  /** Go to Fleet and show a fan-out task's conversation there. */
+  openTaskConversation: (taskId: string) => void;
+  // Fleet's "changed since you last looked" baseline, written when the overlay
+  // closes. Session-only: not in buildSessionData; null until the first close.
+  fleetLastSeen: FleetSeenSnapshot | null;
+  setFleetLastSeen: (statuses: Record<string, FleetSeenEntry>, at?: number) => void;
+
   settingsPanelVisible: boolean;
   toggleSettingsPanel: () => void;
   setSettingsPanelVisible: (visible: boolean) => void;
+  /** A tab Settings should land on the next time it shows (consumed by
+   *  SettingsPanel). Transient, not persisted. */
+  settingsInitialTab: string | null;
+  /** Open Settings on `tab` (an id `resolveSettingsTab` understands). */
+  openSettingsTab: (tab: string) => void;
+  clearSettingsInitialTab: () => void;
 
   notificationSoundEnabled: boolean;
   toggleNotificationSound: () => void;
@@ -182,6 +318,8 @@ export interface UISlice {
   setImagePasteMode: (mode: ImagePasteMode) => void;
 
   defaultShell: string;
+  setDefaultWslDistro: (distro: string | null) => void;
+  defaultWslDistro: string | undefined;
   setDefaultShell: (shell: string) => void;
 
   // Orchestrator (deck brain) model override. '' = the subscription's default
@@ -189,6 +327,10 @@ export interface UISlice {
   // id) passed to the Agent SDK. Applied between turns — see deck.handler.
   deckBrainModel: string;
   setDeckBrainModel: (model: string) => void;
+  // Orchestrator effort ('' = the CLI default). Rides with the model to main
+  // (SDK options.effort / TUI --effort); applied between turns like the model.
+  deckBrainEffort: string;
+  setDeckBrainEffort: (effort: string) => void;
 
   // D2 — global operator-level role→model enforcement map. Keyed by role name
   // (Builder/Reviewer/Tester/Planner ∪ custom). An agent launched in a pane
@@ -231,6 +373,14 @@ export interface UISlice {
   // has; hideable for minimal-chrome, keyboard-only setups.
   paneActionsVisible: boolean;
   setPaneActionsVisible: (visible: boolean) => void;
+
+  // Chat presentation of a local Claude Code session (PR #1440). Off by
+  // default while it is being tested: markdown coverage is incomplete and
+  // the send path is still earning trust. Off hides the Terminal / Chat
+  // switch and shows every surface as a terminal, without touching the
+  // stored viewMode, so turning it back on restores what was open.
+  chatViewEnabled: boolean;
+  setChatViewEnabled: (enabled: boolean) => void;
 
   /**
    * Wall-clock in the titlebar status strip. Default OFF: every OS already
@@ -283,6 +433,11 @@ export interface UISlice {
   coldParkEnabled: boolean;
   setColdParkEnabled: (enabled: boolean) => void;
 
+  // #1641: draw sixel / iTerm2 (OSC 1337) images inline (default ON). Off
+  // disposes the image addon on every terminal.
+  inlineImagesEnabled: boolean;
+  setInlineImagesEnabled: (enabled: boolean) => void;
+
   // #517 browser lightweight mode (default OFF while dogfooding): CPU-throttle
   // embedded browser guests that are effectively invisible (hidden workspace /
   // zoom-hidden / minimized window) and not under automation. CPU-only — does
@@ -296,6 +451,34 @@ export interface UISlice {
   // Only effective while browserLightweightMode is also on.
   browserDiscardHidden: boolean;
   setBrowserDiscardHidden: (enabled: boolean) => void;
+
+  // Per-site procedural memory (default ON). What the browser tools learned
+  // failed on a domain is volunteered on the next landing there; off, nothing
+  // is recorded and nothing is served.
+  siteMemoryEnabled: boolean;
+  setSiteMemoryEnabled: (enabled: boolean) => void;
+
+  // Site guide pointers (default OFF). On a landing, local notes under
+  // <wmuxDir>/site-guides/ that match the page are named by path.
+  siteGuidesEnabled: boolean;
+  setSiteGuidesEnabled: (enabled: boolean) => void;
+  // Persisted marker: site guides were already auto-enabled once for the
+  // Chrome backend (siteGuidesAutoEnablePatch), so it never happens again.
+  siteGuidesAutoEnabled: boolean;
+  setSiteGuidesAutoEnabled: (done: boolean) => void;
+  // Non-persisted: the saved session's settings have been applied (or there
+  // was no saved session). The boot auto-enable waits for this AND
+  // browserBackendHydrated, whichever lands second, so a late session load
+  // cannot overwrite the auto-enabled value with the saved one.
+  sessionSettingsLoaded: boolean;
+  markSessionSettingsLoaded: () => void;
+  // Non-persisted: a SAVED session's workspaces were installed this boot, so
+  // the workspace ids are the ones on disk. Stays false after a failed or
+  // empty load (the tree is then a fresh default workspace). Rides the
+  // workspace mirror so main's startup Deck reconcile can refuse to treat
+  // every real workspace as an orphan.
+  sessionRestored: boolean;
+  markSessionRestored: () => void;
 
   // #517 backend choice (default 'builtin'). NON-PERSISTED renderer mirror:
   // main owns the authoritative value (userData JSON, read synchronously at
@@ -381,6 +564,49 @@ export interface UISlice {
    *  components/Sidebar/attentionOrder.ts for why it is opt-in. */
   sidebarAttentionFirst: boolean;
   setSidebarAttentionFirst: (enabled: boolean) => void;
+
+  /** #1481 — how the workspace list is ordered (manual / needs-you-first /
+   *  recent activity). `sidebarAttentionFirst` stays in lockstep with the
+   *  'attention' mode so its existing readers keep their meaning. */
+  sidebarSortMode: SidebarSortMode;
+  /** The user picked the sort mode in Settings (kept across the default flip). */
+  sidebarSortModeChosen: boolean;
+  /** Session-only: this load moved a Manual list to Attention; the sidebar
+   *  shows a one-time notice with Undo and clears the flag. */
+  sidebarSortMigrated: boolean;
+  clearSidebarSortMigrated: () => void;
+  /** Workspaces pinned to the top of the sidebar. Always a prefix of
+   *  `workspaces` (sidebarLayout.pinnedFirst), so the stored order is pinned-first. */
+  sidebarPinnedIds: string[];
+  toggleSidebarPin: (workspaceId: string) => void;
+  /** Session-only: when a workspace was created, for the new-workspace hold. */
+  sidebarNewAt: Record<string, number>;
+  /**
+   * Session-only: per agent pty, the status + question as the user last saw
+   * it (the pane's workspace was on screen). Same entry shape Fleet's
+   * last-seen snapshot keeps; drives the sidebar's "changed" dot.
+   */
+  sidebarSeen: Record<string, SidebarSeenRecord>;
+  /** Merge tracker writes and drop records of tabs that no longer exist. */
+  markSidebarSeen: (updates: Record<string, SidebarSeenRecord>, removed?: readonly string[]) => void;
+  setSidebarSortMode: (mode: SidebarSortMode) => void;
+
+  /** #1481 — expanded sidebar width in px (clamped 220–400, default 264). */
+  sidebarWidth: number;
+  setSidebarWidth: (width: number) => void;
+
+  /** #1481 — owner workspace id → whether its fan-out task group is expanded
+   *  by the user. Absent = follow the default (expanded while the owner is
+   *  active or a task needs you). */
+  sidebarTaskGroupExpanded: Record<string, boolean>;
+  setSidebarTaskGroupExpanded: (ownerId: string, expanded: boolean) => void;
+
+  /** #1326 — show the auto-generated `w<ws>-<pane>` coordinate in the agent
+   *  roster's muted trailer for panes that have no explicit label. On by
+   *  default so nobody's roster changes without them touching the setting; a
+   *  user-set pane label is unaffected either way and always shows. */
+  sidebarShowPaneCoordinates: boolean;
+  setSidebarShowPaneCoordinates: (enabled: boolean) => void;
 
   // ─── Toast / ring notification UI ────────────────────────────────────────
   toastEnabled: boolean;
@@ -490,6 +716,12 @@ export interface UISlice {
   // it stays in main process memory during a fetch and is discarded.
   anthropicUsageEnabled: boolean;
   setAnthropicUsageEnabled: (enabled: boolean) => void;
+  // Usage-limit pause: when on, a pane that hits its provider's usage limit
+  // with no per-pane decision yet is armed to receive a short continue
+  // message once the limit resets (useUsageLimitBridge applies it). Off by
+  // default; each pane can override it from its limit chip.
+  usageLimitAutoResume: boolean;
+  setUsageLimitAutoResume: (enabled: boolean) => void;
   anthropicUsage: {
     status:
       | 'idle'
@@ -555,6 +787,9 @@ export interface UISlice {
   // silently reject the actual markdown text drop. Keeping reorder state
   // out-of-band lets dataTransfer carry pure text/plain markdown.
   draggedWorkspaceIndex: number | null;
+  /** The dragged workspace's id, captured with the index at dragstart. Drops
+   *  resolve the source by id: closing a workspace mid-drag shifts indexes. */
+  draggedWorkspaceId: string | null;
   setDraggedWorkspaceIndex: (index: number | null) => void;
 
   // ─── Terminal text-drop trust boundary ────────────────────────────────
@@ -572,14 +807,26 @@ export interface UISlice {
   updateKeybinding: (id: string, kb: Partial<Omit<CustomKeybinding, 'id'>>) => void;
   removeKeybinding: (id: string) => void;
   /**
-   * #1152 — built-in combos (WMUX_KEYMAP storage form, e.g. 'Ctrl+T') the
-   * user has switched OFF. A disabled combo is fully unbound: useKeyboard
-   * skips its handler and useTerminal stops bubbling it, so the key reaches
-   * the PTY like any other terminal byte (Ctrl+T then opens Codex's own
-   * transcript instead of a new wmux surface). Persisted in session.json.
+   * The user's changes to the built-in shortcuts (Settings → Shortcuts), per
+   * action: a concrete combo moves the action there, `null` switches it off
+   * (#1152) — the key then reaches the pane like any other terminal byte.
+   * Everything that matches keys reads these through effectiveBindings()
+   * (shared/keymap.ts), so a change applies to every gate at once (#1455).
+   * Persisted in session.json.
    */
-  disabledShortcuts: string[];
-  toggleShortcutDisabled: (combo: string) => void;
+  shortcutOverrides: ShortcutOverrides;
+  /** Move `action` to `combo`, or switch it off with `null`. */
+  setShortcutOverride: (action: ShortcutActionId, combo: string | null) => void;
+  /** Put `action` back on its default combo(s). */
+  resetShortcut: (action: ShortcutActionId) => void;
+  /**
+   * True while Settings is recording a key combo. useKeyboard stands down so
+   * the chord reaches the recorder instead of running the shortcut it is
+   * currently bound to (and being swallowed by it) — otherwise a combo that is
+   * already taken could never even be pressed to see the conflict.
+   */
+  keyCaptureActive: boolean;
+  setKeyCaptureActive: (active: boolean) => void;
 
   // ─── File tree ────────────────────────────────────────────────────────
   fileTreeVisible: boolean;
@@ -693,6 +940,7 @@ export interface UISlice {
   saveLayoutTemplate: (name: string) => void;
   deleteLayoutTemplate: (id: string) => void;
   applyLayoutTemplate: (templateId: string, workspaceId?: string) => void;
+  snapToLayoutTemplate: (templateId: string, workspaceId?: string) => void;
 
   // ─── Recent terminal commands ─────────────────────────────────────
   recentCommands: string[];
@@ -703,7 +951,7 @@ export interface UISlice {
 
 // ─── Layout template helpers ───────────────────────────────────────────────
 
-function extractLayout(pane: Pane): LayoutNode {
+export function extractLayout(pane: Pane): LayoutNode {
   if (pane.type === 'leaf') return { type: 'leaf' };
   return {
     type: 'branch',
@@ -713,7 +961,7 @@ function extractLayout(pane: Pane): LayoutNode {
   };
 }
 
-function buildPaneFromLayout(node: LayoutNode): Pane {
+export function buildPaneFromLayout(node: LayoutNode): Pane {
   if (node.type === 'leaf') return createLeafPane();
   const branch: PaneBranch = {
     id: generateId('pane'),
@@ -723,6 +971,11 @@ function buildPaneFromLayout(node: LayoutNode): Pane {
     children: node.children.map(buildPaneFromLayout),
   };
   return branch;
+}
+
+function countLayoutLeaves(node: LayoutNode): number {
+  if (node.type === 'leaf') return 1;
+  return node.children.reduce((n, c) => n + countLayoutLeaves(c), 0);
 }
 
 function collectFirstLeafId(pane: Pane): string {
@@ -748,6 +1001,34 @@ export function resetInspectState(state: InspectStateFields): void {
   state.inspectMinimized = false;
   state.inspectTargetToken = null;
   state.inspectXtermTarget = null;
+}
+
+export interface AppRouteFields extends InspectStateFields {
+  appRoute: AppRoute;
+  fleetViewVisible: boolean;
+  schedulesViewOpen: boolean;
+  settingsPanelVisible: boolean;
+  /** Ends on a page switch: every prefix action works on the panes. */
+  prefixMode?: boolean;
+}
+
+/**
+ * Swap the sheet to `route` and write the per-page mirror flags. Leaving
+ * Settings tears inspect down (inspectModeActive ⇒ settingsPanelVisible).
+ * Mutates an immer draft — call only inside a set() callback.
+ */
+export function applyAppRoute(state: AppRouteFields, route: AppRoute): void {
+  if (route !== 'settings' && state.inspectModeActive) resetInspectState(state);
+  if (state.appRoute !== route && state.prefixMode) state.prefixMode = false;
+  state.appRoute = route;
+  state.fleetViewVisible = route === 'fleet';
+  state.schedulesViewOpen = route === 'schedules';
+  state.settingsPanelVisible = route === 'settings';
+}
+
+/** Leave `route` for Workspaces if it is the current page; otherwise no-op. */
+export function leaveAppRoute(state: AppRouteFields, route: AppRoute): void {
+  if (state.appRoute === route) applyAppRoute(state, 'workspaces');
 }
 
 /**
@@ -786,6 +1067,8 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   // ─── Startup gate (Fix 0) ─────────────────────────────────────────────
   paneGate: 'pending',
 
+  readOnly: false,
+
   setPaneGate: (gate) => set((state) => {
     state.paneGate = gate;
   }),
@@ -814,8 +1097,6 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.notificationPanelVisible = !state.notificationPanelVisible;
     if (state.notificationPanelVisible) {
       state.commandPaletteVisible = false;
-      state.settingsPanelVisible = false;
-      state.fleetViewVisible = false;
       // D-exclusive: opening a competing surface tears inspect down so the
       // top-level state machine can't coexist with another modal.
       if (state.inspectModeActive) resetInspectState(state);
@@ -839,9 +1120,8 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   toggleCommandPalette: () => set((state) => {
     state.commandPaletteVisible = !state.commandPaletteVisible;
     if (state.commandPaletteVisible) {
+      // The palette floats over whichever page is shown; it never navigates.
       state.notificationPanelVisible = false;
-      state.settingsPanelVisible = false;
-      state.fleetViewVisible = false;
       // D-exclusive: opening the palette tears inspect down (no coexistence).
       if (state.inspectModeActive) resetInspectState(state);
     }
@@ -852,30 +1132,49 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     if (visible && state.inspectModeActive) resetInspectState(state);
   }),
 
+  sidebarFilter: EMPTY_FILTER,
+  setSidebarFilter: (filter) => set((state) => {
+    state.sidebarFilter = filter;
+  }),
+  gitPage: initialGitPageState(),
+  setGitPage: (patch) => set((state) => {
+    Object.assign(state.gitPage, patch);
+  }),
+  gitMerge: {},
+  setGitMerge: (repoKey, active) => set((state) => {
+    if (state.gitMerge[repoKey] !== active) state.gitMerge[repoKey] = active;
+  }),
+  gitDragContext: null,
+  setGitDragContext: (ctx) => set((state) => {
+    state.gitDragContext = ctx;
+  }),
+  gitHandoff: null,
+  setGitHandoff: (open) => set((state) => {
+    state.gitHandoff = open;
+  }),
+
+  // ─── Rail route ──────────────────────────────────────────────────────────
+  appRoute: 'workspaces',
+
+  setAppRoute: (route) => set((state) => {
+    if (state.appRoute === route) return;
+    applyAppRoute(state, route);
+    // A new page is a destination: the overlays that led here step aside.
+    state.commandPaletteVisible = false;
+    state.notificationPanelVisible = false;
+  }),
+
   // ─── Fleet View (S-C1 cockpit) ───────────────────────────────────────────
   fleetViewVisible: false,
 
-  toggleFleetView: () => set((state) => {
-    state.fleetViewVisible = !state.fleetViewVisible;
-    if (state.fleetViewVisible) {
-      // Mutually exclusive with the other top-level overlays (same teardown the
-      // command palette / settings paths use), and inspect can't coexist.
-      state.commandPaletteVisible = false;
-      state.notificationPanelVisible = false;
-      state.settingsPanelVisible = false;
-      if (state.inspectModeActive) resetInspectState(state);
-    }
-  }),
+  // Fleet is a page: opening it swaps the sheet (applyAppRoute closes the
+  // other pages and inspect); closing returns to Workspaces.
+  toggleFleetView: () => get().setFleetViewVisible(get().appRoute !== 'fleet'),
 
-  setFleetViewVisible: (visible) => set((state) => {
-    state.fleetViewVisible = visible;
-    if (visible) {
-      state.commandPaletteVisible = false;
-      state.notificationPanelVisible = false;
-      state.settingsPanelVisible = false;
-      if (state.inspectModeActive) resetInspectState(state);
-    }
-  }),
+  setFleetViewVisible: (visible) => {
+    if (visible) get().setAppRoute('fleet');
+    else set((state) => { leaveAppRoute(state, 'fleet'); });
+  },
 
   // S-C2 — cockpit tab. Defaults to the agent grid; FleetView resets it on
   // unmount so reopening the cockpit always lands on 'fleet'.
@@ -885,34 +1184,66 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.fleetActiveTab = tab;
   }),
 
+
   fleetSortMode: 'attention',
 
   setFleetSortMode: (mode) => set((state) => {
     state.fleetSortMode = mode;
   }),
 
+  fleetIdleExpanded: false,
+
+  setFleetIdleExpanded: (expanded) => set((state) => {
+    state.fleetIdleExpanded = expanded;
+  }),
+
+  fleetFinishedExpanded: false,
+
+  setFleetFinishedExpanded: (expanded) => set((state) => {
+    state.fleetFinishedExpanded = expanded;
+  }),
+
+  fleetFocusReview: false,
+
+  setFleetFocusReview: (focus) => set((state) => {
+    state.fleetFocusReview = focus;
+  }),
+
+  fleetFocusTask: null,
+  setFleetFocusTask: (taskId) => set((state) => {
+    state.fleetFocusTask = taskId;
+  }),
+  openTaskConversation: (taskId) => {
+    get().setFleetFocusTask(taskId);
+    get().setFleetViewVisible(true);
+  },
+
+  fleetLastSeen: null,
+
+  setFleetLastSeen: (statuses, at = Date.now()) => set((state) => {
+    const copy: Record<string, FleetSeenEntry> = {};
+    for (const [ptyId, entry] of Object.entries(statuses)) copy[ptyId] = { ...entry };
+    state.fleetLastSeen = { statuses: copy, at };
+  }),
+
   // ─── Settings panel ──────────────────────────────────────────────────────
   settingsPanelVisible: false,
 
-  toggleSettingsPanel: () => set((state) => {
-    state.settingsPanelVisible = !state.settingsPanelVisible;
-    if (state.settingsPanelVisible) {
-      state.commandPaletteVisible = false;
-      state.notificationPanelVisible = false;
-      state.fleetViewVisible = false;
-    } else if (state.inspectModeActive) {
-      // D-exclusive invariant: inspect can only exist while Settings is open
-      // (inspectModeActive ⇒ settingsPanelVisible). Toggling Settings shut
-      // (true→false) while inspecting would strand a "Settings-less inspect"
-      // overlay, so tear inspect down in lock-step — same reset the
-      // command-palette / notification teardown paths use.
-      resetInspectState(state);
-    }
-  }),
+  // Settings is a page. Leaving it while inspecting tears inspect down in
+  // lock-step (inspectModeActive ⇒ settingsPanelVisible) — applyAppRoute.
+  toggleSettingsPanel: () => get().setSettingsPanelVisible(get().appRoute !== 'settings'),
 
-  setSettingsPanelVisible: (visible) => set((state) => {
-    state.settingsPanelVisible = visible;
-  }),
+  setSettingsPanelVisible: (visible) => {
+    if (visible) get().setAppRoute('settings');
+    else set((state) => { leaveAppRoute(state, 'settings'); });
+  },
+
+  settingsInitialTab: null,
+  openSettingsTab: (tab) => {
+    set((state) => { state.settingsInitialTab = tab; });
+    get().setSettingsPanelVisible(true);
+  },
+  clearSettingsInitialTab: () => set((state) => { state.settingsInitialTab = null; }),
 
   // ─── Notification sound ──────────────────────────────────────────────────
   notificationSoundEnabled: true,
@@ -999,10 +1330,29 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.defaultShell = shell;
   }),
 
+  /**
+   * #1103 — which WSL distro `wsl.exe -d <name>` boots when the default
+   * terminal is WSL. undefined = the system's default distro (today's
+   * behaviour — usually docker-desktop on Docker machines, which is exactly
+   * the complaint). Pushed to main on change/boot; main injects the flag at
+   * the shell-resolution choke point.
+   */
+  defaultWslDistro: undefined,
+
+  setDefaultWslDistro: (distro) => set((state) => {
+    state.defaultWslDistro = distro ? distro : undefined;
+  }),
+
   deckBrainModel: '',
 
   setDeckBrainModel: (model) => set((state) => {
     state.deckBrainModel = model;
+  }),
+
+  deckBrainEffort: '',
+
+  setDeckBrainEffort: (effort) => set((state) => {
+    state.deckBrainEffort = sanitizeClaudeEffort(effort);
   }),
 
   orchestratorRoleBindings: {},
@@ -1060,6 +1410,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.paneActionsVisible = visible;
   }),
 
+  chatViewEnabled: false,
+
+  setChatViewEnabled: (enabled) => set((state) => {
+    state.chatViewEnabled = enabled;
+  }),
+
   // Off unless asked for — see the interface note above.
   titlebarClockVisible: false,
 
@@ -1101,6 +1457,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.coldParkEnabled = enabled;
   }),
 
+  inlineImagesEnabled: true,
+
+  setInlineImagesEnabled: (enabled) => set((state) => {
+    state.inlineImagesEnabled = enabled;
+  }),
+
   setHiddenPaneRetentionEnabled: (enabled) => set((state) => {
     state.hiddenPaneRetentionEnabled = enabled;
     // Explicit user intent — stamp the migration ledger so this choice is
@@ -1124,6 +1486,40 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.browserDiscardHidden = enabled;
   }),
 
+  // Default ON: the feature only ever records what already went wrong, and a
+  // default-off memory is one nobody discovers.
+  siteMemoryEnabled: true,
+
+  setSiteMemoryEnabled: (enabled) => set((state) => {
+    state.siteMemoryEnabled = enabled;
+  }),
+
+  // Default OFF: it reads user files on every landing, so it is opt-in.
+  siteGuidesEnabled: false,
+
+  setSiteGuidesEnabled: (enabled) => set((state) => {
+    state.siteGuidesEnabled = enabled;
+  }),
+
+  siteGuidesAutoEnabled: false,
+
+  setSiteGuidesAutoEnabled: (done) => set((state) => {
+    state.siteGuidesAutoEnabled = done;
+  }),
+
+  sessionSettingsLoaded: false,
+
+  sessionRestored: false,
+
+  markSessionRestored: () => set((state) => {
+    state.sessionRestored = true;
+  }),
+
+  markSessionSettingsLoaded: () => set((state) => {
+    state.sessionSettingsLoaded = true;
+    if (state.browserBackendHydrated) Object.assign(state, siteGuidesAutoEnablePatch(state));
+  }),
+
   // #517 backend choice — mirror of main's authoritative value. Read
   // synchronously at module load (readInitialBrowserBackend) so it is correct
   // before the first render; AppLayout's async hydration is a fallback/refresh.
@@ -1131,6 +1527,11 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
 
   setBrowserBackend: (backend) => set((state) => {
     state.browserBackend = backend;
+    // Before the session lands, loadSession would overwrite the patched values
+    // with the saved ones; it runs the rule itself once it has applied them.
+    if (backend === 'chrome' && state.sessionSettingsLoaded) {
+      Object.assign(state, siteGuidesAutoEnablePatch(state));
+    }
   }),
 
   browserBackendHydrated: INITIAL_BROWSER_BACKEND.hydrated,
@@ -1140,6 +1541,7 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   hydrateBrowserBackend: (backend) => set((state) => {
     if (backend !== null) state.browserBackend = backend;
     state.browserBackendHydrated = true;
+    if (state.sessionSettingsLoaded) Object.assign(state, siteGuidesAutoEnablePatch(state));
   }),
 
   startupDirectory: '',
@@ -1161,9 +1563,9 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   }),
 
   // ─── Theme ──────────────────────────────────────────────────────────────
-  // Default = the amber design system (owner redesign decision 2026-07-11);
-  // persisted choices in session.json are untouched.
-  theme: 'amber',
+  // Default = the tint look (owner decision 2026-10-03); persisted choices
+  // in session.json are untouched, so a saved theme stays.
+  theme: 'tint',
 
   setTheme: (theme) => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -1202,7 +1604,7 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     set((state) => {
       state.inspectModeActive = true;
       state.inspectMinimized = true;   // Settings shrinks to a floating bar.
-      state.settingsPanelVisible = true; // ...but stays mounted (D-settings).
+      applyAppRoute(state, 'settings'); // ...but stays mounted (D-settings).
       // D-exclusive: inspect is the top-level mode — close competing surfaces.
       state.commandPaletteVisible = false;
       state.notificationPanelVisible = false;
@@ -1246,10 +1648,65 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.sidebarPosition = position;
   }),
 
-  sidebarAttentionFirst: false,
+  sidebarAttentionFirst: true,
 
   setSidebarAttentionFirst: (enabled) => set((state) => {
     state.sidebarAttentionFirst = enabled;
+    state.sidebarSortMode = enabled ? 'attention' : 'manual';
+    state.sidebarSortModeChosen = true;
+  }),
+
+  sidebarSortMode: 'attention',
+  sidebarSortModeChosen: false,
+  sidebarSortMigrated: false,
+  clearSidebarSortMigrated: () => set((state) => { state.sidebarSortMigrated = false; }),
+  sidebarPinnedIds: [],
+  toggleSidebarPin: (workspaceId) => set((state) => {
+    if (!workspaceId) return;
+    // A nested task cannot be pinned (it has no top-level slot): refuse
+    // rather than pin-then-unpin, which would still move the row.
+    if (!state.sidebarPinnedIds.includes(workspaceId) && isNestedTask(state, workspaceId)) return;
+    const r = togglePinned(state.workspaces, state.sidebarPinnedIds, workspaceId);
+    if (!r) return;
+    state.workspaces = r.items;
+    state.sidebarPinnedIds = r.pinnedIds;
+  }),
+  sidebarNewAt: {},
+  sidebarSeen: {},
+  markSidebarSeen: (updates, removed = []) => set((state) => {
+    for (const [ptyId, rec] of Object.entries(updates)) {
+      state.sidebarSeen[ptyId] = {
+        entry: rec.entry.question ? { status: rec.entry.status, question: rec.entry.question } : { status: rec.entry.status },
+        rev: rec.rev,
+        seenRev: rec.seenRev,
+      };
+    }
+    for (const ptyId of removed) delete state.sidebarSeen[ptyId];
+  }),
+
+  setSidebarSortMode: (mode) => set((state) => {
+    state.sidebarSortMode = mode;
+    state.sidebarSortModeChosen = true;
+    state.sidebarAttentionFirst = mode === 'attention';
+  }),
+
+  sidebarWidth: SIDEBAR_DEFAULT_WIDTH,
+
+  setSidebarWidth: (width) => set((state) => {
+    state.sidebarWidth = clampSidebarWidth(width);
+  }),
+
+  sidebarTaskGroupExpanded: {},
+
+  setSidebarTaskGroupExpanded: (ownerId, expanded) => set((state) => {
+    if (!ownerId) return;
+    state.sidebarTaskGroupExpanded[ownerId] = expanded;
+  }),
+
+  sidebarShowPaneCoordinates: true,
+
+  setSidebarShowPaneCoordinates: (enabled) => set((state) => {
+    state.sidebarShowPaneCoordinates = enabled;
   }),
 
   // ─── Toast / ring notification UI ────────────────────────────────────────
@@ -1342,6 +1799,10 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   }),
 
   // ─── Phase 2 — Anthropic usage meter ────────────────────────────────────
+  usageLimitAutoResume: false,
+  setUsageLimitAutoResume: (enabled) => set((state) => {
+    state.usageLimitAutoResume = enabled;
+  }),
   anthropicUsageEnabled: false,
   setAnthropicUsageEnabled: (enabled) => {
     // Sync to main so the poller starts/stops. The IPC send is fire-and-
@@ -1402,6 +1863,15 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     if (state.multiviewIds.length <= 1) {
       state.multiviewIds = [];
     }
+    // #1086 — the grid IS the local viewport, so ANY Ctrl+click on it is a
+    // local-view action even though this one never assigns activeWorkspaceId
+    // (which is why activateLocalWorkspace cannot cover this site). Applied to
+    // the whole action rather than the join branch alone: leaving the grid, and
+    // collapsing it by un-picking the last partner, land the user on the local
+    // active workspace just as much as joining does, and a rule that fires on
+    // some Ctrl+clicks but not others is the drift this PR is removing.
+    // Guarded for stores mounted without the remote slice.
+    clearRemoteSelection(state);
     });
   },
 
@@ -1455,8 +1925,10 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   },
 
   draggedWorkspaceIndex: null as number | null,
+  draggedWorkspaceId: null as string | null,
   setDraggedWorkspaceIndex: (index) => set((state) => {
     state.draggedWorkspaceIndex = index;
+    state.draggedWorkspaceId = index === null ? null : state.workspaces[index]?.id ?? null;
   }),
 
   terminalTextDropDragActive: false,
@@ -1493,17 +1965,27 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.customKeybindings = state.customKeybindings.filter((k) => k.id !== id);
   }),
 
-  disabledShortcuts: [],
+  shortcutOverrides: {},
 
-  toggleShortcutDisabled: (combo) => set((state) => {
-    // Same whitelist the session loader applies (advertised rows only) —
-    // otherwise a programmatic caller could disable a combo the UI renders
-    // no re-enable toggle for, and the state would silently revert on the
-    // next load anyway.
-    if (!ADVERTISED_SHORTCUTS.some((k) => k.combo === combo)) return;
-    state.disabledShortcuts = state.disabledShortcuts.includes(combo)
-      ? state.disabledShortcuts.filter((c) => c !== combo)
-      : [...state.disabledShortcuts, combo];
+  setShortcutOverride: (action, combo) => set((state) => {
+    // Same whitelist the session loader applies (configurable actions, valid
+    // combos) — anything else would have no Settings row to undo it from,
+    // and would silently revert on the next load anyway.
+    const next = sanitizeShortcutOverrides({ ...state.shortcutOverrides, [action]: combo });
+    if (!(action in next)) return;
+    state.shortcutOverrides = next;
+  }),
+
+  keyCaptureActive: false,
+  setKeyCaptureActive: (active) => set((state) => {
+    state.keyCaptureActive = active;
+  }),
+
+  resetShortcut: (action) => set((state) => {
+    if (!(action in state.shortcutOverrides)) return;
+    const next = { ...state.shortcutOverrides };
+    delete next[action];
+    state.shortcutOverrides = next;
   }),
 
   // ─── File tree ────────────────────────────────────────────────────────
@@ -1806,6 +2288,172 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
       get().pushToast({
         message: t('pane.maxLeavesReachedWithStash', { count: cap.count, stashed: cap.stashed }),
         level: 'warn',
+      });
+    }
+  },
+
+  /**
+   * #1237 — snap the EXISTING panes into a template's arrangement.
+   *
+   * `applyLayoutTemplate` replaces the tree with fresh empty leaves (the old
+   * PTYs die); this is its non-destructive counterpart: running sessions keep
+   * their pane identities and merely change position. Existing leaves map onto
+   * the template's slots in tree order (top-left to bottom-right), so the
+   * spatial reading the user has stays put.
+   *
+   * Surplus handling, in tree order — the trailing panes are the surplus:
+   *   - an EMPTY pane is discarded: it holds no session, so there is nothing
+   *     to preserve and nothing the stash could replay;
+   *   - a stashable pane is stashed (same contract as `stashPane`: daemon
+   *     connection required — without the ring its bytes would be lost);
+   *   - anything else (editor/diff/git tabs) refuses the whole snap. Losing
+   *     unsaved edits is exactly what this feature exists not to do.
+   *
+   * Deficit handling: fresh empty leaves, ordinals continuing past the
+   * workspace high-water (the same collision rule #977 gave apply).
+   */
+  snapToLayoutTemplate: (templateId, workspaceId) => {
+    type SnapBlock =
+      | { key: 'cap'; count: number; stashed: number }
+      | { key: 'daemon'; count: number }
+      | { key: 'surface'; name: string; type: string };
+    let blocked: SnapBlock | null = null;
+    let stashedSurplus = 0;
+    // Plain values captured INSIDE the producer for the post-transaction
+    // publishes (drafts must not escape set()).
+    let stashedEvent: { wsId: string; paneIds: string[] } | null = null;
+    let focusedEvent: { wsId: string; newPaneId: string; previousPaneId: string } | null = null;
+    let templateName = '';
+    set((state) => {
+      const targetWsId = workspaceId || state.activeWorkspaceId;
+      const ws = state.workspaces.find((w) => w.id === targetWsId);
+      if (!ws) return;
+      const tmpl = state.layoutTemplates.find((t) => t.id === templateId);
+      if (!tmpl) return;
+      templateName = tmpl.name;
+      const visible = getLeafPanes(ws.rootPane);
+      const slotCount = countLayoutLeaves(tmpl.tree);
+      const surplus = visible.length > slotCount ? visible.slice(slotCount) : [];
+      const toStash = surplus.filter((p) => p.surfaces.length > 0);
+
+      // Cap: every pane the workspace owns afterwards must fit. Surplus panes
+      // that get stashed still count (#977), discarded empties do not.
+      const stashedCount = (ws.stashedPanes ?? []).length;
+      if (slotCount + stashedCount + toStash.length > MAX_PANES_PER_WORKSPACE) {
+        blocked = { key: 'cap', count: MAX_PANES_PER_WORKSPACE, stashed: stashedCount };
+        return;
+      }
+
+      // Refusals BEFORE any mutation — a half-snapped tree would be the one
+      // outcome worse than no snap.
+      if (toStash.length > 0) {
+        if (!isDaemonModeActive()) {
+          blocked = { key: 'daemon', count: toStash.length };
+          return;
+        }
+        for (const p of toStash) {
+          const allowed = canStashPaneSurfaces(p);
+          if (!allowed.ok) {
+            blocked = {
+              key: 'surface',
+              // The name the pane header shows — a renamed pane is not
+              // findable by its auto name.
+              name: paneDisplayName(
+                state.paneLabel[p.id],
+                computePaneAutoName(ws.wsOrdinal ?? 0, p.ordinal ?? 0),
+              ),
+              type: allowed.reason === 'surface' ? allowed.surfaceType : 'empty',
+            };
+            return;
+          }
+        }
+      }
+
+      // Reuse in tree order, then fill any deficit with fresh leaves whose
+      // ordinals continue past the high-water (visible + stashed).
+      const queue = visible.slice(0, Math.min(visible.length, slotCount));
+      const ownedOrdinal = getWorkspaceLeafPanes(ws).reduce((m, l) => Math.max(m, l.ordinal ?? 0), 0);
+      // Never below the monotonic counter splitPane advances: the surviving
+      // panes keep their numbers, so lowering it would let the next new pane
+      // recycle a closed pane's ordinal (and with it its A2A address).
+      let nextOrdinal = Math.max(ws.nextPaneOrdinal ?? 0, ownedOrdinal + 1);
+      const build = (node: LayoutNode): Pane => {
+        if (node.type === 'leaf') {
+          const existing = queue.shift();
+          if (existing) return existing;
+          return createLeafPane(undefined, nextOrdinal++);
+        }
+        const branch: PaneBranch = {
+          id: generateId('pane'),
+          type: 'branch',
+          direction: node.direction,
+          sizes: node.sizes,
+          children: node.children.map(build),
+        };
+        return branch;
+      };
+      const newRoot = build(tmpl.tree);
+      ws.nextPaneOrdinal = nextOrdinal;
+
+      if (toStash.length > 0) {
+        // No `origin`: the topology is being replaced wholesale, so a neighbour
+        // anchor would describe a split that no longer exists. Unstash falls
+        // back to "next to the active pane", which is honest here.
+        if (!ws.stashedPanes) ws.stashedPanes = [];
+        const now = Date.now();
+        for (const p of toStash) ws.stashedPanes.push({ pane: p, stashedAt: now });
+        stashedSurplus = toStash.length;
+        // Captured for the events.poll contract below (stashPane's rule): a
+        // pane leaving the default listing is always explained by an event.
+        stashedEvent = { wsId: ws.id, paneIds: toStash.map((p) => p.id) };
+      }
+
+      if (!collectLeafIds(newRoot).includes(ws.activePaneId)) {
+        focusedEvent = { wsId: ws.id, newPaneId: collectFirstLeafId(newRoot), previousPaneId: ws.activePaneId };
+        ws.activePaneId = focusedEvent.newPaneId;
+      }
+      // A zoom pinned to a pane in the SNAPPED workspace is invalidated by the
+      // re-layout; one pinned elsewhere must survive (another multiview tile, or
+      // the foreground during a background snap). Checked against the OLD tree,
+      // which still holds every pane that was on screen — stashed ones included.
+      if (state.zoomedPaneId !== null && findPane(ws.rootPane, state.zoomedPaneId)) {
+        state.zoomedPaneId = null;
+      }
+      ws.rootPane = newRoot;
+    });
+    if (stashedEvent) {
+      const ev = stashedEvent as { wsId: string; paneIds: string[] };
+      for (const paneId of ev.paneIds) publishPaneStashed(ev.wsId, paneId);
+      // The tree+stash mutation otherwise rides the 5s autosave — a snap
+      // followed by an immediate quit must not come back half-applied.
+      saveSessionNow();
+    }
+    if (focusedEvent) {
+      const ev = focusedEvent as { wsId: string; newPaneId: string; previousPaneId: string };
+      publishPaneFocused(ev.wsId, ev.newPaneId, ev.previousPaneId);
+    }
+    if (blocked) {
+      const b = blocked as SnapBlock;
+      if (b.key === 'cap') {
+        get().pushToast({
+          message: t('pane.maxLeavesReachedWithStash', { count: b.count, stashed: b.stashed }),
+          level: 'warn',
+        });
+      } else if (b.key === 'daemon') {
+        get().pushToast({
+          message: t('pane.snapNoDaemon', { count: b.count }),
+          level: 'warn',
+        });
+      } else {
+        get().pushToast({
+          message: t('pane.snapBlockedSurface', { name: b.name, type: b.type }),
+          level: 'warn',
+        });
+      }
+    } else if (stashedSurplus > 0) {
+      get().pushToast({
+        message: t('pane.snapStashedSurplus', { name: templateName, count: stashedSurplus }),
+        level: 'info',
       });
     }
   },

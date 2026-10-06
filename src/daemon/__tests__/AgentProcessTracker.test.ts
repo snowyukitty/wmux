@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
+  AGENT_MISS_BACKOFF_MS,
   AgentProcessTracker,
   parsePipeDelimited,
   parsePsOutput,
@@ -68,6 +69,14 @@ describe('resolveAgentSlug', () => {
     expect(resolveAgentSlug(undefined)).toBeUndefined();
   });
 
+  // #1680 — the live-dogfood fake agents are attributed only when launched by
+  // path (their header says so); a bare script name is the user's own file.
+  it('attributes the fake agent fixtures launched by path, not by bare name', () => {
+    expect(resolveAgentSlug('"C:\\Program Files\\nodejs\\node.exe" C:\\repo\\scripts\\fixtures\\fake-agents\\claude.mjs')).toBe('claude');
+    expect(resolveAgentSlug('node /repo/scripts/fixtures/fake-agents/codex.mjs')).toBe('codex');
+    expect(resolveAgentSlug('node claude.mjs')).toBeUndefined();
+  });
+
   it('never matches arbitrary ancestor directories or trailing positionals', () => {
     expect(resolveAgentSlug('node /work/claude/scratch.js')).toBeUndefined();
     expect(resolveAgentSlug('node demo.js claude')).toBeUndefined();
@@ -105,6 +114,23 @@ describe('resolveAgentSlug', () => {
 
 describe('selectAgentProcess', () => {
   const SHELL = 100;
+
+  it('exec-rooted pane: the PTY root itself is the agent, not its MCP node child', () => {
+    const table = [
+      entry(SHELL, 1, '/Users/me/.local/bin/claude', 'claude --permission-mode default'),
+      entry(101, SHELL, 'node', 'node /tmp/mcp-server.js'),
+    ];
+    expect(selectAgentProcess(table, SHELL)).toEqual({ pid: SHELL, slug: 'claude' });
+  });
+
+  it('a plain shell root is never the pick (interactive panes unchanged)', () => {
+    const table = [
+      entry(SHELL, 1, '-zsh', '-zsh'),
+      entry(201, SHELL, 'claude'),
+      entry(301, 201, 'node', 'node /tmp/mcp-server.js'),
+    ];
+    expect(selectAgentProcess(table, SHELL)).toEqual({ pid: 201, slug: 'claude' });
+  });
 
   it('picks a native agent binary among descendants (over its MCP node children)', () => {
     const table = [
@@ -290,6 +316,162 @@ describe('AgentProcessTracker', () => {
     expect(watcher.watches.size).toBe(0);
   });
 
+  it('armIfAgent names a resumed Codex that no hook or banner announced', async () => {
+    const watcher = makeWatcher();
+    const listener = vi.fn();
+    // zsh → node …/@openai/codex/bin/codex.js resume --last → native codex
+    const table = [
+      entry(200, SHELL, 'node', 'node /usr/local/lib/node_modules/@openai/codex/bin/codex.js resume --last'),
+      entry(201, 200, '/usr/local/lib/node_modules/@openai/codex/vendor/bin/codex', 'codex resume --last'),
+    ];
+    const tracker = new AgentProcessTracker(watcher, async () => table);
+    tracker.setStateChangeListener(listener);
+
+    tracker.armIfAgent('s1', SHELL);
+    await flush();
+    expect(tracker.identityFor('s1')).toEqual({ slug: 'codex', alive: true });
+    // The scoped launcher script names no agent; the native binary does.
+    expect(watcher.watches.get('agent:s1')?.pid).toBe(201);
+    expect(listener).toHaveBeenCalledWith('s1', { slug: 'codex', alive: true });
+  });
+
+  it('armIfAgent leaves no trace for a non-agent command and backs off only itself', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const watcher = makeWatcher();
+      const listener = vi.fn();
+      let table = [entry(200, SHELL, 'node', 'node /work/app/node_modules/.bin/vite')];
+      const enumerate = vi.fn(async () => table);
+      const tracker = new AgentProcessTracker(watcher, enumerate);
+      tracker.setStateChangeListener(listener);
+
+      tracker.armIfAgent('s1', SHELL);
+      await flush();
+      // A plain dev server is not an agent: no liveness flag (so no later
+      // processExit edge), no watch, no listener call.
+      expect(tracker.statusFor('s1')).toBeUndefined();
+      expect(watcher.watches.size).toBe(0);
+      expect(listener).not.toHaveBeenCalled();
+
+      // The miss keeps the next guess away for a few seconds…
+      tracker.armIfAgent('s1', SHELL);
+      await flush();
+      expect(enumerate).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(AGENT_MISS_BACKOFF_MS);
+      tracker.armIfAgent('s1', SHELL);
+      await flush();
+      expect(enumerate).toHaveBeenCalledTimes(2);
+
+      // …but never holds back an agent that hook or banner evidence names.
+      table = [entry(300, SHELL, 'claude')];
+      tracker.arm('s1', SHELL);
+      await flush();
+      expect(enumerate).toHaveBeenCalledTimes(3);
+      expect(tracker.identityFor('s1')).toEqual({ slug: 'claude', alive: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('armIfAgent backs off for ARM_BACKOFF_MS after an enumeration failure', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const enumerate = vi.fn(async (): Promise<ProcessTreeEntry[]> => {
+        throw new Error('ps timeout');
+      });
+      const tracker = new AgentProcessTracker(makeWatcher(), enumerate);
+      tracker.armIfAgent('s1', SHELL);
+      await flush();
+      vi.advanceTimersByTime(AGENT_MISS_BACKOFF_MS);
+      tracker.armIfAgent('s1', SHELL);
+      await flush();
+      expect(enumerate).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(30_000);
+      tracker.armIfAgent('s1', SHELL);
+      await flush();
+      expect(enumerate).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('armIfAgent names the next agent when the tracked one exited before the monitor noticed', async () => {
+    const watcher = makeWatcher();
+    const listener = vi.fn();
+    let table = [entry(200, SHELL, 'claude')];
+    const tracker = new AgentProcessTracker(watcher, async () => table);
+    tracker.setStateChangeListener(listener);
+
+    tracker.arm('s1', SHELL);
+    await flush();
+    expect(tracker.identityFor('s1')).toEqual({ slug: 'claude', alive: true });
+
+    // claude exits, codex starts inside the monitor's polling gap: the tracker
+    // still reads claude as alive when codex's command-start arrives.
+    table = [entry(300, SHELL, 'codex')];
+    tracker.armIfAgent('s1', SHELL);
+    await flush();
+    expect(tracker.identityFor('s1')).toEqual({ slug: 'codex', alive: true });
+    expect(watcher.watches.get('agent:s1')?.pid).toBe(300);
+    expect(listener.mock.calls).toEqual([
+      ['s1', { slug: 'claude', alive: true }],
+      ['s1', { slug: 'claude', alive: false }],
+      ['s1', { slug: 'codex', alive: true }],
+    ]);
+  });
+
+  it('armIfAgent keeps a live agent and does not resurrect a dead one', async () => {
+    const watcher = makeWatcher();
+    let table = [entry(200, SHELL, 'codex')];
+    const listener = vi.fn();
+    const tracker = new AgentProcessTracker(watcher, async () => table);
+    tracker.setStateChangeListener(listener);
+
+    tracker.armIfAgent('s1', SHELL);
+    await flush();
+    tracker.armIfAgent('s1', SHELL); // still in the table → unchanged
+    await flush();
+    expect(tracker.identityFor('s1')).toEqual({ slug: 'codex', alive: true });
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    watcher.watches.get('agent:s1')?.onDead();
+    table = []; // the shell is back at its prompt: nothing under it
+    tracker.armIfAgent('s1', SHELL);
+    await flush();
+    expect(tracker.identityFor('s1')).toEqual({ slug: 'codex', alive: false });
+  });
+
+  it('an armIfAgent call during an in-flight probe is queued, not dropped', async () => {
+    const watcher = makeWatcher();
+    let table: ProcessTreeEntry[] = [];
+    const enumerate = vi.fn(async () => table);
+    const tracker = new AgentProcessTracker(watcher, enumerate);
+
+    tracker.arm('s1', SHELL); // plain probe in flight, sees an empty table
+    table = [entry(300, SHELL, 'codex')];
+    tracker.armIfAgent('s1', SHELL);
+    await flush();
+    await flush();
+    expect(enumerate).toHaveBeenCalledTimes(2);
+    expect(tracker.identityFor('s1')).toEqual({ slug: 'codex', alive: true });
+  });
+
+  it('an arm landing during an armIfAgent probe is replayed, not swallowed', async () => {
+    const watcher = makeWatcher();
+    const table = [entry(200, SHELL, 'somewrapper')];
+    const enumerate = vi.fn(async () => table);
+    const tracker = new AgentProcessTracker(watcher, enumerate);
+
+    tracker.armIfAgent('s1', SHELL); // agent-only probe in flight
+    tracker.arm('s1', SHELL); // hook evidence arrives meanwhile
+    await flush();
+    await flush();
+    // The agent-only probe dropped the slugless pick; the replayed arm keeps
+    // it for liveness, as a plain arm always has.
+    expect(enumerate).toHaveBeenCalledTimes(2);
+    expect(tracker.identityFor('s1')).toEqual({ alive: true });
+  });
+
   it('fires the state listener on attribution and on the death edge', async () => {
     const watcher = makeWatcher();
     const listener = vi.fn();
@@ -337,5 +519,96 @@ describe('AgentProcessTracker', () => {
     // A duplicate/stale death signal for the OLD pid must not flip the new watch.
     first?.onDead();
     expect(tracker.statusFor('s1')).toBe(true);
+  });
+
+  it('verifyLive passes only while a fresh table still picks the tracked pid and slug', async () => {
+    const watcher = makeWatcher();
+    let table = [entry(200, SHELL, 'claude.exe')];
+    const tracker = new AgentProcessTracker(watcher, async () => table);
+
+    expect(await tracker.verifyLive('s1', 'claude')).toBe(false); // never armed
+    tracker.arm('s1', SHELL);
+    await flush();
+    expect(await tracker.verifyLive('s1', 'claude')).toBe(true);
+    expect(await tracker.verifyLive('s1', 'codex')).toBe(false);
+
+    table = [entry(200, 999, 'claude.exe')]; // same pid, no longer under the pane shell
+    expect(await tracker.verifyLive('s1', 'claude')).toBe(false);
+
+    table = [entry(200, SHELL, 'claude.exe')];
+    watcher.watches.get('agent:s1')?.onDead();
+    expect(await tracker.verifyLive('s1', 'claude')).toBe(false);
+  });
+
+  it('verifyLive fails when the tracked pid now runs a different program — the #1307 regression guard', async () => {
+    const watcher = makeWatcher();
+    let table = [entry(200, SHELL, 'claude.exe')];
+    const tracker = new AgentProcessTracker(watcher, async () => table);
+    tracker.arm('s1', SHELL);
+    await flush();
+
+    table = [entry(200, SHELL, 'bash')]; // pid reused before the death poll
+    expect(tracker.statusFor('s1')).toBe(true);
+    expect(await tracker.verifyLive('s1', 'claude')).toBe(false);
+  });
+
+  it('verifyLive fails when the agent dies while the table is being read', async () => {
+    const watcher = makeWatcher();
+    let release: ((table: ProcessTreeEntry[]) => void) | undefined;
+    let gated = false;
+    const tracker = new AgentProcessTracker(watcher, () => (gated
+      ? new Promise<ProcessTreeEntry[]>((resolve) => { release = resolve; })
+      : Promise.resolve(TABLE)));
+    tracker.arm('s1', SHELL);
+    await flush();
+
+    gated = true;
+    const verdict = tracker.verifyLive('s1', 'claude');
+    watcher.watches.get('agent:s1')?.onDead();
+    release?.(TABLE);
+    expect(await verdict).toBe(false);
+  });
+
+  it('verifyLive fails closed when enumeration throws', async () => {
+    const watcher = makeWatcher();
+    let fail = false;
+    const tracker = new AgentProcessTracker(watcher, async () => {
+      if (fail) throw new Error('ps timed out');
+      return TABLE;
+    });
+    tracker.arm('s1', SHELL);
+    await flush();
+
+    fail = true;
+    expect(await tracker.verifyLive('s1', 'claude')).toBe(false);
+  });
+});
+
+describe('owned native agent root', () => {
+  it('accepts only the armed PTY root with freshly matching executable metadata', async () => {
+    let entries = [entry(100, 1, 'opencode')];
+    const watcher = { watch: vi.fn(), unwatch: vi.fn() };
+    const tracker = new AgentProcessTracker(watcher, async () => entries);
+    expect(await tracker.verifyOwnedRoot('pane', 100, 'opencode')).toBe(false);
+    tracker.arm('pane', 100);
+    expect(await tracker.verifyOwnedRoot('pane', 100, 'opencode')).toBe(true);
+    expect(await tracker.verifyOwnedRoot('pane', 100, 'codex')).toBe(false);
+    entries = [entry(100, 1, 'zsh')];
+    expect(await tracker.verifyOwnedRoot('pane', 100, 'opencode')).toBe(false);
+    tracker.disarm('pane');
+    expect(await tracker.verifyOwnedRoot('pane', 100, 'opencode')).toBe(false);
+  });
+});
+
+describe('idle shell launch verification', () => {
+  it('refuses a child process, replaced root or missing PID', async () => {
+    let entries = [entry(100, 1, 'zsh')];
+    const tracker = new AgentProcessTracker({ watch: vi.fn(), unwatch: vi.fn() }, async () => entries);
+    expect(await tracker.verifyIdleShell(100)).toBe(true);
+    entries.push(entry(101, 100, 'vim'));
+    expect(await tracker.verifyIdleShell(100)).toBe(false);
+    entries = [entry(100, 1, 'codex')];
+    expect(await tracker.verifyIdleShell(100)).toBe(false);
+    expect(await tracker.verifyIdleShell(200)).toBe(false);
   });
 });

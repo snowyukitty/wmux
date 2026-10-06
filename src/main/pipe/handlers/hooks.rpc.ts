@@ -50,10 +50,12 @@ import { HookFloodMeter, describeHookFlood } from '../../hooks/HookFloodMeter';
 import { eventBus } from '../../events/EventBus';
 import { IPC, dataSuffix } from '../../../shared/constants';
 import { summarizeActivity } from '../../../shared/activitySummary';
+import { assistantPreview, flattenAgentText } from '../../../shared/assistantPreview';
 import type { DaemonClient } from '../../DaemonClient';
 import type { ResumeBinding, PermissionMode } from '../../../shared/agentResume';
 import { readLastAssistantMessage } from '../../claude/lastAssistantMessage';
 import { deliverBrainPtyHookSignal } from '../../deck/brainPtyHookBus';
+import { noteBrainHookSignal } from '../../deck/moaPaneFeed';
 import { getWorkspaceMirror, type WorkspaceMirror } from '../../workspace/WorkspaceMirror';
 import { normalizeHookCue, type CompletionAlarm } from '../../../shared/hooks/CompletionAlarm';
 import type { AgentLastMessage } from '../../../shared/events';
@@ -75,6 +77,7 @@ const VALID_PERMISSION_MODES: ReadonlySet<string> = new Set([
   'bypassPermissions',
   'acceptEdits',
   'plan',
+  'auto',
   'default',
 ]);
 
@@ -165,18 +168,30 @@ export function activityFromSignalPayload(payload: Record<string, unknown> | und
  * ActivityMonitor.onActive / a fresh awaiting_input hook, both of which clear
  * this attention entry (setSurfaceAgentStatus drops any non-attention status).
  * session_start is a turn BEGINNING, not an end, so it must not set it.
+ *
+ * `lastMessage` is the closing message itself, question or not, cut to the
+ * phone list's grapheme budget (`assistantPreview`) so a Fleet row and a phone
+ * row show the same tail. Written on every boundary like `pendingQuestion`: a
+ * boundary with no readable message (another agent, a failed turn, a fresh
+ * session) sends '' and clears the previous turn's text rather than leaving it.
  */
 export function buildTurnBoundaryMetadata(
   kind: AgentSignal['kind'],
   stopMessage: AgentLastMessage | null,
   leftoverWork = 0,
-): { activity: string; pendingQuestion: string; agentStatus?: 'complete' | 'error' } | null {
+): { activity: string; pendingQuestion: string; lastMessage: string; lastActivity?: ''; agentStatus?: 'complete' | 'error' } | null {
   if (kind !== 'agent.stop' && kind !== 'agent.session_start' && kind !== 'agent.stop_failure') {
     return null;
   }
   return {
     activity: '',
-    pendingQuestion: stopMessage?.endsWithQuestion ? stopMessage.text : '',
+    // Same flatten as lastMessage (agent-authored, rendered on one line), but
+    // not the grapheme cut: the whole question is the point of the row.
+    pendingQuestion: stopMessage?.endsWithQuestion ? flattenAgentText(stopMessage.text) : '',
+    lastMessage: assistantPreview(stopMessage?.text ?? '') ?? '',
+    // A fresh session also drops the retained last-activity line, which a
+    // Stop keeps so the finished row can say what the turn did.
+    ...(kind === 'agent.session_start' ? { lastActivity: '' as const } : {}),
     // #1096 — a lead stop with background agents still running is not a turn
     // end, so it must not stamp the hook-authoritative completion status: the
     // pane sat on Completed for the whole `Waiting for N background agent(s)`
@@ -517,6 +532,7 @@ export function registerHooksRpc(
       return { ok: false, reason: 'invalid-envelope' };
     }
     const signal: AgentSignal = params;
+    const receivedAt = Date.now();
 
     // 1b. Brain-pty lane. The `claude-pty` orchestrator brain runs the
     //     interactive Claude Code TUI in its own daemon session and uses this
@@ -528,11 +544,16 @@ export function registerHooksRpc(
     //     A claimed signal may come back with a BLOCK — the Stop gate refusing
     //     to let the orchestrator end its turn. It rides this response because
     //     a second, independent hook would race the one that ends the turn.
+    //     A claimed prompt-submit may come back with a context line instead
+    //     (the HQ brain's view pointer), carried the same way.
     const brainVerdict = deliverBrainPtyHookSignal(signal);
     if (brainVerdict.consumed) {
-      return brainVerdict.block
-        ? { ok: true, block: { reason: brainVerdict.block } }
-        : { ok: true };
+      // The daemon never sees a brain's hooks, so the Moa pane's transcript
+      // reaches it only through the Moa pane feed (phone turn view).
+      noteBrainHookSignal(signal);
+      if (brainVerdict.block) return { ok: true, block: { reason: brainVerdict.block } };
+      if (brainVerdict.additionalContext) return { ok: true, additionalContext: brainVerdict.additionalContext };
+      return { ok: true };
     }
     // An unclaimed prompt-submit used to be dropped RIGHT HERE, on the premise
     // that the brain lane was its only emitter, so an unclaimed one meant a
@@ -645,11 +666,16 @@ export function registerHooksRpc(
     // durable saveImmediate, and the hook's 2s budget must never block on it.
     // agentSessionId is the #12235-safe origin id (transcript basename) the
     // bridge derived; cwd + permissionMode complete the binding (F5/F7).
+    //
+    // Only for a pane-EXACT route (#1523): this fallback cannot see the pane's
+    // current binding, so a workspace/cwd guess could replace another agent's
+    // conversation. Skipping it also keeps a guess out of the spool.
     if (
       (signal.kind === 'agent.session_start'
         || signal.kind === 'agent.stop'
         || signal.kind === 'agent.subagent_stop')
       && signal.agentSessionId
+      && signal.ptyId === ptyId
     ) {
       const permissionMode = readPermissionMode(signal.payload);
       const transcriptPath = typeof signal.payload?.transcript_path === 'string'
@@ -820,6 +846,9 @@ export function registerHooksRpc(
       // attention window. These kinds return here, so this is their only feed
       // site on the local path.
       alarm?.observe(ptyId, signal.agent, normalizeHookCue(signal));
+      // #1680 — fresh-context evidence, the daemon-unreachable twin of
+      // DaemonNotificationRouter's session_start replay.
+      if (signal.kind === 'agent.session_start') hookRouter.noteSessionStart(ptyId, signal, receivedAt);
       // Turn START. The daemon-unreachable twin of HookIngest's metadata-kind
       // broadcast: a prompt submitted means this pane is working RIGHT NOW, so
       // the status dot lights immediately instead of waiting for the byte-rate
@@ -828,6 +857,8 @@ export function registerHooksRpc(
       // toast, no ledger write, no lifecycle tee, exactly like every other
       // non-emit kind that returns here.
       if (signal.kind === 'agent.user_prompt_submit') {
+        hookRouter.notePromptSubmit(ptyId, signal, receivedAt,
+          isUnambiguousPromptTarget(ptyId, signal, workspaces));
         // Deliberately NOT `noteHookTurnStart`, and deliberately not tagged
         // with `hookKind` for the renderer's latch either. The latch mutes the
         // byte heuristic in both directions, and its two release paths are the
@@ -1143,6 +1174,11 @@ interface WorkspaceListCache {
    */
   peek(): { list: WorkspaceListEntry[]; ageMs: number } | null;
   /**
+   * Force one renderer round-trip, ignoring the TTL (coalesces with an
+   * in-flight fetch). Returns the last-known list when the fetch fails.
+   */
+  refresh(): Promise<WorkspaceListEntry[] | null>;
+  /**
    * Fire-and-forget refresh to keep the cache warm for `peek()` consumers.
    * No-op when already fresh or a refresh is in flight; coalesces with `get()`.
    * Never throws into the caller and never blocks it.
@@ -1197,6 +1233,7 @@ export function createWorkspaceListCache(
       if (isFresh()) return cached; // fresh hit — no renderer round-trip
       return refresh();
     },
+    refresh,
     peek(): { list: WorkspaceListEntry[]; ageMs: number } | null {
       if (cached === null) return null;
       return { list: cached, ageMs: now() - cachedAt };
@@ -1256,7 +1293,7 @@ export function createWorkspaceListCache(
  *     resume-binding clobber the X6③ exact-ptyId routing was added to prevent.
  *     The resolver returns EXACTLY `signal.ptyId` only when its exact-ptyId
  *     branch fires (id present in the list + workspace cross-check), which is
- *     the topology-stable case; any fallback returns a different id.
+ *     the topology-stable case; otherwise it now returns null (#1523).
  *
  * On the env fast path (2) we `prime()` the cache (fire-and-forget) so it stays
  * warm for the next hook without blocking this one. A mirror hit (1) needs no
@@ -1268,7 +1305,7 @@ export function createWorkspaceListCache(
  */
 export async function resolveWorkspacesForSignal(
   signal: AgentSignal,
-  cache: Pick<WorkspaceListCache, 'get' | 'peek' | 'prime'>,
+  cache: Pick<WorkspaceListCache, 'get' | 'peek' | 'prime'> & Partial<Pick<WorkspaceListCache, 'refresh'>>,
   mirror?: Pick<WorkspaceMirror, 'peek'>,
 ): Promise<{ workspaces: WorkspaceListEntry[] | null; fetchMs: number; fastPathed: boolean }> {
   // (1) Mirror first. Populated + fresh + the pure resolver places a pane → no
@@ -1277,10 +1314,9 @@ export async function resolveWorkspacesForSignal(
   // LAG a just-created pane by a few frames. So when the hook carries a ptyId we
   // apply the SAME exact-id guard as the env fast path (2): accept the mirror
   // only when the resolver returns EXACTLY `signal.ptyId` (the pane is really in
-  // the mirror). If the pane's push hasn't landed yet the resolver falls through
-  // to workspaceId → activePtyId (another pane's id); a bare non-null check would
-  // fast-path that misroute — the cross-pane resume-binding clobber the pull path
-  // avoids by fetching a list that already contains the new pane. On guard
+  // the mirror). If the pane's push hasn't landed yet the resolver returns null
+  // (#1523), so the signal must not be refused off a lagging mirror — the pull
+  // path fetches a list that already contains the new pane. On guard
   // failure we fall through to (2)/(3) unchanged. A workspaceId/cwd-only signal
   // (no ptyId) has no exact target to protect, so non-null acceptance holds and
   // it resolves against the mirror's up-to-date active-surface mapping.
@@ -1304,7 +1340,19 @@ export async function resolveWorkspacesForSignal(
     return { workspaces: peeked.list, fetchMs: 0, fastPathed: true };
   }
   const fetchStart = Date.now();
-  const workspaces = await cache.get();
+  let workspaces = await cache.get();
+  // #1523: a claimed ptyId missing from the list is refused, and `get()` may
+  // have served a list up to its TTL old (or the last-known one after a failed
+  // fetch) — so a just-opened pane's first hook would be dropped. Force one
+  // fresh fetch before that verdict; if it fails, the old list stands.
+  if (
+    signal.ptyId
+    && workspaces
+    && cache.refresh
+    && resolvePtyIdForSignal(signal, workspaces) !== signal.ptyId
+  ) {
+    workspaces = (await cache.refresh()) ?? workspaces;
+  }
   return { workspaces, fetchMs: Date.now() - fetchStart, fastPathed: false };
 }
 
@@ -1346,9 +1394,16 @@ export function resolvePtyIdForSignal(
     // WMUX_PTY_ID is pane-env-controlled, so without the workspace cross-check an
     // authenticated hook could target another live pane by id (codex P2). A hook
     // with no workspaceId (older bridge / standalone) still trusts a live ptyId.
-    if (ptyWorkspaceId && (!signal.workspaceId || ptyWorkspaceId === signal.workspaceId)) {
-      return signal.ptyId;
-    }
+    // #1523: a claimed ptyId that fails either check is refused — never re-routed
+    // to the workspace's active pane or a cwd match, which would hand a pane that
+    // is not the sender another agent's turn and resume binding.
+    // The renderer owns pane placement, so a pane adopted into another workspace
+    // keeps its original WMUX_WORKSPACE_ID. When that claimed workspace no longer
+    // exists, the env value is just stale (the daemon, comparing env to env,
+    // routes it too) — only a claim naming a DIFFERENT live workspace is refused.
+    if (!ptyWorkspaceId) return null;
+    if (!signal.workspaceId || ptyWorkspaceId === signal.workspaceId) return signal.ptyId;
+    return workspaces.some((w) => w.id === signal.workspaceId) ? null : signal.ptyId;
   }
   if (signal.workspaceId) {
     const match = workspaces.find((w) => w.id === signal.workspaceId);
@@ -1366,6 +1421,37 @@ export function resolvePtyIdForSignal(
     }
   }
   return resolvePtyIdForCwd(signal.cwd, workspaces);
+}
+
+/** Receipt-only attribution: lifecycle routing may choose an active pane,
+ * but a submit receipt cannot guess between matching workspace surfaces. */
+export function isUnambiguousPromptTarget(
+  ptyId: string,
+  signal: AgentSignal,
+  workspaces: WorkspaceListEntry[],
+): boolean {
+  if (resolvePtyIdForSignal(signal, workspaces) !== ptyId) return false;
+  if (signal.ptyId === ptyId) return true;
+  let matches = signal.workspaceId ? workspaces.filter((w) => w.id === signal.workspaceId) : [];
+  if (matches.length === 0) {
+    const target = normalizeCwd(signal.cwd);
+    let longest = -1;
+    for (const workspace of workspaces) {
+      if (!workspace.metadata?.cwd) continue;
+      const cwd = normalizeCwd(workspace.metadata.cwd);
+      if (target !== cwd && !target.startsWith(cwd.endsWith('/') ? cwd : `${cwd}/`)) continue;
+      if (cwd.length > longest) {
+        longest = cwd.length;
+        matches = [workspace];
+      } else if (cwd.length === longest) matches.push(workspace);
+    }
+  }
+  // Missing membership data cannot prove that the active pane is the only one.
+  if (matches.some((w) => !w.ptyIds)) return false;
+  const candidates = new Set(matches.flatMap((w) => [
+    ...(w.ptyIds ?? []), ...(w.activePtyId ? [w.activePtyId] : []),
+  ]));
+  return candidates.size === 1 && candidates.has(ptyId);
 }
 
 /**

@@ -55,7 +55,7 @@ describe('useRpcBridge — fan-out task roles', () => {
     // inert twice over: no agent change AND no model flag. Panel review caught
     // exactly this.
     const block = fanoutSpawnBlock();
-    expect(block).toMatch(/applyRoleAgent\(bareCommand, roleBinding\)/);
+    expect(block).toMatch(/applyRoleAgent\(bareCommand, roleBinding[,)]/);
     // Match the CALLS, not the prose: the comment above the swap names
     // withRoleBinding first, so a plain indexOf compares against the comment.
     expect(block.search(/applyRoleAgent\(/)).toBeLessThan(block.search(/withRoleBinding\(seeded/));
@@ -66,12 +66,13 @@ describe('useRpcBridge — fan-out task roles', () => {
 
   it('returns the launched command so a re-fire replays the bound one', () => {
     const block = fanoutSpawnBlock();
-    expect(block).toMatch(/return \{ workspaceId: newWsId, ptyId, initialCommand: launchCommand \}/);
+    expect(block).toMatch(/return \{ workspaceId: newWsId, ptyId, initialCommand: launchCommand, \.\.\.\(fanoutOrigin \? \{ fanoutOrigin \} : \{\}\) \}/);
     // …and that variable is read off the options the PTY was actually created
     // with, so the role rewrite, the marker decision and the workspace profile
     // are all already in it.
     expect(block).toMatch(/const launchCommand = createOptions\.initialCommand \?\? ''/);
-    expect(block).toMatch(/pty\.create\(createOptions\)/);
+    // (Spread with only the lineage owner and origin added — the command is unchanged.)
+    expect(block).toMatch(/pty\.create\(\s*fanoutTaskOf \? \{ \.\.\.createOptions, fanoutTaskOf, \.\.\.\(fanoutOrigin \? \{ fanoutOrigin \} : \{\}\) \} : createOptions,?\s*\)/);
   });
 
   it('applies the binding to the launch command via withRoleBinding', () => {
@@ -137,11 +138,47 @@ describe('useRpcBridge — fan-out task roles', () => {
     // "[role: Reviewer]" without seeing it means another CLI, another model, or
     // extra flags would make the approved text and the executed command differ.
     const m = src.match(/if \(method === 'fanout\.requestApproval'\)[\s\S]*?\n {2}\}\n/);
-    expect(m?.[0]).toMatch(/describeFanOutRoles\(params\.roles\)/);
+    expect(m?.[0]).toMatch(/fanOutRoleLines\(params\.roles\)/);
+    expect(m?.[0]).toMatch(/describeFanOutRoles\(roleCommands\)/);
     // Only claim a model that will actually be injected.
-    const helper = src.match(/function describeFanOutRoles\([\s\S]*?\n\}/);
+    const helper = src.match(/function fanOutRoleLines\([\s\S]*?\n\}/);
     expect(helper?.[0]).toMatch(/bindingEnforcesModel\(b\)/);
     expect(helper?.[0]).toMatch(/no binding/);
+  });
+
+  it('hands the lineage owner to pty.create (main stamps it inside the create), with no await before it', () => {
+    const block = fanoutSpawnBlock();
+    expect(block).toMatch(/pty\.create\(\s*fanoutTaskOf \? \{ \.\.\.createOptions, fanoutTaskOf, \.\.\.\(fanoutOrigin \? \{ fanoutOrigin \} : \{\}\) \} : createOptions/);
+    // The requester arrives resolved (main resolved it once, at request
+    // time): the spawn only sanitizes it and never re-resolves a ptyId
+    // against the layout, which may have moved on since.
+    expect(block).toMatch(/const fanoutOrigin = sanitizeFanoutOrigin\(params\.fanoutOrigin\);/);
+    expect(block).not.toMatch(/originFromCaller|fanoutCaller/);
+    // An await between addWorkspace and pty.create lets the empty-leaf funnel
+    // spawn a plain shell into the new pane first.
+    const end = block.indexOf('await window.electronAPI.pty.create(');
+    expect(end).toBeGreaterThan(-1);
+    const between = block
+      .slice(block.indexOf('store.addWorkspace(name)'), end)
+      .split('\n')
+      .filter((l) => !l.trim().startsWith('//'))
+      .join('\n');
+    expect(between).not.toMatch(/\bawait\b/);
+  });
+
+  it('appends the worker permission flags after the role rewrite and before the marker goes back on', () => {
+    const block = fanoutSpawnBlock();
+    const bind = block.indexOf('withRoleBinding(seeded, roleBinding, role');
+    const flags = block.indexOf('applyWorkerPermissionFlags(roleBound.initialCommand, workerMode)');
+    const marker = block.indexOf('reattachModelEnvMarker(marker, bound.initialCommand');
+    expect(bind).toBeGreaterThan(-1);
+    expect(flags).toBeGreaterThan(bind);
+    expect(marker).toBeGreaterThan(flags);
+  });
+
+  it('toasts once for an unattended fan-out', () => {
+    const m = src.match(/if \(method === 'fanout\.requestApproval'\)[\s\S]*?\n {2}\}\n/);
+    expect(m?.[0]).toMatch(/verdict\.outcome === 'auto'[\s\S]*pushToast/);
   });
 
   it('restores focus before the role write, not after', () => {

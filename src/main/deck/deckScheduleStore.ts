@@ -19,6 +19,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getWmuxDir } from '../../daemon/config';
 import { atomicReadJSONSync, atomicWriteJSON } from '../../daemon/util/atomicWrite';
+import { createSerialChain } from './serialChain';
 
 export interface DeckSchedule {
   id: string;
@@ -91,8 +92,24 @@ export function loadDeckSchedules(dir?: string): DeckSchedule[] {
   return raw.map(sanitize).filter((s): s is DeckSchedule => s !== null);
 }
 
+const serialize = createSerialChain();
+
+/** Read-modify-write deck-schedules.json on one chain: `fn` gets the current
+ *  list and returns the list to write, or null to write nothing. Every writer
+ *  (handlers, scheduler, workspace teardown) goes through here so none can
+ *  drop another's change. `fn` must not call back into this store's writers. */
+export function mutateDeckSchedules(
+  fn: (current: DeckSchedule[]) => DeckSchedule[] | null,
+  dir?: string,
+): Promise<void> {
+  return serialize(async () => {
+    const next = fn(loadDeckSchedules(dir));
+    if (next) await atomicWriteJSON(getDeckSchedulesPath(dir), next);
+  });
+}
+
 export async function saveDeckSchedules(schedules: DeckSchedule[], dir?: string): Promise<void> {
-  await atomicWriteJSON(getDeckSchedulesPath(dir), schedules);
+  await mutateDeckSchedules(() => schedules, dir);
 }
 
 /** Validated create — returns null on a bad request (empty prompt, missing

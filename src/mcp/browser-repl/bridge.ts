@@ -9,12 +9,16 @@
  * guarantees. The bridge adds only what direct calls skip: the SDK's Zod
  * validation, and the connection scope that MCP dispatch would have set.
  */
+import { AsyncLocalStorage } from 'async_hooks';
 import { z } from 'zod';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { CollectedTool } from '../playwright/toolCollector';
 import { isHintBlock } from '../playwright/hintBlock';
 import { redactPasswordParams } from '../playwright/redact';
 import { withSnapshotListingCapture } from '../playwright/snapshotListing';
+import { MAX_SCREENSHOT_BASE64_BYTES } from '../resultCap';
+import { withoutActionRecording } from '../browser-replay/recordingSuppression';
+import type { BridgeImage } from './runCollect';
 import {
   getConnectionScope,
   runInConnectionScope,
@@ -26,11 +30,12 @@ import {
  *
  * This is the permission boundary the feature moves: one approval of
  * `browser_repl` covers all of these, so the list holds only the observe/act
- * tools whose round trips a script is meant to fold together. Everything
+ * tools whose round trips a script is meant to fold together, plus
+ * `screenshot`, which only reads the page (its image rides back beside the
+ * run's text result under per-run caps, see runCollect.ts). Everything
  * that reads or writes state outside the page (cookies, storage, files,
- * downloads, PDFs, traces), returns non-text (screenshot), runs page scripts
- * (evaluate), or manages sessions/replay stays a separate, separately
- * approved tool call.
+ * downloads, PDFs, traces), runs page scripts (evaluate), or manages
+ * sessions/replay stays a separate, separately approved tool call.
  */
 export const BROWSER_REPL_TOOLS: readonly string[] = Object.freeze([
   'navigate',
@@ -54,6 +59,16 @@ export const BROWSER_REPL_TOOLS: readonly string[] = Object.freeze([
   'highlight',
   'resize',
   'dialog',
+  'screenshot',
+]);
+
+/**
+ * What `repl_run`'s `browser` object exposes: the browser_repl set plus
+ * screenshot. Its own list, not an alias, so widening either tool later is a
+ * separate decision that cannot move the other.
+ */
+export const REPL_RUN_BROWSER_TOOLS: readonly string[] = Object.freeze([
+  ...new Set([...BROWSER_REPL_TOOLS, 'screenshot']),
 ]);
 
 /** Tools whose value carries a parsed `refs[]` — see `shapeResult`. */
@@ -107,6 +122,12 @@ export interface BridgeValue {
    * recognized.
    */
   readonly refs?: readonly SnapshotRef[];
+  /** Id of the image this call attached to the run's result (`img-N`). */
+  readonly image?: string;
+  /** Why an image the call returned is not in the result. */
+  readonly note?: string;
+  /** Per image block, when the call returned several: its id or why it was left out. */
+  readonly images?: readonly string[];
 }
 
 export type BridgeOutcome =
@@ -116,6 +137,8 @@ export type BridgeOutcome =
       readonly ledger: string;
       /** `[replay]`/`[skill]` blocks this call carried; the run collects them. */
       readonly hints?: readonly string[];
+      /** Image blocks the handler returned; the run decides which to attach. */
+      readonly images?: readonly BridgeImage[];
     }
   | { readonly ok: false; readonly error: string; readonly ledger: string };
 
@@ -129,6 +152,27 @@ export interface BrowserBridgeOptions {
    * engine and refs under the broker.
    */
   readonly scope?: ConnectionScope;
+  /**
+   * False keeps every call out of the action ring. Default true: browser_repl
+   * steps record exactly as direct calls do.
+   */
+  readonly record?: boolean;
+  /** Tool name used in refusal messages; defaults to browser_repl. */
+  readonly label?: string;
+  /**
+   * Every AsyncLocalStorage store of the dispatch that started this run
+   * (`AsyncLocalStorage.snapshot()`), re-entered around each call. A session
+   * outlives the call that spawned it, and its messages arrive in the spawning
+   * call's context — so without this a later call's `browser.*` would run with
+   * the first call's per-call state, e.g. another Codex thread's pane (#1778).
+   */
+  readonly context?: <R>(fn: () => R) => R;
+}
+
+/** The dispatch's AsyncLocalStorage context, where the runtime can capture it. */
+export function captureDispatchContext(): BrowserBridgeOptions['context'] {
+  const snapshot = (AsyncLocalStorage as { snapshot?: () => <R>(fn: () => R) => R }).snapshot;
+  return typeof snapshot === 'function' ? snapshot() : undefined;
 }
 
 export type BridgeCall = (name: string, args: Record<string, unknown>) => Promise<BridgeOutcome>;
@@ -183,7 +227,8 @@ export function parseSnapshotRefs(text: string, tool: string): SnapshotRef[] {
  * `[browser events]` and the `[replay]`/`[skill]` hints. Events are surfaced
  * to the script as data; hints are addressed to whoever wrote the snippet, so
  * they are kept out of the value and reported once per run instead. Any block
- * that matches neither is body. Non-text blocks are noted, never returned.
+ * that matches neither is body. Image blocks are handed to the run, which
+ * attaches them to its result; other non-text blocks are noted in the text.
  *
  * A hint is recognized by the marker only the lease can set, never by its text
  * (see hintBlock.ts): `browser_extract_text` hands back page text as its first
@@ -206,6 +251,7 @@ export interface ShapedResult {
   readonly value: BridgeValue;
   /** `[replay]`/`[skill]` blocks the lease prepended, verbatim. */
   readonly hints: readonly string[];
+  readonly images: readonly BridgeImage[];
 }
 
 /**
@@ -222,7 +268,12 @@ export function shapeResult(
   const events: string[] = [];
   const hints: string[] = [];
   const body: string[] = [];
+  const images: BridgeImage[] = [];
   for (const block of result.content ?? []) {
+    if (block.type === 'image') {
+      images.push({ data: block.data, mimeType: block.mimeType });
+      continue;
+    }
     if (block.type !== 'text') {
       body.push(`[${block.type} content omitted]`);
       continue;
@@ -243,9 +294,9 @@ export function shapeResult(
   }
   const text = body.join('\n');
   if (SNAPSHOT_TOOLS.has(tool)) {
-    return { value: { text, events, refs: parseSnapshotRefs(listing ?? text, tool) }, hints };
+    return { value: { text, events, refs: parseSnapshotRefs(listing ?? text, tool) }, hints, images };
   }
-  return { value: { text, events }, hints };
+  return { value: { text, events }, hints, images };
 }
 
 /**
@@ -265,23 +316,26 @@ function errorText(result: CallToolResult): string {
 
 /**
  * Build the bridge over the collected handlers. `tools` is the collector sink
- * (full `browser_*` names); only whitelisted entries are reachable.
+ * (full `browser_*` names); only entries in `allowedTools` are reachable, and
+ * the name is checked on every call.
  */
 export function createBrowserBridge(
   tools: ReadonlyMap<string, CollectedTool>,
   options: BrowserBridgeOptions,
+  allowedTools: readonly string[] = BROWSER_REPL_TOOLS,
 ): BridgeCall {
   const validators = new Map<string, z.ZodObject<z.ZodRawShape>>();
-  const allowed = new Set(BROWSER_REPL_TOOLS);
+  const allowed = new Set(allowedTools);
+  const label = options.label ?? 'browser_repl';
 
-  return async (name, rawArgs) => {
+  const bridgeCall: BridgeCall = async (name, rawArgs) => {
     const started = Date.now();
     const ledgerFor = (args: Record<string, unknown>, status: string) =>
       `${name}(${summarizeArgs(args)}) ${status} ${Date.now() - started}ms`;
 
     if (!allowed.has(name)) {
       const reason = tools.has(`browser_${name}`)
-        ? `browser.${name} is not available inside browser_repl — call the browser_${name} tool directly`
+        ? `browser.${name} is not available inside ${label} — call the browser_${name} tool directly`
         : `browser.${name} is not a browser tool`;
       return { ok: false, error: reason, ledger: ledgerFor(rawArgs, 'REFUSED') };
     }
@@ -298,6 +352,14 @@ export function createBrowserBridge(
     if (options.surfaceId !== undefined && 'surfaceId' in collected.shape && args.surfaceId === undefined) {
       args.surfaceId = options.surfaceId;
     }
+    // A scripted screenshot never raises its own ceiling: a loop of 8 MiB
+    // captures would dwarf the run's image budget before the cap could count.
+    if (
+      name === 'screenshot' &&
+      (typeof args.maxBytes !== 'number' || !(args.maxBytes <= MAX_SCREENSHOT_BASE64_BYTES))
+    ) {
+      args.maxBytes = MAX_SCREENSHOT_BASE64_BYTES;
+    }
     let validator = validators.get(name);
     if (!validator) {
       validator = z.object(collected.shape);
@@ -310,12 +372,13 @@ export function createBrowserBridge(
         .join('; ');
       return {
         ok: false,
-        error: `browser.${name}: invalid arguments — ${issues}`,
+        error: `browser.${name}: invalid arguments — ${issues} (valid: ${Object.keys(collected.shape).join(', ')})`,
         ledger: ledgerFor(args, 'INVALID'),
       };
     }
 
-    const invoke = () => collected.handler(parsed.data as Record<string, unknown>);
+    const call = () => collected.handler(parsed.data as Record<string, unknown>);
+    const invoke = options.record === false ? () => withoutActionRecording(call) : call;
     const scoped = async (): Promise<CallToolResult> => {
       const scope = options.scope ?? getConnectionScope();
       return scope ? await runInConnectionScope(scope, invoke) : await invoke();
@@ -341,8 +404,18 @@ export function createBrowserBridge(
     if (result.isError) {
       return { ok: false, error: `browser.${name}: ${errorText(result)}`, ledger: ledgerFor(args, 'FAILED') };
     }
-    const { value, hints } = shapeResult(result, name, listing);
+    const { value, hints, images } = shapeResult(result, name, listing);
     const eventNote = value.events.length > 0 ? ` · ${value.events.length} event(s)` : '';
-    return { ok: true, value, ledger: `${ledgerFor(args, 'ok')}${eventNote}`, hints };
+    return {
+      ok: true,
+      value,
+      ledger: `${ledgerFor(args, 'ok')}${eventNote}`,
+      hints,
+      ...(images.length > 0 && { images }),
+    };
   };
+  // Outermost, so the per-call stores below (listing capture, recording
+  // suppression) still nest inside the restored context.
+  const { context } = options;
+  return context ? (name, rawArgs) => context(() => bridgeCall(name, rawArgs)) : bridgeCall;
 }

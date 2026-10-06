@@ -1,28 +1,34 @@
-import { useEffect, useState, useRef, useCallback, lazy, Suspense } from 'react';
+import { useEffect, useState, useRef, useCallback, useSyncExternalStore, lazy, Suspense } from 'react';
 import { isBrowserBackend } from '../../../shared/browserBackend';
+import { deliverChatDrop } from '../Chat/chatAttachments';
 import type { AgentSlug } from '../../../shared/events';
 import type { ResumeBinding } from '../../../shared/agentResume';
 import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
 import Sidebar from '../Sidebar/Sidebar';
 import MiniSidebar from '../Sidebar/MiniSidebar';
+import { SidebarSlot } from './SidebarSlot';
 import { WorkspaceCenter } from './WorkspaceCenter';
 import { EmptyLeafFunnel } from './EmptyLeafFunnel';
 import { selectProjectCwdSignature } from '../../stores/selectors/appLayout';
 import { selectInboxOwnsApprovals } from '../../stores/selectors/approvalInbox';
-import { shouldShowInstallError, shouldReannounceAfterError, truncateReason } from './updateNoticePolicy';
+import { shouldShowInstallError, shouldReannounceAfterError, isSmartAppControlHold, truncateReason } from './updateNoticePolicy';
+import { isInstallBlockedByWindowsReason } from '../../../shared/installAbortReasons';
+import { hooksLaunchCheck, nextFirstBootSurface } from './firstBootSequence';
+import { markPrWakeNoticeSeen, prWakeNoticePending, showPrWakeNoticeOnce } from '../../hooks/prWakeNotice';
+import { openModalLayerCount, subscribeModalLayers } from '../ui/modalLayer';
 import { registerSessionSaver, saveSessionNow } from '../../utils/sessionSaveBridge';
 import { resolveReconcileRebind } from '../../hooks/resolveReconcileRebind';
 import { getLeafPanes, getWorkspaceLeafPanes } from '../../../shared/paneUtils';
 import NotificationPanel from '../Notification/NotificationPanel';
-import FleetView from '../FleetView/FleetView';
-// TASK-2: the 4 always-mounted overlays are lazy-loaded + render-gated below so
-// their chunks stay out of the cold-boot critical path (SettingsPanel alone is
-// ~4k lines). React.lazy without a render gate is a no-op for FCP, so each is
+import RailPage from './RailPage';
+import AutoUpdatePrompt from './AutoUpdatePrompt';
+// TASK-2: the always-mounted overlays are lazy-loaded + render-gated below so
+// their chunks stay out of the cold-boot critical path (SettingsPanel, ~4k
+// lines, is lazy inside RailPage). React.lazy without a render gate is a no-op for FCP, so each is
 // gated on its own open/visible store flag inside <Suspense> + <ErrorBoundary>.
 const CommandPalette = lazy(() => import('../Palette/CommandPalette'));
 const WorktaskCleanupView = lazy(() => import('../WorkTask/WorktaskCleanupView'));
-const SettingsPanel = lazy(() => import('../Settings/SettingsPanel'));
 const InspectOverlay = lazy(() => import('../Inspect/InspectOverlay'));
 import FileTreePanel from '../FileTree/FileTreePanel';
 import ApprovalDialog from '../Company/ApprovalDialog';
@@ -36,10 +42,12 @@ import OnboardingOverlay from '../Onboarding/OnboardingOverlay';
 import FirstRunWizard from '../FirstRunWizard';
 import KeyboardCheatSheet from '../KeyboardCheatSheet';
 import ToastContainer from '../Toast/ToastContainer';
+import MoaHqMissingNotice from '../Moa/MoaHqMissingNotice';
 import { HooksInstallPromptContainer } from '../Deck/HooksInstallPrompt';
 import FloatingPane from '../Terminal/FloatingPane';
 import SearchResultsPanel from '../Search/SearchResultsPanel';
 import ChannelDock from '../Channels/ChannelDock';
+import { useDockMode } from './dockLayout';
 import { ErrorBoundary } from '../ErrorBoundary';
 import { useKeyboard } from '../../hooks/useKeyboard';
 import { FocusManager } from './LayoutLogicMounts';
@@ -47,15 +55,23 @@ import { useAgentActivityClock } from '../../hooks/useAgentActivityClock';
 import { useTerminalCopyShortcut } from '../../hooks/useTerminalCopyShortcut';
 import { useNotificationListener } from '../../hooks/useNotificationListener';
 import { useRpcBridge } from '../../hooks/useRpcBridge';
+import AgentMentionPicker from '../Palette/AgentMentionPicker';
+import HandoffPopover from '../Git/HandoffPopover';
 import { useWorkspaceMirrorPush } from '../../hooks/useWorkspaceMirrorPush';
+import { useMoaSync } from '../../hooks/useMoaSync';
 import { useResizeGuard } from '../../hooks/useResizeGuard';
 import { useApprovalInboxBridge } from '../../hooks/useApprovalInboxBridge';
+import { useBrowserHelpBridge } from '../../hooks/useBrowserHelpBridge';
+import { useUsageLimitBridge } from '../../hooks/useUsageLimitBridge';
+import { useWorkspaceSettleBridge } from '../../hooks/useWorkspaceSettleBridge';
 import { useRemoteInboxBridge } from '../../hooks/useRemoteInboxBridge';
 import { useRemoteAttachmentsLifecycle } from '../../hooks/useRemoteAttachmentsLifecycle';
 import { useDeckStream } from '../../hooks/useDeckStream';
 import { useChannelsEventSubscription } from '../../hooks/useChannelsEventSubscription';
 import { useChannelsHydration } from '../../hooks/useChannelsHydration';
 import { useMissionsPolling } from '../../hooks/useMissionsPolling';
+import { useCheckoutOwnershipWarning } from '../../hooks/useCheckoutOwnershipWarning';
+import { SidebarSeenTracker } from '../../hooks/useSidebarSeenTracker';
 import { useColdParkSweep } from '../../hooks/useColdParkSweep';
 import { usePaneDecorationChannel } from '../../plugins/usePaneDecorationChannel';
 import { useIpc } from '../../hooks/useIpc';
@@ -67,11 +83,13 @@ import { resolvePtyIdsToClear } from '../../hooks/reconcileWithReQuery';
 import { runWithProgressTimeout } from '../../hooks/reconcileProgressTimeout';
 import { createLateReconcileOnConnect } from '../../hooks/lateReconcileOnConnect';
 import ProjectConfigDialog from '../Project/ProjectConfigDialog';
+import AttachRemoteModal from '../Sidebar/AttachRemoteModal';
 import { probeProjectConfig, maybeAutoApplyProjectLayout, workspaceProbeCwd } from '../../utils/projectConfigProbe';
 import { serializeTerminalBuffer } from '../../utils/scrollbackDump';
 import { pastePtyChunked } from '../../utils/clipboardChunk';
 import { isDaemonModeActive, setDaemonModeActive } from '../../daemon/daemonMode';
-import { planAgentCandidateSeed, asAgentSlug, markSeedAttempted } from '../../channels/agentCandidateSeed';
+import { planAgentCandidateSeed, planLiveAgentSeed, asAgentSlug, markSeedAttempted } from '../../channels/agentCandidateSeed';
+import { agentSlugToDisplay } from '../../../shared/agentIdentity';
 import { RECONCILE_TIMEOUT_MS } from '../../../shared/timeouts';
 import ComposeHost from '../AgentToolbar/ComposeHost';
 import ToolbarHost, { AGENT_TOOLBAR_HEIGHT } from '../AgentToolbar/ToolbarHost';
@@ -80,6 +98,10 @@ import {
   createDeadPaneRecovery,
   type DeadPaneSessionSnapshot,
 } from '../../../shared/ptyRecovery';
+import { isChatV2Covering } from '../ChatV2/coverage';
+import { overlayColors } from '../../utils/titlebarOverlay';
+import { dockShownOn } from './pagesBesideDock';
+import { selectDockOpen, selectMoaOn, useMoaDockGate } from './moaDockGate';
 
 interface ReconcilePtySession extends DeadPaneSessionSnapshot {
   id: string;
@@ -88,17 +110,38 @@ interface ReconcilePtySession extends DeadPaneSessionSnapshot {
   createdAt?: string;
 }
 
-/** #1210 — drop a pane's detected agent identity once we know the TUI is gone. */
+/**
+ * #1210 — drop a pane's detected agent identity once we know the TUI is gone.
+ * #1463 — `requestedAt` is when the snapshot was asked for: only running
+ * evidence older than that is dropped with it, so an agent relaunched while the
+ * answer was in flight keeps its stamp. A dead process with a foreground
+ * command still running may be a relaunch the tracker has not re-armed for yet,
+ * so that case keeps the stamp too.
+ */
 function clearSurfaceAgentsKnownGone(
+  agentAlive: Record<string, boolean>,
+  commandRunning: Record<string, boolean>,
+  requestedAt: number,
+): void {
+  const store = useStore.getState();
+  for (const [id, alive] of Object.entries(agentAlive)) {
+    if (alive === false) store.clearSurfaceAgent(id, commandRunning[id] === true ? undefined : requestedAt);
+  }
+  for (const [id, running] of Object.entries(commandRunning)) {
+    if (running === false) store.clearSurfaceAgent(id, requestedAt);
+  }
+}
+
+/** Name panes from the daemon's process truth — see planLiveAgentSeed. */
+function seedSurfaceAgentsFromProcess(
+  sessions: ReadonlyArray<{ id: string; liveAgent?: string }>,
   agentAlive: Record<string, boolean>,
   commandRunning: Record<string, boolean>,
 ): void {
   const store = useStore.getState();
-  for (const [id, alive] of Object.entries(agentAlive)) {
-    if (alive === false) store.clearSurfaceAgent(id);
-  }
-  for (const [id, running] of Object.entries(commandRunning)) {
-    if (running === false) store.clearSurfaceAgent(id);
+  for (const { ptyId, slug, status } of planLiveAgentSeed(sessions, store.surfaceAgent, agentAlive, commandRunning)) {
+    store.setSurfaceAgent(ptyId, agentSlugToDisplay(slug), status, slug);
+    void useStore.getState().principalRegisterPane(ptyId);
   }
 }
 
@@ -331,9 +374,12 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
       stashedPanes: cloneStashedPanes(ws, dumped),
     })),
     activeWorkspaceId: state.activeWorkspaceId,
+    // #1011 — archived snapshots ride the session; restore lists them again.
+    ...(state.archivedWorkspaces.length > 0 ? { archivedWorkspaces: state.archivedWorkspaces } : {}),
     // P2: persist the global workspace-ordinal high-water so wsOrdinals are
     // never recycled across restarts (loadSession reads it back + backfills).
     nextWorkspaceOrdinal: state.nextWorkspaceOrdinal,
+    phoneWorkspaceRequestIds: state.phoneWorkspaceRequestIds,
     sidebarVisible: state.sidebarVisible,
     channelDockVisible: state.channelDockVisible,
     sidebarMode: state.sidebarMode,
@@ -349,7 +395,9 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     terminalCursorStyle: state.terminalCursorStyle,
     imagePasteMode: state.imagePasteMode,
     defaultShell: state.defaultShell,
+    defaultWslDistro: state.defaultWslDistro,
     deckBrainModel: state.deckBrainModel || undefined,
+    deckBrainEffort: state.deckBrainEffort || undefined,
     orchestratorRoleBindings:
       Object.keys(state.orchestratorRoleBindings).length > 0 ? state.orchestratorRoleBindings : undefined,
     // Persisted explicitly (not `|| undefined`): an explicit false survives
@@ -362,28 +410,40 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     deckBrainVendorMigrated: state.deckBrainVendorMigrated,
     channelsTabVisible: state.channelsTabVisible,
     paneActionsVisible: state.paneActionsVisible,
+    chatViewEnabled: state.chatViewEnabled,
     titlebarClockVisible: state.titlebarClockVisible,
     paneNewTerminalButton: state.paneNewTerminalButton,
     splitInheritsCwd: state.splitInheritsCwd,
     imeResidueGuardEnabled: state.imeResidueGuardEnabled,
     hiddenPaneRetentionEnabled: state.hiddenPaneRetentionEnabled,
     coldParkEnabled: state.coldParkEnabled,
+    inlineImagesEnabled: state.inlineImagesEnabled,
     browserLightweightMode: state.browserLightweightMode,
     browserDiscardHidden: state.browserDiscardHidden,
+    siteMemoryEnabled: state.siteMemoryEnabled,
+    siteGuidesEnabled: state.siteGuidesEnabled,
+    siteGuidesAutoEnabled: state.siteGuidesAutoEnabled,
     startupDirectory: state.startupDirectory || undefined,
     scrollbackLines: state.scrollbackLines,
     scrollbackRestoreEnabled: state.scrollbackRestoreEnabled,
     a2aAutoApproveExecute: state.a2aAutoApproveExecute,
     sidebarPosition: state.sidebarPosition,
     sidebarAttentionFirst: state.sidebarAttentionFirst,
+    sidebarShowPaneCoordinates: state.sidebarShowPaneCoordinates,
+    sidebarSortMode: state.sidebarSortMode,
+    sidebarSortModeChosen: state.sidebarSortModeChosen,
+    sidebarPinnedIds: state.sidebarPinnedIds,
+    sidebarWidth: state.sidebarWidth,
+    sidebarTaskGroupExpanded: state.sidebarTaskGroupExpanded,
     multiviewArrangement: state.multiviewArrangement,
     notificationSoundEnabled: state.notificationSoundEnabled,
     toastEnabled: state.toastEnabled,
     notificationRingEnabled: state.notificationRingEnabled,
     anthropicUsageEnabled: state.anthropicUsageEnabled,
+    usageLimitAutoResume: state.usageLimitAutoResume,
     mutedNotificationCategories: state.mutedNotificationCategories,
     customKeybindings: state.customKeybindings,
-    disabledShortcuts: state.disabledShortcuts,
+    shortcutOverrides: state.shortcutOverrides,
     autoUpdateEnabled: state.autoUpdateEnabled,
     customThemeColors: state.customThemeColors ?? undefined,
     onboardingCompleted: state.onboardingCompleted,
@@ -445,7 +505,12 @@ function useRefusedInstallNotice(
         useStore.getState().pushToast({
           level: 'error',
           persist: true,
-          message: t('update.refusedInstall', { detail: truncateReason(reason) }),
+          // #1525 — Windows refusing to run the installer gets its own
+          // sentence: the generic one's "run the installer from the releases
+          // page" is the same file Windows just blocked.
+          message: isInstallBlockedByWindowsReason(reason)
+            ? t('update.refusedInstallBlocked')
+            : t('update.refusedInstall', { detail: truncateReason(reason) }),
         });
       })
       .catch((err) => {
@@ -512,6 +577,9 @@ function usePendingInstallNotice(
     // Set while an install the USER asked for is in flight — see the error
     // subscription below for why an unfiltered UPDATE_ERROR is not usable.
     let installRequestedAt = 0;
+    // #1525 — the Smart App Control warning on screen, so a second hold (the
+    // user pressed Install again) replaces it instead of stacking a copy.
+    let sacToastId: string | null = null;
 
     const announce = (version: string, currentVersion: string): void => {
       if (cancelled || announcedVersion === version) return;
@@ -598,6 +666,25 @@ function usePendingInstallNotice(
       // Only meaningful for UNTAGGED errors now (tagged ones always show);
       // resetting disarms the click window until the next request.
       installRequestedAt = 0;
+      // #1525 — not a failure: main kept wmux open because Smart App Control
+      // would likely block the installer. Warn, and let the user go ahead.
+      if (isSmartAppControlHold(data)) {
+        if (sacToastId) useStore.getState().dismissToast(sacToastId);
+        sacToastId = useStore.getState().pushToast({
+          level: 'warn',
+          persist: true,
+          message: t('update.smartAppControlHold'),
+          action: {
+            label: t('update.installAnyway'),
+            onClick: () => {
+              installRequestedAt = Date.now();
+              sacToastId = null; // the action dismisses this toast itself
+              void install({ installAnyway: true });
+            },
+          },
+        });
+        return;
+      }
       useStore.getState().pushToast({
         level: 'error',
         persist: true,
@@ -630,16 +717,12 @@ function useUiScaleSync(uiScale: number): void {
     const send = window.electronAPI?.window?.setUiScale;
     if (!send) return; // tests / non-electron
     const push = () => {
-      const cs = getComputedStyle(document.documentElement);
-      const color = cs.getPropertyValue('--bg-base').trim();
-      const symbolColor = cs.getPropertyValue('--text-sub').trim();
       // Factor is always sent (zoom applies on every platform); the overlay
       // color pair only matters on Windows and is skipped when unread, which
-      // main treats as "leave the overlay height untouched this round".
-      send({
-        factor: uiScale,
-        ...(color && symbolColor ? { color, symbolColor } : {}),
-      });
+      // main treats as "leave the overlay height untouched this round". The
+      // pair is the titlebar sync's (overlayColors), so the two never fight.
+      const colors = overlayColors();
+      send({ factor: uiScale, ...(colors ?? {}) });
     };
     push();
     // Re-push on theme change so the Windows overlay keeps the scaled height.
@@ -662,8 +745,34 @@ export default function AppLayout() {
   // theme (overlay colors) does — see useUiScaleSync below.
   useUiScaleSync(uiScale);
   const sidebarVisible = useStore((s) => s.sidebarVisible);
-  const channelDockVisible = useStore((s) => s.channelDockVisible);
+  // The right panel renders only while Moa is on (moaDockGate); with Moa off
+  // the persisted open flag is kept but nothing is drawn.
+  const dockOpen = useStore(selectDockOpen);
+  useMoaDockGate();
   const sidebarPosition = useStore((s) => s.sidebarPosition);
+  // The dock never pushes the sheet past the window: when inline would leave
+  // the panes under their floor, it collapses and reopens as an overlay
+  // (dockLayout.ts). Re-opened when the window is wide enough again, if it
+  // was open when it collapsed.
+  const sidebarWidth = useStore((s) => s.sidebarWidth);
+  const sidebarWidthPx = sidebarVisible ? sidebarWidth : 0;
+  const [dockMode, shellRef] = useDockMode(sidebarWidthPx);
+  const dockAutoCollapsed = useRef(false);
+  useEffect(() => {
+    const st = useStore.getState();
+    // With Moa off there is no panel to collapse or restore: leave its flag,
+    // and forget a collapse from before, so it cannot reopen the panel later.
+    if (!selectMoaOn(st)) { dockAutoCollapsed.current = false; return; }
+    if (dockMode === 'overlay' && st.channelDockVisible) {
+      dockAutoCollapsed.current = true;
+      st.setChannelDockVisible(false);
+    } else if (dockMode === 'inline' && dockAutoCollapsed.current) {
+      dockAutoCollapsed.current = false;
+      if (!st.channelDockVisible) st.setChannelDockVisible(true);
+    }
+    // Only a mode change collapses or restores; opening the overlay later
+    // must not be undone.
+  }, [dockMode]);
   const fileTreeVisible = useStore((s) => s.fileTreeVisible);
   const companyViewVisible = useStore((s) => s.companyViewVisible);
   const setCompanyViewVisible = useStore((s) => s.setCompanyViewVisible);
@@ -676,7 +785,6 @@ export default function AppLayout() {
   // stores/selectors/appLayout.ts) that don't change on churn or switch.
   const hasActiveWorkspace = useStore((s) => s.workspaces.some((w) => w.id === s.activeWorkspaceId));
   const projectCwdSignature = useStore(selectProjectCwdSignature);
-  const workspaceCount = useStore((s) => s.workspaces.length);
   // Fix 0 startup gate. See state machine diagram at top of file.
   const paneGate = useStore((s) => s.paneGate);
   const setPaneGate = useStore((s) => s.setPaneGate);
@@ -686,19 +794,19 @@ export default function AppLayout() {
   // Gate the cross-pane SearchResultsPanel mount at the layout level so its
   // 6-field zustand subscription doesn't run when the panel is closed (I3).
   const searchPanelOpen = useStore((s) => s.searchPanelOpen);
-  // Mount-gate the Fleet View overlay so its store subscriptions + selector
-  // only run while the cockpit is open (the open toggle lives in the global
-  // keyboard handler, not inside FleetView, so gating the mount is safe).
+  const remoteRepairHostId = useStore((s) => s.remoteRepairHostId);
+  const requestRemoteRepair = useStore((s) => s.requestRemoteRepair);
+  // The rail page shown in the sheet. Anything but Workspaces covers the
+  // sidebar, panes and dock, which stay mounted and inert underneath.
   const fleetViewVisible = useStore((s) => s.fleetViewVisible);
+  const appRoute = useStore((s) => s.appRoute);
   // TASK-2: render gates for the lazy overlays. Lift each component's own
   // internal open/visible flag to the layout so the lazy chunk is fetched only
   // when the overlay actually opens (the components self-gate on these exact
-  // fields, so behavior is identical). SettingsPanel must also stay mounted
-  // while inspect mode is active (SettingsPanel.tsx: "Settings stays mounted
-  // the whole time" during inspect), hence the extra inspectModeActive term.
+  // fields, so behavior is identical). Inspect mode picks colours on the live
+  // Workspaces page, so it keeps that page interactive under its overlay.
   const commandPaletteVisible = useStore((s) => s.commandPaletteVisible);
   const worktaskCleanupVisible = useStore((s) => s.worktaskCleanupVisible);
-  const settingsPanelVisible = useStore((s) => s.settingsPanelVisible);
   const inspectModeActive = useStore((s) => s.inspectModeActive);
   // S-C2: while the Fleet View's Approvals tab owns the screen, it is the SOLE
   // approval surface — suppress the standalone A2A / MCP modals (delta 5, one
@@ -715,21 +823,44 @@ export default function AppLayout() {
 
   // ─── First-run wizard + cheat sheet (T8a) ───────────────────────────────
   // Local visibility state for the wizard (null = hidden, otherwise mode).
-  // The cheat sheet visibility is derived from uiSlice: it mounts whenever
-  // the first run is completed AND the user has not permanently dismissed it.
-  // Flipping `cheatSheetDismissed` back to false from Settings (T8b) is what
-  // re-mounts the cheat sheet — observing the slice directly here removes the
-  // earlier local-state gate that left the Settings button dead (C1 fix).
+  // The cheat sheet mounts only while `cheatSheetForceShown` is set: the `?`
+  // prefix action and the Settings button force-show it immediately, and the
+  // first-boot queue auto-shows it once (using up `!cheatSheetDismissed`).
   const firstRunCompleted = useStore((s) => s.firstRunCompleted);
   const cheatSheetDismissed = useStore((s) => s.cheatSheetDismissed);
-  // Bypasses the dismissed gate when the `?` prefix action sets it. Without
-  // this subscription here the component never mounts after a permanent
-  // dismissal, so the override would have nothing to react to.
   const cheatSheetForceShown = useStore((s) => s.cheatSheetForceShown);
   const setFirstRunCompleted = useStore((s) => s.setFirstRunCompleted);
   const [showFirstRunWizard, setShowFirstRunWizard] = useState<'firstRun' | 'reopen' | null>(null);
+  // The wizard ran on this boot — it offered the hooks install itself, so the
+  // launch-time hooks prompt stands down (hooksLaunchCheck).
+  const [firstRunWizardRanThisBoot, setFirstRunWizardRanThisBoot] = useState(false);
+  // Set only by the firstRun.check outcome (resolved, rejected or absent).
+  // The store's firstRunCompleted is not enough: loadSession can set it before
+  // the probe answers, which would let the hooks check run before we know the
+  // wizard is coming.
+  const [firstRunProbeSettled, setFirstRunProbeSettled] = useState(false);
 
+  // Pending = an upgrade from a build that never stored the choice; showing =
+  // the first-boot queue opened it (latched until a button is pressed).
   const [showAutoUpdatePrompt, setShowAutoUpdatePrompt] = useState(false);
+  const [autoUpdatePromptOpen, setAutoUpdatePromptOpen] = useState(false);
+  // The one-time "New: …" announcement, decided once the first-run probe
+  // says whether this is a fresh install.
+  const [featureNoticePending, setFeatureNoticePending] = useState(false);
+  // The announcement toast is not a modal layer, so the queue holds while it
+  // is still on screen (persistent until dismissed).
+  const [featureNoticeToastId, setFeatureNoticeToastId] = useState<string | null>(null);
+  const featureNoticeShowing = useStore(
+    (s) => featureNoticeToastId !== null && s.toasts.some((toast) => toast.id === featureNoticeToastId),
+  );
+  const settingsPanelVisible = useStore((s) => s.settingsPanelVisible);
+  const modalLayerCount = useSyncExternalStore(subscribeModalLayers, openModalLayerCount);
+  // The launch-time hooks check has answered (or has no bridge to ask): its
+  // dialog opens after an async probe, so the queue waits for that answer.
+  const [hooksLaunchCheckDone, setHooksLaunchCheckDone] = useState(
+    () => !window.electronAPI?.deck?.hooksBridge,
+  );
+  const handleHooksLaunchCheckDone = useCallback(() => setHooksLaunchCheckDone(true), []);
   const t = useT();
 
   useRefusedInstallNotice(t);
@@ -754,10 +885,19 @@ export default function AppLayout() {
   // per-pane agent status whenever it changes, so main resolves hooks/routing
   // locally instead of round-tripping workspace.list back to the renderer.
   useWorkspaceMirrorPush();
+  useMoaSync();
   // S-C2 Approval Inbox bridge: the SINGLE owner of permissionPrompt.onOpen /
   // onClosed (guard #2). Always-on (not gated on fleetViewVisible) so MCP
   // prompts accumulate in the store before the cockpit's Approvals tab opens.
   useApprovalInboxBridge();
+  // browser_request_help — the SINGLE owner of browserHelp.onOpen / onClosed.
+  // Always-on for the same reason as the approval bridge: a request must land in
+  // the store (and jump to its pane) whichever surface the operator is on.
+  useBrowserHelpBridge();
+  useUsageLimitBridge();
+  // Workspace settle / snooze — main owns the state; this mirrors it and
+  // raises the Undo toasts.
+  useWorkspaceSettleBridge();
   // LanLink PR-2 — own the remote-inbox subscription (always-on, mounted once)
   // so remote peer messages accumulate in the store before any surface opens.
   useRemoteInboxBridge();
@@ -784,6 +924,8 @@ export default function AppLayout() {
   // 사이드바 "Missions" 섹션 + FleetCard 미션 라인을 채운다(순수 pull, 성긴 폴링 —
   // useMissionsPolling 헤더 참조).
   useMissionsPolling();
+  // Warn when an agent starts in a fan-out task's checkout from another workspace.
+  useCheckoutOwnershipWarning();
   // TASK-9 cold-park: sparse sweep that unmounts terminals of long-hidden
   // workspaces to reclaim renderer RAM (reveal replays from the daemon snapshot).
   useColdParkSweep();
@@ -807,7 +949,9 @@ export default function AppLayout() {
   // Rationale and trigger choice live in terminal/atlasWakeRecovery.ts.
   useEffect(() => {
     // optional-chain electronAPI — jsdom (tests) has no preload bridge; an
-    // older main without the push degrades to visibility-only recovery.
+    // older main without the push degrades to visibility-only recovery (the
+    // module tracks whether a resume is ever actually DELIVERED, so a platform
+    // where powerMonitor never fires keeps that fallback — see #1234).
     const onResumed = (window as any).electronAPI?.system?.onResumed;
     return initAtlasWakeRecovery({
       onSystemResumed:
@@ -818,8 +962,11 @@ export default function AppLayout() {
   // #882 — one renderer-wide subscription to "is anyone looking at this
   // window" (minimized / hidden to tray / screen locked), which panes fold
   // into their #766 viewer-visibility report. All platforms: the bit is right
-  // everywhere, it is only Windows where `document.visibilityState` could not
-  // supply it. See hooks/useWindowDisplayed.ts.
+  // everywhere, whereas `document.visibilityState` cannot supply it — on
+  // Windows it is occlusion-driven, so it flips on an ordinary alt-tab and says
+  // nothing about whether the window is minimized or the screen is locked
+  // (#1234 corrected the earlier claim that it never flips there at all).
+  // See hooks/useWindowDisplayed.ts.
   useEffect(() => windowDisplayedStore.init(), []);
 
 
@@ -881,6 +1028,12 @@ export default function AppLayout() {
   const [isDragging, setIsDragging] = useState(false);
   const dragCounterRef = useRef(0);
   const sessionLoadedRef = useRef(false);
+  // #1276: render-visible mirror of sessionLoadedRef, so the onboarding-start
+  // effect re-runs when the session lands and the cheat-sheet gate reads the
+  // same input. sessionLoadFailed settles the gate when session.load() throws
+  // (the ref intentionally stays false then — see the save guards below).
+  const [sessionLoaded, setSessionLoaded] = useState(false);
+  const [sessionLoadFailed, setSessionLoadFailed] = useState(false);
   // Fix 0: monotonic startup generation counter. Each mount-effect run
   // bumps it; the startup catch only fires clearAllPtyState if its own
   // gen still matches the current ref. Prevents a stale startup from
@@ -924,6 +1077,14 @@ export default function AppLayout() {
       const activeSurface = leaf.surfaces.find((s) => s.id === leaf.activeSurfaceId);
       // browser/editor/diff는 PTY가 없어 경로 붙여넣기 대상이 아님(J2 — diff 추가).
       if (!activeSurface || activeSurface.surfaceType === 'browser' || activeSurface.surfaceType === 'editor' || activeSurface.surfaceType === 'diff' || activeSurface.surfaceType === 'remote-terminal') return;
+
+      // Chat view shows the drop as a composer chip; typing the path into the
+      // hidden terminal would attach it where the user cannot see it. With no
+      // composer to take it, the drop is dropped — never typed into the PTY.
+      if ((activeSurface.viewMode === 'chat' && state.chatViewEnabled) || isChatV2Covering(activeSurface.ptyId)) {
+        if (activeSurface.ptyId) deliverChatDrop(activeSurface.ptyId, paths);
+        return;
+      }
 
       const text = paths.map((p) => (p.includes(' ') ? `"${p}"` : p)).join(' ');
       // Route the joined path string through the paste chunker. Single-file
@@ -1256,9 +1417,11 @@ export default function AppLayout() {
       try {
         const saved = await window.electronAPI.session.load();
         if (!saved) {
+          // Nothing to restore; let the boot site-guides auto-enable proceed.
+          useStore.getState().markSessionSettingsLoaded();
           sessionLoadedRef.current = true;
-          // First ever launch — ask about auto-update
-          setShowAutoUpdatePrompt(true);
+          setSessionLoaded(true);
+          // First ever launch: the welcome dialog's auto-update row asks.
           return;
         }
 
@@ -1287,6 +1450,13 @@ export default function AppLayout() {
         }
 
         sessionLoadedRef.current = true;
+        setSessionLoaded(true);
+        // Only a saved session that brought workspaces back counts as
+        // restored: an empty one leaves the fresh default workspace in place,
+        // whose id matches nothing on disk (main's startup Deck reconcile).
+        if (Array.isArray(saved.workspaces) && saved.workspaces.length > 0) {
+          useStore.getState().markSessionRestored();
+        }
 
         if (isFirstAutoUpdateChoice) {
           setShowAutoUpdatePrompt(true);
@@ -1352,6 +1522,7 @@ export default function AppLayout() {
         // consistent blank slate. Generation check prevents a stale startup
         // from wiping state a fresher startup already reconciled correctly.
         console.warn('[AppLayout] startup reconcile failed:', err);
+        if (!sessionLoadedRef.current) setSessionLoadFailed(true);
         abortCtl?.abort();
         if (gen === startupGenRef.current) {
           clearAllPtyState();
@@ -1381,18 +1552,32 @@ export default function AppLayout() {
   useEffect(() => {
     let cancelled = false;
     const api = window.electronAPI.firstRun;
-    if (!api) return; // preload may not yet expose firstRun in non-Electron contexts (tests)
+    if (!api) {
+      // preload may not yet expose firstRun in non-Electron contexts (tests)
+      setFirstRunProbeSettled(true);
+      return;
+    }
     void api.check().then((result) => {
       if (cancelled) return;
+      setFirstRunProbeSettled(true);
       if (!result.shown) {
         setShowFirstRunWizard('firstRun');
+        setFirstRunWizardRanThisBoot(true);
+        // A fresh install has no earlier behaviour to announce a change to.
+        markPrWakeNoticeSeen();
       } else {
         setFirstRunCompleted(true);
+        setFeatureNoticePending(prWakeNoticePending());
       }
     }).catch(() => {
       // Best-effort. If main is unreachable, fall back to "completed" so
       // the user is not blocked by a missing wizard channel.
-      if (!cancelled) setFirstRunCompleted(true);
+      if (!cancelled) {
+        setFirstRunCompleted(true);
+        setFirstRunProbeSettled(true);
+        // No announcement: a failed probe cannot tell a fresh install from an
+        // upgrade, and a fresh install must never get a "New: …" toast.
+      }
     });
     return () => {
       cancelled = true;
@@ -1429,20 +1614,70 @@ export default function AppLayout() {
   // but that path does not exist for the terminal brain (no composer — the TUI
   // is the input) and never covered scheduled / event-woken turns.
   const deckBrainModelLive = useStore((s) => s.deckBrainModel);
+  const deckBrainEffortLive = useStore((s) => s.deckBrainEffort);
   useEffect(() => {
-    void window.electronAPI?.deck?.modelSet?.(deckBrainModelLive);
-  }, [deckBrainModelLive]);
+    void window.electronAPI?.deck?.modelSet?.(deckBrainModelLive, deckBrainEffortLive);
+  }, [deckBrainModelLive, deckBrainEffortLive]);
 
-  // ─── First-run onboarding (spotlight) detection ─────────────────────
-  // D8: spotlight stays gated behind firstRunCompleted so the wizard always
-  // wins the first impression. Once the wizard completes/dismisses, the
-  // spotlight tutorial picks up the UI tour for single-workspace users.
+  // An upgrader may answer the update question in Settings › General before
+  // the queue reaches the prompt: any change after hydration answers it.
+  const autoUpdateEnabled = useStore((s) => s.autoUpdateEnabled);
+  const hydratedAutoUpdateRef = useRef<boolean | null>(null);
   useEffect(() => {
-    if (!sessionLoadedRef.current) return;
-    if (firstRunCompleted && !onboardingCompleted && workspaceCount === 1) {
-      startOnboarding();
+    if (!sessionLoaded) return;
+    if (hydratedAutoUpdateRef.current === null) {
+      hydratedAutoUpdateRef.current = autoUpdateEnabled;
+      return;
     }
-  }, [firstRunCompleted, onboardingCompleted, workspaceCount, startOnboarding]);
+    if (autoUpdateEnabled !== hydratedAutoUpdateRef.current) setShowAutoUpdatePrompt(false);
+  }, [sessionLoaded, autoUpdateEnabled]);
+
+  // ─── First-boot queue: one self-opening surface at a time ────────────
+  // The wizard owns the first impression; after it, the legacy update
+  // question (upgraders only), the one-time "New: …" toast (upgraders only),
+  // the spotlight tour (first visit to the Fleet page) and the keyboard cheat
+  // sheet (once, after the tour) each wait until nothing else is open — no
+  // dialog, no Settings panel, no other queued surface. Each start is latched
+  // here: the surface's own modal layer must not count against itself.
+  const firstBootNext = nextFirstBootSurface({
+    firstRunSettled: firstRunProbeSettled,
+    sessionSettled: sessionLoaded || sessionLoadFailed,
+    launchChecksSettled: hooksLaunchCheckDone
+      || hooksLaunchCheck({ firstRunSettled: firstRunProbeSettled, firstRunWizardRanThisBoot }) === 'skip',
+    wizardOpen: showFirstRunWizard !== null,
+    wizardRanThisBoot: firstRunWizardRanThisBoot,
+    otherSurfaceOpen: modalLayerCount > 0 || settingsPanelVisible,
+    surfaceShowing: autoUpdatePromptOpen || onboardingActive || cheatSheetForceShown || featureNoticeShowing,
+    autoUpdatePromptPending: showAutoUpdatePrompt,
+    featureNoticePending,
+    firstRunCompleted,
+    onboardingCompleted,
+    onFleetPage: appRoute === 'fleet',
+    cheatSheetPending: !cheatSheetDismissed,
+  });
+  useEffect(() => {
+    // A dialog that mounted in this same commit has registered its layer
+    // already (child effects run first) but not yet re-rendered us.
+    if (!firstBootNext || openModalLayerCount() > 0) return;
+    const st = useStore.getState();
+    switch (firstBootNext) {
+      case 'autoUpdatePrompt':
+        setAutoUpdatePromptOpen(true);
+        break;
+      case 'featureNotice':
+        setFeatureNoticePending(false);
+        setFeatureNoticeToastId(showPrWakeNoticeOnce());
+        break;
+      case 'onboarding':
+        startOnboarding();
+        break;
+      case 'cheatSheet':
+        // Shown once: used up as it opens, then shown like the `?` action.
+        st.setCheatSheetDismissed(true);
+        st.setCheatSheetForceShown(true);
+        break;
+    }
+  }, [firstBootNext, modalLayerCount, startOnboarding]);
 
   // Re-reconcile when daemon connects late (respawn/reconnect after the
   // startup reconcile already ran). Gating + abort/timeout/preserve logic
@@ -1560,6 +1795,7 @@ export default function AppLayout() {
   //     respawn re-derives badges without waiting for the next event.
   useEffect(() => {
     const hydrate = () => {
+      const requestedAt = Date.now();
       void window.electronAPI.pty.list().then((sessions) => {
         const snapshot: Record<string, { status: 'armed' | 'stopped'; restartCount: number }> = {};
         // X6 ②: resume hints for recovered interactive agent panes.
@@ -1587,7 +1823,8 @@ export default function AppLayout() {
         // are the two signals that the TUI is gone — drop the identity so
         // auto-name, image-paste `auto`, and the principal registry stop
         // treating the leftover shell as Claude.
-        clearSurfaceAgentsKnownGone(agentAliveSnapshot, commandRunningSnapshot);
+        clearSurfaceAgentsKnownGone(agentAliveSnapshot, commandRunningSnapshot, requestedAt);
+        seedSurfaceAgentsFromProcess(sessions, agentAliveSnapshot, commandRunningSnapshot);
         // 4d (channels): seed agent identity for panes the user has NOT
         // visited yet, so recovered agents show up as invite/mention
         // candidates right after boot instead of only after a visit.
@@ -1647,6 +1884,7 @@ export default function AppLayout() {
   // note). One in-memory list RPC per 15s; negligible against the daemon idle diet.
   useEffect(() => {
     const refreshBindings = () => {
+      const requestedAt = Date.now();
       void window.electronAPI.pty.list().then((sessions) => {
         const snapshot: Record<string, ResumeBinding> = {};
         // OSC 133 shell state rides the same poll — keeps the chip's authoritative
@@ -1663,7 +1901,10 @@ export default function AppLayout() {
         useStore.getState().hydrateResumeBindings(snapshot);
         useStore.getState().hydrateCommandRunning(cmdSnapshot);
         useStore.getState().hydrateAgentAlive(agentAliveSnapshot);
-        clearSurfaceAgentsKnownGone(agentAliveSnapshot, cmdSnapshot);
+        clearSurfaceAgentsKnownGone(agentAliveSnapshot, cmdSnapshot, requestedAt);
+        // An agent relaunched after boot (the Resume pill) is attributed by
+        // the daemon seconds later; this tick is what brings its row back.
+        seedSurfaceAgentsFromProcess(sessions, agentAliveSnapshot, cmdSnapshot);
       }).catch(() => { /* transient list failure — the next tick self-heals */ });
     };
     const id = window.setInterval(refreshBindings, 15_000);
@@ -1767,8 +2008,8 @@ export default function AppLayout() {
 
   // Wizard close handler (T8a). Mirrors firstRunCompleted into uiSlice (main
   // already wrote the marker via firstRun:complete or :dismiss). The cheat
-  // sheet auto-mounts via the derived condition below as soon as
-  // firstRunCompleted flips true (D11) — no separate reveal flag needed.
+  // sheet auto-mounts via the derived condition below once firstRunCompleted
+  // flips true (D11) and the consent prompt / spotlight have cleared (#1276).
   const handleWizardClose = useCallback(() => {
     setShowFirstRunWizard(null);
     setFirstRunCompleted(true);
@@ -1779,7 +2020,13 @@ export default function AppLayout() {
   return (
     <ErrorBoundary name="AppLayout">
     <div
-      className="flex flex-col h-screen w-screen bg-[var(--bg-base)] overflow-hidden"
+      // Clip rather than hide overflow (#1688). The sheet (.wmux-shell-body)
+      // already clips the parked agent toolbar; the titlebar and the icon rail
+      // sit outside it, and a rail taller than a short window must not give
+      // this box a scroll range a focus or caret reveal can move. Keep the
+      // scroll pin as a backstop against the titlebar sliding away (#1679).
+      data-pin-scroll
+      className="wmux-app-root flex flex-col h-screen w-screen bg-[var(--bg-base)] overflow-clip"
       style={{
         ...(prefixMode ? {
           boxShadow: 'inset 0 0 0 2px var(--accent-red)',
@@ -1790,16 +2037,30 @@ export default function AppLayout() {
         }),
       }}
     >
-      {/* Bridge redesign — custom 36px titlebar spans the FULL window width,
+      {/* Bridge redesign — custom 40px titlebar spans the FULL window width,
           above the sidebar|main|dock row. The BrowserWindow is frameless
           (titleBarStyle:'hidden'), so this bar owns window dragging. */}
       <ErrorBoundary name="Titlebar">
         <Titlebar />
       </ErrorBoundary>
-      <div className={`flex flex-1 min-h-0 ${sidebarPosition === 'right' ? 'flex-row-reverse' : ''}`}>
-      <ErrorBoundary name="Sidebar">
-        {sidebarVisible ? <Sidebar /> : <MiniSidebar />}
+      {/* The icon rail sits on the window frame beside the floating sheet and
+          stays when the sidebar collapses (MiniSidebar `rail`); the sheet holds
+          the sidebar, the panes and the dock. */}
+      <div className={`wmux-frame-row flex flex-1 min-h-0 ${sidebarPosition === 'right' ? 'flex-row-reverse' : ''}`}>
+      <ErrorBoundary name="SidebarRail">
+        <MiniSidebar rail collapsed={!sidebarVisible} />
       </ErrorBoundary>
+      <div ref={shellRef} className={`wmux-shell-body relative flex flex-1 min-h-0 min-w-0 ${sidebarPosition === 'right' ? 'flex-row-reverse' : ''}`}>
+      {/* The Workspaces page. Another rail page covers it (RailPage) while it
+          stays mounted, full size and inert, so no PTY is resized or lost. */}
+      <div className="contents" inert={appRoute !== 'workspaces' && !inspectModeActive} data-workspaces-page>
+      {/* The column animates a toggle and holds terminal fits until it ends
+          (SidebarSlot), so panes refit once instead of per frame. */}
+      <SidebarSlot visible={sidebarVisible} width={sidebarWidth} position={sidebarPosition}>
+        <ErrorBoundary name="Sidebar">
+          <Sidebar chrome="sheet" />
+        </ErrorBoundary>
+      </SidebarSlot>
       <ErrorBoundary name="Main">
       {/* `relative` anchors ToolbarHost: the agent toolbar overlays this column
           rather than taking a row, so revealing it never resizes a PTY. */}
@@ -1818,6 +2079,10 @@ export default function AppLayout() {
             NOT in AppLayout, so the switch re-renders these tiny components
             instead of the ~1300-line chrome (2026-07-13 switch-lag fix). */}
         <EmptyLeafFunnel />
+        {/* Glance board: the sidebar's "changed since you last looked"
+            snapshot. A null component so its subscription never re-renders
+            this layout. */}
+        <SidebarSeenTracker />
         <FocusManager />
         <ErrorBoundary name="ComposeHost">
           <ComposeHost />
@@ -1826,7 +2091,7 @@ export default function AppLayout() {
             ErrorBoundary's fallback is a plain `height:100%` block — as a flex
             child it would join the column's flow and squeeze the pane grid. So
             the BOUNDARY is the absolutely-positioned thing: a crash costs the
-            bar's own 36px strip, never the terminals' height. ToolbarHost's
+            bar's own 40px strip, never the terminals' height. ToolbarHost's
             own `inset-0` fills this box, so the trigger band still measures to
             the column's bottom edge. */}
         <div
@@ -1846,30 +2111,46 @@ export default function AppLayout() {
           reflows the panes instead of the old fixed overlay that covered them.
           Holds the channel list + active conversation; collapsible. */}
       {/* Collapsed, the deck renders NOTHING here — the terminals take the
-          whole width. The way back is the titlebar's DeckToggle beside
-          Settings (owner decision 2026-08-18, replacing the 36px glyph rail).
+          whole width. The way back is Moa's titlebar button; with Moa off
+          there is no panel at all (owner decision 2026-08-18, replacing the 36px glyph rail).
           The rail spent a full-height column on four glyphs and an expand
           chevron, ~85% of it empty; one button on a row that already exists
           costs the terminals nothing. */}
-      {channelDockVisible && (
+      </div>
+      {/* The dock stays interactive beside every rail page but Settings (they
+          cover only the sidebar and the panes, so Moa is in reach); Settings
+          covers it, inert, like the rest of the Workspaces page. Both dock
+          modes live in this region: `contents` keeps the inline dock the same
+          flex item it always was, and the overlay still positions against
+          the sheet. */}
+      <div className="contents" inert={!dockShownOn(appRoute) && !inspectModeActive} data-dock-region>
+      {dockOpen && dockMode === 'inline' && (
         <ErrorBoundary name="ChannelDock">
           <ChannelDock />
         </ErrorBoundary>
       )}
-      {/* S-C1 Fleet View (Ctrl+Shift+A) — NB2 파동2 사이클 A에서 전체화면 모달을
-          상시 크롬으로 전환. ChannelDock과 같은 flex 형제 패턴으로 워크스페이스
-          사이드바 반대편 엣지에 고정폭으로 앉아 페인을 reflow한다(더 이상 z-fleet
-          fixed 오버레이가 아니다). Mount-gated on fleetViewVisible. */}
-      {fleetViewVisible && (
-        <ErrorBoundary name="FleetView">
-          <FleetView />
-        </ErrorBoundary>
+      {/* Too narrow for the dock beside the panes: it floats over them on the
+          far edge instead, and never reflows a PTY. */}
+      {dockOpen && dockMode === 'overlay' && (
+        <div
+          data-dock-overlay
+          className={`absolute inset-y-0 z-30 flex max-w-full ${sidebarPosition === 'right' ? 'left-0' : 'right-0'}`}
+        >
+          <ErrorBoundary name="ChannelDock">
+            <ChannelDock />
+          </ErrorBoundary>
+        </div>
       )}
+      </div>
+      <div className="contents" inert={appRoute !== 'workspaces' && !inspectModeActive} data-workspaces-page>
       {fileTreeVisible && (
         <ErrorBoundary name="FileTree">
           <FileTreePanel position={sidebarPosition === 'left' ? 'right' : 'left'} />
         </ErrorBoundary>
       )}
+      </div>
+      {/* Fleet, Schedules, Remote or Settings, swapped in by the rail. */}
+      <RailPage />
       <NotificationPanel />
       <MessageFeedPanel />
       {/* Cross-pane search results panel (T-F). Mount-gated on
@@ -1883,6 +2164,11 @@ export default function AppLayout() {
       {/* TASK-2: lazy overlays, render-gated on their own store flags and
           wrapped in <Suspense fallback={null}> inside <ErrorBoundary> so a
           failed chunk load surfaces instead of silently dropping the overlay. */}
+      {/* Always mounted: it opens on an event (⌘⇧2 / F2, sidebar) and renders
+          nothing until then. */}
+      <ErrorBoundary name="AgentMentionPicker"><AgentMentionPicker /></ErrorBoundary>
+      {/* The Git page's hand-off confirm (a drop on an agent pane / workspace row, or Send to agent…). */}
+      <ErrorBoundary name="HandoffPopover"><HandoffPopover /></ErrorBoundary>
       {commandPaletteVisible && (
         <ErrorBoundary name="CommandPalette">
           <Suspense fallback={null}><CommandPalette /></Suspense>
@@ -1891,14 +2177,6 @@ export default function AppLayout() {
       {worktaskCleanupVisible && (
         <ErrorBoundary name="WorktaskCleanupView">
           <Suspense fallback={null}><WorktaskCleanupView /></Suspense>
-        </ErrorBoundary>
-      )}
-      {/* SettingsPanel: gate on visible OR inspect-active — inspect mode keeps
-          the panel mounted while the overlay picks colors (D3 / SettingsPanel
-          ESC + inspect contract). */}
-      {(settingsPanelVisible || inspectModeActive) && (
-        <ErrorBoundary name="SettingsPanel">
-          <Suspense fallback={null}><SettingsPanel /></Suspense>
         </ErrorBoundary>
       )}
       {/* Color inspect-mode overlay (S4). Sits at --z-inspect (65, declared
@@ -1914,56 +2192,33 @@ export default function AppLayout() {
       {!inboxOwnsApprovals && <ExecuteApprovalDialog />}
       {!inboxOwnsApprovals && <PermissionApprovalDialogContainer />}
       <ProjectConfigDialog />
+      {/* "Pair again" from a remote workspace whose host rejected us. Lives
+          here because re-pairing removes that host's views. */}
+      {remoteRepairHostId && (
+        <AttachRemoteModal
+          key={remoteRepairHostId}
+          repairHostId={remoteRepairHostId}
+          onClose={() => requestRemoteRepair(null)}
+        />
+      )}
 
       {onboardingActive && (
         <OnboardingOverlay onComplete={() => { completeOnboarding(); }} />
       )}
 
-      {/* First-run auto-update prompt */}
-      {showAutoUpdatePrompt && (
-        <div
-          className="fixed inset-0 z-[var(--z-modal)] flex items-center justify-center"
-          style={{ backgroundColor: 'var(--backdrop-modal)' }}
-        >
-          <div
-            className="flex flex-col gap-4 p-6 rounded-xl"
-            style={{
-              width: 400,
-              backgroundColor: 'var(--bg-base)',
-              border: '1px solid var(--bg-surface)',
-              boxShadow: 'var(--shadow-modal)',
-            }}
-          >
-            <p className="text-sm font-semibold text-[color:var(--text-main)] font-mono">
-              {t('firstRun.autoUpdateTitle')}
-            </p>
-            <p className="text-xs text-[color:var(--text-sub)]">
-              {t('firstRun.autoUpdateMessage')}
-            </p>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => {
-                  useStore.getState().setAutoUpdateEnabled(false);
-                  window.electronAPI.settings.setAutoUpdateEnabled(false);
-                  setShowAutoUpdatePrompt(false);
-                }}
-                className="ui-btn ui-btn-secondary"
-              >
-                {t('firstRun.disable')}
-              </button>
-              <button
-                onClick={() => {
-                  useStore.getState().setAutoUpdateEnabled(true);
-                  window.electronAPI.settings.setAutoUpdateEnabled(true);
-                  setShowAutoUpdatePrompt(false);
-                }}
-                className="ui-btn ui-btn-primary"
-              >
-                {t('firstRun.enable')}
-              </button>
-            </div>
-          </div>
-        </div>
+      {/* Auto-update consent for an upgrade that never stored the choice
+          (#1164). A fresh install answers it in the welcome dialog's row;
+          this one opens through the first-boot queue, never over another
+          surface. */}
+      {autoUpdatePromptOpen && (
+        <AutoUpdatePrompt
+          onChoose={(enabled) => {
+            useStore.getState().setAutoUpdateEnabled(enabled);
+            window.electronAPI.settings.setAutoUpdateEnabled(enabled);
+            setShowAutoUpdatePrompt(false);
+            setAutoUpdatePromptOpen(false);
+          }}
+        />
       )}
 
       {/* First-run wizard (T8a). Sits at --z-dialog (70, declared inside the
@@ -1974,13 +2229,11 @@ export default function AppLayout() {
         <FirstRunWizard mode={showFirstRunWizard} onClose={handleWizardClose} />
       )}
 
-      {/* Keyboard cheat sheet (T8a / Plan 1.18). Mounts derivatively from
-          firstRunCompleted + !cheatSheetDismissed so that flipping
-          cheatSheetDismissed=false from Settings (T8b) immediately re-mounts
-          the sheet. The component itself is a no-op when dismissed (D11).
-          `cheatSheetForceShown` (set by the `?` prefix action) bypasses the
-          permanent dismissal so the cheat sheet can always be pulled back up. */}
-      {firstRunCompleted && (!cheatSheetDismissed || cheatSheetForceShown) && <KeyboardCheatSheet />}
+      {/* Keyboard cheat sheet (T8a / Plan 1.18). Mounted only while shown:
+          the `?` prefix action and Settings › First-run setup force-show it
+          immediately; the first-boot queue auto-shows it once, after the tour
+          (#1276) — never by itself on a first run. */}
+      {firstRunCompleted && cheatSheetForceShown && <KeyboardCheatSheet />}
 
       {companyViewVisible && (
         <CompanyView onClose={() => setCompanyViewVisible(false)} />
@@ -2002,7 +2255,14 @@ export default function AppLayout() {
       )}
       <FloatingPane />
       <ToastContainer />
-      <HooksInstallPromptContainer t={t} />
+      <MoaHqMissingNotice />
+      <HooksInstallPromptContainer
+        t={t}
+        launchCheck={hooksLaunchCheck({ firstRunSettled: firstRunProbeSettled, firstRunWizardRanThisBoot })}
+        deferred={showFirstRunWizard !== null}
+        onLaunchCheckDone={handleHooksLaunchCheckDone}
+      />
+      </div>
       </div>
     </div>
     </ErrorBoundary>

@@ -1,3 +1,6 @@
+import { registerQuickCommandHandlers } from './handlers/quickCommand.handler';
+import { registerUsageLimitHandlers } from '../usageLimit/usageLimit.handler';
+import { registerWorkspaceSettle } from '../workspace/settle/workspaceSettleHost';
 import { ipcMain, type BrowserWindow } from 'electron';
 import { PTYManager } from '../pty/PTYManager';
 import { PTYBridge } from '../pty/PTYBridge';
@@ -18,6 +21,7 @@ import { registerFontHandlers } from './handlers/fonts.handler';
 import { registerMetadataHandlers } from './handlers/metadata.handler';
 import { startLocalContextWatch } from '../metadata/localContextWatch';
 import { registerClipboardHandlers } from './handlers/clipboard.handler';
+import { registerAgentModelsHandlers } from './handlers/agentModels.handler';
 import { registerHooksBridgeHandlers } from './handlers/hooksBridge.handler';
 import { registerStatuslineBridgeHandlers } from './handlers/statuslineBridge.handler';
 import { registerFsHandlers } from './handlers/fs.handler';
@@ -25,17 +29,30 @@ import { registerToolbarHandlers } from './handlers/toolbar.handler';
 import { registerDiffHandlers } from './handlers/diff.handler';
 import { registerWorktreeHandlers } from './handlers/worktree.handler';
 import { registerGithubHandlers } from './handlers/github.handler';
+import { registerPrReviewHandlers } from './handlers/prReview.handler';
+import { registerWorkLinkHandlers } from './handlers/workLink.handler';
+import { registerTrackRecordHandlers } from './handlers/trackRecord.handler';
+import { registerGitShipHandlers } from './handlers/gitShip.handler';
+import { registerGhLoginHandlers } from './handlers/ghLogin.handler';
 import { registerMcpHandlers } from './handlers/mcp.handler';
+import { registerTokenUsageQuotaHandlers } from './handlers/tokenUsageQuota.handler';
+import { registerTokenUsageSurfaceHandlers } from './handlers/tokenUsageSurface.handler';
+import { registerTokenUsageProfilesHandlers } from './handlers/tokenUsageProfiles.handler';
 import { registerLanLinkHandlers } from './handlers/lanlink.handler';
 import { registerPaneResourcesHandlers } from './handlers/paneResources.handler';
+import { registerChatHandlers } from './handlers/chat.handler';
+import { registerChatV2Handlers } from './handlers/chatv2.handler';
 import { registerWebHandlers } from './handlers/web.handler';
+import { registerAutomationHandlers } from './handlers/automation.handler';
 import { registerAccountHandlers } from './handlers/account.handler';
+import { registerAccountRotationHandlers } from './handlers/accountRotation.handler';
 import { createFlashFrameHandler } from '../window/flashFrame';
 import { applyUiZoom, winOverlayHeight } from '../window/uiZoom';
 import { IPC } from '../../shared/constants';
 import { toastManager } from '../pipe/handlers/notify.rpc';
 import { markRendererNotificationListenerReady } from '../notification/rendererNotificationReadiness';
 import { setMutedNotificationCategories } from '../notification/mutedCategories';
+import { setDefaultWslDistro } from '../pty/defaultWslDistro';
 import { updateUnreadBadge } from '../tray';
 import { eventBus } from '../events/EventBus';
 import { WMUX_EVENT_TYPES, type WmuxEventType } from '../../shared/events';
@@ -150,6 +167,8 @@ export function registerAllHandlers(
   options: RegisterHandlersOptions = {},
 ): () => void {
   const cleanupPty = registerPTYHandlers(ptyManager, ptyBridge, daemonClient, getWindow);
+  const cleanupUsageLimit = registerUsageLimitHandlers(daemonClient, getWindow);
+  const cleanupWorkspaceSettle = registerWorkspaceSettle(getWindow, { daemonClient, ptyManager });
   // session/scrollback handlers: installed elsewhere (module-load in
   // main/index.ts) and intentionally NOT in this swap cycle. See the
   // import-block note above for the race rationale.
@@ -162,6 +181,7 @@ export function registerAllHandlers(
     localPtyOwnership: !daemonClient,
   });
   registerClipboardHandlers();
+  registerAgentModelsHandlers();
   registerHooksBridgeHandlers();
   registerStatuslineBridgeHandlers();
   const cleanupFs = registerFsHandlers();
@@ -172,9 +192,20 @@ export function registerAllHandlers(
   const cleanupWorktree = registerWorktreeHandlers();
   // Deck Git 탭 PR 섹션 — gh CLI 기반(미설치/미인증은 fail-closed 안내).
   const cleanupGithub = registerGithubHandlers();
+  // PR review and CI on the Git page's detail pane.
+  const cleanupPrReview = registerPrReviewHandlers();
+  // Work links — read-only for the renderer (docs/work-links.md).
+  const cleanupWorkLinks = registerWorkLinkHandlers(getWindow);
+  // Moa's track record — the retro card and its schedule (Settings → Moa).
+  const cleanupTrackRecord = registerTrackRecordHandlers(getWindow);
+  const cleanupGitShip = registerGitShipHandlers();
+  const cleanupGhLogin = registerGhLoginHandlers(getWindow);
   const cleanupMcp = options.mcpRegistrar
     ? registerMcpHandlers(options.mcpRegistrar, options.getMcpAuthToken ?? (() => null))
     : null;
+  const cleanupTokenUsageQuota = registerTokenUsageQuotaHandlers();
+  const cleanupTokenUsageSurface = registerTokenUsageSurfaceHandlers();
+  const cleanupTokenUsageProfiles = registerTokenUsageProfilesHandlers();
   // LanLink PR-3 control plane — daemon-mode only (the enable/NIC state lives in
   // the daemon). Without a DaemonClient there is no control pipe to forward to, so
   // the handlers stay unregistered and the Settings section hides itself.
@@ -190,11 +221,19 @@ export function registerAllHandlers(
   // this whole function is re-run on every daemon connect/disconnect, so the
   // snapshot is refreshed each swap. With no daemon the handler resolves
   // `{ running:false, error }` rather than throwing (see web.handler.ts).
+  const cleanupChat = registerChatHandlers(daemonClient, getWindow);
+  // Chat v2 — unconditional like chat: with no daemon every call answers `unavailable`.
+  const cleanupChatV2 = registerChatV2Handlers(daemonClient, getWindow);
   const cleanupWeb = registerWebHandlers(() => daemonClient ?? null);
+  // Scheduled runs — unconditional like web: with no daemon the calls resolve
+  // empty / refused instead of meeting a missing handler.
+  const cleanupAutomation = registerAutomationHandlers(() => daemonClient ?? null);
 
   // Multi-account registry (M1) — renderer-only, mode-agnostic (main owns
   // accounts.json in both local and daemon mode; spawn env is resolved in main).
   const cleanupAccounts = registerAccountHandlers();
+  const cleanupAccountRotation = registerAccountRotationHandlers();
+  const cleanupQuickCommands = registerQuickCommandHandlers();
 
   // X1 local-mode context watchers (git HEAD fs.watch + PID-tree ports).
   // Daemon mode gets the same data from the daemon process via
@@ -207,6 +246,15 @@ export function registerAllHandlers(
   };
   ipcMain.removeAllListeners(IPC.TOAST_ENABLED);
   ipcMain.on(IPC.TOAST_ENABLED, onToastEnabled);
+
+  // #1103 — mirror the renderer's WSL distro choice; pty.create injects it
+  // as `wsl.exe -d <distro>` at the shell-resolution choke point. Rejected
+  // values degrade to no-args at use time, never to a broken spawn.
+  const onDefaultWslDistro = (_event: Electron.IpcMainEvent, distro: unknown): void => {
+    setDefaultWslDistro(typeof distro === 'string' ? distro : null);
+  };
+  ipcMain.removeAllListeners(IPC.SETTINGS_DEFAULT_WSL_DISTRO);
+  ipcMain.on(IPC.SETTINGS_DEFAULT_WSL_DISTRO, onDefaultWslDistro);
 
   // #516 — mirror the renderer's per-category mute so the no-renderer toast
   // fallback in dispatchNotification can honor it.
@@ -460,6 +508,8 @@ export function registerAllHandlers(
 
   return () => {
     cleanupPty();
+    cleanupUsageLimit();
+    cleanupWorkspaceSettle();
     // cleanupSession deliberately omitted — session/scrollback handlers
     // live outside this swap cycle (see import-block note above).
     cleanupShell();
@@ -471,16 +521,30 @@ export function registerAllHandlers(
     cleanupDiff();
     cleanupWorktree();
     cleanupGithub();
+    cleanupPrReview();
+    cleanupWorkLinks();
+    cleanupTrackRecord();
+    cleanupGitShip();
+    cleanupGhLogin();
     if (cleanupMcp) cleanupMcp();
+    cleanupTokenUsageQuota();
+    cleanupTokenUsageSurface();
+    cleanupTokenUsageProfiles();
     if (cleanupLanLink) cleanupLanLink();
     if (cleanupPaneResources) cleanupPaneResources();
     cleanupWeb();
+    cleanupAutomation();
+    cleanupChat();
+    cleanupChatV2();
     cleanupAccounts();
+    cleanupAccountRotation();
+    cleanupQuickCommands();
     // Mirror the register-side removeHandler so a teardown leaves no stale
     // handle behind (handle handlers are not .on listeners — see above).
     ipcMain.removeHandler(IPC.RPC_INVOKE);
     ipcMain.removeAllListeners(IPC.TOAST_ENABLED);
     ipcMain.removeAllListeners(IPC.MUTED_NOTIFICATION_CATEGORIES);
+    ipcMain.removeAllListeners(IPC.SETTINGS_DEFAULT_WSL_DISTRO);
     ipcMain.removeAllListeners(IPC.WINDOW_HIDE);
     ipcMain.removeAllListeners(IPC.WINDOW_FLASH_FRAME);
     ipcMain.removeAllListeners(IPC.NOTIFICATION_OS_TOAST);

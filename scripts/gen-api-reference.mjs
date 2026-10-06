@@ -237,6 +237,7 @@ const GROUP_ORDER = [
   { key: 'system.', title: 'system' },
   { key: 'notify', title: 'notify' },
   { key: 'browser.', title: 'browser' },
+  { key: 'computer.', title: 'computer' },
   { key: 'a2a.', title: 'a2a' },
   { key: 'company.a2a.', title: 'company.a2a' },
   { key: 'company.', title: 'company' },
@@ -328,8 +329,8 @@ function buildMarkdown() {
   p('- `capability` is the `wmuxPermissions` capability the method requires.');
   p('  `null` = bootstrap/introspection (any caller, no declaration needed).');
   p('  `wmux.internal` = reserved prefix no plugin can declare (internal-only;');
-  p('  legacy envelope-less callers grandfather through until #1111 closes');
-  p('  the lane — first release on or after 2026-09-30).');
+  p('  reached only through wmux\'s own curated lanes; an envelope-less caller');
+  p('  is refused since #1111 closed the legacy grandfather lane).');
   p('- `riskClass` drives the approval-dialog wording; blank for `null` and');
   p('  `wmux.internal` methods.');
   p('');

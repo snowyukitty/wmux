@@ -41,6 +41,22 @@ describe('PaneSlice', () => {
     store = createTestStore();
   });
 
+  describe('updatePaneSizes', () => {
+    it('writes to the named workspace, not the active one (a multiview tile)', () => {
+      const other = createWorkspace('Other');
+      store.setState((s) => { s.workspaces.push(other); });
+      store.getState().splitPane(other.rootPane.id, 'horizontal', other.id);
+      const otherRoot = store.getState().workspaces.find((w) => w.id === other.id)!.rootPane;
+      if (otherRoot.type !== 'branch') throw new Error('expected the split to create a branch');
+
+      store.getState().updatePaneSizes(otherRoot.id, [30, 70], other.id);
+
+      const after = store.getState().workspaces.find((w) => w.id === other.id)!.rootPane;
+      expect(after.type === 'branch' && after.sizes).toEqual([30, 70]);
+      expect(getActiveWorkspace(store).rootPane.type).toBe('leaf');
+    });
+  });
+
   describe('splitPane', () => {
     it('creates a branch with 2 children from a leaf', () => {
       const ws = getActiveWorkspace(store);
@@ -611,6 +627,25 @@ describe('PaneSlice', () => {
       expect(map['pty-4']).toBe('error');
     });
 
+    it('stamps the turn end once per turn, keeps it through the focus clear, drops it when a turn opens', () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(1_000);
+        store.getState().setSurfaceAgentStatus('pty-1', 'complete');
+        vi.setSystemTime(5_000);
+        store.getState().setSurfaceAgentStatus('pty-1', null);
+        store.getState().setSurfaceAgentStatus('pty-1', 'complete');
+        expect(store.getState().surfaceTurnEndAt['pty-1']).toBe(1_000);
+        store.getState().markSurfaceTurnOpen('pty-1');
+        expect(store.getState().surfaceTurnEndAt['pty-1']).toBeUndefined();
+        vi.setSystemTime(9_000);
+        store.getState().setSurfaceAgentStatus('pty-1', 'complete');
+        expect(store.getState().surfaceTurnEndAt['pty-1']).toBe(9_000);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('clears the entry on running / idle (non-attention statuses)', () => {
       store.getState().setSurfaceAgentStatus('pty-1', 'complete');
       store.getState().setSurfaceAgentStatus('pty-1', 'running');
@@ -790,6 +825,26 @@ describe('PaneSlice', () => {
       expect(store.getState().surfaceActivity['pty-act']).toBe('✎ fleet.ts');
       store.getState().closePane(closing.id);
       expect(store.getState().surfaceActivity['pty-act']).toBeUndefined();
+      expect(store.getState().surfaceLastActivity['pty-act']).toBeUndefined();
+    });
+
+    it('keeps the last activity past the turn-boundary clear, so a finished row can say what it did', () => {
+      store.getState().setSurfaceActivity('pty-1', '→ types.ts');
+      store.getState().setSurfaceActivity('pty-1', '$ npm test');
+      // Stop / SessionStart / StopFailure send '' — the live line goes, the last one stays.
+      store.getState().setSurfaceActivity('pty-1', '');
+      expect(store.getState().surfaceActivity['pty-1']).toBeUndefined();
+      expect(store.getState().surfaceLastActivity['pty-1']).toBe('$ npm test');
+      // The next turn's first tool replaces it.
+      store.getState().setSurfaceActivity('pty-1', '✎ fleet.ts');
+      expect(store.getState().surfaceLastActivity['pty-1']).toBe('✎ fleet.ts');
+    });
+
+    it('a session start (/clear, a restarted agent) drops the retained line', () => {
+      store.getState().setSurfaceActivity('pty-1', '$ npm test');
+      store.getState().setSurfaceActivity('pty-1', '');
+      store.getState().clearSurfaceLastActivity('pty-1');
+      expect(store.getState().surfaceLastActivity['pty-1']).toBeUndefined();
     });
   });
 
@@ -903,5 +958,69 @@ describe('surfacePendingQuestion lifecycle', () => {
     store.getState().setSurfacePendingQuestion('pty-1', 'Shall I merge?');
     store.getState().setSurfaceActivity('pty-1', '');
     expect(store.getState().surfacePendingQuestion['pty-1']).toBe('Shall I merge?');
+  });
+
+  // #1176 — seen markers ride the question lifecycle.
+  it('markSurfaceQuestionSeen records the CURRENT question text only', () => {
+    const store = createTestStore();
+    store.getState().setSurfacePendingQuestion('pty-1', 'Shall I merge?');
+    store.getState().markSurfaceQuestionSeen('pty-1');
+    expect(store.getState().surfaceQuestionSeen['pty-1']).toBe('Shall I merge?');
+    // A no-op without a live question — a stale marker would glow-drop a
+    // FUTURE question the user never saw.
+    store.getState().markSurfaceQuestionSeen('pty-2');
+    expect(store.getState().surfaceQuestionSeen['pty-2']).toBeUndefined();
+  });
+
+  it('a NEW question text is unseen again (the marker still names the old one)', () => {
+    const store = createTestStore();
+    store.getState().setSurfacePendingQuestion('pty-1', 'Shall I merge?');
+    store.getState().markSurfaceQuestionSeen('pty-1');
+    store.getState().setSurfacePendingQuestion('pty-1', 'Delete the repo?');
+    expect(store.getState().surfaceQuestionSeen['pty-1']).toBe('Shall I merge?');
+    // Text mismatch → the selector treats the new question as unseen.
+  });
+
+  it('the marker dies with the question on every clear path', () => {
+    const store = createTestStore();
+    store.getState().setSurfacePendingQuestion('pty-1', 'Shall I merge?');
+    store.getState().markSurfaceQuestionSeen('pty-1');
+
+    store.getState().setSurfaceActivity('pty-1', '✎ fleet.ts');
+    expect(store.getState().surfaceQuestionSeen['pty-1']).toBeUndefined();
+
+    store.getState().setSurfacePendingQuestion('pty-1', 'Again?');
+    store.getState().markSurfaceQuestionSeen('pty-1');
+    store.getState().markSurfaceRunning('pty-1');
+    expect(store.getState().surfaceQuestionSeen['pty-1']).toBeUndefined();
+
+    store.getState().setSurfacePendingQuestion('pty-1', 'Once more?');
+    store.getState().markSurfaceQuestionSeen('pty-1');
+    store.getState().setSurfacePendingQuestion('pty-1', '');
+    expect(store.getState().surfaceQuestionSeen['pty-1']).toBeUndefined();
+  });
+});
+
+describe('surfaceLastMessage', () => {
+  it('stores the text per ptyId, clears on an empty write, and dies with closePane', () => {
+    const store = createTestStore();
+    store.getState().setSurfaceLastMessage('pty-1', 'Merged as 08be43f.');
+    expect(store.getState().surfaceLastMessage['pty-1']).toBe('Merged as 08be43f.');
+    // Every turn boundary writes the field; '' is the clear.
+    store.getState().setSurfaceLastMessage('pty-1', '');
+    expect(store.getState().surfaceLastMessage['pty-1']).toBeUndefined();
+
+    const ws = getActiveWorkspace(store);
+    const rootLeafId = getLeafPanes(ws.rootPane)[0].id;
+    store.getState().splitPane(rootLeafId, 'horizontal');
+    const closing = getLeafPanes(getActiveWorkspace(store).rootPane)[1];
+    store.setState((s) => {
+      const leaf = getLeafPanes(s.workspaces[0].rootPane).find((l) => l.id === closing.id);
+      if (leaf) leaf.surfaces.push({ id: 'surf-lm', ptyId: 'pty-lm', title: 'x', shell: '', cwd: '', surfaceType: 'terminal' } as Surface);
+    });
+    store.getState().setSurfaceLastMessage('pty-lm', 'Done.');
+    store.getState().closePane(closing.id);
+    // A reused ptyId must not inherit a closed pane's text.
+    expect(store.getState().surfaceLastMessage['pty-lm']).toBeUndefined();
   });
 });

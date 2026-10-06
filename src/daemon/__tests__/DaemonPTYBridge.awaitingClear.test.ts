@@ -1,0 +1,316 @@
+// The shared answered path, and the input shapes that must still count as an
+// answer.
+//
+// A pane answered in Terminal kept reading "awaiting" for the rest of the turn
+// when the answer key arrived glued to SGR mouse reports (mouse reporting on,
+// unframed stdin), because the lone-key test saw a 20-byte chunk instead of
+// `1`. `clearAwaiting` is the screen-verified release for whatever shape still
+// slips past; it has to leave the bridge exactly where a recognised key does.
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { IPty } from 'node-pty';
+import { DaemonPTYBridge } from '../DaemonPTYBridge';
+import { RingBuffer } from '../RingBuffer';
+
+function makeFakePty(): { pty: IPty; feed: (data: string) => void } {
+  let dataHandler: ((data: string) => void) | null = null;
+  const pty = {
+    onData: (cb: (data: string) => void) => {
+      dataHandler = cb;
+      return { dispose: () => { dataHandler = null; } };
+    },
+    onExit: () => ({ dispose: () => undefined }),
+  } as unknown as IPty;
+  return { pty, feed: (data: string) => dataHandler?.(data) };
+}
+
+interface Harness {
+  bridge: DaemonPTYBridge;
+  feed: (data: string) => void;
+  answered: Array<{ sessionId: string; reason: string }>;
+  active: string[];
+  activity: Array<Record<string, unknown>>;
+}
+
+function makeHarness(): Harness {
+  const bridge = new DaemonPTYBridge();
+  const fake = makeFakePty();
+  const h: Harness = { bridge, feed: fake.feed, answered: [], active: [], activity: [] };
+  bridge.on('answered', (e: { sessionId: string; reason: string }) => h.answered.push(e));
+  bridge.on('active', (e: { sessionId: string }) => h.active.push(e.sessionId));
+  bridge.on('awaitingActivity', (e: Record<string, unknown>) => h.activity.push(e));
+  bridge.setupDataForwarding(fake.pty, new RingBuffer(65536), 'sess-1');
+  return h;
+}
+
+// An SGR mouse report (motion, button 35) at column 40 row 12.
+const MOUSE = '\x1b[<35;40;12M';
+
+describe('DaemonPTYBridge — shared answered path', () => {
+  let harnesses: Harness[];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    harnesses = [];
+  });
+
+  afterEach(() => {
+    for (const h of harnesses) h.bridge.cleanup();
+    vi.useRealTimers();
+  });
+
+  const fresh = (): Harness => {
+    const h = makeHarness();
+    harnesses.push(h);
+    return h;
+  };
+
+  it('clearAwaiting leaves the bridge exactly where an answer key does', () => {
+    const byKey = fresh();
+    const byScreen = fresh();
+    for (const h of [byKey, byScreen]) h.bridge.noteAgentStatus('awaiting_input');
+
+    byKey.bridge.noteInput('1');
+    expect(byScreen.bridge.clearAwaiting('screen-cleared')).toBe(true);
+
+    expect(byScreen.bridge.getAgentStatus()).toBe(byKey.bridge.getAgentStatus());
+    for (const h of [byKey, byScreen]) {
+      // settledStatus is cleared too, so no terminal status is left behind.
+      expect(h.bridge.isAwaitingHuman()).toBe(false);
+      expect(['idle', 'running']).toContain(h.bridge.getAgentStatus());
+      expect(h.bridge.getLastTurnStartedAt()).toBeGreaterThan(0);
+      // The next output is the turn running again, on both.
+      h.feed('.');
+      expect(h.active).toEqual(['sess-1']);
+    }
+    expect(byKey.answered).toEqual([{ sessionId: 'sess-1', reason: 'input' }]);
+    expect(byScreen.answered).toEqual([{ sessionId: 'sess-1', reason: 'screen-cleared' }]);
+  });
+
+  it('clearAwaiting on a pane that is not awaiting does nothing', () => {
+    const h = fresh();
+    h.bridge.noteAgentStatus('complete', true);
+    expect(h.bridge.clearAwaiting('screen-cleared')).toBe(false);
+    expect(h.bridge.getAgentStatus()).toBe('complete');
+    expect(h.answered).toEqual([]);
+  });
+
+  it('#1463 — the agent\'s answer releases only the question it answers', () => {
+    // Blocked on an AskUserQuestion asked at t=100: its answer (t=150) releases it.
+    const asked = fresh();
+    asked.bridge.noteAgentStatus('awaiting_input', true, 100);
+    expect(asked.bridge.clearAnsweredQuestion(150)).toBe(true);
+    expect(asked.bridge.isAwaitingHuman()).toBe(false);
+    expect(asked.answered).toEqual([{ sessionId: 'sess-1', reason: 'input' }]);
+
+    // A late answer to an EARLIER question leaves the newer one standing.
+    const newer = fresh();
+    newer.bridge.noteAgentStatus('awaiting_input', true, 200);
+    expect(newer.bridge.clearAnsweredQuestion(150)).toBe(false);
+    expect(newer.bridge.isAwaitingHuman()).toBe(true);
+
+    // A permission dialog (no question mark) is never released by it.
+    const permission = fresh();
+    permission.bridge.noteAgentStatus('awaiting_input', true);
+    expect(permission.bridge.clearAnsweredQuestion(10_000)).toBe(false);
+    expect(permission.bridge.isAwaitingHuman()).toBe(true);
+    expect([...newer.answered, ...permission.answered]).toEqual([]);
+  });
+
+  it.each([
+    ['before', `${MOUSE}${MOUSE}1`],
+    ['after', `1${MOUSE}`],
+    ['around', `${MOUSE}1\x1b[<35;41;12m`],
+  ])('a digit with SGR mouse reports glued %s it is an answer', (_where, chunk) => {
+    const h = fresh();
+    h.bridge.noteAgentStatus('awaiting_input');
+    h.bridge.noteInput(chunk);
+    expect(h.bridge.getAgentStatus()).not.toBe('awaiting_input');
+    expect(h.answered).toEqual([{ sessionId: 'sess-1', reason: 'input' }]);
+  });
+
+  it('focus in/out reports are stripped before the lone-key test', () => {
+    const h = fresh();
+    h.bridge.noteAgentStatus('awaiting_input');
+    h.bridge.noteInput('\x1b[O');
+    h.bridge.noteInput('\x1b[I');
+    expect(h.bridge.getAgentStatus()).toBe('awaiting_input');
+    h.bridge.noteInput('\x1b[I\x1b');
+    expect(h.bridge.getAgentStatus()).not.toBe('awaiting_input');
+    expect(h.answered).toHaveLength(1);
+  });
+
+  it('mouse reports alone, or an arrow key with them, are not an answer', () => {
+    const h = fresh();
+    h.bridge.noteAgentStatus('awaiting_input');
+    h.bridge.noteInput(`${MOUSE}${MOUSE}`);
+    h.bridge.noteInput(`\x1b[B${MOUSE}`);
+    expect(h.bridge.getAgentStatus()).toBe('awaiting_input');
+    expect(h.answered).toEqual([]);
+  });
+
+  it('reports input and output on an awaiting pane by size, never by text', () => {
+    const h = fresh();
+    h.bridge.noteInput('x');
+    h.feed('before');
+    expect(h.activity).toEqual([]);
+
+    h.bridge.noteAgentStatus('awaiting_input');
+    h.bridge.noteInput(`${MOUSE}q`);
+    h.feed('frame');
+    expect(h.activity).toEqual([
+      { sessionId: 'sess-1', cause: 'input', bytes: MOUSE.length + 1, nonKeyBytes: MOUSE.length, answered: false },
+      { sessionId: 'sess-1', cause: 'output' },
+    ]);
+    expect(JSON.stringify(h.activity)).not.toContain('q');
+  });
+});
+
+describe('DaemonPTYBridge — fence input revision', () => {
+  // SGR button codes: 0 = left press (M) / release (m), 35 = motion with no
+  // button (32 motion + 3 none), 32 = drag with the left button, 64 = wheel up.
+  it('pointer motion and focus reports do not advance it', () => {
+    const bridge = new DaemonPTYBridge();
+    bridge.noteInput('\x1b[<35;40;12M\x1b[<35;41;12M');
+    bridge.noteInput('\x1b[I\x1b[O');
+    expect(bridge.getKeyInputRevision()).toBe(0);
+    expect(bridge.getInputRevision()).toBe(2);
+    bridge.cleanup();
+  });
+
+  it.each([
+    ['a click (press)', '\x1b[<0;6;13M'],
+    ['a release', '\x1b[<0;6;13m'],
+    ['a drag with a button held', '\x1b[<32;6;13M'],
+    ['a wheel turn', '\x1b[<64;6;13M'],
+    ['a key glued to motion', '\x1b[<35;40;12Mx'],
+  ])('%s advances it', (_label, chunk) => {
+    const bridge = new DaemonPTYBridge();
+    bridge.noteInput(chunk);
+    expect(bridge.getKeyInputRevision()).toBe(1);
+    bridge.cleanup();
+  });
+});
+
+// #1680 — replies the terminal writes back to the app's queries are not keys.
+// A redraw after `/clear` or `/new` may ask; counting the reply failed the
+// fresh-context step with `input_interleaved` after the clear had run.
+describe('DaemonPTYBridge — terminal replies are not key input', () => {
+  const ESC = '\x1b';
+  const ST = `${ESC}\\`;
+  const BEL = '\x07';
+
+  it.each([
+    ['DA1 (xterm.js)', `${ESC}[?1;2c`],
+    ['DA1 VT102 form', `${ESC}[?6c`],
+    ['DA2 (xterm.js)', `${ESC}[>0;276;0c`],
+    ['DSR status OK', `${ESC}[0n`],
+    ['CPR, row > 1', `${ESC}[24;80R`],
+    ['CPR, row 1 past column 16', `${ESC}[1;40R`],
+    ['DECXCPR', `${ESC}[?12;5R`],
+    ['DECRQM, DEC private', `${ESC}[?2004;1$y`],
+    ['DECRQM, ANSI', `${ESC}[4;2$y`],
+    ['window size report (chars)', `${ESC}[8;40;120t`],
+    ['window size report (pixels)', `${ESC}[4;800;1200t`],
+    ['cell size report', `${ESC}[6;17;9t`],
+    ['DECRQSS', `${ESC}P1$r0m${ST}`],
+    ['DECRQSS invalid', `${ESC}P0$r${ST}`],
+    ['DA3', `${ESC}P!|00000000${ST}`],
+    ['XTVERSION', `${ESC}P>|xterm.js(6.0.0)${ST}`],
+    ['OSC 11 background, ST', `${ESC}]11;rgb:1e1e/1e1e/1e1e${ST}`],
+    ['OSC 10 foreground, BEL', `${ESC}]10;rgb:cccc/cccc/cccc${BEL}`],
+    ['OSC 12 cursor', `${ESC}]12;rgb:ffff/ffff/ffff${ST}`],
+    ['OSC 4 palette', `${ESC}]4;1;rgb:cd00/0000/0000${ST}`],
+    ['kitty keyboard flags', `${ESC}[?1u`],
+    ['several at once, with focus and motion', `${ESC}[I${ESC}[?1;2c${ESC}[24;80R${ESC}[<35;4;4M`],
+  ])('%s does not advance it', (_label, chunk) => {
+    const bridge = new DaemonPTYBridge();
+    bridge.noteInput(chunk);
+    expect(bridge.getKeyInputRevision()).toBe(0);
+    expect(bridge.getInputRevision()).toBe(1);
+    bridge.cleanup();
+  });
+
+  it.each([
+    ['a letter', 'x'],
+    ['Enter', '\r'],
+    ['Esc', ESC],
+    ['an arrow', `${ESC}[A`],
+    ['an SS3 arrow', `${ESC}OA`],
+    ['F3', `${ESC}OR`],
+    // Modified F3 is `CSI 1 ; m R` (m 2..16): it looks like a row-1 CPR, so
+    // that range keeps counting.
+    ['Shift+F3', `${ESC}[1;2R`],
+    ['Ctrl+F3', `${ESC}[1;5R`],
+    ['Ctrl+Alt+Shift+Meta+F3', `${ESC}[1;16R`],
+    ['Ctrl+F1', `${ESC}[1;5P`],
+    ['F5', `${ESC}[15~`],
+    ['Alt+Shift+P (ESC P, no terminator)', `${ESC}P`],
+    ['a reply glued to a key', `${ESC}[?1;2cx`],
+    ['a key glued to a CPR', `y${ESC}[24;80R`],
+  ])('%s still advances it', (_label, chunk) => {
+    const bridge = new DaemonPTYBridge();
+    bridge.noteInput(chunk);
+    expect(bridge.getKeyInputRevision()).toBe(1);
+    bridge.cleanup();
+  });
+});
+
+// #1680 — the fresh-context step reads this quiet flag: a pointer over the pane
+// or a focus change must not read as someone typing, a key must.
+describe('DaemonPTYBridge — key input quiet', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('stays quiet through motion and focus reports, breaks on a key, and recovers', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    const bridge = new DaemonPTYBridge();
+    expect(bridge.isKeyInputQuiet()).toBe(true);
+    bridge.noteInput('\x1b[<35;40;12M\x1b[I\x1b[O');
+    expect(bridge.isInputQuiet()).toBe(false);
+    expect(bridge.isKeyInputQuiet()).toBe(true);
+    bridge.noteInput('x');
+    expect(bridge.isKeyInputQuiet()).toBe(false);
+    vi.setSystemTime(103_001);
+    expect(bridge.isKeyInputQuiet()).toBe(true);
+    bridge.noteInput('/clear', { selfWrite: true });
+    expect(bridge.isKeyInputQuiet()).toBe(false);
+    bridge.cleanup();
+  });
+});
+
+describe('DaemonPTYBridge — the stepwise driver\'s own keys', () => {
+  it('move the key revision and return it, but are not a human answering; noteSubmitted is', () => {
+    const h = makeHarness();
+    const fence: string[] = [];
+    h.bridge.on('fenceInput', (e: { sessionId: string }) => fence.push(e.sessionId));
+    h.bridge.noteAgentStatus('awaiting_input');
+    const before = h.bridge.getKeyInputRevision();
+    expect(h.bridge.noteInput('3', { selfWrite: true })).toBe(before + 1);
+    expect(h.bridge.noteInput('\x1b[200~use bye\x1b[201~', { selfWrite: true })).toBe(before + 2);
+    expect(h.bridge.noteInput('\r', { selfWrite: true })).toBe(before + 3);
+    expect(h.bridge.getKeyInputRevision()).toBe(before + 3);
+    expect(fence).toEqual([]);
+    expect(h.answered).toEqual([]);
+    expect(h.activity).toEqual([]);
+    expect(h.bridge.isAwaitingHuman()).toBe(true);
+    h.bridge.noteSubmitted();
+    expect(h.answered).toEqual([{ sessionId: 'sess-1', reason: 'input' }]);
+    expect(h.bridge.isAwaitingHuman()).toBe(false);
+    h.bridge.cleanup();
+  });
+});
+
+describe('DaemonPTYBridge — fenceInput event', () => {
+  it('fires for a key or click, never for motion or focus', () => {
+    const h = makeHarness();
+    const seen: string[] = [];
+    h.bridge.on('fenceInput', (e: { sessionId: string }) => seen.push(e.sessionId));
+    h.bridge.noteInput('\x1b[<35;40;12M');
+    h.bridge.noteInput('\x1b[I');
+    expect(seen).toEqual([]);
+    h.bridge.noteInput('\x1b[B');
+    h.bridge.noteInput('\x1b[<0;6;13M');
+    expect(seen).toEqual(['sess-1', 'sess-1']);
+    h.bridge.cleanup();
+  });
+});

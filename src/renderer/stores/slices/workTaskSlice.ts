@@ -21,6 +21,10 @@
 import type { StateCreator } from 'zustand';
 import type { StoreState } from '../index';
 import type { WorkTask } from '../../../shared/workTask';
+import { unwrapRpc } from '../../utils/unwrapRpc';
+import { unpinNestedTasks } from '../../utils/sidebarLayout';
+import { provenanceFromAudit, sameProvenance, type FanoutAuditLike, type FanoutProvenance } from '../../utils/fanoutProvenance';
+import { sameFanoutOrigin, sanitizeFanoutOrigin, type FanoutOrigin } from '../../../shared/fanoutOrigin';
 
 /** The mission bridge useRpcBridge installs (reads + the close used for workspace-lifetime binding). */
 interface MissionRpcBridge {
@@ -30,24 +34,6 @@ interface MissionRpcBridge {
 
 function readMissionRpc(): MissionRpcBridge | undefined {
   return (window as unknown as { __wmuxMissionRpc?: MissionRpcBridge }).__wmuxMissionRpc;
-}
-
-/**
- * `rpc.invoke`는 데몬 응답을 프로토콜 봉투 `{ id, ok, result }`로 감싼다(result가
- * 데몬 자신의 `{ ok, tasks }`). useChannelsHydration의 unwrapRpc와 동형 — 전송
- * 봉투를 벗겨 데몬 응답을 노출한다.
- */
-function unwrapRpc(res: unknown): unknown {
-  if (
-    res !== null &&
-    typeof res === 'object' &&
-    'result' in res &&
-    (res as { result?: unknown }).result !== null &&
-    typeof (res as { result?: unknown }).result === 'object'
-  ) {
-    return (res as { result: unknown }).result;
-  }
-  return res;
 }
 
 function isOkObject(v: unknown): v is Record<string, unknown> {
@@ -126,6 +112,47 @@ export interface WorkTaskSlice {
   taskPtyRegistry: Record<string, TaskPtyEntry>;
   /** J3 §4 — paneGroupId(=태스크 워크스페이스 id) → 이탈한 cwd(경계 밖). 없으면 부재. */
   departedPaneGroups: Record<string, string>;
+  /**
+   * #1481 — task workspace id → who fanned it out (owner, caller kind, calling
+   * pane, time), joined from the fan-out audit log. Read-only display data for
+   * the sidebar's nesting fallback and provenance tooltip.
+   */
+  fanoutProvenance: Record<string, FanoutProvenance>;
+  /**
+   * #1481 — task workspace id → owner id, stamped by the renderer the moment a
+   * fan-out creates the workspace. Bridges the window before the ledger
+   * record materializes and the audit log's launch record is written, so a
+   * task mid-spawn nests under its owner instead of looking orphaned.
+   * Session-only.
+   */
+  fanoutSpawnOwner: Record<string, string>;
+  noteFanoutSpawn: (workspaceId: string, ownerWorkspaceId: string, origin?: FanoutOrigin) => void;
+  /**
+   * Task workspace id → who asked for it (pane ids + a name snapshot, the
+   * orchestrator, or the GUI), from the lineage stamp's `origin`. Seeded by
+   * the spawn itself, then answered by the durable stamp. Preferred over the
+   * audit-derived caller in `fanoutProvenance`.
+   */
+  fanoutOrigin: Record<string, FanoutOrigin>;
+  /**
+   * #1481 — task workspace id → owner id from main's durable lineage stamps
+   * (`fanout-lineage.json`, written before the task's agent launches). With
+   * the ledger record, this is what nesting trusts; the audit log only names
+   * the caller. Only live workspaces are asked for and kept.
+   */
+  fanoutLineage: Record<string, string>;
+  /** #1481 — the first lineage + missions refresh has finished. Until then the
+   *  sidebar cannot tell an orphaned task from one whose records are loading. */
+  fanoutRefreshSettled: boolean;
+  markFanoutRefreshSettled: () => void;
+  /**
+   * Re-read the durable lineage for the open workspaces and, with `audit`,
+   * the audit log's recent launches (caller labels). Prunes spawn stamps the
+   * lineage or ledger now answers. Best-effort.
+   */
+  refreshFanoutProvenance: (opts?: { audit?: boolean }) => Promise<void>;
+  /** #1481 — drop every fan-out display entry keyed by a removed workspace. */
+  pruneFanoutFor: (workspaceId: string) => void;
 
   /** 한 부모의 미션 목록을 통째로 교체하고 역인덱스를 재구성한다(정본=데몬). */
   setMissions: (parentWorkspaceId: string, tasks: WorkTask[]) => void;
@@ -171,6 +198,99 @@ export const createWorkTaskSlice: StateCreator<
   missionByPaneGroup: {},
   taskPtyRegistry: {},
   departedPaneGroups: {},
+  fanoutProvenance: {},
+  fanoutSpawnOwner: {},
+  fanoutOrigin: {},
+  fanoutLineage: {},
+  fanoutRefreshSettled: false,
+
+  markFanoutRefreshSettled: () =>
+    set((state: StoreState) => {
+      if (!state.fanoutRefreshSettled) state.fanoutRefreshSettled = true;
+    }),
+
+  pruneFanoutFor: (workspaceId) =>
+    set((state: StoreState) => {
+      if (!workspaceId) return;
+      delete state.fanoutSpawnOwner[workspaceId];
+      delete state.fanoutLineage[workspaceId];
+      delete state.fanoutProvenance[workspaceId];
+      delete state.fanoutOrigin[workspaceId];
+    }),
+
+  noteFanoutSpawn: (workspaceId, ownerWorkspaceId, origin) =>
+    set((state: StoreState) => {
+      if (!workspaceId || !ownerWorkspaceId) return;
+      state.fanoutSpawnOwner[workspaceId] = ownerWorkspaceId;
+      if (origin) state.fanoutOrigin[workspaceId] = origin;
+      unpinNestedTasks(state);
+    }),
+
+  refreshFanoutProvenance: async (opts = { audit: true }) => {
+    const api = (window as unknown as {
+      electronAPI?: { fanout?: {
+        recentAudit?: (limit: number) => Promise<unknown>;
+        lineage?: (ids: string[]) => Promise<unknown>;
+      } };
+    }).electronAPI?.fanout;
+    if (!api) return;
+    const liveIds = get().workspaces.map((w) => w.id);
+    let lineage: Record<string, string> | null = null;
+    let origins: Record<string, FanoutOrigin> | null = null;
+    if (api.lineage) {
+      try {
+        const raw = await api.lineage(liveIds);
+        if (raw && typeof raw === 'object') {
+          lineage = {};
+          origins = {};
+          for (const [id, stamp] of Object.entries(raw as Record<string, { owner?: unknown; origin?: unknown }>)) {
+            if (typeof stamp?.owner === 'string' && stamp.owner) lineage[id] = stamp.owner;
+            const origin = sanitizeFanoutOrigin(stamp?.origin);
+            if (origin) origins[id] = origin;
+          }
+        }
+      } catch {
+        // main not ready — the next trigger retries
+      }
+    }
+    let provenance: Record<string, FanoutProvenance> | null = null;
+    if (opts.audit && api.recentAudit) {
+      try {
+        const records = await api.recentAudit(100);
+        if (Array.isArray(records)) provenance = provenanceFromAudit(records as FanoutAuditLike[]);
+      } catch {
+        // same
+      }
+    }
+    set((state: StoreState) => {
+      const live = new Set(state.workspaces.map((w) => w.id));
+      if (lineage && JSON.stringify(lineage) !== JSON.stringify(state.fanoutLineage)) state.fanoutLineage = lineage;
+      if (origins) {
+        // The durable stamp answers; a spawn-seeded origin the stamp does not
+        // carry (yet) stays while its workspace is open.
+        for (const id of Object.keys(state.fanoutOrigin)) {
+          if (!live.has(id)) delete state.fanoutOrigin[id];
+        }
+        for (const [id, origin] of Object.entries(origins)) {
+          if (live.has(id) && !sameFanoutOrigin(state.fanoutOrigin[id], origin)) state.fanoutOrigin[id] = origin;
+        }
+      }
+      if (provenance) {
+        // Keep only open workspaces: the audit tail names closed ones too.
+        const kept: Record<string, FanoutProvenance> = {};
+        for (const [id, p] of Object.entries(provenance)) if (live.has(id)) kept[id] = p;
+        if (!sameProvenance(state.fanoutProvenance, kept)) state.fanoutProvenance = kept;
+      }
+      // A spawn stamp is only a bridge until the durable records answer.
+      for (const id of Object.keys(state.fanoutSpawnOwner)) {
+        if (!live.has(id) || state.fanoutLineage[id] || state.missionByPaneGroup[id]) {
+          delete state.fanoutSpawnOwner[id];
+        }
+      }
+      // Lineage can nest a workspace that was pinned before it resolved.
+      unpinNestedTasks(state);
+    });
+  },
 
   registerTaskPtys: (entries) =>
     set((state: StoreState) => {
@@ -205,6 +325,7 @@ export const createWorkTaskSlice: StateCreator<
       if (sameMissionList(state.missionsByWorkspace[parentWorkspaceId], tasks)) return;
       state.missionsByWorkspace[parentWorkspaceId] = tasks;
       state.missionByPaneGroup = rebuildPaneGroupIndex(state.missionsByWorkspace);
+      unpinNestedTasks(state);
     }),
 
   clearMissionsFor: (parentWorkspaceId) =>

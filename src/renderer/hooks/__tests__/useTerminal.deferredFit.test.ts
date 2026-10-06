@@ -76,18 +76,131 @@ describe('#747 — a deferred fit must be recorded and settled', () => {
     expect(src).toMatch(/pendingFitRaf/);
     expect(
       src,
-      'the queued fit frame is not cancelled next to the debounce timer in cleanup',
+      'the queued fit frame is not cancelled next to the resize scheduler in cleanup',
     ).toMatch(
-      /clearTimeout\(resizeDebounceTimer\);\s*if \(pendingFitRaf !== null\) cancelAnimationFrame\(pendingFitRaf\);/,
+      /resizeScheduler\.dispose\(\);\s*if \(pendingFitRaf !== null\) cancelAnimationFrame\(pendingFitRaf\);/,
     );
   });
 
   it('the ResizeObserver delegates to runFit instead of duplicating it', () => {
-    const start = src.indexOf('new ResizeObserver(');
+    // The observer feeds a fit scheduler (layoutTransitionGate), whose
+    // fitNextFrame callback is the one path into runFit.
+    const start = src.indexOf('createFitScheduler(');
     expect(start).toBeGreaterThan(-1);
     const block = src.slice(start, src.indexOf('resizeObserver.observe(', start));
     expect(block).toMatch(/runFit/);
     // A second copy of the fit body here would drift out of sync with the retry.
     expect(block).not.toMatch(/fitAddon\.fit\(\)/);
+  });
+});
+
+// #1255 — sub-floor fits are skipped, and recovered sessions re-assert their
+// real geometry. A transient small-but-nonzero container (mid-split, session
+// restore before the panels settle) used to be FITTED: the tiny columns were
+// applied to the xterm buffer and the reflow re-wrapped the whole scrollback
+// at that width — damage a later correct fit does not undo, which is how a
+// pane rendered ~1 column wide forever. The daemon clamps its side to
+// MIN_SAFE_COLS(10) regardless, so the two sides of the pipe also split.
+describe('#1255 — every fit() apply site is floor-gated, every recovery re-asserts', () => {
+  const hookPath = path.join(__dirname, '..', 'useTerminal.ts');
+  const src = readSource(hookPath);
+
+  it('imports the shared floor (single-sourced with the daemon clamp)', () => {
+    expect(src).toMatch(/import \{ isSafeGeometry \} from '\.\.\/\.\.\/shared\/terminalGeometry'/);
+  });
+
+  it('the exported fit() gates below the floor, after the zero-dimension guard', () => {
+    const start = src.indexOf('const fit = useCallback');
+    const block = src.slice(start, src.indexOf('}, [ptyId, containerRef]', start));
+    const zero = block.indexOf('offsetWidth === 0');
+    const gate = block.indexOf('proposedSafeDimensions(fitAddonRef.current)');
+    const fitCall = block.indexOf('fitAddonRef.current.fit()');
+    expect(zero).toBeGreaterThan(-1);
+    expect(gate).toBeGreaterThan(zero);
+    expect(fitCall).toBeGreaterThan(gate);
+  });
+
+  it('the initial mount fit treats a sub-floor container like a hidden one', () => {
+    const anchor = 'container.offsetWidth > 0 && container.offsetHeight > 0 && proposedSafeDimensions(fitAddon)';
+    expect(src).toContain(anchor);
+  });
+
+  it('fonts.ready and runFit gate their fits too', () => {
+    // fonts.ready fits through runFit, which carries the gate (locked below).
+    const fonts = src.slice(src.indexOf('document.fonts.ready'), src.indexOf('document.fonts.ready') + 1400);
+    expect(fonts).toMatch(/runFit\(\)/);
+    expect(fonts).not.toMatch(/fitAddon\.fit\(\)/);
+    const runFitStart = src.indexOf('const runFit = () => {');
+    const runFit = src.slice(runFitStart, src.indexOf('const autoCopy = createAutoSelectionCopy', runFitStart));
+    // BEFORE claimFit: a floor skip records no selection debt — the settled
+    // layout re-fires the ResizeObserver, which is the retry.
+    // #1436 turned the gate into a captured proposal (the shrink path sends
+    // those dims to the PTY before xterm applies them), so anchor on the
+    // capture + its early return rather than the old one-liner.
+    const gate = runFit.indexOf('const proposed = proposedSafeDimensions(fitAddon);');
+    expect(runFit.slice(gate)).toMatch(/const proposed = proposedSafeDimensions\(fitAddon\);\s+if \(!proposed\) return;/);
+    const claim = runFit.indexOf('claimFit(');
+    expect(gate).toBeGreaterThan(-1);
+    expect(claim).toBeGreaterThan(gate);
+  });
+
+  it('the font/theme effect gates its fit as well', () => {
+    // The zero-dimension skip logs a near-identical line; anchor on the
+    // sub-floor one specifically.
+    const start = src.indexOf('[Terminal] font/theme fit skipped — sub-floor dimensions');
+    expect(start).toBeGreaterThan(-1);
+    const block = src.slice(start - 500, start);
+    expect(block).toMatch(/proposedSafeDimensions\(fitAddonRef\.current\)/);
+  });
+
+  it('a resync settle and a daemon reattach both re-assert DOM geometry (no dedup)', () => {
+    // sendResize carries no lastSentCols dedup — these two points must push
+    // the real size even when the renderer cache already "matches", or the
+    // daemon stays pinned at its clamp after a transient tiny fit.
+    // Window covers the whole settle fn — #1258's scroll-preservation block
+    // also lives inside it, ahead of the re-assert.
+    const resync = src.slice(src.indexOf('const completeResyncFromFlush'), src.indexOf('const completeResyncFromFlush') + 2700);
+    expect(resync).toMatch(/proposedSafeDimensions\(fitAddon\)/);
+    expect(resync).toMatch(/sendResize\(ptyId, dims\.cols, dims\.rows\)/);
+    // Anchor on the reattach log line itself — plain "daemon reattach" also
+    // appears in unrelated comments above this effect.
+    const reattach = src.slice(src.indexOf('[useTerminal] daemon reattach ptyId='), src.indexOf('[useTerminal] daemon reattach ptyId=') + 2200);
+    expect(reattach).toMatch(/proposedSafeDimensions\(fitAddonRef\.current\)/);
+    expect(reattach).toMatch(/sendResize\(id, dims\.cols, dims\.rows\)/);
+  });
+});
+
+// #1497 — a recovered pane opened before the bundled webfont loaded keeps a
+// fallback-font cell; its first resize re-measures only after FitAddon fitted
+// with the stale cell. The re-measure itself is unit-tested for real in
+// terminal/__tests__/charSizeRefit.test.ts; the hook wiring is pinned here.
+describe('#1497 — fonts re-measure the cell, and a changed cell refits', () => {
+  const hookPath = path.join(__dirname, '..', 'useTerminal.ts');
+  const src = readSource(hookPath);
+
+  it('fonts.ready re-measures before the hidden-container bail and the fit', () => {
+    const start = src.indexOf('document.fonts.ready.then(');
+    const block = src.slice(start, src.indexOf('});', src.indexOf('runFit()', start)));
+    const measure = block.indexOf('forceCharSizeMeasure(terminal)');
+    const bail = block.indexOf('offsetWidth === 0');
+    const fitCall = block.indexOf('runFit()');
+    expect(measure, 'fonts.ready does not re-measure the cell').toBeGreaterThan(-1);
+    expect(bail).toBeGreaterThan(measure);
+    expect(fitCall).toBeGreaterThan(bail);
+  });
+
+  it('a font load that settles after fonts.ready re-measures too, and is removed at teardown', () => {
+    expect(src).toMatch(/document\.fonts\.addEventListener\('loadingdone', onFontsLoadingDone\)/);
+    expect(src).toMatch(/document\.fonts\.removeEventListener\('loadingdone', onFontsLoadingDone\)/);
+  });
+
+  it('a char-size change queues the real fit path on a frame, and is disposed', () => {
+    const start = src.indexOf('onCharSizeChange(terminal, () => {');
+    expect(start, 'nothing subscribes to the char-size change').toBeGreaterThan(-1);
+    const block = src.slice(start, src.indexOf('});', src.indexOf('runFit()', start)));
+    expect(block).toMatch(/requestAnimationFrame\(/);
+    expect(block).toMatch(/pendingFitRaf/);
+    expect(block).not.toMatch(/fitAddon\.fit\(\)/);
+    expect(src).toMatch(/charSizeDisposable\?\.dispose\(\)/);
   });
 });

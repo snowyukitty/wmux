@@ -12,10 +12,15 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import { REPL_RUN_BROWSER_TOOLS, captureDispatchContext, createBrowserBridge } from '../browser-repl/bridge';
+import { renderImageLegend, textWithImages } from '../browser-repl/runCollect';
+import { getConnectionScope } from '../connectionScope';
+import type { CollectedTool } from '../playwright/toolCollector';
 import {
   defineWmuxTool,
   registerWmuxTools,
   type RegisterWmuxToolsOptions,
+  type WmuxToolProfile,
   type WmuxToolSpec,
 } from '../toolCatalog';
 import {
@@ -26,7 +31,8 @@ import {
   getReplRegistry,
   isValidSessionName,
 } from './replRegistry';
-import type { ReplEvalOutcome } from './ReplSession';
+import type { ReplBrowserBinding, ReplEvalOutcome } from './ReplSession';
+import { fromAgentPath, toAgentPath } from '../wslPaths';
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const MIN_TIMEOUT_MS = 100;
@@ -40,6 +46,52 @@ export function clampTimeout(requested: number | undefined): number {
 
 function text(body: string, isError = false): CallToolResult {
   return { content: [{ type: 'text' as const, text: body }], isError: isError || undefined };
+}
+
+/** The browser handlers a repl_run `browser` object would call, and the profile. */
+export interface ReplBrowserAccess {
+  /** The collector sink (full `browser_*` names). */
+  readonly tools: ReadonlyMap<string, CollectedTool>;
+  readonly profile: WmuxToolProfile;
+}
+
+export const REPL_BROWSER_PROFILE_REFUSAL = 'browser tools are not part of this profile';
+
+/**
+ * The `browser` binding for one repl_run call.
+ *
+ * The gate is the PROFILE, never "does the sink hold browser handlers": the
+ * collecting view records a handler into the sink before delegating, so under
+ * `--core` (where the surface filter skips the registration) the sink still
+ * holds every browser handler. Reading the sink would therefore hand a core
+ * server the whole browser surface through a tool that IS on the core
+ * surface. The names are installed in the child either way, so a refusal says
+ * "not in this profile" instead of "browser.click is not a function".
+ *
+ * `scope` is the connection scope captured at dispatch: IPC messages from the
+ * child arrive outside that AsyncLocalStorage context, and without re-entering
+ * it the handlers would fall back to process globals — another agent's engine
+ * and refs under the broker.
+ */
+export function resolveReplBrowser(
+  access: ReplBrowserAccess | undefined,
+  scope: ReturnType<typeof getConnectionScope>,
+): ReplBrowserBinding {
+  if (!access || access.profile !== 'full') {
+    return { tools: REPL_RUN_BROWSER_TOOLS, call: null, refusal: REPL_BROWSER_PROFILE_REFUSAL };
+  }
+  return {
+    tools: REPL_RUN_BROWSER_TOOLS,
+    // record:false — a scripted call's arguments can come from a file, a
+    // network response, or a secret, so replaying the browser half alone
+    // would be a different run wearing this one's clothes.
+    call: createBrowserBridge(
+      access.tools,
+      { scope, record: false, label: 'repl_run', context: captureDispatchContext() },
+      REPL_RUN_BROWSER_TOOLS,
+    ),
+    refusal: REPL_BROWSER_PROFILE_REFUSAL,
+  };
 }
 
 function formatDuration(ms: number): string {
@@ -84,6 +136,15 @@ export function formatOutcome(
       lines.push(`(stderr truncated: ${outcome.stderr.totalBytes} bytes total)`);
     }
   }
+  if (outcome.browser && outcome.browser.hints.length > 0) {
+    lines.push('', '--- hints ---', ...outcome.browser.hints);
+    if (outcome.browser.hintsElided > 0) {
+      lines.push(`(${outcome.browser.hintsElided} more hint line(s) not shown)`);
+    }
+  }
+  if (outcome.browser) {
+    lines.push(...renderImageLegend(outcome.browser.images, outcome.browser.imagesElided));
+  }
   if (outcome.ok && outcome.result) {
     lines.push('', '--- result ---', outcome.result.text);
     if (outcome.result.truncated) {
@@ -104,13 +165,22 @@ export function formatOutcome(
 // connection). The `let` re-declaration rule is deliberately NOT here: the
 // session reports it as a remedy at the moment it bites, which reaches the
 // caller when it matters instead of costing context on every session.
+// Per-call text-result cap, honoured by the dispatch-layer guard
+// (src/mcp/resultCap.ts). Plain z.number(): the guard floors and clamps the
+// value itself (every zod numeric modifier costs bytes in tools/list).
+const maxBytesParam = z
+  .number()
+  .optional()
+  .describe('Cap the text result in bytes (default 65536, max 524288).');
+
 const REPL_RUN_DESCRIPTION =
   'Run JavaScript in a persistent Node runtime and get the return value back. ' +
   'State survives between calls: variables (including top-level let/const), required ' +
   'modules, and open handles are still there next call. Top-level await works, but ' +
   'declarations inside an awaiting snippet do not persist — assign to a global ' +
   '(x = await f()). Full fs/net/require access, NO sandbox. Lives only as long as your ' +
-  'MCP connection: no wmux restart, no sharing with other panes or workspaces.';
+  'MCP connection: no wmux restart, no sharing with other panes or workspaces. ' +
+  'await browser.X(args) drives the browser like browser_repl (full profile only).';
 
 const REPL_RESET_DESCRIPTION =
   'Throw away a REPL session and its state; the next repl_run starts a fresh runtime.';
@@ -118,7 +188,9 @@ const REPL_RESET_DESCRIPTION =
 const REPL_SESSIONS_DESCRIPTION =
   'List this connection\'s REPL sessions: cwd, pid, age, and current state.';
 
-export function createReplToolCatalog(): readonly WmuxToolSpec[] {
+export function createReplToolCatalog(
+  browserAccess?: ReplBrowserAccess,
+): readonly WmuxToolSpec[] {
   const replRun = defineWmuxTool({
     name: 'repl_run',
     description: REPL_RUN_DESCRIPTION,
@@ -141,41 +213,62 @@ export function createReplToolCatalog(): readonly WmuxToolSpec[] {
           "Working directory, honoured only when the session is created. Defaults to the MCP " +
             "server's cwd, which is not necessarily your pane's — pass it explicitly.",
         ),
+      maxBytes: maxBytesParam,
     },
+    strictInput: true,
     profiles: ['full', 'core'],
     invoke: async ({ code, session, timeout, cwd }) => {
       const name = session ?? DEFAULT_SESSION_NAME;
       if (!isValidSessionName(name)) {
         return text(`Invalid session name "${name}". Use 1-64 of: letters, digits, dot, underscore, hyphen.`, true);
       }
+      // The runtime runs on the host; a WSL caller's /mnt/<drive>/ cwd is
+      // translated, and a distro path has no host directory to start in.
+      const hostCwd = cwd === undefined ? undefined : fromAgentPath(cwd);
+      if (hostCwd === null) {
+        return text(
+          `cwd "${cwd}" is not an absolute /mnt/<drive>/ path; the REPL runs on Windows and can only start ` +
+            'in a drive-mount directory (/mnt/<drive>/...).',
+          true,
+        );
+      }
       const registry = getReplRegistry();
       const notes: string[] = [];
       let acquired;
       try {
-        acquired = registry.acquire(name, cwd ?? process.cwd());
+        acquired = registry.acquire(name, hostCwd ?? process.cwd());
       } catch (error) {
-        return text(String(error instanceof Error ? error.message : error), true);
+        const message = String(error instanceof Error ? error.message : error);
+        // A bad cwd is reported in the spelling the caller passed, not the host's.
+        return text(cwd && hostCwd && hostCwd !== cwd ? message.split(hostCwd).join(cwd) : message, true);
       }
       if (acquired.created) {
         if (acquired.previousDeath) {
           notes.push(`the previous "${name}" runtime is gone (${acquired.previousDeath}); this is a fresh one with no state`);
         }
-        notes.push(`started a new runtime in ${acquired.session.cwd}`);
+        notes.push(`started a new runtime in ${toAgentPath(acquired.session.cwd)}`);
         if (acquired.session.withheldCredentials.length > 0) {
           notes.push(
             `credential env vars are withheld from the REPL: ${acquired.session.withheldCredentials.join(', ')}`,
           );
         }
-      } else if (cwd && cwd !== acquired.session.cwd) {
+      } else if (hostCwd && hostCwd !== acquired.session.cwd) {
         notes.push(
-          `cwd was ignored — session "${name}" is already running in ${acquired.session.cwd}. ` +
+          `cwd was ignored — session "${name}" is already running in ${toAgentPath(acquired.session.cwd)}. ` +
             'Call repl_reset first, or use a different session name.',
         );
       }
 
       try {
-        const outcome = await acquired.session.run(code, clampTimeout(timeout));
-        return text(formatOutcome(name, outcome, notes), !outcome.ok);
+        // Captured HERE, inside the MCP dispatch: the child's browserCall
+        // messages arrive outside this AsyncLocalStorage context.
+        const browser = resolveReplBrowser(browserAccess, getConnectionScope());
+        const outcome = await acquired.session.run(code, clampTimeout(timeout), browser);
+        return textWithImages(
+          formatOutcome(name, outcome, notes),
+          outcome.browser?.images ?? [],
+          !outcome.ok,
+        );
       } catch (error) {
         return text(
           `session ${name}: ${String(error instanceof Error ? error.message : error)}`,
@@ -194,6 +287,7 @@ export function createReplToolCatalog(): readonly WmuxToolSpec[] {
         .optional()
         .describe(`Session name; defaults to "${DEFAULT_SESSION_NAME}".`),
     },
+    strictInput: true,
     profiles: ['full', 'core'],
     invoke: ({ session }) => {
       const name = session ?? DEFAULT_SESSION_NAME;
@@ -213,6 +307,7 @@ export function createReplToolCatalog(): readonly WmuxToolSpec[] {
     name: 'repl_sessions',
     description: REPL_SESSIONS_DESCRIPTION,
     inputSchema: {},
+    strictInput: true,
     profiles: ['full', 'core'],
     invoke: () => {
       const sessions = getReplRegistry().list();
@@ -243,7 +338,7 @@ export function createReplToolCatalog(): readonly WmuxToolSpec[] {
           s.busy
             ? 'reclaim held while busy'
             : `reclaim in ${formatDuration(Math.max(0, IDLE_TIMEOUT_MS - (now - s.lastUsed)))}`,
-          s.cwd,
+          toAgentPath(s.cwd),
         ].join(' · '),
       );
       return text([...rows, '', header].join('\n'));
@@ -254,6 +349,16 @@ export function createReplToolCatalog(): readonly WmuxToolSpec[] {
 }
 
 /** Register the REPL catalog through the wire-neutral current-SDK adapter. */
-export function registerReplTools(server: McpServer, options: RegisterWmuxToolsOptions): void {
-  registerWmuxTools(server, createReplToolCatalog(), options);
+export function registerReplTools(
+  server: McpServer,
+  options: RegisterWmuxToolsOptions,
+  browserTools?: ReadonlyMap<string, CollectedTool>,
+): void {
+  registerWmuxTools(
+    server,
+    createReplToolCatalog(
+      browserTools && { tools: browserTools, profile: options.profile },
+    ),
+    options,
+  );
 }

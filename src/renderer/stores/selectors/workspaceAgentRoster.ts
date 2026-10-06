@@ -2,9 +2,11 @@ import type { AgentStatus } from '../../../shared/types';
 import { isBrainPtyId } from '../../../shared/constants';
 import { getLeafPanes } from '../../../shared/paneUtils';
 import { stashedPaneLiveness, type StashedLiveness } from '../../../shared/paneStash';
+import { remoteAgentKey } from '../../../shared/remoteHosts';
+import { agentDisplayToSlug } from '../../../shared/agentIdentity';
 import type { StoreState } from '../index';
 import { computePaneAutoName, paneDisplayName } from '../../utils/paneNaming';
-import { HOOK_RUNNING_TTL_MS, isHookRunning, pickStashedRepresentativeSurface } from './fleet';
+import { HOOK_RUNNING_TTL_MS, isHookRunning, isQuietUsageLimitError, pickStashedRepresentativeSurface, resolveRemoteAgent } from './fleet';
 
 /** One detected agent session, kept attached to the terminal surface that owns it. */
 export interface WorkspaceAgentRosterRow {
@@ -13,6 +15,12 @@ export interface WorkspaceAgentRosterRow {
   surfaceId: string;
   ptyId: string;
   agentName: string;
+  /**
+   * #1481 — the agent kind for the row's identity glyph: the detector's slug
+   * when it reported one, else derived from the display name. Undefined for an
+   * unknown kind or a plain shell (the glyph falls back to a terminal mark).
+   */
+  slug?: string;
   paneName: string;
   surfaceTitle?: string;
   surfaceIndex: number;
@@ -20,6 +28,21 @@ export interface WorkspaceAgentRosterRow {
   status: AgentStatus;
   attentionStatus?: AgentStatus;
   pendingQuestion?: string;
+  /**
+   * #1176 — the user focused the pane while THIS question was showing. The dot
+   * stays red (still blocked) but the roster drops the animated glow: triaged
+   * vs untriaged blocked agents at a glance. Undefined when there is no live
+   * question or it has not been seen.
+   */
+  questionSeen?: boolean;
+  /**
+   * #1163 — this row is an agent session running on a REMOTE host, mirrored
+   * into this workspace as a remote-terminal surface. `ptyId` is then the
+   * synthetic `remote:{hostId}:{sessionId}` key (never a local ptyId), and
+   * hostLabel drives the origin badge so a remote row can never be mistaken
+   * for a local agent.
+   */
+  remote?: { hostId: string; hostLabel: string };
   activity?: string;
   hasAttention: boolean;
   needsAttention: boolean;
@@ -35,6 +58,12 @@ export interface WorkspaceAgentRosterRow {
   stashed?: boolean;
   /** Derived, never stored — see `stashedPaneLiveness`. Stashed rows only. */
   stashedLiveness?: StashedLiveness;
+  /**
+   * The agent is quietly waiting out a provider usage limit: its `error` is
+   * dropped from the status (no red mark, not counted) and the row draws the
+   * waiting mark instead. See fleet.ts isQuietUsageLimitError.
+   */
+  usageLimitWaiting?: true;
   /** When it was stashed, for the "2h ago" trailer. Stashed rows only. */
   stashedAt?: number;
 }
@@ -50,6 +79,35 @@ export interface WorkspaceAgentRosterProjection {
 function nonEmpty(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+const BARE_SHELL_TITLES = new Set([
+  'bash', 'zsh', 'sh', 'fish', 'dash', 'ksh', 'tcsh', 'csh', 'nu', 'cmd',
+  'pwsh', 'powershell', 'windows powershell', 'powershell 7', 'wsl',
+  // The placeholder wmux gives a new tab before the shell names itself.
+  'terminal',
+]);
+
+/** True when a tab title is only a shell's name (`Bash`, `-zsh`, `pwsh.exe`). */
+export function isBareShellTitle(title: string): boolean {
+  // A path title (`/bin/zsh`, `C:\\Windows\\System32\\cmd.exe`) is judged by
+  // its basename.
+  const base = title.trim().replace(/\\/g, '/').split('/').pop() ?? '';
+  const name = base.toLowerCase().replace(/^-/, '').replace(/\.exe$/, '');
+  return BARE_SHELL_TITLES.has(name);
+}
+
+/**
+ * The title an AGENT row may lead with. A tab still titled after the shell
+ * that hosts the agent ("Bash", "Zsh") says nothing about the agent, so it is
+ * dropped and the row falls back to the agent's name. Plain shell panes keep
+ * their title; this is applied to agent rows only.
+ */
+export function agentSurfaceTitle(surface: { title?: string; titleLocked?: boolean }): string | undefined {
+  const trimmed = nonEmpty(surface.title);
+  // A title the user typed is theirs even if it spells a shell name.
+  if (surface.titleLocked) return trimmed;
+  return trimmed && !isBareShellTitle(trimmed) ? trimmed : undefined;
 }
 
 function needsAttention(status: AgentStatus): boolean {
@@ -71,14 +129,60 @@ export function selectWorkspaceAgentRoster(
   const workspace = state.workspaces.find((candidate) => candidate.id === workspaceId);
   if (!workspace) return { rows: [], agentCount: 0, needsAttentionCount: 0, stashedCount: 0 };
 
+  // #1326 — default true (undefined in tests/older sessions must behave like
+  // the setting was never touched): the coordinate is withheld from the
+  // trailer only for panes that have no explicit label, never for one the
+  // user actually set.
+  const showCoordinates = state.sidebarShowPaneCoordinates !== false;
+
   const rows: WorkspaceAgentRosterRow[] = [];
   for (const leaf of getLeafPanes(workspace.rootPane)) {
     const paneName = paneDisplayName(
       state.paneLabel[leaf.id],
-      computePaneAutoName(workspace.wsOrdinal ?? 0, leaf.ordinal ?? 0),
+      showCoordinates ? computePaneAutoName(workspace.wsOrdinal ?? 0, leaf.ordinal ?? 0) : '',
     );
 
     leaf.surfaces.forEach((surface, surfaceIndex) => {
+      // #1163 — a remote-terminal surface has ptyId '' by contract and is
+      // invisible to every local PTY-keyed map. It gets a row iff the attached
+      // mirror carries agent metadata for its session: same "only agent rows"
+      // rule as local panes, counting remote agents into the same roster.
+      if ((surface.surfaceType ?? 'terminal') === 'remote-terminal') {
+        const hostId = surface.remoteHostId;
+        const sessionId = surface.remoteSessionId;
+        if (!hostId || !sessionId) return;
+        // #1343 — the resolution rules (every entry on the host, never a stale
+        // one) now live in fleet.ts, shared with selectFleetPanes so the
+        // sidebar roster and the Fleet cards cannot disagree about which
+        // remote sessions are agents.
+        const remoteAgent = resolveRemoteAgent(state.remoteWorkspaces, hostId, sessionId);
+        if (!remoteAgent) return;
+        const status: AgentStatus = remoteAgent.status;
+        rows.push({
+          workspaceId,
+          paneId: leaf.id,
+          surfaceId: surface.id,
+          ptyId: remoteAgentKey(hostId, sessionId),
+          agentName: remoteAgent.agentName,
+          slug: agentDisplayToSlug(remoteAgent.agentName),
+          paneName,
+          surfaceTitle: agentSurfaceTitle(surface),
+          surfaceIndex,
+          surfaceCount: leaf.surfaces.length,
+          status,
+          // The host snapshot has no event channel: no unseen-attention state,
+          // no transcript-derived question. The status IS the whole signal.
+          pendingQuestion: undefined,
+          hasAttention: false,
+          needsAttention: needsAttention(status),
+          isFocused:
+            state.activeWorkspaceId === workspaceId &&
+            workspace.activePaneId === leaf.id &&
+            leaf.activeSurfaceId === surface.id,
+          remote: { hostId, hostLabel: remoteAgent.hostLabel },
+        });
+        return;
+      }
       if ((surface.surfaceType ?? 'terminal') !== 'terminal') return;
       const ptyId = surface.ptyId;
       if (!ptyId || isBrainPtyId(ptyId)) return;
@@ -87,7 +191,9 @@ export function selectWorkspaceAgentRoster(
       if (!agent?.name) return;
 
       const pendingQuestion = nonEmpty(state.surfacePendingQuestion[ptyId]);
-      const attentionStatus = state.surfaceAgentStatus[ptyId];
+      const limitWaiting = state.usageLimitWaiting?.[ptyId] === true;
+      const rawAttention = state.surfaceAgentStatus[ptyId];
+      const attentionStatus = isQuietUsageLimitError(state.usageLimitWaiting, ptyId, rawAttention) ? undefined : rawAttention;
       const activityAt = state.surfaceActivityAt[ptyId] ?? 0;
       const activityIsFresh =
         activityAt > 0 && state.agentClockMs - activityAt <= HOOK_RUNNING_TTL_MS;
@@ -99,6 +205,7 @@ export function selectWorkspaceAgentRoster(
         activityAt,
         turnOpenAt: state.surfaceTurnOpenAt?.[ptyId],
         agentClockMs: state.agentClockMs,
+        turnEndAt: state.surfaceTurnEndAt?.[ptyId],
       });
 
       // Identity-only boot hydration currently seeds `running` without an
@@ -106,7 +213,9 @@ export function selectWorkspaceAgentRoster(
       // or a hook proves the agent is working; otherwise a quiet recovered
       // pane would pulse forever and disagree with the workspace aggregate.
       const lifecycleStatus: AgentStatus =
-        agent.status === 'running' && !hookRunning ? 'idle' : agent.status;
+        (agent.status === 'running' && !hookRunning) || isQuietUsageLimitError(state.usageLimitWaiting, ptyId, agent.status)
+          ? 'idle'
+          : agent.status;
 
       // A transcript-derived pending question is the strongest evidence that
       // this agent needs input. Otherwise an unseen attention state outranks
@@ -134,13 +243,17 @@ export function selectWorkspaceAgentRoster(
         surfaceId: surface.id,
         ptyId,
         agentName: agent.name,
+        slug: agent.slug ?? agentDisplayToSlug(agent.name),
         paneName,
-        surfaceTitle: nonEmpty(surface.title),
+        surfaceTitle: agentSurfaceTitle(surface),
         surfaceIndex,
         surfaceCount: leaf.surfaces.length,
         status,
         attentionStatus,
         pendingQuestion,
+        // Optional-chained like surfaceTurnOpenAt in fleet.ts: minimal test
+        // states (dotRosterParity) build partial stores without this map.
+        questionSeen: pendingQuestion !== undefined && state.surfaceQuestionSeen?.[ptyId] === pendingQuestion,
         activity,
         hasAttention: attentionStatus !== undefined || pendingQuestion !== undefined,
         needsAttention: needsAttention(status),
@@ -148,6 +261,7 @@ export function selectWorkspaceAgentRoster(
           state.activeWorkspaceId === workspaceId &&
           workspace.activePaneId === leaf.id &&
           leaf.activeSurfaceId === surface.id,
+        ...(limitWaiting ? { usageLimitWaiting: true as const } : {}),
       });
     });
   }
@@ -178,7 +292,9 @@ export function selectWorkspaceAgentRoster(
     const liveness = stashedPaneLiveness(leaf);
     const agent = ptyId ? state.surfaceAgent[ptyId] : undefined;
     const pendingQuestion = ptyId ? nonEmpty(state.surfacePendingQuestion[ptyId]) : undefined;
-    const attentionStatus = ptyId ? state.surfaceAgentStatus[ptyId] : undefined;
+    const rawAttention = ptyId ? state.surfaceAgentStatus[ptyId] : undefined;
+    const attentionStatus = isQuietUsageLimitError(state.usageLimitWaiting, ptyId, rawAttention) ? undefined : rawAttention;
+    const limitWaiting = !!ptyId && state.usageLimitWaiting?.[ptyId] === true;
     const activityAt = (ptyId ? state.surfaceActivityAt[ptyId] : 0) ?? 0;
     const activityIsFresh =
       activityAt > 0 && state.agentClockMs - activityAt <= HOOK_RUNNING_TTL_MS;
@@ -188,6 +304,7 @@ export function selectWorkspaceAgentRoster(
       activityAt,
       turnOpenAt: ptyId ? state.surfaceTurnOpenAt?.[ptyId] : undefined,
       agentClockMs: state.agentClockMs,
+      turnEndAt: ptyId ? state.surfaceTurnEndAt?.[ptyId] : undefined,
     });
 
     // An exited pane has no status to report — the session is gone, and painting
@@ -200,7 +317,9 @@ export function selectWorkspaceAgentRoster(
       status = 'awaiting_input';
     } else {
       const lifecycle: AgentStatus =
-        agent?.status === 'running' && !hookRunning ? 'idle' : (agent?.status ?? 'idle');
+        (agent?.status === 'running' && !hookRunning) || isQuietUsageLimitError(state.usageLimitWaiting, ptyId, agent?.status)
+          ? 'idle'
+          : (agent?.status ?? 'idle');
       status = attentionStatus ?? lifecycle;
       if (!attentionStatus && lifecycle === 'idle' && hookRunning) status = 'running';
     }
@@ -211,11 +330,12 @@ export function selectWorkspaceAgentRoster(
       surfaceId: surface.id,
       ptyId,
       agentName: agent?.name ?? '',
+      slug: agent ? agent.slug ?? agentDisplayToSlug(agent.name) : undefined,
       paneName: paneDisplayName(
         state.paneLabel[leaf.id],
-        computePaneAutoName(workspace.wsOrdinal ?? 0, leaf.ordinal ?? 0),
+        showCoordinates ? computePaneAutoName(workspace.wsOrdinal ?? 0, leaf.ordinal ?? 0) : '',
       ),
-      surfaceTitle: nonEmpty(surface.title),
+      surfaceTitle: agent ? agentSurfaceTitle(surface) : nonEmpty(surface.title),
       surfaceIndex: Math.max(0, leaf.surfaces.findIndex((s) => s.id === surface.id)),
       surfaceCount: leaf.surfaces.length,
       status,
@@ -228,6 +348,7 @@ export function selectWorkspaceAgentRoster(
       needsAttention: liveness === 'exited' || needsAttention(status),
       isFocused: false,
       stashed: true,
+      ...(limitWaiting && liveness !== 'exited' ? { usageLimitWaiting: true as const } : {}),
       stashedLiveness: liveness,
       stashedAt: entry.stashedAt,
     });
@@ -258,6 +379,7 @@ function rowsEqual(
       a.surfaceId !== b.surfaceId ||
       a.ptyId !== b.ptyId ||
       a.agentName !== b.agentName ||
+      a.slug !== b.slug ||
       a.paneName !== b.paneName ||
       a.surfaceTitle !== b.surfaceTitle ||
       a.surfaceIndex !== b.surfaceIndex ||
@@ -265,13 +387,17 @@ function rowsEqual(
       a.status !== b.status ||
       a.attentionStatus !== b.attentionStatus ||
       a.pendingQuestion !== b.pendingQuestion ||
+      a.questionSeen !== b.questionSeen ||
       a.activity !== b.activity ||
       a.hasAttention !== b.hasAttention ||
       a.needsAttention !== b.needsAttention ||
       a.isFocused !== b.isFocused ||
       a.stashed !== b.stashed ||
       a.stashedLiveness !== b.stashedLiveness ||
-      a.stashedAt !== b.stashedAt
+      a.usageLimitWaiting !== b.usageLimitWaiting ||
+      a.stashedAt !== b.stashedAt ||
+      a.remote?.hostId !== b.remote?.hostId ||
+      a.remote?.hostLabel !== b.remote?.hostLabel
     ) {
       return false;
     }
@@ -322,6 +448,93 @@ export function createWorkspaceAgentRosterSelector(
     ) {
       return previous;
     }
+    previous = next;
+    return next;
+  };
+}
+
+/** #1481 — one agent in the collapsed-row summary. */
+export interface RosterChipAgent {
+  slug?: string;
+  agentName: string;
+  status: AgentStatus;
+}
+
+/** #1481 — what a collapsed workspace row shows instead of a bare count. */
+export interface RosterChip {
+  agentCount: number;
+  stashedCount: number;
+  /** Every visible agent, most urgent status first, grouped by status. */
+  agents: RosterChipAgent[];
+  /** Agents not listed in `agents` (stashed ones); kept for the summary's count. */
+  extra: number;
+}
+
+export const CHIP_MAX_GLYPHS = 3;
+
+/** Lower = more urgent. Needs-you first, then error, running, done, idle. */
+export function chipStatusRank(status: AgentStatus): number {
+  switch (status) {
+    case 'awaiting_input':
+    case 'waiting':
+      return 0;
+    case 'error':
+      return 1;
+    case 'running':
+      return 2;
+    case 'complete':
+      return 3;
+    default:
+      return 4;
+  }
+}
+
+/**
+ * Pure: pick the chip's agents from roster rows. Visible agents only (stashed
+ * panes keep their own glyph in the summary), stable-sorted by urgency so rows
+ * sharing a status sit together. The summary counts per status, so the list
+ * is not capped.
+ */
+export function buildRosterChip(projection: WorkspaceAgentRosterProjection): RosterChip {
+  const visible = projection.rows.filter((row) => !row.stashed);
+  const eff = (row: WorkspaceAgentRosterRow) => (row.status === 'waiting' && !row.pendingQuestion ? 'idle' : row.status);
+  const ranked = visible
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => chipStatusRank(eff(a.row)) - chipStatusRank(eff(b.row)) || a.index - b.index)
+    // Plain waiting with no question is idle in the shared class
+    // (fleetAttentionClass) — the summary must not draw it as needs you.
+    .map(({ row }) => ({ slug: row.slug, agentName: row.agentName, status: row.status === 'waiting' && !row.pendingQuestion ? 'idle' as const : row.status }));
+  return {
+    agentCount: projection.agentCount,
+    stashedCount: projection.stashedCount,
+    agents: ranked,
+    extra: Math.max(0, projection.agentCount - ranked.length),
+  };
+}
+
+function chipsEqual(a: RosterChip, b: RosterChip): boolean {
+  if (a.agentCount !== b.agentCount || a.stashedCount !== b.stashedCount || a.extra !== b.extra) return false;
+  if (a.agents.length !== b.agents.length) return false;
+  for (let i = 0; i < a.agents.length; i += 1) {
+    const x = a.agents[i];
+    const y = b.agents[i];
+    if (x.slug !== y.slug || x.agentName !== y.agentName || x.status !== y.status) return false;
+  }
+  return true;
+}
+
+/**
+ * Reference-stable chip projection for the workspace row: re-renders the row
+ * only when a drawn glyph, its status or a count changes — never on terminal
+ * output or activity text.
+ */
+export function createWorkspaceRosterChipSelector(
+  workspaceId: string,
+): (state: StoreState) => RosterChip {
+  let previous: RosterChip | undefined;
+  return (state) => {
+    const next = buildRosterChip(selectWorkspaceAgentRoster(state, workspaceId));
+    if (previous && chipsEqual(previous, next)) return previous;
     previous = next;
     return next;
   };

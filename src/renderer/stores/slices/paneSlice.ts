@@ -1,4 +1,5 @@
 import type { StateCreator } from 'zustand';
+import { paneTaskFoldKey } from '../../utils/sidebarLayout';
 import type { StoreState } from '../index';
 import type { Pane, PaneBranch, StashedPane, Workspace, AgentStatus } from '../../../shared/types';
 import type { AgentSlug } from '../../../shared/events';
@@ -166,7 +167,9 @@ export interface PaneSlice {
   focusPaneSurface: (workspaceId: string, paneId: string, surfaceId?: string) => boolean;
   focusPaneDirection: (direction: 'up' | 'down' | 'left' | 'right') => void;
   cyclePane: (direction: 'next' | 'prev') => void;
-  updatePaneSizes: (branchId: string, sizes: number[]) => void;
+  /** `workspaceId` defaults to the active workspace; a multiview tile that is
+   *  not active passes its own. */
+  updatePaneSizes: (branchId: string, sizes: number[], workspaceId?: string) => void;
   resizeActivePane: (direction: 'left' | 'right' | 'up' | 'down', amount: number) => void;
   equalizePaneSizes: () => void;
   // Sparse map of per-pane visual notification rings. Missing entry = no ring.
@@ -192,7 +195,8 @@ export interface PaneSlice {
   // Transient — never persisted (buildSessionData allowlist excludes it).
   surfaceAgent: Record<string, { name: string; status: AgentStatus; slug?: AgentSlug }>;
   setSurfaceAgent: (ptyId: string, name: string | undefined, status: AgentStatus | undefined, slug?: AgentSlug) => void;
-  clearSurfaceAgent: (ptyId: string) => void;
+  /** `evidenceBefore`: also drop the running stamp when it is no newer (#1463). */
+  clearSurfaceAgent: (ptyId: string, evidenceBefore?: number) => void;
   // P2 — per-pane user label (rename) mirror, keyed by paneId. Volatile and
   // never persisted (buildSessionData allowlist excludes it; MetadataStore /
   // metadata.json is the durable source). Fed by the pane.metadata.changed
@@ -221,12 +225,18 @@ export interface PaneSlice {
   // The string is derived + sanitized + throttled in the MAIN process
   // (hooks.rpc summarizeActivity, 3s leading-edge per-ptyId) and arrives on
   // METADATA_UPDATE.activity; the renderer only stores + renders it — never
-  // re-throttles, never re-sanitizes. Kept across Stop so a finished card still
-  // reads "✎ fleet.ts" rather than blank; cleared at the two real surface
-  // teardown sites (closePane here + closeSurface). Transient — never persisted
+  // re-throttles, never re-sanitizes. Cleared at every turn boundary (main's
+  // buildTurnBoundaryMetadata sends '') and at the two real surface teardown
+  // sites (closePane here + closeSurface). Transient — never persisted
   // (buildSessionData is an allowlist and deliberately omits it).
   surfaceActivity: Record<string, string>;
   setSurfaceActivity: (ptyId: string, activity: string | null) => void;
+  // The last non-empty activity line per ptyId. Unlike surfaceActivity it
+  // survives a Stop's clear, so a finished or idle Fleet row can say what the
+  // agent did last. Written by setSurfaceActivity; cleared on a session start
+  // (clearSurfaceLastActivity) and at the same teardown sites. Transient.
+  surfaceLastActivity: Record<string, string>;
+  clearSurfaceLastActivity: (ptyId: string) => void;
   // Per-surface "this agent ended its turn asking something" text, keyed by
   // ptyId. Populated from METADATA_UPDATE.pendingQuestion, which main derives
   // from the Stop hook's transcript — not from the rendered terminal, where a
@@ -236,6 +246,23 @@ export interface PaneSlice {
   // Transient — never persisted (buildSessionData allowlist excludes it).
   surfacePendingQuestion: Record<string, string>;
   setSurfacePendingQuestion: (ptyId: string, question: string | null) => void;
+  // Per-surface tail of the agent's closing message for its last turn, keyed
+  // by ptyId. Populated from METADATA_UPDATE.lastMessage, which main cuts to
+  // the phone list's grapheme budget. Every turn boundary writes it ('' clears),
+  // so a new session or a failed turn never shows the previous turn's text.
+  // Transient — never persisted (buildSessionData allowlist excludes it).
+  surfaceLastMessage: Record<string, string>;
+  setSurfaceLastMessage: (ptyId: string, text: string | null) => void;
+  /**
+   * #1176 — the pendingQuestion text the user has already laid eyes on (they
+   * focused the pane while it was blocked). The dot stays red — the agent IS
+   * still blocked — but the roster drops the animated glow for a seen
+   * question, so across many workspaces triaged and untriaged blocked agents
+   * are distinguishable at a glance. Keyed by text, not a boolean: a NEW
+   * question (agent asked again) is unseen again. Cleared with the question.
+   */
+  surfaceQuestionSeen: Record<string, string>;
+  markSurfaceQuestionSeen: (ptyId: string) => void;
   // Stamp the "running" freshness clock for a pane WITHOUT an activity string —
   // the byte-based per-PTY 'running' broadcast has no tool name. Same 120s-TTL
   // decay as setSurfaceActivity's stamp; lights background dots from bytes.
@@ -270,6 +297,10 @@ export interface PaneSlice {
   // otherwise cross the 120 s TTL and read as idle mid-turn, which is the
   // exact bug the hook was installed to fix.
   surfaceTurnOpenAt: Record<string, number>;
+  // When each pty's turn last ended — complete, waiting or error (stamped on
+  // the first turn-ending status, not on repeats). Fleet's Ready to review ages and orders
+  // finished tasks by it; output stamps move with every TUI redraw.
+  surfaceTurnEndAt: Record<string, number>;
   markSurfaceTurnOpen: (ptyId: string) => void;
   clearSurfaceTurnOpen: (ptyId: string) => void;
   // A SETTLE from main (`settled:true` on an idle broadcast): the turn is over,
@@ -330,6 +361,15 @@ const TURN_CLOSING_STATUSES: ReadonlySet<AgentStatus> = new Set<AgentStatus>([
   'awaiting_input',
   'error',
   'idle',
+]);
+
+// The statuses that stamp `surfaceTurnEndAt`: a turn that ended, whatever it
+// ended on. Not 'awaiting_input' (a question pauses a turn) and not 'idle'
+// (byte silence proves nothing; a settled idle drops the activity stamp itself).
+const TURN_END_STATUSES: ReadonlySet<AgentStatus> = new Set<AgentStatus>([
+  'complete',
+  'waiting',
+  'error',
 ]);
 
 /** Normalized leaf rectangle in a 0–100 coordinate space (both axes). */
@@ -525,7 +565,14 @@ function attachBeside(
   const liveTarget = findPane(ws.rootPane, targetLeafId);
   if (!liveTarget) return false;
 
-  const [nodeShare, targetShare] = sizes && sizes.length === 2 ? sizes : [50, 50];
+  // Normalised to sum to 100: origin sizes are the pair's shares of a parent
+  // that may have had more children (two of three thirds is [33.3, 33.3]), and
+  // a branch is persisted — session file, archive snapshots — with whatever
+  // sizes it carries, not the ones the library normalises on screen.
+  const [rawNode, rawTarget] =
+    sizes && sizes.length === 2 && sizes.every((n) => Number.isFinite(n) && n > 0) ? sizes : [50, 50];
+  const nodeShare = (rawNode * 100) / (rawNode + rawTarget);
+  const targetShare = (rawTarget * 100) / (rawNode + rawTarget);
   const branch: PaneBranch = {
     id: generateId('pane'),
     type: 'branch',
@@ -603,6 +650,16 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     // Store only attention-worthy statuses; everything else (running, idle,
     // null) clears the entry so the blink stops as soon as the agent
     // resumes, goes idle, or the PTY exits.
+    // Turn-end stamp: set on the first turn-ending status after a turn opened,
+    // kept through repeats and through the focus clear (null), withdrawn when
+    // the agent runs again. #1463 — `waiting` and `error` end a turn as surely
+    // as `complete`, and `isHookRunning` reads activity older than this stamp
+    // as the finished turn's.
+    if (TURN_END_STATUSES.has(status as AgentStatus) && state.surfaceTurnEndAt[ptyId] === undefined) {
+      state.surfaceTurnEndAt[ptyId] = Date.now();
+    } else if (status === 'running') {
+      delete state.surfaceTurnEndAt[ptyId];
+    }
     if (status && ATTENTION_STATUSES.has(status)) {
       state.surfaceAgentStatus[ptyId] = status;
     } else {
@@ -640,9 +697,19 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     };
   }),
 
-  clearSurfaceAgent: (ptyId) => set((state: StoreState) => {
+  clearSurfaceAgent: (ptyId, evidenceBefore) => set((state: StoreState) => {
     if (!ptyId) return;
     delete state.surfaceAgent[ptyId];
+    // #1463 — the agent is gone, so its byte/activity evidence is too. Fleet
+    // rows are per pane, not per agent: a leftover running stamp kept "Turn in
+    // progress" there for up to 120 s after the roster row had already dropped.
+    // Only evidence from before the liveness snapshot was taken: a newer stamp
+    // belongs to whatever runs in the pane now. The turn latch is left alone:
+    // main's settle edges withdraw it when the agent really is gone.
+    const at = state.surfaceActivityAt[ptyId];
+    if (evidenceBefore !== undefined && at !== undefined && at <= evidenceBefore) {
+      delete state.surfaceActivityAt[ptyId];
+    }
   }),
 
   paneLabel: {},
@@ -685,9 +752,13 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
   }),
 
   surfaceActivity: {},
+  surfaceLastActivity: {},
   surfaceActivityAt: {},
   surfaceTurnOpenAt: {},
+  surfaceTurnEndAt: {},
   surfacePendingQuestion: {},
+  surfaceLastMessage: {},
+  surfaceQuestionSeen: {},
   agentClockMs: Date.now(),
 
   bumpAgentClock: () => set((state: StoreState) => {
@@ -701,12 +772,14 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     // keeps the existing reference (immer), so React shallow-compares it away.
     if (activity) {
       state.surfaceActivity[ptyId] = activity;
+      state.surfaceLastActivity[ptyId] = activity;
       // The agent is demonstrably working again, so any question it was
       // blocked on has been answered. Without this the two fields disagree
       // exactly when a cross-pane orchestrator is most likely to read them:
       // "running" and "blocked on a question" at the same time, until the
       // NEXT stop finally clears it.
       delete state.surfacePendingQuestion[ptyId];
+      delete state.surfaceQuestionSeen[ptyId];
       // Stamp the arrival time for the hook-driven 'running' derivation. Always
       // updated (even on a same-string tool repeat) so the freshness window
       // tracks the LATEST tool, not the first.
@@ -717,12 +790,39 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     }
   }),
 
+  clearSurfaceLastActivity: (ptyId) => set((state: StoreState) => {
+    if (ptyId) delete state.surfaceLastActivity[ptyId];
+  }),
+
   setSurfacePendingQuestion: (ptyId, question) => set((state: StoreState) => {
     if (!ptyId) return;
     // Main already truncated the text. Empty/null clears — every stop writes
     // this field, so an answered pane drops its question on its next turn end.
     if (question) state.surfacePendingQuestion[ptyId] = question;
-    else delete state.surfacePendingQuestion[ptyId];
+    else {
+      delete state.surfacePendingQuestion[ptyId];
+      // #1176 — the seen marker dies with the question it described; a NEW
+      // question text simply never matches the old marker, so it reads as
+      // unseen with no extra bookkeeping.
+      delete state.surfaceQuestionSeen[ptyId];
+    }
+  }),
+
+  setSurfaceLastMessage: (ptyId, text) => set((state: StoreState) => {
+    if (!ptyId) return;
+    // Main already truncated the text. Empty/null clears.
+    if (text) state.surfaceLastMessage[ptyId] = text;
+    else delete state.surfaceLastMessage[ptyId];
+  }),
+
+  markSurfaceQuestionSeen: (ptyId) => set((state: StoreState) => {
+    if (!ptyId) return;
+    const question = state.surfacePendingQuestion[ptyId];
+    // No-op without a live question: there is nothing to mark seen, and a
+    // stale entry would glow-drop a FUTURE question the user never saw.
+    if (question && state.surfaceQuestionSeen[ptyId] !== question) {
+      state.surfaceQuestionSeen[ptyId] = question;
+    }
   }),
 
   markSurfaceRunning: (ptyId) => set((state: StoreState) => {
@@ -734,6 +834,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     // question. Same reasoning as setSurfaceActivity; this is the path that
     // covers agents with no tool hooks at all.
     delete state.surfacePendingQuestion[ptyId];
+    delete state.surfaceQuestionSeen[ptyId];
   }),
 
   markSurfaceTurnOpen: (ptyId) => set((state: StoreState) => {
@@ -742,6 +843,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     // Stop between them (the human hit ESC and re-submitted) is the SAME open
     // turn, but the silence clock must run from the latest submission.
     state.surfaceTurnOpenAt[ptyId] = Date.now();
+    delete state.surfaceTurnEndAt[ptyId];
   }),
 
   clearSurfaceTurnOpen: (ptyId) => set((state: StoreState) => {
@@ -970,16 +1072,22 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
         delete state.paneLabel[leaf.id];
         // Drop the orchestrator-role mirror on the same teardown (mirrors label).
         delete state.paneRole[leaf.id];
+        // The sidebar's fold state for the tasks this pane requested.
+        if (state.sidebarTaskGroupExpanded) delete state.sidebarTaskGroupExpanded[paneTaskFoldKey(ws.id, leaf.id)];
         for (const s of leaf.surfaces) {
           if (s.ptyId) {
             delete state.surfaceAgent[s.ptyId];
             delete state.surfaceActivity[s.ptyId];
+            delete state.surfaceLastActivity[s.ptyId];
             delete state.surfacePendingQuestion[s.ptyId];
+            delete state.surfaceLastMessage[s.ptyId];
+            delete state.surfaceQuestionSeen[s.ptyId];
             delete state.surfaceActivityAt[s.ptyId];
             // A reused ptyId must not inherit a dead pane's open turn — the
             // latch outranks the byte heuristic, so a leaked one would pin the
             // new pane at 'running' with nothing left alive to withdraw it.
             delete state.surfaceTurnOpenAt[s.ptyId];
+            delete state.surfaceTurnEndAt[s.ptyId];
             delete state.surfaceOutputAt[s.ptyId];
             delete state.surfacePorts[s.ptyId];
             delete state.surfaceAgentStatus[s.ptyId];
@@ -1416,8 +1524,8 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     return ok;
   },
 
-  updatePaneSizes: (branchId, sizes) => set((state: StoreState) => {
-    const ws = state.workspaces.find((w: Workspace) => w.id === state.activeWorkspaceId);
+  updatePaneSizes: (branchId, sizes, workspaceId) => set((state: StoreState) => {
+    const ws = state.workspaces.find((w: Workspace) => w.id === (workspaceId || state.activeWorkspaceId));
     if (!ws) return;
     const branch = findPane(ws.rootPane, branchId);
     if (branch && branch.type === 'branch') {

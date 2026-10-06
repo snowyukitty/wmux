@@ -130,6 +130,10 @@ vi.mock('../../../deck/deckScheduleStore', () => ({
   saveDeckSchedules: vi.fn(async (next: FakeSchedule[]) => {
     schedules = [...next];
   }),
+  mutateDeckSchedules: vi.fn(async (fn: (current: FakeSchedule[]) => FakeSchedule[] | null) => {
+    const next = fn([...schedules]);
+    if (next) schedules = [...next];
+  }),
   createSchedule: vi.fn((args: { workspaceId: string; prompt: string; nextRunAt: number; intervalMinutes?: number }) => {
     if (!args.prompt.trim() || !args.workspaceId) return null;
     const s: FakeSchedule = {
@@ -159,12 +163,18 @@ interface FakeDecision {
   resolution?: string;
   raisedAt: number;
   resolvedAt?: number;
+  origin?: 'issue-proposal' | 'moa-handoff';
+  ref?: string;
 }
 const decisions = new Map<string, FakeDecision>();
 vi.mock('../../../deck/deckDecisionStore', () => ({
+  onDecisionsChanged: vi.fn(() => () => undefined),
+  isIssueProposalDecision: vi.fn((d: FakeDecision | null | undefined) => d?.origin === 'issue-proposal'),
+  isMainOwnedDecision: vi.fn((d: FakeDecision | null | undefined) => d?.origin === 'issue-proposal' || d?.origin === 'moa-handoff'),
   loadWorkspaceDecision: vi.fn((ws: string) => decisions.get(ws) ?? null),
   loadDeckDecisions: vi.fn(() => Object.fromEntries(decisions.entries())),
   hasPendingDecision: vi.fn((ws: string) => decisions.get(ws)?.status === 'pending'),
+  hasBrainBlockingDecision: vi.fn((ws: string) => decisions.get(ws)?.status === 'pending' && decisions.get(ws)?.origin !== 'issue-proposal' && decisions.get(ws)?.origin !== 'moa-handoff'),
   resolveDecision: vi.fn(async (ws: string, id: string, resolution: string) => {
     const d = decisions.get(ws);
     if (!d || d.id !== id || d.status !== 'pending' || !resolution.trim()) return null;
@@ -188,6 +198,23 @@ vi.mock('../../../deck/deckDecisionStore', () => ({
       : `[decision] BLOCKED — ${d.question}`,
   ),
 }));
+
+// Moa's hand-off service: a fake, so the wiring in deck.handler (generic
+// resolve routing, bus-event owner routing, worker-stop routing) is what runs.
+const handoffFake = vi.hoisted(() => ({
+  resolve: vi.fn(async () => ({ ok: true, delivered: true, taskId: 't-1' })),
+  noteTaskState: vi.fn((): string | null => null),
+  onWorkerStop: vi.fn(async (): Promise<{ hq: string; taskId: string; movedToInputRequired: boolean } | null> => null),
+  hqForTask: vi.fn((): string | null => null),
+  handoffDetail: vi.fn((): { question?: string } | null => null),
+  waitingOnHandoff: vi.fn(() => false),
+  handoffTaskStatus: vi.fn((): 'open' | 'settled' | null => null),
+  cardInfo: vi.fn(() => null),
+  receipts: vi.fn(() => []),
+  stop: vi.fn(async () => ({ ok: true })),
+  reconcile: vi.fn(async () => undefined),
+}));
+vi.mock('../../../deck/moaHandoffHost', () => ({ createMoaHandoffService: () => handoffFake }));
 
 // Active deck work: these loop/decision/autonomy tests pre-date the active-work
 // feature. Mock the store empty so real disk state (a stale deck-work.json from
@@ -224,11 +251,13 @@ import {
   renderAutonomyBlock,
   modeToPermissionMode,
 } from '../deck.handler';
+import { setMoaEnabled } from '../../../deck/deckHqStore';
 import { buildCommanderSystemPrompt } from '../../../deck/ClaudeSdkAdapter';
 import { IPC } from '../../../../shared/constants';
 import type { FleetSnapshot } from '../../../workspace/WorkspaceMirror';
 import { eventBus } from '../../../events/EventBus';
 import { createGlobalTurnGate } from '../../../deck/globalTurnGate';
+import { setFanOutGuardsForTests } from '../../../worktask/fanoutGuards';
 import type { BrainAdapter, BrainEvent, BrainStartOptions } from '../../../deck/BrainAdapter';
 
 /** Fake adapter recording the exact text each turn was sent with. */
@@ -261,6 +290,12 @@ const fakeWindow = {
 
 const invoke = (channel: string, payload: Record<string, unknown>) =>
   captured.get(channel)!({}, payload) as Promise<Record<string, unknown>>;
+
+// These suites exercise the deck brain itself: start with Moa's master
+// switch on (a fresh data dir would otherwise read as a new install, off).
+beforeEach(async () => {
+  await setMoaEnabled(true);
+});
 
 beforeEach(() => {
   captured.clear();
@@ -447,6 +482,48 @@ describe('deck:decision — the gate (handler wiring)', () => {
       status: 'pending',
       raisedAt: 1,
     });
+
+  const seedProposal = (ws: string, status: 'pending' | 'resolved' = 'pending') =>
+    decisions.set(ws, {
+      id: 'card-1',
+      question: 'New issue acme/widgets#7 "Item" — hand it to W?',
+      options: ['Hand off', 'Not now', 'Ignore this repo'],
+      context: '',
+      status,
+      ...(status === 'resolved' ? { resolution: 'Not now', resolvedAt: 2 } : {}),
+      raisedAt: 1,
+      origin: 'issue-proposal',
+      ref: 'issue:github.com/acme/widgets#7',
+    });
+
+  it('an issue-proposal card never rides a brain turn as a [decision]', async () => {
+    seedProposal('ws-1');
+    await invoke(IPC.DECK_SEND, { workspaceId: 'ws-1', text: 'status?' });
+    const sent = adapters.find((x) => x.workspaceId === 'ws-1')!.sentTexts.join('\n');
+    expect(sent).toContain('status?');
+    expect(sent).not.toContain('[decision]');
+    expect(sent).not.toContain('acme/widgets#7');
+  });
+
+  it('answering an issue-proposal card resumes no brain and clears the card', async () => {
+    seedProposal('ws-1');
+    const sends = vi.spyOn(fakeWindow.webContents, 'send');
+    const res = await invoke(IPC.DECK_DECISION_RESOLVE, { workspaceId: 'ws-1', id: 'card-1', resolution: 'Not now' });
+    expect(res.ok).toBe(true);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(decisions.has('ws-1')).toBe(false);
+    expect(adapters.find((x) => x.workspaceId === 'ws-1')?.sentTexts ?? []).toEqual([]);
+    // The workspace's open decision card is told to refetch.
+    expect(sends).toHaveBeenCalledWith(IPC.DECK_STREAM, { workspaceId: 'ws-1', event: { type: 'decision-changed' } });
+    sends.mockRestore();
+  });
+
+  it('GET on a resolved issue-proposal card resumes no brain', async () => {
+    seedProposal('ws-1', 'resolved');
+    await invoke(IPC.DECK_DECISION_GET, { workspaceId: 'ws-1' });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(adapters.find((x) => x.workspaceId === 'ws-1')?.sentTexts ?? []).toEqual([]);
+  });
 
   it('GET hydrates a pending decision', async () => {
     seedPending('ws-1');
@@ -1049,6 +1126,8 @@ describe("regression — yesterday's frozen fork now composes a resolve-first tu
     expect(sys).toContain('the [policy]');
     // The exact qualifier that reclassifies yesterday's fork as self-resolvable.
     expect(sys).toContain('A choice that a standing rule already answers is NOT a genuine choice');
+    // #1680 — the terminal brain gets the same new-task rule as the SDK brain.
+    expect(sys).toContain('NEW TASK = FRESH START');
   });
 
   it('a danger turn on the frozen fork carries authority + the binding worktree rule + the decision', async () => {
@@ -1153,7 +1232,16 @@ describe('fan-out task workspaces never run a brain of their own (wave 2 dogfood
     expect(capWrites).toContainEqual({ ws: 'ws-task', patch: { mode: 'off' } });
   });
 
-  it("an owner that is itself a task workspace (nested fan-out) has no brain: the event is parked, not pushed", async () => {
+  // #1274: this failed on windows-latest as `expected +0 to be 1`. There is no
+  // debounce on this path — deck.handler skips `coalescer.push` for a task
+  // workspace and calls `routeWorkerEventToOwner` inline. The only async step
+  // is `TaskLedger.recordOrphanedEvent` (serialize + jsonl append), whose
+  // rejection is swallowed by a `.catch(console.warn)` in the ledger host, so a
+  // slow or failed append surfaces here only as the poll never seeing the
+  // event. `vi.waitFor`'s DEFAULT timeout is 1 s, which a loaded Windows
+  // runner's fs append can outlast; the wait is now 10 s (and the test past
+  // it). Locally the park lands in ~36 ms, so a healthy run is unaffected.
+  it("an owner that is itself a task workspace (nested fan-out) has no brain: the event is parked, not pushed", { timeout: 15_000 }, async () => {
     // ws-1 owns wtask-1 (ws-task); make ws-1 itself a task of ws-root.
     await ledger.register({ id: 'wtask-0', taskWorkspaceId: 'ws-1', ownerWorkspaceId: 'ws-root', title: 'outer' });
     eventBus.emit({
@@ -1166,7 +1254,168 @@ describe('fan-out task workspaces never run a brain of their own (wave 2 dogfood
       decision: 'emit',
     });
     // The park is an async ledger append; poll instead of a fixed delay.
-    await vi.waitFor(() => expect(ledger.peekOrphanedEvents('ws-1').length).toBe(1));
+    await vi.waitFor(
+      () => expect(ledger.peekOrphanedEvents('ws-1').length).toBe(1),
+      { timeout: 10_000, interval: 25 },
+    );
     expect(adapters).toHaveLength(0);
+  });
+});
+
+describe('fan-out caller nudge wiring (owner with no brain)', () => {
+  let ledgerDir: string;
+  let ledger: TaskLedger;
+  let sent: Array<{ channel: string; payload: Record<string, unknown> }>;
+  beforeEach(async () => {
+    ledgerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-deck-caller-'));
+    ledger = new TaskLedger({ dir: ledgerDir });
+    setTaskLedgerForTests(ledger);
+    await ledger.register({ id: 'wtask-1', taskWorkspaceId: 'ws-task', ownerWorkspaceId: 'ws-1', title: 'lane' });
+    setFanOutGuardsForTests({
+      lineageFor: (ids: readonly string[]) =>
+        ids.includes('ws-task')
+          ? { 'ws-task': { owner: 'ws-1', at: 1, origin: { kind: 'pane', paneId: 'pane-c', surfaceId: 'surf-c' } } }
+          : {},
+    } as unknown as Parameters<typeof setFanOutGuardsForTests>[0]);
+    mockMode = 'off';
+    sent = [];
+    const spyWindow = {
+      isDestroyed: () => false,
+      webContents: {
+        send: (channel: string, payload: Record<string, unknown>) => sent.push({ channel, payload }),
+      },
+    } as unknown as import('electron').BrowserWindow;
+    cleanup?.();
+    captured.clear();
+    adapters = [];
+    cleanup = registerDeckHandler(() => spyWindow, {
+      createAdapter: (opts) => {
+        const a = new FakeAdapter(opts.workspaceId);
+        adapters.push(a);
+        return a;
+      },
+    });
+  });
+  afterEach(() => {
+    setFanOutGuardsForTests(null);
+    setTaskLedgerForTests(null);
+    fs.rmSync(ledgerDir, { recursive: true, force: true });
+  });
+
+  const callerPointers = () =>
+    sent.filter((s) => s.channel === IPC.DECK_FANOUT_CALLER).map((s) => s.payload);
+
+  it('one turn end reported twice (emit, then dedup) parks both and tells the caller once', { timeout: 15_000 }, async () => {
+    for (const decision of ['emit', 'dedup'] as const) {
+      eventBus.emit({
+        type: 'agent.lifecycle',
+        workspaceId: 'ws-task',
+        ptyId: 'p-worker',
+        kind: 'agent.stop',
+        source: decision === 'emit' ? 'hook' : 'detector',
+        agent: 'claude',
+        decision,
+      });
+    }
+    await vi.waitFor(() => expect(ledger.peekOrphanedEvents('ws-1').length).toBe(2), { timeout: 10_000, interval: 25 });
+    expect(callerPointers()).toHaveLength(1);
+    expect(callerPointers()[0]).toMatchObject({
+      ownerWorkspaceId: 'ws-1',
+      taskId: 'wtask-1',
+      kind: 'agent.stop',
+      origin: { paneId: 'pane-c', surfaceId: 'surf-c' },
+    });
+    expect(adapters).toHaveLength(0);
+  });
+
+  it('a worker recording failed tells the caller even though its row is now closed', async () => {
+    await ledger.update({ id: 'wtask-1', status: 'failed', actor: { kind: 'worker', workspaceId: 'ws-task' }, expectedRev: 1 });
+    expect(callerPointers()).toEqual([
+      expect.objectContaining({ taskId: 'wtask-1', kind: 'ledger.failed', seq: 2 }),
+    ]);
+    // The Stop that follows is no longer routed (the row is closed).
+    eventBus.emit({
+      type: 'agent.lifecycle',
+      workspaceId: 'ws-task',
+      ptyId: 'p-worker',
+      kind: 'agent.stop',
+      source: 'hook',
+      agent: 'claude',
+      decision: 'emit',
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(callerPointers()).toHaveLength(1);
+  });
+
+  it('a brain-run owner is never sent a caller pointer', async () => {
+    mockMode = 'assist';
+    await ledger.update({ id: 'wtask-1', status: 'review_requested', actor: { kind: 'worker', workspaceId: 'ws-task' }, expectedRev: 1 });
+    expect(callerPointers()).toHaveLength(0);
+  });
+});
+
+
+describe('Moa hand-off wiring in deck.handler', () => {
+  beforeEach(() => {
+    cleanup?.();
+    captured.clear();
+    adapters = [];
+    Object.values(handoffFake).forEach((f) => f.mockClear());
+    cleanup = registerDeckHandler(() => fakeWindow, {
+      createAdapter: (opts) => {
+        const a = new FakeAdapter(opts.workspaceId);
+        adapters.push(a);
+        return a;
+      },
+      invokeOperatorRpc: async () => ({ ok: true }),
+    });
+  });
+
+  const handoffCard = (): void => {
+    decisions.set('ws-seal', {
+      id: 'dec-h', question: 'Moa proposes…', options: ['Hand off', 'Edit', 'Cancel'], context: '',
+      status: 'pending', raisedAt: 1, origin: 'moa-handoff', ref: 'h1',
+    });
+  };
+
+  it('the generic decision resolve hands a hand-off card to main by id; a bare Edit is refused', async () => {
+    handoffCard();
+    expect(await invoke(IPC.DECK_DECISION_RESOLVE, { workspaceId: 'ws-seal', id: 'dec-h', resolution: 'Hand off' })).toEqual({ ok: true });
+    expect(handoffFake.resolve).toHaveBeenCalledWith('ws-seal', 'dec-h', 'handoff');
+    // The store's own resolve never ran: the answer is main's, no brain resumes.
+    expect(decisions.get('ws-seal')?.status).toBe('pending');
+    expect(adapters).toHaveLength(0);
+
+    handoffFake.resolve.mockClear();
+    expect(await invoke(IPC.DECK_DECISION_RESOLVE, { workspaceId: 'ws-seal', id: 'dec-h', resolution: 'Edit' })).toEqual({ ok: false, code: 'edit_needs_body' });
+    expect(handoffFake.resolve).not.toHaveBeenCalled();
+  });
+
+  it('DECK_MOA_HANDOFF_RESOLVE passes the edited body as the operator\'s input', async () => {
+    await invoke(IPC.DECK_MOA_HANDOFF_RESOLVE, { workspaceId: 'ws-seal', id: 'dec-h', action: 'handoff', body: 'edited' });
+    expect(handoffFake.resolve).toHaveBeenCalledWith('ws-seal', 'dec-h', 'handoff', 'edited');
+  });
+
+  it('an A2A event for a hand-off task wakes the HQ that proposed it, not the operator lane', { timeout: 10_000 }, async () => {
+    mockMode = 'danger';
+    handoffFake.noteTaskState.mockReturnValue('ws-1');
+    handoffFake.handoffDetail.mockReturnValue({ question: 'Which stack is it?' });
+    eventBus.emit({ type: 'a2a.task', workspaceId: 'ws-human', from: 'ws-human', to: 'ws-seal', taskId: 'task-h1', state: 'input-required' } as never);
+    expect(handoffFake.noteTaskState).toHaveBeenCalledWith('task-h1', 'input-required');
+    await vi.waitFor(() => expect(adapters.find((a) => a.workspaceId === 'ws-1')?.sentTexts.join('\n') ?? '').toContain('task-h1'), { timeout: 5_000 });
+    expect(adapters.some((a) => a.workspaceId === 'ws-human')).toBe(false);
+    // The wake names it as the operator's hand-off and carries the question.
+    const sent = adapters.find((a) => a.workspaceId === 'ws-1')!.sentTexts.join('\n');
+    expect(sent).toContain('HAND-OFF NEEDS INPUT');
+    expect(sent).toContain('Which stack is it?');
+  });
+
+  it('a worker turn end reaches the hand-off store with its closing words; a repeat or an approval wait does not', async () => {
+    const lastMessage = { text: 'Which module first?', endsWithQuestion: true };
+    eventBus.emit({ type: 'agent.lifecycle', workspaceId: 'ws-seal', ptyId: 'pty-w', kind: 'agent.stop', source: 'hook', agent: 'claude', decision: 'emit', lastMessage } as never);
+    eventBus.emit({ type: 'agent.lifecycle', workspaceId: 'ws-seal', ptyId: 'pty-w', kind: 'agent.stop', source: 'hook', agent: 'claude', decision: 'dedup' } as never);
+    eventBus.emit({ type: 'agent.lifecycle', workspaceId: 'ws-seal', ptyId: 'pty-w', kind: 'agent.awaiting_input', source: 'hook', agent: 'claude', decision: 'emit' } as never);
+    await vi.waitFor(() => expect(handoffFake.onWorkerStop).toHaveBeenCalledTimes(1));
+    expect(handoffFake.onWorkerStop).toHaveBeenCalledWith('pty-w', 'claude', lastMessage);
   });
 });

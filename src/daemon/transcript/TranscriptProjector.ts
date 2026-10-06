@@ -31,9 +31,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import {
-  parseTranscriptLineDetailed,
-} from './parseEntry';
+import { fileTranscriptProvider, checkNativeTranscriptPath } from './providers';
+import type { ParsedTranscriptLine } from './parseEntry';
 import {
   TAIL_BYTES,
   isLineBoundary,
@@ -42,9 +41,7 @@ import {
   readTranscriptPage,
   statTranscript,
   transcriptBasename,
-  transcriptSessionId,
 } from './readTail';
-import { checkTranscriptPath } from '../hooks/transcriptPathGuard';
 import type { AgentSignalKind, CodeBlockRequest, TranscriptProjectorDeps } from './types';
 import type {
   TranscriptAppendData,
@@ -52,6 +49,7 @@ import type {
   TranscriptStatus,
   TurnEvent,
 } from '../../shared/transcript/turnEvents';
+import { watchTarget } from '../../shared/watchTarget';
 
 /**
  * A3 — hard serialized-byte budget for one RPC response and for one emitted
@@ -82,8 +80,7 @@ const DRAIN_DELAY_MS = 10;
  */
 const MAX_STALL_BACKOFF_MS = 5000;
 
-/** Only Claude Code publishes a transcript wmux can project today. */
-const SUPPORTED_AGENT = 'claude';
+
 
 /** One budget-fitted read, ready to become an append event. */
 interface BudgetedRead {
@@ -98,6 +95,7 @@ interface WatchState {
   /** Subscribers, keyed by pipe clientId. Empty ⇒ tear the watch down. */
   clients: Set<string>;
   transcriptPath: string;
+  parse: (line: string, offset: number) => ParsedTranscriptLine;
   watcher: fs.FSWatcher | null;
   poller: ReturnType<typeof setInterval> | null;
   debounce: ReturnType<typeof setTimeout> | null;
@@ -123,11 +121,30 @@ interface WatchState {
   staleAgentSessionId: string | null;
 }
 
+/**
+ * A SHRINK (size < cursor) means the file was truncated/rewritten. A grow is a
+ * normal append. Rotation past the cursor is caught by isLineBoundary (review:
+ * Claude+Codex 2-MODEL).
+ */
+function cursorStale(transcriptPath: string, size: number, offset: number, cursorFileSize: number | undefined): boolean {
+  if (cursorFileSize !== undefined && size < cursorFileSize) return true;
+  return offset > 0 && !isLineBoundary(transcriptPath, offset);
+}
+
 export class TranscriptProjector {
   private readonly deps: TranscriptProjectorDeps;
   private readonly debounceMs: number;
   private readonly pollMs: number;
   private readonly watches = new Map<string, WatchState>();
+  /**
+   * Per pane, the binding a `session_start` superseded, kept whether or not a
+   * client is subscribed (unlike `WatchState.staleAgentSessionId`), plus a
+   * counter bumped on every `session_start`. `sentFileBinding` reads both.
+   * `untilStop` marks a hold whose signal carried no agent session id: it is
+   * released by the next stop instead of by a binding change.
+   */
+  private readonly sessionHolds = new Map<string, { staleId: string; untilStop: boolean }>();
+  private readonly sessionGenerations = new Map<string, number>();
   /** Keys already logged by `warnOnce`. */
   private readonly warned = new Set<string>();
   private disposed = false;
@@ -161,9 +178,50 @@ export class TranscriptProjector {
       available: true,
       reason: 'ok',
       transcriptBasename: basename,
-      agentSessionId: transcriptSessionId(resolved.transcriptPath),
+      agentSessionId: resolved.agentSessionId,
+      terminal: { kind: 'terminal', agent: resolved.agent, nativeSessionId: resolved.agentSessionId,
+        capabilities: { history: true, send: false, permissions: false, cancel: false, fileUndo: false } },
       sizeBytes: stat.size,
       mtimeMs: stat.mtimeMs,
+    };
+  }
+
+  /**
+   * The resolved, containment-checked transcript path for a pane, or null when
+   * there is none (no binding, not Claude, refused path).
+   *
+   * Exposed because `/api/sessions` summarizes the pane's last assistant line
+   * through `readLastAssistantMessage(path)`, which takes a path rather than a
+   * projector cursor. `TranscriptStatus` deliberately carries only the basename
+   * — it goes on the wire — so the full path needs its own accessor. It still
+   * goes through `resolvePath`, so a refused path stays refused here too.
+   */
+  transcriptPath(sessionId: string): string | null {
+    const resolved = this.resolvePath(sessionId);
+    return resolved.ok ? resolved.transcriptPath : null;
+  }
+
+  /**
+   * The transcript a pane's `SendUserFile` lookups may read, or null.
+   *
+   * Null while a `session_start` has superseded the standing binding and the
+   * new session has not bound yet (`/clear`, or a new agent in the same pane):
+   * until then the binding on file still names the previous conversation.
+   * `generation` changes on every `session_start`, so a caller that awaited
+   * between two reads can tell the session moved under it.
+   */
+  sentFileBinding(sessionId: string): { transcriptPath: string; agentSessionId: string; generation: number } | null {
+    const resolved = this.resolvePath(sessionId);
+    if (!resolved.ok) return null;
+    const hold = this.sessionHolds.get(sessionId);
+    if (hold) {
+      if (hold.untilStop || resolved.agentSessionId === hold.staleId) return null;
+      this.sessionHolds.delete(sessionId);
+    }
+    return {
+      transcriptPath: resolved.transcriptPath,
+      agentSessionId: resolved.agentSessionId,
+      generation: this.sessionGenerations.get(sessionId) ?? 0,
     };
   }
 
@@ -176,13 +234,13 @@ export class TranscriptProjector {
     if (!resolved.ok) return null;
 
     let maxBytes = TAIL_BYTES;
-    let page = readTranscriptPage(resolved.transcriptPath, { ...opts, maxBytes });
+    let page = readTranscriptPage(resolved.transcriptPath, { ...opts, maxBytes, parseLine: (line, offset) => resolved.parse(line, offset).events });
     while (page && maxBytes > MIN_READ_BYTES && !withinBudget(page.events)) {
       // A3: shrink the WINDOW, never the honesty of the cursor. The events we
       // did not return are still reachable — the caller pages backward for
       // older ones, and the delta path carries newer ones.
       maxBytes = Math.max(MIN_READ_BYTES, Math.floor(maxBytes / 2));
-      page = readTranscriptPage(resolved.transcriptPath, { ...opts, maxBytes });
+      page = readTranscriptPage(resolved.transcriptPath, { ...opts, maxBytes, parseLine: (line, offset) => resolved.parse(line, offset).events });
     }
     if (page && !withinBudget(page.events)) {
       // One entry alone exceeds the budget. Report the cursor truthfully with
@@ -191,6 +249,46 @@ export class TranscriptProjector {
       return { ...page, events: [] };
     }
     return page;
+  }
+
+  /**
+   * One raw page for the phone's host search (`GET /api/search`): the same
+   * binding resolution and containment check as `snapshot`, WITHOUT the A3
+   * budget. These events never cross the control pipe — they are matched
+   * in-process and only short snippets leave — so shrinking the window to fit
+   * a wire budget would only cost more reads for the same bytes.
+   *
+   * `lineEnds[i]` is the byte offset just past the line `page.events[i]` came
+   * from: the next line's start, or the page's tail for the last line. That
+   * is a line boundary, so it is a valid `before` for `snapshot` — the page it
+   * returns ends with that event. Taken from the scanner's own offsets rather
+   * than re-measured from the decoded text, which invalid UTF-8 would skew.
+   */
+  searchPage(
+    sessionId: string,
+    before?: number,
+  ): { ok: true; page: TranscriptPage; lineEnds: number[] } | { ok: false; reason: string } {
+    const resolved = this.resolvePath(sessionId);
+    if (!resolved.ok) return { ok: false, reason: resolved.reason };
+    const starts: number[] = [];
+    const counts: number[] = [];
+    const page = readTranscriptPage(resolved.transcriptPath, {
+      ...(before !== undefined ? { before } : {}),
+      maxBytes: TAIL_BYTES,
+      parseLine: (line, offset) => {
+        const events = resolved.parse(line, offset).events;
+        starts.push(offset);
+        counts.push(events.length);
+        return events;
+      },
+    });
+    if (!page) return { ok: false, reason: 'unreadable' };
+    const lineEnds: number[] = [];
+    starts.forEach((_, i) => {
+      const end = i + 1 < starts.length ? starts[i + 1] : page.cursor.tailOffset;
+      for (let n = 0; n < counts[i]; n++) lineEnds.push(end);
+    });
+    return { ok: true, page, lineEnds };
   }
 
   /**
@@ -213,6 +311,18 @@ export class TranscriptProjector {
    *
    * `budgetDropped` is surfaced so the phone can render an "omitted" seam
    * instead of the silent hole `fit` left the push path with. */
+  /**
+   * `delta`'s two reset signals for a cursor offset the phone pages BACK from:
+   * true when the file shrank below the cursor's `fileSize` or `offset` is no
+   * longer a line boundary (and when the transcript cannot be read at all).
+   */
+  staleCursor(sessionId: string, offset: number, cursorFileSize?: number): boolean {
+    const resolved = this.resolvePath(sessionId);
+    if (!resolved.ok) return true;
+    const stat = statTranscript(resolved.transcriptPath);
+    return !stat || cursorStale(resolved.transcriptPath, stat.size, offset, cursorFileSize);
+  }
+
   delta(
     sessionId: string,
     fromOffset: number,
@@ -223,17 +333,12 @@ export class TranscriptProjector {
     const stat = statTranscript(resolved.transcriptPath);
     if (!stat) return null;
 
-    let reset = false;
-    // A SHRINK (size < cursor) means the file was truncated/rewritten. A grow
-    // is a normal append. Rotation past the cursor is caught by isLineBoundary
-    // below (review: Claude+Codex 2-MODEL).
-    if (opts?.cursorFileSize !== undefined && stat.size < opts.cursorFileSize) reset = true;
-    if (fromOffset > 0 && !isLineBoundary(resolved.transcriptPath, fromOffset)) reset = true;
+    const reset = cursorStale(resolved.transcriptPath, stat.size, fromOffset, opts?.cursorFileSize);
     // A shrunk file (stat.size < from) is readTranscriptDelta's own reset path.
 
     if (reset) {
       const { result: page, budgetDropped } = this.fitWithReceipt((maxBytes) =>
-        readTranscriptPage(resolved.transcriptPath, { maxBytes }),
+        readTranscriptPage(resolved.transcriptPath, { maxBytes, parseLine: (line, offset) => resolved.parse(line, offset).events }),
       );
       if (!page) return null;
       return {
@@ -245,7 +350,7 @@ export class TranscriptProjector {
     }
 
     const { result, budgetDropped } = this.fitWithReceipt((maxBytes) => {
-      const d = readTranscriptDelta(resolved.transcriptPath, fromOffset, maxBytes);
+      const d = readTranscriptDelta(resolved.transcriptPath, fromOffset, maxBytes, (line, offset) => resolved.parse(line, offset).events);
       return d && { events: d.events, cursor: d.cursor, ...(d.reset ? { reset: true } : {}) };
     });
     if (!result) return null;
@@ -277,6 +382,7 @@ export class TranscriptProjector {
       state = {
         clients: new Set(),
         transcriptPath: resolved.ok ? resolved.transcriptPath : '',
+        parse: resolved.ok ? resolved.parse : () => ({ events: [], bodies: new Map() }),
         watcher: null,
         poller: null,
         debounce: null,
@@ -357,6 +463,7 @@ export class TranscriptProjector {
    * genuinely NEW session apart from a resume of the standing one.
    */
   nudge(sessionId: string, kind: AgentSignalKind, agentSessionId?: string): void {
+    if (!this.disposed) this.noteSessionHold(sessionId, kind, agentSessionId);
     const state = this.watches.get(sessionId);
     if (!state || this.disposed) return;
     if (kind === 'agent.session_start') {
@@ -430,7 +537,7 @@ export class TranscriptProjector {
     if (offset > 0 && !isLineBoundary(resolved.transcriptPath, offset)) return null;
     const line = readTranscriptLineAt(resolved.transcriptPath, offset);
     if (line === null) return null;
-    const parsed = parseTranscriptLineDetailed(line, offset);
+    const parsed = resolved.parse(line, offset);
 
     if (req.eventId) {
       // The file may have rotated since the ref was minted; without this check
@@ -446,8 +553,31 @@ export class TranscriptProjector {
     return null;
   }
 
+  /**
+   * `sentFileBinding`'s bookkeeping, for every pane whether or not anyone is
+   * subscribed. A `session_start` that names a session other than the bound
+   * one holds the bound one; one that names no session holds until the next
+   * stop; one that names the bound session (a resume) holds nothing.
+   */
+  private noteSessionHold(sessionId: string, kind: AgentSignalKind, agentSessionId?: string): void {
+    if (kind === 'agent.session_start') {
+      this.sessionGenerations.set(sessionId, (this.sessionGenerations.get(sessionId) ?? 0) + 1);
+      const current = this.resolvePath(sessionId);
+      const currentId = current.ok ? current.agentSessionId : '';
+      if (!currentId || currentId === agentSessionId) {
+        this.sessionHolds.delete(sessionId);
+      } else {
+        this.sessionHolds.set(sessionId, { staleId: currentId, untilStop: !agentSessionId });
+      }
+    } else if (kind === 'agent.stop' && this.sessionHolds.get(sessionId)?.untilStop) {
+      this.sessionHolds.delete(sessionId);
+    }
+  }
+
   /** Wire to session:died / session:destroyed — the pane's rows are moot. */
   dropPty(sessionId: string): void {
+    this.sessionHolds.delete(sessionId);
+    this.sessionGenerations.delete(sessionId);
     const state = this.watches.get(sessionId);
     if (!state) return;
     this.teardown(state);
@@ -472,7 +602,7 @@ export class TranscriptProjector {
   private resolvePath(
     sessionId: string,
   ):
-    | { ok: true; transcriptPath: string; agentSessionId: string }
+    | { ok: true; agent: string; transcriptPath: string; agentSessionId: string; parse: (line: string, offset: number) => ParsedTranscriptLine }
     | { ok: false; reason: string } {
     let binding;
     try {
@@ -481,7 +611,8 @@ export class TranscriptProjector {
       return { ok: false, reason: this.absentBindingReason(sessionId) };
     }
     if (!binding) return { ok: false, reason: this.absentBindingReason(sessionId) };
-    if (binding.agent !== SUPPORTED_AGENT) return { ok: false, reason: 'not-claude' };
+    const provider = fileTranscriptProvider(binding.agent);
+    if (!provider) return { ok: false, reason: 'unsupported-agent' };
     if (!binding.transcriptPath) return { ok: false, reason: 'no-transcript-path' };
     // The containment guard belongs HERE, at the single point every read goes
     // through, not only on the hook path that happens to be validated today.
@@ -491,14 +622,15 @@ export class TranscriptProjector {
     // file — and any one of them landing an unchecked path would otherwise turn
     // the projector back into "open this file and render it as a conversation".
     // Refusal degrades exactly like a missing path: Chat View is unavailable.
-    const check = checkTranscriptPath(
+    const check = checkNativeTranscriptPath(
+      binding.agent,
       binding.transcriptPath,
       binding.sessionId,
       this.deps.getSessionEnv?.(sessionId),
     );
     if (!check.ok) {
       this.warnOnce(
-        `${sessionId} ${binding.transcriptPath}`,
+        `${sessionId}\u0000${binding.transcriptPath}`,
         `[transcript] refused transcript path for ${sessionId}: ${check.reason}`,
       );
       return { ok: false, reason: 'unsafe-transcript-path' };
@@ -507,6 +639,8 @@ export class TranscriptProjector {
       ok: true,
       transcriptPath: binding.transcriptPath,
       agentSessionId: binding.sessionId,
+      parse: provider.parse,
+      agent: binding.agent,
     };
   }
 
@@ -519,7 +653,12 @@ export class TranscriptProjector {
    * Without a detector wired this degrades to `no-hook`, the pre-split behaviour.
    */
   private absentBindingReason(sessionId: string): string {
-    return this.deps.getDetectedAgent?.(sessionId) ? 'stale-session' : 'no-hook';
+    const detected = this.deps.getDetectedAgent?.(sessionId);
+    // A Codex pane binds only once its rollout is known (#1764): until the cwd
+    // bind or the exact-id search lands, it is waiting for its record, not a
+    // pane that moved on, so it keeps the reason it reported before #1764.
+    if (detected === 'codex') return 'no-transcript-path';
+    return detected ? 'stale-session' : 'no-hook';
   }
 
   /**
@@ -548,6 +687,7 @@ export class TranscriptProjector {
       state.staleAgentSessionId = null;
     }
     const next = resolved.ok ? resolved.transcriptPath : '';
+    if (resolved.ok) state.parse = resolved.parse;
     if (next === state.transcriptPath) return;
     state.transcriptPath = next;
     state.tailOffset = -1;
@@ -578,7 +718,8 @@ export class TranscriptProjector {
     const dir = path.dirname(state.transcriptPath);
     const basename = transcriptBasename(state.transcriptPath);
     try {
-      const watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
+      // Long spelling: libuv 1.52 mishandles an 8.3 short dir (watchTarget, #984).
+      const watcher = fs.watch(watchTarget(dir), { persistent: false }, (_event, filename) => {
         // The directory holds every session for this project slug, so the
         // basename filter is what keeps a sibling pane's writes from waking us.
         // A null filename (some platforms drop it) is treated as "maybe ours".
@@ -733,7 +874,7 @@ export class TranscriptProjector {
     state: WatchState,
   ): BudgetedRead | null {
     const page = this.fit((maxBytes) => {
-      const p = readTranscriptPage(state.transcriptPath, { maxBytes });
+      const p = readTranscriptPage(state.transcriptPath, { maxBytes, parseLine: (line, offset) => state.parse(line, offset).events });
       return p && { events: p.events, cursor: p.cursor, reset: false };
     });
     return page;
@@ -743,7 +884,7 @@ export class TranscriptProjector {
     state: WatchState,
   ): BudgetedRead | null {
     return this.fit((maxBytes) => {
-      const delta = readTranscriptDelta(state.transcriptPath, state.tailOffset, maxBytes);
+      const delta = readTranscriptDelta(state.transcriptPath, state.tailOffset, maxBytes, (line, offset) => state.parse(line, offset).events);
       return delta && {
         events: delta.events,
         cursor: delta.cursor,

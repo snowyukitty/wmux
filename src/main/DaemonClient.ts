@@ -1,4 +1,5 @@
 import net from 'node:net';
+import type { PaneUsageLimit, PaneUsageLimitPatch } from '../shared/usageLimit';
 import { EventEmitter } from 'node:events';
 import crypto from 'node:crypto';
 import type { RpcResponse, DaemonEvent } from '../shared/rpc';
@@ -572,21 +573,46 @@ export class DaemonClient extends EventEmitter {
     }
   }
 
-  /** Current daemon-owned agent identity and status for reconnect-safe actions. */
-  async getAgentState(sessionId: string): Promise<{
+  /** Current daemon-owned agent identity and status for reconnect-safe actions.
+   *  `opts.timeoutMs` bounds one read for a caller that polls (#1680). */
+  async getAgentState(sessionId: string, opts: { timeoutMs?: number } = {}): Promise<{
     agentName: string | null;
+    /** #1307 — true when a live attributed process backs this pane.
+     *  Missing or non-boolean parses to false, so an older daemon
+     *  without the field still lets the resume path's slug check run. */
+    agentVerified: boolean;
     agentStatus: AgentStatus;
     inputQuiet: boolean;
     inputRevision: number;
     incarnationId: string;
+    /** #1680 — the key-only input counter: focus and pointer-motion reports do
+     *  not move it. Absent on an older daemon. */
+    keyInputRevision?: number;
+    /** #1680 — `inputQuiet` for key input only. Absent on an older daemon. */
+    keyInputQuiet?: boolean;
+    /** #1680 — the pane's CURRENT agent has delivered a hook (reset when that
+     *  agent ends). Absent on an older daemon. */
+    hookReports?: boolean;
+    /** The composer holds a typed but unsubmitted draft. Absent on an older daemon. */
+    hasDraft?: boolean;
+    /** Milliseconds since the last key input. Absent on an older daemon. */
+    keyInputIdleMs?: number;
   } | null> {
     try {
-      const result = await this.rpc('daemon.getAgentState', { id: sessionId }) as {
+      const result = await (opts.timeoutMs !== undefined
+        ? this.rpc('daemon.getAgentState', { id: sessionId }, { timeoutMs: opts.timeoutMs })
+        : this.rpc('daemon.getAgentState', { id: sessionId })) as {
         agentName?: unknown;
+        agentVerified?: unknown;
         agentStatus?: unknown;
         inputQuiet?: unknown;
         inputRevision?: unknown;
         incarnationId?: unknown;
+        keyInputRevision?: unknown;
+        keyInputQuiet?: unknown;
+        hookReports?: unknown;
+        hasDraft?: unknown;
+        keyInputIdleMs?: unknown;
       };
       const validStatuses: AgentStatus[] = [
         'running',
@@ -610,13 +636,71 @@ export class DaemonClient extends EventEmitter {
         agentName: typeof result.agentName === 'string' && result.agentName
           ? result.agentName
           : null,
+        agentVerified: result.agentVerified === true,
         agentStatus: result.agentStatus as AgentStatus,
         inputQuiet: result.inputQuiet,
         inputRevision: result.inputRevision,
         incarnationId: result.incarnationId,
+        ...(typeof result.keyInputRevision === 'number' &&
+        Number.isInteger(result.keyInputRevision) &&
+        result.keyInputRevision >= 0
+          ? { keyInputRevision: result.keyInputRevision }
+          : {}),
+        ...(typeof result.keyInputQuiet === 'boolean' ? { keyInputQuiet: result.keyInputQuiet } : {}),
+        ...(typeof result.hookReports === 'boolean' ? { hookReports: result.hookReports } : {}),
+        ...(typeof result.hasDraft === 'boolean' ? { hasDraft: result.hasDraft } : {}),
+        ...(typeof result.keyInputIdleMs === 'number' && Number.isFinite(result.keyInputIdleMs) && result.keyInputIdleMs >= 0
+          ? { keyInputIdleMs: result.keyInputIdleMs }
+          : {}),
       };
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * What `input.send` needs to paste and submit into a session (#1594): the
+   * detected agent and whether the app enabled bracketed paste, both from the
+   * daemon's live streams. Null on any failure, including a daemon that
+   * predates the method — the caller then types, as before.
+   */
+  async getSendTarget(
+    sessionId: string,
+  ): Promise<{ agent: string | null; bracketedPaste: boolean | null } | null> {
+    try {
+      const r = (await this.rpc('daemon.getSendTarget', { id: sessionId }, { timeoutMs: 500 })) as {
+        agentName?: unknown;
+        bracketedPaste?: unknown;
+      } | null;
+      if (!r || typeof r !== 'object') return null;
+      return {
+        agent: typeof r.agentName === 'string' && r.agentName ? r.agentName : null,
+        bracketedPaste: typeof r.bracketedPaste === 'boolean' ? r.bracketedPaste : null,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** The daemon's pane usage-limit holds; empty when it is unreachable or predates them. */
+  async listUsageLimits(): Promise<PaneUsageLimit[]> {
+    if (!this.isConnected) return [];
+    try {
+      const response = await this.rpc('daemon.usageLimit.list', {}) as { limits?: unknown };
+      return Array.isArray(response.limits) ? response.limits as PaneUsageLimit[] : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Edit one pane's usage-limit hold (auto-resume, dismiss, resume now, reset fill). */
+  async updateUsageLimit(id: string, patch: PaneUsageLimitPatch): Promise<boolean> {
+    if (!this.isConnected) return false;
+    try {
+      const response = await this.rpc('daemon.usageLimit.update', { id, patch }) as { ok?: unknown };
+      return response.ok === true;
+    } catch {
+      return false;
     }
   }
 
@@ -656,6 +740,32 @@ export class DaemonClient extends EventEmitter {
       // The daemon may have accepted part of the occurrence before the control
       // reply was lost. Consume it as error; automatic retry could duplicate.
       return 'error';
+    }
+  }
+
+  /** The fan-out caller nudge (daemon/callerNudgeDelivery.ts). An older
+   *  daemon without the method answers Unknown method before any write. */
+  async deliverCallerNudge(args: {
+    id: string;
+    agentSlug: AgentSlug;
+    incarnationId: string;
+    prompt: string;
+  }): Promise<{ result: 'sent' | 'held' | 'session_changed' | 'unavailable' | 'error'; pasted: boolean }> {
+    if (!this.isConnected) return { result: 'unavailable', pasted: false };
+    try {
+      const response = await this.rpc('daemon.deliverCallerNudgeV1', args) as { result?: unknown; pasted?: unknown };
+      const pasted = response.pasted === true;
+      const r = response.result;
+      if (r === 'sent' || r === 'held' || r === 'session_changed' || r === 'unavailable' || r === 'error') {
+        return { result: r, pasted };
+      }
+      return { result: 'error', pasted: true };
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('Unknown method')) {
+        return { result: 'unavailable', pasted: false };
+      }
+      // The reply was lost: the daemon may have written. Never paste again.
+      return { result: 'error', pasted: true };
     }
   }
 
@@ -796,9 +906,25 @@ export class DaemonClient extends EventEmitter {
           });
           break;
         }
-        case 'activity.idle':
-          this.emit('session:idle', { sessionId: event.sessionId });
+        case 'usage.limit.changed': {
+          // A pane's usage-limit hold changed (shared/usageLimit); null = cleared.
+          const data = event.data as { limit?: PaneUsageLimit | null } | null;
+          this.emit('usageLimit:changed', { sessionId: event.sessionId, limit: data?.limit ?? null });
           break;
+        }
+        case 'input.typed':
+          this.emit('session:input', { sessionId: event.sessionId });
+          break;
+        case 'approvals.changed':
+          // A re-list nudge (no record data) for the HQ approval lane.
+          this.emit('approvals:changed');
+          break;
+        case 'activity.idle': {
+          // #1463 — a daemon that knows the silence came before any turn says so.
+          const preTurn = (event.data as { preTurn?: unknown } | null)?.preTurn === true;
+          this.emit('session:idle', { sessionId: event.sessionId, ...(preTurn ? { preTurn } : {}) });
+          break;
+        }
         case 'activity.active':
           // data에 실린 gate 확정 agentName(없으면 null)을 함께 전달.
           this.emit('session:active', {
@@ -822,6 +948,14 @@ export class DaemonClient extends EventEmitter {
             sessionId: event.sessionId,
             slug: data?.slug ?? null,
           });
+          break;
+        }
+        case 'agent.transcriptActivity': {
+          // The last tool of an agent with no per-tool hook, from its transcript.
+          const data = event.data as { activity?: unknown } | null;
+          if (typeof data?.activity === 'string') {
+            this.emit('session:transcriptActivity', { sessionId: event.sessionId, activity: data.activity });
+          }
           break;
         }
         case 'prompt.event':

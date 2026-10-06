@@ -8,6 +8,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import {
   HooksInstallPrompt,
+  LAUNCH_CHECK_REPORT_TIMEOUT_MS,
   requestHooksInstallPrompt,
   type HooksBridgeApi,
 } from '../HooksInstallPrompt';
@@ -520,5 +521,170 @@ describe('HooksInstallPrompt — refusals', () => {
     );
     await flush();
     expect(el.querySelector('[data-hooks-install-prompt]')).toBeTruthy();
+  });
+
+  // It opens by itself after an async check, so focus stays in the terminal:
+  // a Space or Enter meant for it cannot press Don't ask again or Install.
+  it('leaves focus where the user is when it appears', async () => {
+    const terminal = document.createElement('textarea');
+    document.body.appendChild(terminal);
+    terminal.focus();
+    const setPromptPreference = vi.fn(async (v: boolean) => ({ suppressed: v }));
+    const el = render(
+      <HooksInstallPrompt
+        api={apiOf({ getPromptPreference: async () => ({ suppressed: false }), setPromptPreference })}
+        t={t}
+      />,
+    );
+    await flush();
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeTruthy();
+    expect(document.activeElement).toBe(terminal);
+    act(() => {
+      terminal.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    });
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeTruthy();
+    expect(setPromptPreference).not.toHaveBeenCalled();
+    terminal.remove();
+  });
+
+  // On the shared Dialog: Escape (once focus is in the prompt) is the same
+  // one-modal dismissal as Later — and, like Later, unavailable while the
+  // install write is in flight.
+  it('Escape dismisses like Later, but not mid-install', async () => {
+    let finish: (v: { ok: boolean; error: string | null }) => void = () => undefined;
+    const install = vi.fn(() => new Promise<{ ok: boolean; error: string | null }>((r) => { finish = r; }));
+    const el = render(<HooksInstallPrompt api={apiOf({ install })} t={t} />);
+    await flush();
+    const esc = () => act(() => {
+      (document.activeElement ?? document.body).dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    });
+    // The user is in the prompt (it never pulls focus in by itself).
+    (el.querySelector('[data-hooks-later]') as HTMLButtonElement).focus();
+    act(() => (el.querySelector('[data-hooks-install]') as HTMLButtonElement).click());
+    expect(el.contains(document.activeElement)).toBe(true);
+    esc();
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeTruthy();
+    await act(async () => { finish({ ok: false, error: 'nope' }); });
+    await flush();
+    (el.querySelector('[data-hooks-later]') as HTMLButtonElement).focus();
+    esc();
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeNull();
+  });
+});
+
+describe('HooksInstallPrompt — first boot (never on top of the Welcome dialog)', () => {
+  function mount(node: React.ReactElement): { el: HTMLElement; rerender: (n: React.ReactElement) => void } {
+    const el = render(node);
+    const { root } = roots[roots.length - 1];
+    return { el, rerender: (n) => act(() => root.render(n)) };
+  }
+
+  it('holds the launch check while the gate waits, then runs it once', async () => {
+    const status = vi.fn(async () => ({ installed: false }));
+    const { el, rerender } = mount(<HooksInstallPrompt api={apiOf({ status })} t={t} launchCheck="wait" />);
+    await flush();
+    expect(status).not.toHaveBeenCalled();
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeNull();
+
+    rerender(<HooksInstallPrompt api={apiOf({ status })} t={t} launchCheck="check" />);
+    await flush();
+    expect(status).toHaveBeenCalledOnce();
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeTruthy();
+  });
+
+  it('skips the launch check on the wizard boot, but a later mode raise still asks', async () => {
+    const status = vi.fn(async () => ({ installed: false }));
+    const el = render(<HooksInstallPrompt api={apiOf({ status })} t={t} launchCheck="skip" />);
+    await flush();
+    expect(status).not.toHaveBeenCalled();
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeNull();
+
+    act(() => requestHooksInstallPrompt());
+    await flush();
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeTruthy();
+  });
+
+  it('a due prompt stays hidden while deferred and appears when the wizard closes', async () => {
+    const { el, rerender } = mount(<HooksInstallPrompt api={apiOf()} t={t} deferred />);
+    act(() => requestHooksInstallPrompt());
+    await flush();
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeNull();
+
+    rerender(<HooksInstallPrompt api={apiOf()} t={t} deferred={false} />);
+    await flush();
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeTruthy();
+  });
+
+  it('re-checks status when the deferral ends: hooks installed by the wizard means no prompt', async () => {
+    let installed = false;
+    const status = vi.fn(async () => ({ installed }));
+    const api = apiOf({ status });
+    const { el, rerender } = mount(<HooksInstallPrompt api={api} t={t} checkOnMount={false} deferred />);
+    act(() => requestHooksInstallPrompt());
+    await flush();
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeNull();
+
+    installed = true; // the wizard's own "Install hooks" row ran
+    rerender(<HooksInstallPrompt api={api} t={t} checkOnMount={false} deferred={false} />);
+    await flush();
+    await flush();
+    expect(status).toHaveBeenCalledTimes(2);
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeNull();
+  });
+
+  it('never hides an install already in flight when a deferral starts', async () => {
+    let finish: (v: { ok: boolean; error: string | null }) => void = () => undefined;
+    const install = vi.fn(() => new Promise<{ ok: boolean; error: string | null }>((r) => { finish = r; }));
+    const api = apiOf({ install });
+    const { el, rerender } = mount(<HooksInstallPrompt api={api} t={t} />);
+    await flush();
+    act(() => (el.querySelector('[data-hooks-install]') as HTMLButtonElement).click());
+    rerender(<HooksInstallPrompt api={api} t={t} deferred />);
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeTruthy();
+    await act(async () => { finish({ ok: true, error: null }); });
+    await flush();
+    expect(el.textContent).toContain('hooks.prompt.doneTitle');
+  });
+});
+
+describe('HooksInstallPrompt launch-check signal (first-boot queue)', () => {
+  it('reports the launch check done after it asked, and when there was nothing to ask', async () => {
+    const asked = vi.fn();
+    const el = render(<HooksInstallPrompt api={apiOf()} t={t} onLaunchCheckDone={asked} />);
+    await flush();
+    await flush();
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeTruthy();
+    expect(asked).toHaveBeenCalledTimes(1);
+
+    const quiet = vi.fn();
+    render(
+      <HooksInstallPrompt api={apiOf({ status: async () => ({ installed: true }) })} t={t} onLaunchCheckDone={quiet} />,
+    );
+    await flush();
+    await flush();
+    expect(quiet).toHaveBeenCalledTimes(1);
+  });
+
+  it('a skipped launch check is done at once', async () => {
+    const done = vi.fn();
+    render(<HooksInstallPrompt api={apiOf()} t={t} launchCheck="skip" onLaunchCheckDone={done} />);
+    await flush();
+    expect(done).toHaveBeenCalledTimes(1);
+  });
+
+  it('a bridge that never answers is reported done after the bound, once', async () => {
+    vi.useFakeTimers();
+    try {
+      const done = vi.fn();
+      render(
+        <HooksInstallPrompt api={apiOf({ status: () => new Promise(() => undefined) })} t={t} onLaunchCheckDone={done} />,
+      );
+      await act(async () => { await Promise.resolve(); });
+      expect(done).not.toHaveBeenCalled();
+      await act(async () => { vi.advanceTimersByTime(LAUNCH_CHECK_REPORT_TIMEOUT_MS); });
+      expect(done).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -9,6 +9,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { DaemonClient } from '../../DaemonClient';
 import type { HookSignalRouter } from '../../hooks/HookSignalRouter';
+import type { WorkspaceListEntry } from '../../workspace/WorkspaceMirror';
 
 vi.mock('electron', () => ({ BrowserWindow: class {} }));
 
@@ -20,14 +21,20 @@ const metadataHandlerMocks = vi.hoisted(() => {
   // Same faithful stand-in as DaemonNotificationRouter.statusClear.test.ts:
   // the funnel records the last broadcast status, which the idle clear reads.
   const lastBroadcastAgentStatus = new Map<string, string>();
+  // #1463 — the funnel's outstanding running-claim record, same rule.
+  const runningClaim = new Set<string>();
   const broadcastMetadataUpdate = vi.fn(
-    (_win: unknown, payload: { ptyId?: string; agentStatus?: string }) => {
+    (_win: unknown, payload: { ptyId?: string; agentStatus?: string; activity?: string; settled?: boolean }) => {
       if (payload.ptyId && payload.agentStatus !== undefined) {
         lastBroadcastAgentStatus.set(payload.ptyId, payload.agentStatus);
       }
+      if (payload.ptyId) {
+        if (payload.settled === true) runningClaim.delete(payload.ptyId);
+        else if (payload.agentStatus === 'running') runningClaim.add(payload.ptyId);
+      }
     },
   );
-  return { broadcastMetadataUpdate, lastBroadcastAgentStatus };
+  return { broadcastMetadataUpdate, lastBroadcastAgentStatus, runningClaim };
 });
 
 vi.mock('../../ipc/handlers/metadata.handler', () => ({
@@ -36,7 +43,9 @@ vi.mock('../../ipc/handlers/metadata.handler', () => ({
     metadataHandlerMocks.lastBroadcastAgentStatus.get(ptyId),
   clearLastBroadcastAgentStatus: (ptyId: string) => {
     metadataHandlerMocks.lastBroadcastAgentStatus.delete(ptyId);
+    metadataHandlerMocks.runningClaim.delete(ptyId);
   },
+  hasOutstandingRunningClaim: (ptyId: string) => metadataHandlerMocks.runningClaim.has(ptyId),
 }));
 
 vi.mock('../dispatchNotification', () => ({
@@ -55,7 +64,7 @@ const broadcastMetadataUpdateMock = metadataHandlerMocks.broadcastMetadataUpdate
 const PTY = 'daemon-worker-pane';
 
 interface Captured {
-  idle?: (payload: { sessionId: string }) => void;
+  idle?: (payload: { sessionId: string; preTurn?: boolean }) => void;
   agent?: (payload: { sessionId: string; event: unknown }) => void;
   active?: (payload: { sessionId: string; agentName?: string }) => void;
   processExit?: (payload: { sessionId: string; slug: string | null }) => void;
@@ -70,6 +79,8 @@ interface Captured {
 function stubHookRouter(runningGoverned: boolean): HookSignalRouter {
   return {
     noteHookTurnStart: vi.fn(),
+    notePromptSubmit: vi.fn(),
+    noteSessionStart: vi.fn(),
     releaseHookTurnStart: vi.fn(),
     governsRunningState: vi.fn().mockReturnValue(runningGoverned),
     noteAgentOnPane: vi.fn(),
@@ -80,7 +91,12 @@ function stubHookRouter(runningGoverned: boolean): HookSignalRouter {
   } as unknown as HookSignalRouter;
 }
 
-function makeRouter(hookRouter?: HookSignalRouter) {
+function makeRouter(
+  hookRouter?: HookSignalRouter,
+  entries: WorkspaceListEntry[] = [],
+  ageMs = 0,
+  now: () => number = Date.now,
+) {
   const captured: Captured = {};
   const fakeDaemon = {
     on: vi.fn((event: string, cb: (payload: never) => void) => {
@@ -96,6 +112,8 @@ function makeRouter(hookRouter?: HookSignalRouter) {
     fakeDaemon,
     () => null,
     hookRouter ? () => hookRouter : undefined,
+    now,
+    () => ({ peek: () => ({ entries, ageMs }) }),
   );
   router.start();
   return { router, captured };
@@ -121,7 +139,7 @@ function metadataEvent(hookKind: string, agent = 'Claude Code') {
       source: 'hook',
       hookKind,
       decision: 'activity',
-      signal: { kind: hookKind, agent: 'claude', cwd: '/repo', payload: {}, ts: 1 },
+      signal: { kind: hookKind, agent: 'claude', ptyId: PTY, cwd: '/repo', payload: {}, ts: 1 },
     },
   };
 }
@@ -130,6 +148,7 @@ describe('DaemonNotificationRouter — turn start lights the pane', () => {
   beforeEach(() => {
     broadcastMetadataUpdateMock.mockClear();
     metadataHandlerMocks.lastBroadcastAgentStatus.delete(PTY);
+    metadataHandlerMocks.runningClaim.delete(PTY);
   });
 
   it('broadcasts running on agent.user_prompt_submit, with no byte threshold', () => {
@@ -179,15 +198,44 @@ describe('DaemonNotificationRouter — the byte heuristic stands down on a hook-
   beforeEach(() => {
     broadcastMetadataUpdateMock.mockClear();
     metadataHandlerMocks.lastBroadcastAgentStatus.delete(PTY);
+    metadataHandlerMocks.runningClaim.delete(PTY);
+  });
+
+  it('warns once when prompt receipt evidence arrives before the hook router', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { router, captured } = makeRouter();
+    try {
+      captured.agent?.(metadataEvent('agent.user_prompt_submit'));
+      captured.agent?.(metadataEvent('agent.user_prompt_submit'));
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('receipt evidence unavailable'));
+    } finally {
+      router.stop();
+      warn.mockRestore();
+    }
   });
 
   it('claims the running dot for the hook when the turn start lands', () => {
     const hookRouter = stubHookRouter(false);
-    const { router, captured } = makeRouter(hookRouter);
+    const { router, captured } = makeRouter(hookRouter, [], 0, () => 5000);
     captured.agent?.(metadataEvent('agent.user_prompt_submit'));
     // The latch records WHICH agent opened the turn (F4): a different agent
     // launched in the same shell must not inherit this one's claim.
     expect(hookRouter.noteHookTurnStart).toHaveBeenCalledWith(PTY, expect.any(Number), 'claude');
+    expect(hookRouter.notePromptSubmit).toHaveBeenCalledWith(PTY,
+      expect.objectContaining({ kind: 'agent.user_prompt_submit', ptyId: PTY, ts: 1 }), 5000, false);
+    for (const [ptyIds, ageMs, unique] of [
+      [[PTY], 0, true], [[PTY, 'other'], 0, false], [[PTY], 10_000, false],
+    ] as const) {
+      const replay = makeRouter(hookRouter, [{
+        id: 'w1', name: 'one', metadata: { cwd: '/repo' }, activePtyId: PTY, ptyIds: [...ptyIds],
+      }], ageMs, () => 5000);
+      const event = metadataEvent('agent.user_prompt_submit');
+      const { ptyId: _ptyId, ...signal } = event.event.signal;
+      replay.captured.agent?.({ ...event, event: { ...event.event, signal } });
+      expect(hookRouter.notePromptSubmit).toHaveBeenLastCalledWith(PTY, signal, 5000, unique);
+      replay.router.stop();
+    }
     router.stop();
   });
 
@@ -228,6 +276,7 @@ describe('DaemonNotificationRouter — an agent that died without a Stop settles
   beforeEach(() => {
     broadcastMetadataUpdateMock.mockClear();
     metadataHandlerMocks.lastBroadcastAgentStatus.delete(PTY);
+    metadataHandlerMocks.runningClaim.delete(PTY);
   });
 
   it('clears the pane to idle on the process death edge', () => {
@@ -310,6 +359,7 @@ describe('DaemonNotificationRouter — OSC 133 back-at-prompt closes the turn', 
   beforeEach(() => {
     broadcastMetadataUpdateMock.mockClear();
     metadataHandlerMocks.lastBroadcastAgentStatus.delete(PTY);
+    metadataHandlerMocks.runningClaim.delete(PTY);
   });
 
   const promptEvent = (type: string) => ({
@@ -333,6 +383,7 @@ describe('DaemonNotificationRouter — OSC 133 back-at-prompt closes the turn', 
     for (const marker of ['prompt_start', 'prompt_end']) {
       broadcastMetadataUpdateMock.mockClear();
       metadataHandlerMocks.lastBroadcastAgentStatus.delete(PTY);
+      metadataHandlerMocks.runningClaim.delete(PTY);
       const { router, captured } = makeRouter(stubHookRouter(true));
       captured.prompt?.(promptEvent(marker));
       expect(lastStatus()).toBe('idle');
@@ -389,6 +440,8 @@ describe('DaemonNotificationRouter — a settle is marked, and survives its own 
     let governed = true;
     return {
       noteHookTurnStart: vi.fn(() => { governed = true; }),
+      notePromptSubmit: vi.fn(),
+      noteSessionStart: vi.fn(),
       releaseHookTurnStart: vi.fn(() => { governed = false; }),
       governsRunningState: vi.fn(() => governed),
       noteAgentOnPane: vi.fn(),
@@ -412,6 +465,7 @@ describe('DaemonNotificationRouter — a settle is marked, and survives its own 
     vi.useFakeTimers();
     broadcastMetadataUpdateMock.mockClear();
     metadataHandlerMocks.lastBroadcastAgentStatus.delete(PTY);
+    metadataHandlerMocks.runningClaim.delete(PTY);
     clearSuppression(PTY);
   });
 
@@ -458,6 +512,166 @@ describe('DaemonNotificationRouter — a settle is marked, and survives its own 
     captured.active?.({ sessionId: PTY });
 
     expect(runningBroadcasts()).toBe(1);
+    router.stop();
+  });
+});
+
+/**
+ * #1463 — the renderer keeps a byte/activity 'running' stamp for 120 s through
+ * an UNMARKED idle. Live: a fresh idle Claude pane read Running after its boot
+ * burst, and a Codex pane ended with Ctrl+C kept "Turn in progress" in Fleet
+ * for 60-120 s. Each case needs a MARKED idle, so the renderer drops the stamp.
+ */
+describe('DaemonNotificationRouter — #1463 withdraws an unlatched running stamp', () => {
+  beforeEach(() => {
+    broadcastMetadataUpdateMock.mockClear();
+    metadataHandlerMocks.lastBroadcastAgentStatus.delete(PTY);
+    metadataHandlerMocks.runningClaim.delete(PTY);
+    clearSuppression(PTY);
+  });
+
+  const lastPatch = () => broadcastMetadataUpdateMock.mock.calls.at(-1)?.[1] as
+    { agentStatus?: string; settled?: boolean } | undefined;
+
+  it('marks the silence after a boot burst with no turn since as a settle', () => {
+    const { router, captured } = makeRouter(stubHookRouter(false));
+    captured.active?.({ sessionId: PTY, agentName: 'Claude Code' });
+    captured.idle?.({ sessionId: PTY, preTurn: true });
+    expect(lastPatch()).toMatchObject({ agentStatus: 'idle', settled: true });
+    // Status only: the live agent's identity is not blanked.
+    expect(lastPatch()).not.toHaveProperty('agentName');
+    router.stop();
+  });
+
+  it('does not swallow the running edge of a turn submitted right after the settle', () => {
+    const { router, captured } = makeRouter(stubHookRouter(false));
+    captured.active?.({ sessionId: PTY, agentName: 'Claude Code' });
+    captured.idle?.({ sessionId: PTY, preTurn: true });
+    broadcastMetadataUpdateMock.mockClear();
+    captured.active?.({ sessionId: PTY, agentName: 'Claude Code' });
+    expect(lastPatch()?.agentStatus).toBe('running');
+    router.stop();
+  });
+
+  it('settles pre-turn silence right after the detector\'s withheld idle-prompt waiting', () => {
+    // A hook-reporting pane: main withholds the detector's `waiting`, but it
+    // still opens the deference window. Deferring to a status the renderer
+    // never received left the boot stamp standing.
+    const hookRouter = stubHookRouter(false);
+    (hookRouter.governsDetectorStatus as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    const { router, captured } = makeRouter(hookRouter);
+    metadataHandlerMocks.lastBroadcastAgentStatus.set(PTY, 'idle');
+    captured.agent?.({
+      sessionId: PTY,
+      event: { agent: 'Claude Code', status: 'waiting', message: '' },
+    });
+    captured.idle?.({ sessionId: PTY, preTurn: true });
+    expect(lastPatch()).toMatchObject({ agentStatus: 'idle', settled: true });
+    router.stop();
+  });
+
+  it('leaves ordinary byte silence unmarked — a quiet turn is not a turn end', () => {
+    const { router, captured } = makeRouter(stubHookRouter(false));
+    captured.active?.({ sessionId: PTY, agentName: 'Codex' });
+    captured.idle?.({ sessionId: PTY });
+    expect(lastPatch()?.agentStatus).toBe('idle');
+    expect(lastPatch()?.settled).toBeUndefined();
+    router.stop();
+  });
+
+  it('does not settle an unlatched pane on a prompt marker alone', () => {
+    // A nested shell inside a quiet byte-heuristic turn can print the same
+    // marker. Only process truth (the exit edge below) proves the agent gone.
+    const { router, captured } = makeRouter(stubHookRouter(false));
+    captured.active?.({ sessionId: PTY, agentName: 'Codex' });
+    captured.idle?.({ sessionId: PTY });
+    broadcastMetadataUpdateMock.mockClear();
+
+    captured.prompt?.({ sessionId: PTY, event: { type: 'command_end', ts: 1, byteOffset: 10, exitCode: 130 } });
+    expect(broadcastMetadataUpdateMock).not.toHaveBeenCalled();
+    router.stop();
+  });
+
+  it('settles an unlatched, byte-idle pane on its agent process exit', () => {
+    const { router, captured } = makeRouter(stubHookRouter(false));
+    captured.active?.({ sessionId: PTY, agentName: 'Codex' });
+    captured.idle?.({ sessionId: PTY });
+    broadcastMetadataUpdateMock.mockClear();
+
+    captured.processExit?.({ sessionId: PTY, slug: 'codex' });
+    expect(lastPatch()).toMatchObject({ agentStatus: 'idle', settled: true });
+    router.stop();
+  });
+});
+
+/**
+ * #1463 live dogfood — `/clear` typed during a turn runs right after the Stop.
+ * Its SessionStart(clear) reaches the daemon ~60 ms after the Stop, inside the
+ * completion alarm's 1.5 s verdict window, and the session boundary cancels
+ * the held Stop: no turn end is ever broadcast. The latch the turn's prompt
+ * submit opened then held the pane Running (sidebar, Fleet, pane_list) until
+ * its 30-minute expiry. What reaches main is exactly: prompt submit, then
+ * SessionStart(clear).
+ */
+describe('DaemonNotificationRouter — #1463 a fresh session closes the turn it follows', () => {
+  function latchedRouter(): HookSignalRouter {
+    let governed = false;
+    return {
+      noteHookTurnStart: vi.fn(() => { governed = true; }),
+      notePromptSubmit: vi.fn(),
+      noteSessionStart: vi.fn(),
+      releaseHookTurnStart: vi.fn(() => { governed = false; }),
+      governsRunningState: vi.fn(() => governed),
+      noteAgentOnPane: vi.fn(),
+      isGovernedFor: vi.fn().mockReturnValue(false),
+      governsDetectorStatus: vi.fn().mockReturnValue(false),
+      recordDetector: vi.fn().mockReturnValue('emit'),
+      dropPty: vi.fn(),
+    } as unknown as HookSignalRouter;
+  }
+
+  const sessionStart = (source?: string) => {
+    const e = metadataEvent('agent.session_start');
+    (e.event.signal as { payload: Record<string, unknown> }).payload = source ? { source } : {};
+    return e;
+  };
+
+  beforeEach(() => {
+    broadcastMetadataUpdateMock.mockClear();
+    metadataHandlerMocks.lastBroadcastAgentStatus.delete(PTY);
+    clearSuppression(PTY);
+  });
+
+  it('records the session start as fresh-context evidence on main time (#1680)', () => {
+    const hookRouter = latchedRouter();
+    const { router, captured } = makeRouter(hookRouter, [], 0, () => 7000);
+    const event = sessionStart('clear');
+    captured.agent?.(event);
+    expect(hookRouter.noteSessionStart).toHaveBeenCalledWith(PTY, event.event.signal, 7000);
+    router.stop();
+  });
+
+  it('settles the pane when SessionStart(clear) follows a turn whose Stop never arrived', () => {
+    const hookRouter = latchedRouter();
+    const { router, captured } = makeRouter(hookRouter);
+    captured.agent?.(metadataEvent('agent.user_prompt_submit'));
+    expect(lastStatus()).toBe('running');
+
+    captured.agent?.(sessionStart('clear'));
+    expect(hookRouter.releaseHookTurnStart).toHaveBeenCalledWith(PTY);
+    const patch = broadcastMetadataUpdateMock.mock.calls.at(-1)?.[1] as { agentStatus?: string; settled?: boolean };
+    expect(patch).toMatchObject({ agentStatus: 'idle', settled: true });
+    router.stop();
+  });
+
+  it('never closes a live turn on a mid-turn auto-compact or source-less SessionStart', () => {
+    const hookRouter = latchedRouter();
+    const { router, captured } = makeRouter(hookRouter);
+    captured.agent?.(metadataEvent('agent.user_prompt_submit'));
+    captured.agent?.(sessionStart('compact'));
+    captured.agent?.(sessionStart());
+    expect(hookRouter.releaseHookTurnStart).not.toHaveBeenCalled();
+    expect(metadataHandlerMocks.lastBroadcastAgentStatus.get(PTY)).toBe('running');
     router.stop();
   });
 });

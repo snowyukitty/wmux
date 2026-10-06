@@ -18,14 +18,23 @@ import {
   parseProcessRows,
   buildWaiterScript,
   buildWaiterVbsLauncher,
+  buildScheduledTaskCreateArgs,
+  buildScheduledTaskRunArgs,
+  buildScheduledTaskDeleteArgs,
+  buildScheduledTaskXml,
   readDaemonPid,
   terminatePids,
   readAbortMarker,
+  readAbortRecord,
   clearAbortMarker,
   waitForWaiterHeartbeat,
   INSTALL_ABORT_MARKER,
   type WaiterPlan,
 } from '../installTeardown';
+import {
+  INSTALL_BLOCKED_BY_WINDOWS_REASON,
+  isInstallBlockedByWindowsReason,
+} from '../../../shared/installAbortReasons';
 
 const PLAN: WaiterPlan = {
   pids: [111, 222],
@@ -71,6 +80,40 @@ describe('buildWaiterScript — ordering is the whole contract', () => {
     expect(abortIdx).toBeGreaterThan(-1);
     expect(abortIdx).toBeLessThan(start);
     expect(s).toContain('exit 2');
+  });
+
+  it('#1525 — names a Windows application-control block instead of the generic launch failure', () => {
+    const s = buildWaiterScript(PLAN) ?? '';
+    const start = s.indexOf('Start-Process -FilePath $setup -PassThru');
+    const branch = s.indexOf('$blockedByPolicy = $false');
+    const exit4 = s.indexOf('exit 4');
+    expect(start).toBeGreaterThan(-1);
+    // The launch error is kept, then classified, before the one exit 4.
+    expect(s).toContain('catch { $started = $false; $startErr = $_.Exception }');
+    expect(branch).toBeGreaterThan(start);
+    expect(exit4).toBeGreaterThan(branch);
+    const block = s.slice(branch, exit4);
+    // 4551 = Smart App Control / App Control for Business, 1260 = AppLocker /
+    // Software Restriction Policies — both a real Win32Exception in the chain
+    // and the Win32 text Windows PowerShell 5.1 embeds in its message.
+    expect(block).toContain('$policyCodes = @(4551, 1260)');
+    expect(block).toContain('[System.ComponentModel.Win32Exception]');
+    expect(block).toContain('NativeErrorCode');
+    expect(block).toContain('InnerException');
+    expect(block).toContain('New-Object System.ComponentModel.Win32Exception $code');
+    // The distinct reason goes through the shared writer (target-version stamp
+    // included), and every other failure keeps the old reason.
+    expect(block).toContain(`if ($blockedByPolicy) { Write-InstallAbortMarker '${INSTALL_BLOCKED_BY_WINDOWS_REASON}' }`);
+    expect(block).toContain("else { Write-InstallAbortMarker 'install-aborted: the installer could not be started' }");
+    // Only one exit for a failed launch, still 4.
+    expect(s.match(/exit 4/g)).toHaveLength(1);
+  });
+
+  it('#1525 — the blocked reason is a single, apostrophe-free line the renderer recognizes', () => {
+    expect(INSTALL_BLOCKED_BY_WINDOWS_REASON).not.toMatch(/['\r\n]/);
+    expect(INSTALL_BLOCKED_BY_WINDOWS_REASON.startsWith('install-aborted: ')).toBe(true);
+    expect(isInstallBlockedByWindowsReason(INSTALL_BLOCKED_BY_WINDOWS_REASON)).toBe(true);
+    expect(isInstallBlockedByWindowsReason('install-aborted: the installer could not be started')).toBe(false);
   });
 
   it('captures handles by pid up front rather than polling pids', () => {
@@ -410,6 +453,75 @@ describe('consumeAbortMarker', () => {
     fs.writeFileSync(marker, '   \n');
     expect(readAbortMarker(marker)).toBe('install-aborted');
   });
+
+  // #1341 — the marker now names the version the install was FOR, so the app
+  // that boots out of it can tell "this install finished and the waiter has
+  // not cleaned up yet" from "this install was refused".
+  it('#1341: splits the target version out, and keeps it out of the reason', () => {
+    const dir = tempDir();
+    const marker = path.join(dir, INSTALL_ABORT_MARKER);
+    fs.writeFileSync(marker, 'install-aborted: install root still locked\nwmux-install-target: 3.57.0\n');
+
+    expect(readAbortRecord(marker)).toEqual({
+      reason: 'install-aborted: install root still locked',
+      targetVersion: '3.57.0',
+    });
+    // Nothing that renders the reason may ever show the machine-readable line.
+    expect(readAbortMarker(marker)).toBe('install-aborted: install root still locked');
+  });
+
+  it('#1341: a leading v compares equal, like normalizeVersion', () => {
+    const dir = tempDir();
+    const marker = path.join(dir, INSTALL_ABORT_MARKER);
+    fs.writeFileSync(marker, 'install-aborted: x\r\nwmux-install-target: v3.57.0\r\n');
+    expect(readAbortRecord(marker)?.targetVersion).toBe('3.57.0');
+  });
+
+  it('#1341: a pre-fix marker with no stamp reads as target-unknown', () => {
+    const dir = tempDir();
+    const marker = path.join(dir, INSTALL_ABORT_MARKER);
+    fs.writeFileSync(marker, 'install-aborted: install root still locked\n');
+    expect(readAbortRecord(marker)).toEqual({
+      reason: 'install-aborted: install root still locked',
+      targetVersion: null,
+    });
+  });
+
+  it('#1341: a marker that is nothing but a stamp still reports a refusal', () => {
+    const dir = tempDir();
+    const marker = path.join(dir, INSTALL_ABORT_MARKER);
+    fs.writeFileSync(marker, 'wmux-install-target: 3.57.0\n');
+    expect(readAbortRecord(marker)).toEqual({ reason: 'install-aborted', targetVersion: '3.57.0' });
+  });
+});
+
+describe('buildWaiterScript — #1341 target-version stamp', () => {
+  it('stamps every abort path through one writer, so no branch can forget it', () => {
+    const s = buildWaiterScript({ ...PLAN, targetVersion: '3.57.0' }) ?? '';
+    expect(s).toContain(`$targetLine = 'wmux-install-target: 3.57.0'`);
+    // One writer, one write: a reason and its stamp in two Set-Content calls
+    // would leave a window where the new app reads an unstamped reason — the
+    // very race this fixes.
+    expect(s).toContain('function Write-InstallAbortMarker($reason) {');
+    expect(s).not.toMatch(/Set-Content -LiteralPath \$marker -Value 'install-aborted/);
+    const writes = (s.match(/Write-InstallAbortMarker /g) ?? []).length;
+    // interrupted sentinel + stuck handle + locked root + blocked-by-policy
+    // (#1525) + cannot-start + incomplete-install = 6 marker writes, all
+    // stamped.
+    expect(writes).toBe(6);
+  });
+
+  it('omits the stamp when the caller cannot name the target, instead of failing the build', () => {
+    const s = buildWaiterScript(PLAN) ?? '';
+    expect(s).toContain('$targetLine = $null');
+    expect(s).toContain('Write-InstallAbortMarker ');
+  });
+
+  it('drops an unusable version rather than refusing to update', () => {
+    const s = buildWaiterScript({ ...PLAN, targetVersion: "3.57.0'; rm -rf" }) ?? '';
+    expect(s).not.toBe('');
+    expect(s).toContain('$targetLine = $null');
+  });
 });
 
 describe('buildWaiterScript — the lock probe covers loadable images, not just .exe', () => {
@@ -556,7 +668,10 @@ describe('buildWaiterScript — one waiter per install root (#980, coderabbit)',
     // #1056 heartbeat write IS expected before this point — it says "a
     // process ran," not "the install was refused," and every waiter
     // (incumbent or newcomer) writes its own regardless of the mutex outcome.
-    expect(s.slice(0, yieldAt)).not.toContain('-LiteralPath $marker');
+    // #1341 — the marker writer is DEFINED before the mutex (a function
+    // definition writes nothing); what must not appear above the yield is a
+    // CALL to it.
+    expect(s.slice(0, yieldAt)).not.toMatch(/^Write-InstallAbortMarker /m);
     expect(s.slice(0, yieldAt)).toContain('-LiteralPath $ready');
   });
 
@@ -758,5 +873,133 @@ describe('buildWaiterVbsLauncher (#1136 — the hidden transport)', () => {
     expect(buildWaiterVbsLauncher(PS, ['-NoProfile', ''], 'C:\\Temp\\w.ps1')).toBeNull();
     // A space in either PATH stays legal — that is the whole point of quoting.
     expect(buildWaiterVbsLauncher(PS, ARGS, 'C:\\Program Files\\w.ps1')).not.toBeNull();
+  });
+});
+
+describe('buildScheduledTaskXml (#1264 — the definition that survives a laptop)', () => {
+  const WSCRIPT = 'C:\\Windows\\System32\\wscript.exe';
+  const VBS = 'C:\\Users\\Daniel\\AppData\\Local\\Temp\\wmux-install-waiter-eOsG6n\\launch-waiter-s.vbs';
+
+  it('carries the power settings the /TR short form cannot express', () => {
+    // These four are the correctness of the transport, not polish. With the
+    // scheduler's defaults (DisallowStartIfOnBatteries / StopIfGoingOnBatteries
+    // both true) a laptop on battery starts NOTHING on /Run — we fall through
+    // to the transport that cannot survive the job — and unplugging mid-wait
+    // makes the scheduler terminate the waiter, which is #1264 all over again.
+    const xml = buildScheduledTaskXml(WSCRIPT, VBS) as string;
+    expect(xml).not.toBeNull();
+    expect(xml).toContain('<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>');
+    expect(xml).toContain('<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>');
+    // The waiter's own budgets are the only deadline it may have.
+    expect(xml).toContain('<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>');
+    expect(xml).toContain('<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>');
+    // The scheduler must not hard-kill it either.
+    expect(xml).toContain('<AllowHardTerminate>false</AllowHardTerminate>');
+    // /IT equivalent: a logon type with a desktop and no stored password.
+    expect(xml).toContain('<LogonType>InteractiveToken</LogonType>');
+  });
+
+  it('has NO trigger, so a leaked registration can never fire by itself', () => {
+    // The /TR form needed /SC ONCE /ST <time>. A registration that leaked (a
+    // /Create that timed out after the server committed, a /Delete that failed)
+    // would then fire later the same day — and a late waiter opens the recorded
+    // pids BY NUMBER, so after pid recycling it would taskkill strangers and
+    // write a false "install root still locked" marker against an already
+    // updated install.
+    const xml = buildScheduledTaskXml(WSCRIPT, VBS) as string;
+    expect(xml).not.toContain('<Triggers');
+    expect(xml).not.toContain('<StartBoundary>');
+    // On-demand is therefore the ONLY way it can start.
+    expect(xml).toContain('<AllowStartOnDemand>true</AllowStartOnDemand>');
+  });
+
+  it('mirrors the current process elevation onto the run level', () => {
+    // An elevated wmux handing the install to a medium-IL waiter means its
+    // taskkill against the app's own pids fails, $stuck fires, and the install
+    // is refused with exit 3 — a failure mode the in-tree transports never had,
+    // because they inherited the app's token.
+    expect(buildScheduledTaskXml(WSCRIPT, VBS) as string)
+      .toContain('<RunLevel>LeastPrivilege</RunLevel>');
+    expect(buildScheduledTaskXml(WSCRIPT, VBS, 'HighestAvailable') as string)
+      .toContain('<RunLevel>HighestAvailable</RunLevel>');
+  });
+
+  it('escapes the command path instead of letting it break the document', () => {
+    // `&` is legal in a Windows path and is the one character that silently
+    // turns a valid path into an invalid document. Quotes and angle brackets
+    // cannot occur in a path, but the escape is unconditional rather than
+    // resting on that.
+    const amp = 'C:\\Temp\\R&D\\launch-waiter-s.vbs';
+    const xml = buildScheduledTaskXml(WSCRIPT, amp) as string;
+    expect(xml).toContain('R&amp;D');
+    expect(xml).not.toMatch(/R&D/);
+    // Non-ASCII rides through untouched — the file is written as UTF-16 and
+    // the declaration says so, which is what makes a non-Latin %TEMP% safe.
+    const korean = 'C:\\Users\\홍길동\\AppData\\Local\\Temp\\w\\launch-waiter-s.vbs';
+    expect(buildScheduledTaskXml(WSCRIPT, korean) as string).toContain('홍길동');
+    expect(buildScheduledTaskXml(WSCRIPT, VBS) as string)
+      .toContain('<?xml version="1.0" encoding="UTF-16"?>');
+    // A line break would split the text node and silently change the command.
+    expect(buildScheduledTaskXml(WSCRIPT, 'C:\\a\nb.vbs')).toBeNull();
+    expect(buildScheduledTaskXml(WSCRIPT, 'C:\\a\rb.vbs')).toBeNull();
+    expect(buildScheduledTaskXml('', VBS)).toBeNull();
+  });
+
+  it('emits Settings in the order the importer round-trips', () => {
+    // The task XSD validates a SEQUENCE; a definition in the wrong order is
+    // refused, which fails closed to transport W and silently costs the fix.
+    // This is the order `schtasks /Query /XML` itself emits.
+    const xml = buildScheduledTaskXml(WSCRIPT, VBS) as string;
+    const order = [
+      'MultipleInstancesPolicy', 'DisallowStartIfOnBatteries', 'StopIfGoingOnBatteries',
+      'AllowHardTerminate', 'StartWhenAvailable', 'RunOnlyIfNetworkAvailable',
+      'IdleSettings', 'AllowStartOnDemand', 'Enabled', 'Hidden', 'RunOnlyIfIdle',
+      'WakeToRun', 'ExecutionTimeLimit', 'Priority',
+    ].map((tag) => xml.indexOf(`<${tag}`));
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // RegistrationInfo → Principals → Settings → Actions, likewise a sequence.
+    const top = ['<RegistrationInfo>', '<Principals>', '<Settings>', '<Actions']
+      .map((tag) => xml.indexOf(tag));
+    expect([...top].sort((a, b) => a - b)).toEqual(top);
+  });
+});
+
+describe('buildScheduledTaskCreateArgs (#1264 — the job-escaping transport)', () => {
+  const XML = 'C:\\Users\\Daniel\\AppData\\Local\\Temp\\wmux-install-waiter-eOsG6n\\waiter-task.xml';
+
+  it('registers the definition from XML, overwriting a leftover name', () => {
+    const args = buildScheduledTaskCreateArgs('wmux-update-abc123', XML) as string[];
+    expect(args).not.toBeNull();
+    expect(args[args.indexOf('/TN') + 1]).toBe('wmux-update-abc123');
+    // /XML, not /TR: the short form cannot express the battery settings.
+    expect(args[args.indexOf('/XML') + 1]).toBe(XML);
+    expect(args).not.toContain('/TR');
+    expect(args).not.toContain('/SC');
+    expect(args).toContain('/F');
+    // No /RU or /RP: the principal is in the XML, and no password is stored.
+    expect(args).not.toContain('/RU');
+    expect(args).not.toContain('/RP');
+  });
+
+  it('the run and delete calls address the same task', () => {
+    expect(buildScheduledTaskRunArgs('wmux-update-abc123')).toEqual(['/Run', '/TN', 'wmux-update-abc123']);
+    expect(buildScheduledTaskDeleteArgs('wmux-update-abc123')).toEqual(['/Delete', '/TN', 'wmux-update-abc123', '/F']);
+  });
+
+  it('refuses a name it could not address again later', () => {
+    // The name is a Task Scheduler PATH and the handle /Run, /Delete and the
+    // startup sweep all use. A backslash would nest it into a folder the sweep
+    // does not look in.
+    expect(buildScheduledTaskCreateArgs('wmux-update-a\\b', XML)).toBeNull();
+    expect(buildScheduledTaskCreateArgs('Some Other Task', XML)).toBeNull();
+    expect(buildScheduledTaskCreateArgs('wmux-update-', XML)).toBeNull();
+    expect(buildScheduledTaskCreateArgs('wmux-update-abc123', 'C:\\a"b.xml')).toBeNull();
+    expect(buildScheduledTaskCreateArgs('wmux-update-abc123', '')).toBeNull();
+  });
+
+  it('accepts the name shape spawnInstallWaiter actually generates', () => {
+    const generated = `wmux-update-${'wmux-install-waiter-eOsG6n'.replace(/[^A-Za-z0-9]/g, '')}`;
+    expect(buildScheduledTaskCreateArgs(generated, XML)).not.toBeNull();
   });
 });

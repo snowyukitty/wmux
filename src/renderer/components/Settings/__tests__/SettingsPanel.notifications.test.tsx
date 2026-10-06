@@ -139,18 +139,16 @@ describe('NotificationsView — initial render', () => {
       paneFlashEnabled: false,
       taskbarFlashEnabled: false,
     })));
-    // Find the aria-label="settings.paneRing" switch and assert it is aria-checked=false.
-    const m = html.match(/aria-checked="(true|false)"[^>]*aria-label="settings.paneRing"/);
-    expect(m).not.toBeNull();
-    expect(m && m[1]).toBe('false');
-
-    const m2 = html.match(/aria-checked="(true|false)"[^>]*aria-label="settings.paneFlash"/);
-    expect(m2).not.toBeNull();
-    expect(m2 && m2[1]).toBe('false');
-
-    const m3 = html.match(/aria-checked="(true|false)"[^>]*aria-label="settings.taskbarFlash"/);
-    expect(m3).not.toBeNull();
-    expect(m3 && m3[1]).toBe('false');
+    // Find the aria-label="settings.paneRing" switch and assert it is
+    // aria-checked=false. Attribute order is the primitive's business, so the
+    // switch's opening tag is found first and its state read from it.
+    const switchState = (label: string): string | null => {
+      const tag = html.match(new RegExp(`<button[^>]*aria-label="${label}"[^>]*>`));
+      return tag ? (tag[0].match(/aria-checked="(true|false)"/)?.[1] ?? null) : null;
+    };
+    expect(switchState('settings.paneRing')).toBe('false');
+    expect(switchState('settings.paneFlash')).toBe('false');
+    expect(switchState('settings.taskbarFlash')).toBe('false');
   });
 });
 
@@ -303,5 +301,53 @@ describe('NotificationsView — existing toggle regressions', () => {
     const props = makeProps({ notificationRingEnabled: true, onChangeNotificationRingEnabled: setter });
     props.onChangeNotificationRingEnabled(!props.notificationRingEnabled);
     expect(setter).toHaveBeenCalledWith(false);
+  });
+});
+
+// ─── Per-workspace "Wake the agent on PR events" ───────────────────────────
+
+describe('NotificationsView — wake the agent on PR events', () => {
+  it('renders one checkbox per workspace, on unless the workspace turned it off', () => {
+    const workspaces = [
+      { ...workspaceRow('ws-1', 'Workspace 1'), prWake: true },
+      { ...workspaceRow('ws-2', 'Workspace 2'), prWake: false },
+      workspaceRow('ws-3', 'Workspace 3'),
+    ];
+    const html = renderToStaticMarkup(
+      createElement(NotificationsView, makeProps({ workspaces, onChangeWorkspacePrWake: () => undefined })),
+    );
+    expect(html).toContain('per-workspace-pr-wake-section');
+    expect(html.match(/id="workspace-pr-wake-ws-1"[^>]*checked/)).not.toBeNull();
+    expect(html.match(/id="workspace-pr-wake-ws-2"[^>]*checked/)).toBeNull();
+    expect(html.match(/id="workspace-pr-wake-ws-3"[^>]*checked/)).not.toBeNull();
+  });
+
+  it('checks passed is its own checkbox: off by default, disabled while the workspace is off', () => {
+    const workspaces = [
+      { ...workspaceRow('ws-1', 'Workspace 1'), prWake: true },
+      { ...workspaceRow('ws-2', 'Workspace 2'), prWake: true, prWakeChecksPassed: true },
+      { ...workspaceRow('ws-3', 'Workspace 3'), prWake: false, prWakeChecksPassed: true },
+    ];
+    const html = renderToStaticMarkup(
+      createElement(NotificationsView, makeProps({
+        workspaces,
+        onChangeWorkspacePrWake: () => undefined,
+        onChangeWorkspacePrWakeChecksPassed: () => undefined,
+      })),
+    );
+    const tag = (id: string) => html.match(new RegExp(`<input[^>]*id="workspace-pr-wake-passed-${id}"[^>]*>`))?.[0] ?? '';
+    expect(tag('ws-1')).not.toMatch(/checked/);
+    expect(tag('ws-2')).toMatch(/checked/);
+    expect(tag('ws-3')).toMatch(/disabled/);
+    expect(tag('ws-3')).not.toMatch(/checked/);
+  });
+
+    it('is absent without a handler or without workspaces', () => {
+    expect(renderToStaticMarkup(createElement(NotificationsView, makeProps({ workspaces: [workspaceRow('ws-1', 'W')] })))).not.toContain(
+      'per-workspace-pr-wake-section',
+    );
+    expect(
+      renderToStaticMarkup(createElement(NotificationsView, makeProps({ workspaces: [], onChangeWorkspacePrWake: () => undefined }))),
+    ).not.toContain('per-workspace-pr-wake-section');
   });
 });

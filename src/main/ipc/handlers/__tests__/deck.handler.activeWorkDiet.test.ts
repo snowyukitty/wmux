@@ -109,6 +109,7 @@ vi.mock('../../../deck/deckAutonomyStore', async (importOriginal) => {
 vi.mock('../../../deck/deckScheduleStore', () => ({
   loadDeckSchedules: vi.fn(() => []),
   saveDeckSchedules: vi.fn(async () => undefined),
+  mutateDeckSchedules: vi.fn(async () => undefined),
   createSchedule: vi.fn(() => null),
   dueSchedules: vi.fn(() => []),
   advanceAfterRun: vi.fn((s: unknown) => s),
@@ -116,9 +117,13 @@ vi.mock('../../../deck/deckScheduleStore', () => ({
 }));
 
 vi.mock('../../../deck/deckDecisionStore', () => ({
+  onDecisionsChanged: vi.fn(() => () => undefined),
+  isIssueProposalDecision: vi.fn(() => false),
+  isMainOwnedDecision: vi.fn(() => false),
   loadWorkspaceDecision: vi.fn(() => null),
   loadDeckDecisions: vi.fn(() => ({})),
   hasPendingDecision: vi.fn(() => false),
+  hasBrainBlockingDecision: vi.fn(() => false),
   resolveDecision: vi.fn(async () => null),
   clearResolvedDecision: vi.fn(async () => undefined),
   clearDecision: vi.fn(async () => undefined),
@@ -135,6 +140,7 @@ vi.mock('../../../deck/deckPolicy', () => ({
 }));
 
 import { registerDeckHandler } from '../deck.handler';
+import { setMoaEnabled } from '../../../deck/deckHqStore';
 import { setDeckWorkBootId } from '../../../deck/deckWorkStore';
 import { IPC } from '../../../../shared/constants';
 import type { BrainAdapter, BrainEvent, BrainStartOptions } from '../../../deck/BrainAdapter';
@@ -174,6 +180,12 @@ const send = (text: string) => invoke(IPC.DECK_SEND, { workspaceId: 'ws-1', text
 
 /** All texts every fake adapter has been sent, in order. */
 const sentTexts = (): string[] => adapters.flatMap((a) => a.sentTexts);
+
+// These suites exercise the deck brain itself: start with Moa's master
+// switch on (a fresh data dir would otherwise read as a new install, off).
+beforeEach(async () => {
+  await setMoaEnabled(true);
+});
 
 beforeEach(() => {
   captured.clear();

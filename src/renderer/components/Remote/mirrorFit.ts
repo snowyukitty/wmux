@@ -88,6 +88,57 @@ export function mirrorFitKey(parts: {
 }
 
 /**
+ * When the mirror may ask the remote to resize again: once per box size, font
+ * ceiling and face — the inputs that decide what grid the box holds.
+ *
+ * Deliberately NOT {@link mirrorFitKey}: that one carries the remote grid, and
+ * the remote grid is exactly what a granted request changes. Keyed on it, every
+ * grant re-armed the request, and because the ideal grid was re-derived from a
+ * font the fit had just changed, the next answer could be a cell or two off the
+ * last — so the mirror and the remote traded two grids forever, delivering a
+ * SIGWINCH to the remote app on every swap. A remote-side change (a grant, or
+ * someone re-gridding the pane on the host) is never a reason to ask again.
+ */
+export function mirrorResizeRequestKey(parts: {
+  boxWidth: number;
+  boxHeight: number;
+  maxFontSize: number;
+  fontFamily: string;
+  /** Cell sizes round through the device pixel ratio, so moving the window to
+   *  a display with a different one changes the grid the box holds. */
+  devicePixelRatio: number;
+}): string {
+  const { boxWidth, boxHeight, maxFontSize, fontFamily, devicePixelRatio } = parts;
+  return `${boxWidth}x${boxHeight}x${maxFontSize}x${fontFamily}@${devicePixelRatio}`;
+}
+
+/** Identity of a measured ceiling cell: the same font, face and pixel ratio
+ *  draw the same cell, anything else must be measured again. */
+export function mirrorCeilingCellKey(parts: {
+  ceilingFontSize: number;
+  fontFamily: string;
+  devicePixelRatio: number;
+}): string {
+  return `${parts.ceilingFontSize}x${parts.fontFamily}@${parts.devicePixelRatio}`;
+}
+
+/** A remote grid within this many cells of the ideal in both axes is left
+ *  alone: the font fit absorbs a one-cell residue, while a resize costs the
+ *  remote app a SIGWINCH and a full repaint. */
+export const REMOTE_RESIZE_HYSTERESIS_CELLS = 1;
+
+/** Whether `ideal` is far enough from the remote's current grid to be worth a
+ *  resize request (see {@link REMOTE_RESIZE_HYSTERESIS_CELLS}). */
+export function shouldRequestRemoteResize(
+  ideal: { cols: number; rows: number },
+  cols: number,
+  rows: number,
+): boolean {
+  return Math.abs(ideal.cols - cols) > REMOTE_RESIZE_HYSTERESIS_CELLS
+    || Math.abs(ideal.rows - rows) > REMOTE_RESIZE_HYSTERESIS_CELLS;
+}
+
+/**
  * Pick the font size at which `cols × rows` fits inside the box.
  *
  * Pass 1 is a linear prediction: cell width is very nearly proportional to font
@@ -152,4 +203,158 @@ export function computeMirrorFontSize(input: MirrorFitInput): MirrorFitResult {
 /** Round DOWN to a FONT_STEP multiple — rounding up would re-overflow the box. */
 function quantise(size: number): number {
   return Math.floor(size / FONT_STEP) * FONT_STEP;
+}
+
+/**
+ * The grid (cols × rows) that would fill the box AT THE USER'S OWN FONT SIZE
+ * — i.e. without the font-shrink `computeMirrorFontSize` performs.
+ *
+ * The two functions answer different halves of the same problem. Font-shrink
+ * is the fallback: it never touches the remote and always works, but a
+ * grid smaller than the box stays small (letterboxed) and a grid bigger than
+ * the box renders unreadably tiny. This function is the input to the
+ * PREFERRED fix (#1322): ask the remote daemon to resize its PTY to a grid
+ * that actually fills the box (`RemoteMirrorTerminal`'s `requestRemoteResize`),
+ * so the remote reflows its own output at the new width instead of this
+ * mirror silently misrepresenting a still-differently-sized session through a
+ * shrunk or oversized font.
+ *
+ * Prefers `ceilingCell`, the cell size MEASURED while the mirror was drawn at
+ * `maxFontSize`. Without it, the cell size is extrapolated from the CURRENT
+ * render (px per font unit) — the same approximation `computeMirrorFontSize`
+ * uses for its pass-1 prediction. That approximation is not good enough to ask
+ * a remote for a grid with: xterm's cell size is a staircase in the font size
+ * (`ceil`/`floor` through the device pixel ratio), so extrapolating from a
+ * shrunk font lands a cell or two away from the real answer, and a different
+ * shrunk font lands somewhere else. The caller must therefore not re-ask on
+ * every remote grid change — see {@link mirrorResizeRequestKey}.
+ */
+export function computeMirrorGeometry(input: {
+  boxWidth: number;
+  boxHeight: number;
+  cols: number;
+  rows: number;
+  renderedWidth: number;
+  renderedHeight: number;
+  currentFontSize: number;
+  maxFontSize: number;
+  /** Cell size (CSS px) measured at `maxFontSize` for the current face. */
+  ceilingCell?: { width: number; height: number };
+}): { cols: number; rows: number } | null {
+  const {
+    boxWidth, boxHeight, cols, rows,
+    renderedWidth, renderedHeight, currentFontSize, maxFontSize, ceilingCell,
+  } = input;
+
+  const measurable =
+    boxWidth > 0 && boxHeight > 0 &&
+    renderedWidth > 0 && renderedHeight > 0 &&
+    cols > 0 && rows > 0 && currentFontSize > 0 &&
+    Number.isFinite(boxWidth) && Number.isFinite(boxHeight) &&
+    Number.isFinite(renderedWidth) && Number.isFinite(renderedHeight);
+  if (!measurable) return null;
+
+  const ceiling = Math.max(MIN_MIRROR_FONT_SIZE, Number.isFinite(maxFontSize) ? maxFontSize : 0);
+
+  // The measured ceiling cell when there is one; otherwise the cell size at the
+  // CURRENT font, extrapolated to the ceiling (only "very nearly" right).
+  const measured = ceilingCell
+    && Number.isFinite(ceilingCell.width) && Number.isFinite(ceilingCell.height)
+    && ceilingCell.width > 0 && ceilingCell.height > 0;
+  const cellWidthAtCeiling = measured
+    ? ceilingCell.width
+    : (renderedWidth / currentFontSize) * (ceiling / cols);
+  const cellHeightAtCeiling = measured
+    ? ceilingCell.height
+    : (renderedHeight / currentFontSize) * (ceiling / rows);
+  if (!(cellWidthAtCeiling > 0) || !(cellHeightAtCeiling > 0)) return null;
+
+  const idealCols = Math.floor(boxWidth / cellWidthAtCeiling);
+  const idealRows = Math.floor(boxHeight / cellHeightAtCeiling);
+  if (idealCols <= 0 || idealRows <= 0) return null;
+  return { cols: idealCols, rows: idealRows };
+}
+
+/**
+ * What the mirror does with a refused or failed resize request.
+ *
+ * - `desk`: the host's own window shows the pane and owns its size. Nothing to
+ *   retry soon; the font fit handles the box, and a slow probe asks again later
+ *   in case the host has since looked away (it sends no event when it does).
+ * - `final`: a request that cannot succeed by asking again (bad geometry,
+ *   rejected credential, attach gone).
+ * - `retry`: rate-limited or transient (network, a pane still recovering).
+ */
+export type ResizeRefusal = 'desk' | 'retry' | 'final';
+
+export function classifyResizeRefusal(reason: string): ResizeRefusal {
+  if (reason === 'desk-owns-size') return 'desk';
+  if (
+    reason === 'bad-geometry' ||
+    reason === 'auth-rejected' ||
+    reason === 'insecure-transport' ||
+    reason === 'unknown attach' ||
+    reason === 'unknown host' ||
+    reason === 'cols and rows must be numbers'
+  ) return 'final';
+  return 'retry';
+}
+
+/** Backoff for `retry` refusals. The host's own floor between accepted resizes
+ *  is 250 ms, so the first retry already clears it. */
+export const RESIZE_RETRY_DELAYS_MS = [500, 1000, 2000, 4000] as const;
+
+/** Delay before retry number `attempt` (0-based), or null once exhausted. */
+export function resizeRetryDelayMs(attempt: number): number | null {
+  return RESIZE_RETRY_DELAYS_MS[attempt] ?? null;
+}
+
+/** How often a desk-refused request is asked again while nothing else changes.
+ *  A refused request costs the host nothing (no SIGWINCH), so this is cheap. */
+export const DESK_PROBE_INTERVAL_MS = 10_000;
+
+/** Least time between two decisions re-opened by resizes this mirror did not ask
+ *  for. Well above the host's 400 ms meta debounce, so a burst collapses. */
+export const EXTERNAL_REOPEN_MIN_INTERVAL_MS = 2_000;
+
+/** A resize from elsewhere this soon after one of OUR grants is someone else
+ *  asking for a different grid — another viewer, or the host's own window. */
+export const REMOTE_FIGHT_WINDOW_MS = 10_000;
+
+export interface ExternalResizeState {
+  /** When an external change last re-opened the decision. */
+  lastReopenAt: number;
+  /** External changes that overrode a recent grant of ours, within the window. */
+  overrides: number;
+  lastOverrideAt: number;
+}
+
+export function initialExternalResizeState(): ExternalResizeState {
+  return { lastReopenAt: -Infinity, overrides: 0, lastOverrideAt: -Infinity };
+}
+
+/**
+ * A resize this mirror did not ask for (not an echo of its own grant) arrived.
+ * Returns how long to wait before re-opening the resize decision, or null to
+ * leave the remote's grid alone and only fit the font.
+ *
+ * One re-open per external change, never sooner than
+ * {@link EXTERNAL_REOPEN_MIN_INTERVAL_MS} after the previous one. When a change
+ * overrides a grant of ours for the SECOND time inside
+ * {@link REMOTE_FIGHT_WINDOW_MS}, another party wants a different grid and
+ * asking again would only trade grids with it — so this mirror yields until
+ * its own box or font changes (which resets `overrides`).
+ */
+export function planExternalReopen(
+  state: ExternalResizeState,
+  now: number,
+  lastGrantAt: number,
+): number | null {
+  if (now - state.lastOverrideAt > REMOTE_FIGHT_WINDOW_MS) state.overrides = 0;
+  if (now - lastGrantAt < REMOTE_FIGHT_WINDOW_MS) {
+    state.overrides += 1;
+    state.lastOverrideAt = now;
+  }
+  if (state.overrides > 1) return null;
+  return Math.max(0, state.lastReopenAt + EXTERNAL_REOPEN_MIN_INTERVAL_MS - now);
 }

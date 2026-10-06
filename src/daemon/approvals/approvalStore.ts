@@ -15,7 +15,8 @@
 
 import path from 'node:path';
 import { atomicReadJSONSync, atomicWriteJSON } from '../util/atomicWrite';
-import { sanitizeChoices, sanitizeOptions, sanitizeQuestion } from './askUserQuestion';
+import { sanitizeChoices, sanitizeOptions, sanitizeQuestion, sanitizeQuestionShape } from './askUserQuestion';
+import { boundRecordText, TERMINAL_PROMPT_SUMMARY_MAX, TERMINAL_PROMPT_TOOL_NAME_MAX } from './terminalPrompt';
 import type { ApprovalDecision, ApprovalRequest, ApprovalState } from './types';
 
 const STATE_FILE = 'approvals.json';
@@ -57,6 +58,12 @@ const STATES: ReadonlySet<string> = new Set<ApprovalState>([
 
 const DECISIONS: ReadonlySet<string> = new Set<ApprovalDecision>(['approve', 'deny']);
 
+const KINDS: ReadonlySet<string> = new Set<ApprovalRequest['kind']>([
+  'awaiting_input',
+  'awaiting_permission',
+  'terminal_prompt',
+]);
+
 /**
  * Coerce one raw entry. Unlike webStateStore's per-FIELD fallback, a record
  * missing any of its identity fields (id / sessionId / agent / createdAt /
@@ -82,7 +89,11 @@ function coerceRequest(raw: unknown): ApprovalRequest | null {
     id,
     sessionId,
     agent,
-    kind: 'awaiting_input',
+    // A closed set. Anything else (or nothing, from a file written before the
+    // field existed) reads as the original kind, as it always did.
+    kind: typeof o['kind'] === 'string' && KINDS.has(o['kind'])
+      ? (o['kind'] as ApprovalRequest['kind'])
+      : 'awaiting_input',
     createdAt,
     state,
   };
@@ -112,6 +123,8 @@ function coerceRequest(raw: unknown): ApprovalRequest | null {
   if (options) out.options = options;
   const choices = sanitizeChoices(o['choices']);
   if (choices) out.choices = choices;
+  const questionShape = sanitizeQuestionShape(o['questionShape']);
+  if (questionShape) out.questionShape = questionShape;
   // selectedChoiceKey: a 1-2 digit string, validated against the choices set.
   if (typeof o['selectedChoiceKey'] === 'string' && /^\d{1,2}$/.test(o['selectedChoiceKey'])) {
     out.selectedChoiceKey = o['selectedChoiceKey'];
@@ -120,6 +133,41 @@ function coerceRequest(raw: unknown): ApprovalRequest | null {
   // through, so a hand-edited file cannot invent a risk level a client would
   // then have to interpret.
   if (o['risk'] === 'critical') out.risk = 'critical';
+  // Bounded and cleaned on the way in, like every other text field here.
+  const toolName = boundRecordText(o['toolName'], TERMINAL_PROMPT_TOOL_NAME_MAX);
+  if (toolName) out.toolName = toolName;
+  const summary = boundRecordText(o['summary'], TERMINAL_PROMPT_SUMMARY_MAX);
+  if (summary) out.summary = summary;
+  const reason = boundRecordText(o['reason'], TERMINAL_PROMPT_SUMMARY_MAX);
+  if (reason) out.reason = reason;
+  if (typeof o['promptFingerprint'] === 'string' && /^[0-9a-f]{32}$/.test(o['promptFingerprint'])) {
+    out.promptFingerprint = o['promptFingerprint'];
+  }
+  if (typeof o['pressedAt'] === 'number' && Number.isFinite(o['pressedAt'])) out.pressedAt = o['pressedAt'];
+  // Kept so a native answer given before a restart still reads as one in the
+  // history (it has no `pressedAt`). A closed set, like `kind`.
+  if (o['channel'] === 'native-rpc' || o['channel'] === 'none' || o['channel'] === 'fenced-keys') out.channel = o['channel'];
+  // A stepwise answer's progress: a restart expires one that had not finished.
+  const step = o['step'];
+  if (step && typeof step === 'object' && !Array.isArray(step)) {
+    const s = step as Record<string, unknown>;
+    const count = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 64;
+    const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+    if ((s['status'] === 'running' || s['status'] === 'partial' || s['status'] === 'done')
+      && count(s['index']) && count(s['total']) && typeof s['answerId'] === 'string'
+      && typeof s['incarnation'] === 'string'
+      && isCount(s['expectedRevision']) && isCount(s['startedAt'])) {
+      out.step = {
+        answerId: s['answerId'].slice(0, 128),
+        index: s['index'],
+        total: s['total'],
+        expectedRevision: s['expectedRevision'] as number,
+        incarnation: s['incarnation'].slice(0, 128),
+        status: s['status'],
+        startedAt: s['startedAt'] as number,
+      };
+    }
+  }
   return out;
 }
 
@@ -191,8 +239,10 @@ export function trimHistory(requests: readonly ApprovalRequest[]): ApprovalReque
 }
 
 /** Bound a captured pane tail so a record can never carry a screenful of noise. */
-/** Longest `resolvedBy` we will persist. Room for a device name plus a UUID. */
-export const RESOLVED_BY_MAX = 128;
+/** Longest `resolvedBy` we will persist. Room for a device name plus a UUID,
+ *  and for the HQ lane's `hq:<ws>;owner:<ws>;lane:hq` with two 80-char
+ *  workspace ids — the audit must not lose its owner or lane to the cap. */
+export const RESOLVED_BY_MAX = 200;
 
 /**
  * Bound and clean the "who answered this" label.

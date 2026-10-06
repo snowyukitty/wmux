@@ -1,5 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
+import { spawnSync } from 'child_process';
+import { FACTORY_DEFAULT_SCOPES, __setPolicyProbeForTests } from '../../shared/pwshExecutionPolicy';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { classifyShell, buildSpawnInjection, ZSH_RC, PWSH_INIT, BASH_INIT } from '../shell-integration';
+import { PromptEventLog, parseOsc133Payload } from '../PromptEventLog';
 
 // zsh 지원(macOS 기본 셸) — ZDOTDIR 가로채기 방식의 핵심 불변식 검증.
 describe('classifyShell', () => {
@@ -43,6 +49,44 @@ describe('buildSpawnInjection — zsh', () => {
   it('알 수 없는 셸은 injection이 없다(일반 spawn)', () => {
     expect(buildSpawnInjection('/usr/bin/fish')).toBeNull();
     expect(buildSpawnInjection('cmd.exe')).toBeNull();
+  });
+});
+
+// #1620: a Windows client that never set an execution policy runs Restricted,
+// which refuses to dot-source the init script. Windows PowerShell 5.1 then gets
+// a process-scoped RemoteSigned; pwsh 7 (ships RemoteSigned) and any machine
+// with an explicit policy get nothing extra.
+describe('buildSpawnInjection — PowerShell execution policy (#1620)', () => {
+  // Bare names, like classifyShell's own tests: classifyShell uses
+  // path.basename, which does not split a Windows path on POSIX CI runners.
+  const PS51 = 'powershell.exe';
+  const PS7 = 'pwsh.exe';
+  afterEach(() => __setPolicyProbeForTests(null));
+
+  function dotSource(args: string[] | undefined): string {
+    return args?.[args.length - 1] ?? '';
+  }
+
+  it('5.1 on a factory-default machine: RemoteSigned, placed before -Command', () => {
+    __setPolicyProbeForTests({ scopes: FACTORY_DEFAULT_SCOPES, platform: 'win32' });
+    const inj = buildSpawnInjection(PS51);
+    expect(inj?.args.slice(0, 5)).toEqual(['-NoLogo', '-NoExit', '-ExecutionPolicy', 'RemoteSigned', '-Command']);
+    expect(dotSource(inj?.args)).toMatch(/^\. '.*wmux-shell-init\.ps1'$/);
+    expect(inj?.env.WMUX_SHELL_INTEGRATION).toBe('1');
+  });
+
+  it('5.1 with an explicit policy: argv unchanged from before the fix', () => {
+    __setPolicyProbeForTests({ scopes: { ...FACTORY_DEFAULT_SCOPES, currentUser: 'set' }, platform: 'win32' });
+    const inj = buildSpawnInjection(PS51);
+    expect(inj?.args.slice(0, 3)).toEqual(['-NoLogo', '-NoExit', '-Command']);
+    expect(inj?.args).not.toContain('-ExecutionPolicy');
+  });
+
+  it('pwsh 7 never gets the flag, even on a factory-default machine', () => {
+    __setPolicyProbeForTests({ scopes: FACTORY_DEFAULT_SCOPES, platform: 'win32' });
+    const inj = buildSpawnInjection(PS7);
+    expect(inj?.args.slice(0, 3)).toEqual(['-NoLogo', '-NoExit', '-Command']);
+    expect(inj?.args).not.toContain('-ExecutionPolicy');
   });
 });
 
@@ -179,5 +223,104 @@ describe('BASH_INIT — OSC 7 cwd report (#540)', () => {
     expect(BASH_INIT).toContain('"$(__wmux_osc7_encode "$p")"');
     // And no emission path passes the raw $p to printf anymore.
     expect(BASH_INIT).not.toContain('"${HOSTNAME-localhost}" "$p"');
+  });
+});
+
+// bash < 4.4 has no PS0, so the integration can never emit C (command start)
+// there, while D/A/B still arrive every prompt. The prompt markers stay — exit
+// codes, the shell-prompt settle and the Welcome sample task depend on them —
+// but the daemon must not read "no C" as "at a prompt": a live agent in the
+// pane would lose its identity every poll. PromptEventLog.commandRunningIfKnown
+// stays unknown until the shell has proven it emits C.
+function bashVersion(): { bin: string; major: number; minor: number } | undefined {
+  if (process.platform === 'win32') return undefined;
+  const bin = ['/bin/bash', '/usr/bin/bash'].find((b) => fs.existsSync(b));
+  if (!bin) return undefined;
+  const r = spawnSync(bin, ['-c', 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"'], {
+    encoding: 'utf-8', timeout: 2_000, env: { PATH: '/usr/bin:/bin' },
+  });
+  const m = /^(\d+)\.(\d+)/.exec(r.stdout ?? '');
+  return m ? { bin, major: Number(m[1]), minor: Number(m[2]) } : undefined;
+}
+const realBash = bashVersion();
+
+describe('BASH_INIT — prompt markers on every bash, command state only once C is proven', () => {
+  it.skipIf(!realBash)('real bash: D/A/B always arrive; command state is known only where PS0 emits C', () => {
+    const bash = realBash;
+    if (!bash) return;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-bash-init-'));
+    try {
+      const rc = path.join(dir, 'init.bash');
+      fs.writeFileSync(rc, BASH_INIT);
+      const out = spawnSync(bash.bin, ['--rcfile', rc, '-i'], {
+        // End on EOF, not `exit`: PS0 fires for `exit` too and leaves a
+        // trailing C with no D after it.
+        input: 'true\n',
+        encoding: 'utf-8',
+        env: { HOME: dir, PATH: '/usr/bin:/bin', TERM: 'dumb' },
+        timeout: 5_000,
+      });
+      const log = new PromptEventLog();
+      const all = `${out.stdout}${out.stderr}`;
+      let i = 0;
+      const esc = String.fromCharCode(0x1b);
+      const bel = String.fromCharCode(0x07);
+      for (const m of all.matchAll(new RegExp(`${esc}\\]133;([^${bel}]*)${bel}`, 'g'))) {
+        const ev = parseOsc133Payload(m[1], i, i);
+        i += 1;
+        if (ev) log.append(ev);
+      }
+      const types = new Set(log.snapshot().map((e) => e.type));
+      expect(types.has('prompt_start')).toBe(true);
+      expect(types.has('prompt_end')).toBe(true);
+      expect(types.has('command_end')).toBe(true);
+      const hasPs0 = bash.major > 4 || (bash.major === 4 && bash.minor >= 4);
+      if (hasPs0) {
+        expect(types.has('command_start')).toBe(true);
+        expect(log.commandRunningIfKnown()).toBe(false);
+      } else {
+        expect(types.has('command_start')).toBe(false);
+        // An agent launched here would be running now — and must not read as idle.
+        expect(log.commandRunningIfKnown()).toBeUndefined();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// Issue #1267: the wrapper snapshots $? as its very first statement but used
+// to delegate to the wrapped prompt ~10 statements later — and in PowerShell
+// EVERY statement resets $? to true. So any prompt engine that reads $? to
+// detect the last command's status (oh-my-posh `status`, Starship) saw
+// "success" forever inside a wmux pane, while the same config in Windows
+// Terminal coloured correctly. $? is not assignable and the snapshot cannot be
+// deferred, so the wrapper re-creates the value immediately before delegating.
+describe('PWSH_INIT — the wrapped prompt sees the real $? (#1267)', () => {
+  const promptBody = PWSH_INIT.slice(PWSH_INIT.indexOf('function global:prompt'));
+
+  it('re-asserts the status with nothing between it and the delegation', () => {
+    // Placement IS the fix. A single cmdlet call in between — a Test-Path,
+    // say — resets $? straight back to true and the restore silently becomes
+    // a no-op, which looks identical in review and fails only at runtime.
+    expect(promptBody).toMatch(
+      /if \(-not \$__wmux_ok\) \{ Write-Error [^\n]*-ErrorAction Ignore \}\s*\r?\n\s*\$body = if \(\$global:__wmux_prev_prompt\)/,
+    );
+  });
+
+  it('re-asserts AFTER the snapshot is taken, never before', () => {
+    const snapshot = promptBody.indexOf('$__wmux_ok = $?');
+    const restore = promptBody.indexOf('if (-not $__wmux_ok)');
+    expect(snapshot).toBeGreaterThanOrEqual(0);
+    expect(restore).toBeGreaterThan(snapshot);
+  });
+
+  it('uses -ErrorAction Ignore, never SilentlyContinue', () => {
+    // Ignore sets $? false and records NOTHING in $Error. SilentlyContinue
+    // also sets $? false, but pushes a synthetic ErrorRecord — and oh-my-posh
+    // reads the newest record as exit code 1, so the swap would report 1 over
+    // the real exit code instead of fixing anything.
+    expect(promptBody).toMatch(/Write-Error [^\n]*-ErrorAction Ignore/);
+    expect(promptBody).not.toMatch(/Write-Error [^\n]*-ErrorAction SilentlyContinue/);
   });
 });

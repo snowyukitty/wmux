@@ -18,7 +18,7 @@ import type {
 } from '../../shared/workspaceMirror';
 import { normalizeRoleBinding } from '../../shared/orchestratorRole';
 import type { StoreState } from '../stores';
-import { selectFleetPanes, type FleetPane, type FleetSelectorState } from '../stores/selectors/fleet';
+import { selectFleetPanes, surfaceAttentionStatus, type FleetPane, type FleetSelectorState } from '../stores/selectors/fleet';
 
 /**
  * The push builder's input: everything the fleet snapshot reads (below) plus
@@ -33,6 +33,10 @@ import { selectFleetPanes, type FleetPane, type FleetSelectorState } from '../st
  */
 export type MirrorSnapshotState = FleetSnapshotState & {
   orchestratorRoleBindings?: StoreState['orchestratorRoleBindings'];
+  sessionRestored?: StoreState['sessionRestored'];
+  sidebarPinnedIds?: StoreState['sidebarPinnedIds'];
+  activeWorkspaceId?: StoreState['activeWorkspaceId'];
+  surfaceGitBranch?: StoreState['surfaceGitBranch'];
 };
 
 /**
@@ -153,7 +157,15 @@ export function buildFleetSnapshots(state: FleetSnapshotState, ts: number): Flee
   // Pane-level derived row per leaf (active-surface ptyId, agentName, cwd,
   // isActivePane) — the canonical selector, keyed by paneId.
   const derivedByPane = new Map<string, FleetPane>();
-  for (const p of selectFleetPanes(state)) derivedByPane.set(p.paneId, p);
+  // #1343 — the mirror is the DECK's view, and the deck commands what it sees:
+  // a remote pane is drivable only through its own host's input API, so an
+  // `input.send` or an approval aimed at one would go nowhere and the
+  // completion gate would wait on a session this desktop cannot end. The
+  // callers hand this function the whole live store, so withholding
+  // `remoteWorkspaces` has to be explicit — a type that merely omits the field
+  // does not strip it at runtime.
+  const localOnly = { ...state, remoteWorkspaces: undefined };
+  for (const p of selectFleetPanes(localOnly)) derivedByPane.set(p.paneId, p);
   // Attention-stripped base status per leaf: the same selector with no retained
   // attention statuses collapses each pane to running/idle (its non-attention
   // derivation). This is what the active surface carries when the attention
@@ -162,7 +174,19 @@ export function buildFleetSnapshots(state: FleetSnapshotState, ts: number): Flee
   // #1168 — the pending-question map is a SECOND attention source inside the
   // selector, so stripping only `surfaceAgentStatus` would leave a blocked pane
   // reporting `awaiting_input` as its non-attention base status. Both go.
-  for (const p of selectFleetPanes({ ...state, surfaceAgentStatus: {}, surfacePendingQuestion: {} })) {
+  // #1509 — so does the third: an open dialog in the lifecycle status. Its
+  // entries stay (the selector still needs each pane's agent NAME); only the
+  // status is neutralized.
+  const surfaceAgentNoAttention: FleetSelectorState['surfaceAgent'] = {};
+  for (const [ptyId, agent] of Object.entries(localOnly.surfaceAgent ?? {})) {
+    surfaceAgentNoAttention[ptyId] = agent.status === 'awaiting_input' ? { ...agent, status: 'idle' } : agent;
+  }
+  for (const p of selectFleetPanes({
+    ...localOnly,
+    surfaceAgentStatus: {},
+    surfacePendingQuestion: {},
+    surfaceAgent: surfaceAgentNoAttention,
+  })) {
     baseByPane.set(p.paneId, p.agentStatus);
   }
 
@@ -235,8 +259,9 @@ export function buildFleetSnapshots(state: FleetSnapshotState, ts: number): Flee
         // of error the #977 note below describes. It also emits a row for a
         // question that OUTLIVED its retained status — focusing the pane clears
         // `surfaceAgentStatus` but not the question.
-        const blocked = !!state.surfacePendingQuestion?.[s.ptyId]?.trim();
-        const att = blocked ? 'awaiting_input' : state.surfaceAgentStatus[s.ptyId];
+        // #1509 — and an open dialog the user already looked at: the shared
+        // helper reads it from the pane's lifecycle status.
+        const att = surfaceAttentionStatus(state, s.ptyId);
         if (att === undefined) continue;
         const isActiveSurface = s.id === leaf.activeSurfaceId;
         const row: FleetSnapshotPane = {
@@ -318,5 +343,30 @@ export function buildWorkspaceMirrorPayload(
     entries: buildWorkspaceListEntries(state.workspaces),
     fleets: buildFleetSnapshots(state, ts),
     roleBindings: buildRoleBindings(state),
+    sessionRestored: state.sessionRestored === true,
+    pinnedIds: [...(state.sidebarPinnedIds ?? [])],
+    viewed: buildViewed(state),
+  };
+}
+
+/** The active workspace, its active pane, and that pane's ACTIVE surface's
+ *  own cwd and branch — what the human is looking at. Workspace metadata is
+ *  not used: it holds whichever surface reported last. A value this surface
+ *  never reported is omitted. Undefined when no workspace is active. */
+export function buildViewed(state: MirrorSnapshotState): WorkspaceMirrorPushPayload['viewed'] {
+  const ws = state.activeWorkspaceId
+    ? state.workspaces.find((w) => w.id === state.activeWorkspaceId)
+    : undefined;
+  if (!ws) return undefined;
+  const leaf = getWorkspaceLeafPanes(ws).find((p) => p.id === ws.activePaneId);
+  const surface = leaf?.surfaces.find((s) => s.id === leaf.activeSurfaceId);
+  const isTerminal = !!surface && (!surface.surfaceType || surface.surfaceType === 'terminal');
+  const cwd = isTerminal && surface.cwd ? surface.cwd : undefined;
+  const branch = isTerminal && surface.ptyId ? state.surfaceGitBranch?.[surface.ptyId] : undefined;
+  return {
+    workspaceId: ws.id,
+    paneId: ws.activePaneId || null,
+    ...(cwd ? { cwd } : {}),
+    ...(branch ? { branch } : {}),
   };
 }

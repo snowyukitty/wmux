@@ -1,3 +1,6 @@
+// Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/styles/index.css), MIT License, Copyright (c) 2026 Nick
+// A card that needs you: content-20% fill and a dashed content-30% border;
+// the amber eyebrow is its one state mark.
 // ─── Command Deck — decision gate card (M1) ──────────────────────────────────
 //
 // The human's side of the brain-raised decision gate. When the orchestrator
@@ -20,6 +23,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { tokenAttrs } from '../../themes';
 import { FOCUS_RING } from '../focusRing';
 import type { WorkspaceDecision } from '../../../main/deck/deckDecisionStore';
+import { HANDOFF_NOTICE_OPTION } from '../../../shared/moaHandoff';
 
 export interface DeckDecisionApi {
   get: (workspaceId: string) => Promise<{ decision: WorkspaceDecision | null }>;
@@ -129,6 +133,13 @@ export function DeckDecisionCard({
   // transient (consumed by the resuming turn).
   if (!decision || decision.status !== 'pending') return null;
 
+  // A hand-off Moa proposed is answered in Moa's panel only (it has Edit and
+  // the full body there); here it just says so. Main's one-option failure
+  // notice ("OK") stays answerable in place.
+  const handoffElsewhere =
+    decision.origin === 'moa-handoff' &&
+    !(decision.options.length === 1 && decision.options[0] === HANDOFF_NOTICE_OPTION);
+
   const submit = async (resolution: string): Promise<void> => {
     const text = resolution.trim();
     if (!text || submitting || !workspaceId) return;
@@ -149,10 +160,9 @@ export function DeckDecisionCard({
   return (
     <div
       data-deck-decision
-      className="rounded-[7px] px-4 py-3 space-y-2.5 border-l-2 border-[var(--accent-amber)] bg-[rgba(var(--bg-surface-rgb),0.55)]"
-      {...tokenAttrs('bgSurface', 'bg')}
+      className="rounded-md px-4 py-3 space-y-2.5 border border-dashed border-[color-mix(in_srgb,var(--text-main)_30%,transparent)] bg-[color-mix(in_srgb,var(--text-main)_20%,transparent)]"
     >
-      <div className="text-[11px] font-mono uppercase tracking-wider text-[var(--accent-amber)]">
+      <div className="text-[11px] font-mono uppercase tracking-wider text-[var(--accent-yellow)]" {...tokenAttrs('warning', 'text')}>
         {t('deck.decisionEyebrow') || 'Decision needed'}
       </div>
       <div
@@ -163,13 +173,18 @@ export function DeckDecisionCard({
       </div>
       {decision.context && (
         <div
-          className="text-[11px] font-mono text-[var(--text-sub)] leading-relaxed"
-          {...tokenAttrs('textSub', 'text')}
+          className="text-[11px] font-mono text-[color-mix(in_srgb,var(--text-main)_70%,transparent)] leading-relaxed"
+          {...tokenAttrs('textMain', 'text')}
         >
           {decision.context}
         </div>
       )}
-      {decision.options.length > 0 && (
+      {handoffElsewhere && (
+        <div data-deck-decision-handoff className="text-[12px] text-[color-mix(in_srgb,var(--text-main)_70%,transparent)]" {...tokenAttrs('textMain', 'text')}>
+          {t('deck.decisionHandoffElsewhere') || "Moa proposed a hand-off here. Answer it in Moa's panel."}
+        </div>
+      )}
+      {!handoffElsewhere && decision.options.length > 0 && (
         <div className="flex flex-wrap gap-1.5">
           {decision.options.map((opt) => (
             <button
@@ -178,14 +193,14 @@ export function DeckDecisionCard({
               data-decision-option
               disabled={submitting}
               onClick={() => void submit(opt)}
-              className={`px-2.5 py-1 rounded-[4px] text-[12px] font-semibold text-[var(--text-sub)] bg-[rgba(var(--bg-surface-rgb),0.8)] hover:text-[var(--accent-blue)] transition-colors disabled:opacity-40 ${FOCUS_RING}`}
+              className={`h-[26px] px-2 rounded-md text-[12px] text-[color-mix(in_srgb,var(--text-main)_70%,transparent)] bg-[var(--selection)] hover:bg-[var(--selection-hover)] hover:text-[var(--text-main)] transition-colors disabled:opacity-40 ${FOCUS_RING}`}
             >
               {opt}
             </button>
           ))}
         </div>
       )}
-      <div className="flex items-center gap-2">
+      {!handoffElsewhere && <div className="flex items-center gap-2">
         <input
           type="text"
           data-decision-answer
@@ -197,7 +212,7 @@ export function DeckDecisionCard({
             if (e.key === 'Enter') void submit(answer);
           }}
           placeholder={t('deck.decisionPlaceholder') || 'Type your answer…'}
-          className="flex-1 min-w-0 px-2 py-1 rounded-[4px] text-[12px] bg-[rgba(var(--bg-surface-rgb),0.8)] text-[var(--text-main)] outline-none"
+          className="flex-1 min-w-0 h-[26px] px-2 rounded-md border border-[var(--line)] focus:border-[var(--line-strong)] text-[12px] bg-[var(--bg-base)] text-[var(--text-main)] placeholder:text-[color-mix(in_srgb,var(--text-main)_40%,transparent)] outline-none"
           {...tokenAttrs('textMain', 'text')}
         />
         <button
@@ -205,11 +220,11 @@ export function DeckDecisionCard({
           data-decision-resolve
           disabled={submitting || !answer.trim()}
           onClick={() => void submit(answer)}
-          className={`px-2.5 py-1 rounded-[4px] text-[12px] font-semibold text-[var(--text-sub)] bg-[rgba(var(--bg-surface-rgb),0.8)] hover:text-[var(--accent-blue)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${FOCUS_RING}`}
+          className={`h-[26px] px-2 rounded-md text-[12px] font-medium bg-[var(--primary-fill)] text-[var(--primary-ink)] hover:bg-[color-mix(in_srgb,var(--primary-fill)_90%,transparent)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${FOCUS_RING}`}
         >
           {t('deck.decisionResolve') || 'Resolve'}
         </button>
-      </div>
+      </div>}
     </div>
   );
 }

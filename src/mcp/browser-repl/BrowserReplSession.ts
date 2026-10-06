@@ -18,24 +18,40 @@
 import { Worker } from 'worker_threads';
 import { OutputBuffer, truncateText, type TruncatedText } from '../repl/truncate';
 import type { BridgeCall } from './bridge';
+import {
+  RunHintCollector,
+  RunImageCollector,
+  lateCallRefusal,
+  type RunImage,
+} from './runCollect';
 import { BROWSER_REPL_WORKER_SOURCE } from './workerSource';
 
 export const CONSOLE_CAP_BYTES = 32 * 1024;
 export const RESULT_CAP_BYTES = 16 * 1024;
 /** Ledger lines kept per run; a snapshot loop must not turn the result into megabytes. */
 export const LEDGER_MAX_LINES = 200;
-/** Hint lines shown per run, and how much text one line and the whole block may spend. */
-export const HINT_MAX_LINES = 20;
-export const HINT_LINE_MAX_BYTES = 512;
-export const HINT_CAP_BYTES = 8 * 1024;
-/**
- * How many distinct hint lines the dedupe set remembers. A page is free to
- * vary its hint on every call, and the set must not grow with the call count
- * once the block is full anyway.
- */
-const HINT_DEDUPE_MAX = 500;
+export {
+  HINT_CAP_BYTES,
+  HINT_LINE_MAX_BYTES,
+  HINT_MAX_LINES,
+  RUN_IMAGE_MAX,
+  RUN_IMAGE_TOTAL_BYTES,
+} from './runCollect';
 /** Worker startup is local and fast; anything slower is a broken runtime. */
 const READY_TIMEOUT_MS = 10_000;
+
+function workerFailureMessage(err: unknown): string {
+  try {
+    if (err instanceof Error) return err.message;
+    if (err && typeof err === 'object' && 'message' in err) {
+      const message = err.message;
+      if (typeof message === 'string') return message;
+    }
+    return String(err);
+  } catch {
+    return 'unprintable worker error';
+  }
+}
 
 export interface BrowserReplRunOutcome {
   readonly ok: boolean;
@@ -53,9 +69,24 @@ export interface BrowserReplRunOutcome {
   readonly hints?: readonly string[];
   /** Hint lines dropped by the caps; the result says so rather than truncating in silence. */
   readonly hintsElided?: number;
+  /** Images the run's calls returned and this result carries, in id order. */
+  readonly images?: readonly RunImage[];
+  /** Images a call produced that the per-run caps kept out of the result. */
+  readonly imagesElided?: number;
   readonly console: TruncatedText;
   readonly result?: TruncatedText;
   readonly error?: string;
+  /**
+   * The ledger number of the first `browser.*` call that FAILED, and its name.
+   *
+   * A snippet that throws at step 40 used to report only the exception, and the
+   * 39 calls that had already succeeded were left for the caller to count off
+   * the ledger by hand — or, when the throw came from somewhere else entirely,
+   * to look for a failed step that was never there (#1360). Absent when every
+   * call the run made succeeded.
+   */
+  readonly failedStep?: number;
+  readonly failedCall?: string;
   /** True when the run was killed by the deadline; the worker is gone. */
   readonly timedOut: boolean;
   /** True when this run started a new worker (first run, or after a timeout/crash). */
@@ -68,30 +99,14 @@ interface WorkerMessage {
   type: string;
   id?: number;
   callId?: number;
+  /** Id of the run whose evaluation made the call, set by the worker. */
+  runId?: number;
   name?: string;
   args?: Record<string, unknown>;
   ok?: boolean;
   result?: string;
   error?: string;
   text?: string;
-}
-
-/**
- * Cut a hint line to a byte budget on a codepoint boundary. A hint is one line
- * of advice; a page that made it a paragraph gets the start of it, not the run
- * result's whole budget.
- */
-function clipToBytes(line: string, capBytes: number): string {
-  if (Buffer.byteLength(line, 'utf8') <= capBytes) return line;
-  let used = 0;
-  let out = '';
-  for (const ch of line) {
-    const size = Buffer.byteLength(ch, 'utf8');
-    if (used + size > capBytes - 3) break; // room for the ellipsis
-    out += ch;
-    used += size;
-  }
-  return `${out}…`;
 }
 
 export class BrowserReplSession {
@@ -180,7 +195,7 @@ export class BrowserReplSession {
       if (this.activeRunId === null && this.worker === worker) this.killWorker(reason);
     };
     worker.on('error', (err) => onIdleDeath(
-      `crashed between runs: ${err instanceof Error ? err.message : String(err)}`,
+      `crashed between runs: ${workerFailureMessage(err)}`,
     ));
     worker.on('exit', (code) => onIdleDeath(`exited between runs (code ${code})`));
     this.ready = new Promise<void>((resolve, reject) => {
@@ -210,7 +225,7 @@ export class BrowserReplSession {
         type: 'callResult',
         callId: msg.callId,
         ok: false,
-        error: `browser.${typeof msg.name === 'string' ? msg.name : '?'}: called after its browser_repl run finished — await every browser call inside the run`,
+        error: lateCallRefusal(typeof msg.name === 'string' ? msg.name : '?', 'browser_repl'),
       });
     });
     return { worker, ready: this.ready, fresh: true };
@@ -221,42 +236,39 @@ export class BrowserReplSession {
     const started = Date.now();
     const ledger: string[] = [];
     let callCount = 0;
-    const record = (line: string) => {
+    // First failure only: the snippet may catch and carry on, and the step that
+    // broke the flow is the one the caller is looking for.
+    let failedStep: number | undefined;
+    let failedCall: string | undefined;
+    const record = (line: string, failure?: string) => {
       callCount++;
       if (ledger.length < LEDGER_MAX_LINES) ledger.push(line);
-    };
-    const hints: string[] = [];
-    const seenHints = new Set<string>();
-    let hintBytes = 0;
-    let hintsElided = 0;
-    // The call number is carried into the line: two pages in one run both say
-    // "for this page", and merged into one anonymous list they would name flows
-    // for a page the reader cannot identify.
-    const recordHints = (blocks: readonly string[] | undefined, callIndex: number) => {
-      for (const block of blocks ?? []) {
-        for (const line of block.split('\n')) {
-          const trimmed = line.trim();
-          if (trimmed === '' || seenHints.has(trimmed)) continue;
-          if (seenHints.size < HINT_DEDUPE_MAX) seenHints.add(trimmed);
-          const rendered = `${callIndex}. ${clipToBytes(trimmed, HINT_LINE_MAX_BYTES)}`;
-          const cost = Buffer.byteLength(rendered, 'utf8') + 1;
-          if (hints.length >= HINT_MAX_LINES || hintBytes + cost > HINT_CAP_BYTES) {
-            hintsElided++;
-            continue;
-          }
-          hintBytes += cost;
-          hints.push(rendered);
-        }
+      if (failure !== undefined && failedStep === undefined) {
+        failedStep = callCount;
+        failedCall = failure;
       }
     };
+    const hintCollector = new RunHintCollector();
+    const hints = hintCollector.lines;
+    const images = new RunImageCollector();
     const consoleBuf = new OutputBuffer(CONSOLE_CAP_BYTES);
     const previousDeath = this.previousDeath;
     this.previousDeath = undefined;
     const { worker, ready, fresh } = this.ensureWorker();
     const base = { ledger, hints, freshRuntime: fresh, previousDeath: fresh ? previousDeath : undefined };
-    const withHintCount = () => ({ ...base, hintsElided });
+    const withHintCount = () => ({
+      ...base,
+      hintsElided: hintCollector.elided,
+      images: images.images,
+      imagesElided: images.elided,
+    });
+    /** The first failed call, folded into every outcome shape below. */
+    const failure = () => ({
+      ...(failedStep !== undefined && { failedStep, failedCall }),
+    });
     const abort = (error: string) => ({
       ...withHintCount(),
+      ...failure(),
       callCount,
       ok: false,
       elapsedMs: Date.now() - started,
@@ -299,10 +311,13 @@ export class BrowserReplSession {
     return new Promise<BrowserReplRunOutcome>((resolve) => {
       let settled = false;
       const finish = (
-        outcome: Omit<BrowserReplRunOutcome, 'ledger' | 'hints' | 'hintsElided' | 'callCount' | 'freshRuntime' | 'previousDeath' | 'elapsedMs' | 'console'>,
+        outcome: Omit<BrowserReplRunOutcome, 'ledger' | 'hints' | 'hintsElided' | 'callCount' | 'freshRuntime' | 'previousDeath' | 'elapsedMs' | 'console' | 'failedStep' | 'failedCall'>,
       ) => {
         if (settled) return;
         settled = true;
+        // Nothing can ride in this result any more: a later image would be an
+        // id in the script's value naming a block no reader ever sees.
+        images.close();
         this.activeRunId = null;
         clearTimeout(timer);
         worker.off('message', onMessage);
@@ -312,7 +327,7 @@ export class BrowserReplSession {
           this.straggling.add(pending);
           void pending.finally(() => this.straggling.delete(pending));
         }
-        resolve({ ...withHintCount(), ...outcome, callCount, elapsedMs: Date.now() - started, console: consoleBuf.render() });
+        resolve({ ...withHintCount(), ...failure(), ...outcome, callCount, elapsedMs: Date.now() - started, console: consoleBuf.render() });
       };
 
       const timer = setTimeout(() => {
@@ -333,6 +348,13 @@ export class BrowserReplSession {
           case 'call': {
             const callId = msg.callId;
             const name = typeof msg.name === 'string' ? msg.name : '';
+            // A timer left by an earlier run fires during this one carrying its
+            // own run's id. Executing it here would drive the page between this
+            // run's steps and record it into this run's action trace.
+            if (msg.runId !== id) {
+              worker.postMessage({ type: 'callResult', callId, ok: false, error: lateCallRefusal(name || '?', 'browser_repl') });
+              return;
+            }
             const args = msg.args && typeof msg.args === 'object' ? msg.args : {};
             const reply = (message: Record<string, unknown>) => {
               // After a timeout the worker is gone; the handler ran to
@@ -342,17 +364,22 @@ export class BrowserReplSession {
             };
             const pending = bridge(name, args).then(
               (outcome) => {
-                record(outcome.ledger);
+                record(outcome.ledger, outcome.ok ? undefined : name);
+                if (!outcome.ok) {
+                  reply({ ok: false, error: outcome.error });
+                  return;
+                }
                 // The run is over: its outcome has been handed back already, so
                 // a late hint would be appended to an array nobody reads again.
-                if (!settled && outcome.ok) recordHints(outcome.hints, callCount);
-                reply(outcome.ok ? { ok: true, value: outcome.value } : { ok: false, error: outcome.error });
+                if (!settled) hintCollector.record(outcome.hints, callCount);
+                const mark = images.offer(outcome.images, callCount);
+                reply({ ok: true, value: { ...outcome.value, ...mark } });
               },
               // The bridge reports handler failures as outcomes; a rejection here
               // is a bug in the bridge itself. Still answer, or the script hangs.
               (error: unknown) => {
                 const message = error instanceof Error ? error.message : String(error);
-                record(`${name}(…) THREW ${message}`);
+                record(`${name}(…) THREW ${message}`, name);
                 reply({ ok: false, error: `browser.${name}: bridge failure: ${message}` });
               },
             );
@@ -377,7 +404,7 @@ export class BrowserReplSession {
         }
       };
       const onError = (err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = workerFailureMessage(err);
         this.killWorker(`crashed: ${message}`);
         finish({ ok: false, error: `browser_repl runtime crashed: ${message}`, timedOut: false });
       };

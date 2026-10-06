@@ -8,12 +8,16 @@ import { useIpc } from '../../hooks/useIpc';
 import { resolveStartupCwd, withDefaultShell, withWorkspaceProfile } from '../../utils/ptyCreateOptions';
 import { pastePtyChunked } from '../../utils/clipboardChunk';
 import { openUrlInBrowserPane } from '../../utils/browserPaneActions';
+import { hasAdoptableTaskDiff, openTaskDiff } from '../../utils/openTaskDiff';
 import { tokenAttrs } from '../../themes';
 import { usePlugins } from '../../plugins/usePlugins';
 import { postPluginCommand } from '../../plugins/pluginFrameRegistry';
 import { runProjectCommand } from '../../utils/projectCommands';
 import { applyProjectLayoutFresh } from '../../utils/projectConfigProbe';
 import { COMPANY_MODE_ENABLED } from '../../../shared/featureFlags';
+import { isRemoteMirrorVisible } from '../../stores/slices/remoteWorkspacesSlice';
+import { isChatV2Covering } from '../ChatV2/coverage';
+import { showWorkspaces } from '../../utils/showWorkspaces';
 
 // ---------------------------------------------------------------------------
 // SVG Icons (inline, no external dependency)
@@ -156,6 +160,11 @@ export default function CommandPalette() {
   const { plugins } = usePlugins();
   // Project config commands (X5 wmux.json) — active workspace only.
   const projectConfigs = useStore((s) => s.projectConfigs);
+  // The fan-out task whose workspace is active, if any (Show Task Diff).
+  // Visible-gated like activeWorkspaceForItems: no re-render while closed.
+  const activeTask = useStore((s) =>
+    s.commandPaletteVisible && s.activeWorkspaceId ? s.missionByPaneGroup[s.activeWorkspaceId] : undefined,
+  );
 
   const buildItems = useCallback((): PaletteItemData[] => {
     const items: PaletteItemData[] = [];
@@ -169,6 +178,7 @@ export default function CommandPalette() {
         icon: <IconWorkspace />,
         action: () => {
           useStore.getState().setActiveWorkspace(ws.id);
+          showWorkspaces(useStore.getState());
           setVisible(false);
         },
       });
@@ -188,6 +198,7 @@ export default function CommandPalette() {
               icon: <IconSurface />,
               action: () => {
                 useStore.getState().setActiveSurface(pane.id, surface.id);
+                showWorkspaces(useStore.getState());
                 setVisible(false);
               },
             });
@@ -211,6 +222,7 @@ export default function CommandPalette() {
           const state = useStore.getState();
           const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
           if (ws) state.splitPane(ws.activePaneId, 'horizontal');
+          showWorkspaces(useStore.getState());
           setVisible(false);
         },
       },
@@ -220,6 +232,7 @@ export default function CommandPalette() {
           const state = useStore.getState();
           const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
           if (ws) state.splitPane(ws.activePaneId, 'vertical');
+          showWorkspaces(useStore.getState());
           setVisible(false);
         },
       },
@@ -233,6 +246,7 @@ export default function CommandPalette() {
           const state = useStore.getState();
           const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
           if (ws) state.stashPane(ws.activePaneId, ws.id);
+          showWorkspaces(useStore.getState());
           setVisible(false);
         },
       },
@@ -241,11 +255,11 @@ export default function CommandPalette() {
       // typing "move pane l" should just do it.
       ...(['left', 'right', 'up', 'down'] as const).map((dir) => ({
         label: t(`palette.cmd.movePane.${dir}` as Parameters<typeof t>[0]),
-        action: () => { useStore.getState().moveActivePaneDirection(dir); setVisible(false); },
+        action: () => { useStore.getState().moveActivePaneDirection(dir); showWorkspaces(useStore.getState()); setVisible(false); },
       })),
       {
         label: t('palette.cmd.newWorkspace'),
-        action: () => { useStore.getState().addWorkspace(); setVisible(false); },
+        action: () => { useStore.getState().addWorkspace(); showWorkspaces(useStore.getState()); setVisible(false); },
       },
       {
         label: t('palette.cmd.newSurface'),
@@ -271,6 +285,7 @@ export default function CommandPalette() {
                 useStore.getState().addSurface(ws.activePaneId, result.data.id, 'Terminal', result.data.cwd || '');
               }
             });
+            showWorkspaces(state);
           }
           setVisible(false);
         },
@@ -296,8 +311,12 @@ export default function CommandPalette() {
           // worktrees in a repo the user is not looking at. Suppressing the
           // toolbar for remote views and then adding an unguarded keyboard
           // route would have reopened the hole from the other side.
-          if (state.activeRemoteKey != null) { setVisible(false); return; }
-          if (state.activeWorkspaceId) state.openFanOut(state.activeWorkspaceId, null);
+          if (isRemoteMirrorVisible(state)) { setVisible(false); return; }
+          if (state.activeWorkspaceId) {
+            state.openFanOut(state.activeWorkspaceId, null);
+            // The fan-out dialog opens over the Workspaces page.
+            showWorkspaces(useStore.getState());
+          }
           setVisible(false);
         },
       },
@@ -322,6 +341,7 @@ export default function CommandPalette() {
           // forceNew: the explicit "Open Browser" command always creates a
           // fresh split — reuse is for link/port clicks (browserPaneActions).
           openUrlInBrowserPane(undefined, { forceNew: true });
+          showWorkspaces(useStore.getState());
           setVisible(false);
         },
       },
@@ -357,6 +377,7 @@ export default function CommandPalette() {
             }
             const repoName = r.repoPath.split(/[/\\]/).filter(Boolean).pop() || r.repoPath;
             st.addWorkspaceDiffSurface(leaf.id, r.repoPath, `diff: ${repoName}`);
+            showWorkspaces(st);
           }).catch((err) => {
             // IPC reject(핸들러 미등록·직렬화 실패 등)도 무음이 아니라 토스트로.
             useStore.getState().pushToast({ level: 'warn', message: t('diff.noRepo') });
@@ -376,6 +397,28 @@ export default function CommandPalette() {
         action: cmd.action,
       });
     });
+
+    // #1461 — the task diff (hunk checkboxes and Adopt, plus PR and Close while
+    // the task is open) for the fan-out task whose workspace is active. Show
+    // Git Diff opens the read-only workspace diff, so without this the fan-out
+    // toast and Fleet's Ready to review rows were the only ways back to a task
+    // diff. Listed only in a task workspace that still has a worktree, under a
+    // fixed id so it does not shift the `cmd-${i}` ids above.
+    if (activeWorkspaceId && activeTask && hasAdoptableTaskDiff(activeTask)) {
+      const task = activeTask;
+      items.push({
+        id: 'cmd-task-diff',
+        label: t('palette.cmd.showTaskDiff'),
+        category: 'command' as PaletteCategory,
+        icon: <IconCommand />,
+        action: () => {
+          openTaskDiff(task.id, activeWorkspaceId, task.title, task.owner.verifiedWorkspaceId);
+          // The diff opens in a pane, which is on the Workspaces page.
+          showWorkspaces(useStore.getState());
+          setVisible(false);
+        },
+      });
+    }
 
     // Company commands
     const state = useStore.getState();
@@ -559,6 +602,18 @@ export default function CommandPalette() {
           setVisible(false);
         },
       });
+      // #1237 — the non-destructive twin: re-fit the RUNNING panes into the
+      // template instead of replacing them with empty leaves.
+      items.push({
+        id: `snap-template-${tmpl.id}`,
+        label: `${t('palette.cmd.snapPrefix')}${tmpl.name}`,
+        category: 'command' as PaletteCategory,
+        icon: <IconGrid />,
+        action: () => {
+          useStore.getState().snapToLayoutTemplate(tmpl.id);
+          setVisible(false);
+        },
+      });
     }
 
     items.push({
@@ -625,7 +680,8 @@ export default function CommandPalette() {
           const pane = findPaneLeaf(ws.rootPane, ws.activePaneId);
           if (pane) {
             const surface = pane.surfaces.find((s) => s.id === pane.activeSurfaceId);
-            if (surface?.ptyId) {
+            // Never into a shell the chat-v2 view hides.
+            if (surface?.ptyId && !isChatV2Covering(surface.ptyId)) {
               // Route through the paste chunker. Recent commands originate
               // from the user's `inputBuffer`, which accumulates raw paste
               // payloads (`useTerminal.ts: terminal.onData`) — so a
@@ -646,7 +702,7 @@ export default function CommandPalette() {
     }
 
     return items;
-  }, [workspaces, activeWorkspaceId, activeWorkspaceForItems, layoutTemplates, setVisible, ipcInvoke, recentCommands, togglePalette, plugins, projectConfigs, t]);
+  }, [workspaces, activeWorkspaceId, activeWorkspaceForItems, activeTask, layoutTemplates, setVisible, ipcInvoke, recentCommands, togglePalette, plugins, projectConfigs, t]);
 
   // -------------------------------------------------------------------------
   // Filtered + scored results — useMemo to cache across renders
@@ -736,24 +792,20 @@ export default function CommandPalette() {
         if (e.target === e.currentTarget) setVisible(false);
       }}
     >
-      {/* Palette container */}
+      {/* Palette container — the quiet popover panel (ui-popover +
+          ui-surface: 14px, hairline, one soft shadow). */}
       <div
-        className="w-[480px] max-h-[60vh] flex flex-col rounded-xl overflow-hidden shadow-2xl"
-        style={{
-          backgroundColor: 'var(--bg-base)',
-          border: '1px solid var(--bg-surface)',
-          boxShadow: 'var(--shadow-modal-soft)',
-        }}
+        className="ui-popover ui-surface w-[480px] max-h-[60vh] flex flex-col overflow-hidden"
+        style={{ padding: 0 }}
         onMouseDown={(e) => e.stopPropagation()}
         {...tokenAttrs('bgBase', 'bg')}
-        {...tokenAttrs('bgSurface', 'border')}
       >
         {/* Search input row */}
         <div
           className="flex items-center gap-2.5 px-4 py-3"
-          style={{ borderBottom: '1px solid var(--bg-surface)' }}
+          style={{ borderBottom: '1px solid var(--surface-hairline)' }}
         >
-          <span className="shrink-0 text-[var(--text-subtle)]" {...tokenAttrs('textSub', 'text')} data-derived="textSubtle">
+          <span className="shrink-0 text-[var(--text-sub)]" {...tokenAttrs('textSub', 'text')}>
             <IconSearch />
           </span>
           <input
@@ -766,31 +818,33 @@ export default function CommandPalette() {
             }}
             onKeyDown={handleKeyDown}
             placeholder={t('palette.placeholder')}
-            className="flex-1 bg-transparent text-[var(--text-main)] text-sm placeholder-[var(--text-muted)] outline-none"
+            className="flex-1 bg-transparent text-[var(--text-main)] text-[14px] leading-5 placeholder-[var(--text-muted)] outline-none"
             spellCheck={false}
             autoComplete="off"
             {...tokenAttrs('textMain', 'text')}
           />
-          <kbd
-            className="shrink-0 text-xs text-[var(--text-muted)] px-1.5 py-0.5 rounded"
-            style={{ border: '1px solid var(--bg-overlay)', fontFamily: 'monospace' }}
-            {...tokenAttrs('textMuted', 'text')}
-            {...tokenAttrs('bgSurface', 'border')}
-            data-derived="bgOverlay"
-          >
+          <kbd className="ui-kbd shrink-0" {...tokenAttrs('textSub', 'text')}>
             ESC
           </kbd>
         </div>
 
         {/* Results list */}
-        <div ref={listRef} className="overflow-y-auto flex-1">
+        <div ref={listRef} className="overflow-y-auto flex-1 py-1.5">
           {results.length === 0 ? (
-            <div className="px-4 py-8 text-center text-sm text-[var(--text-muted)]">
+            <div className="px-4 py-8 text-center text-[13px] text-[var(--text-sub)]">
               {t('palette.noResults')} &ldquo;{query}&rdquo;
             </div>
           ) : (
             results.map((item, idx) => (
-              <div key={item.id} data-active={idx === activeIdx ? 'true' : undefined}>
+              <div
+                key={item.id}
+                data-active={idx === activeIdx ? 'true' : undefined}
+                // The pointer moves the selection, so the keyboard-active row
+                // and the hovered row are never two different highlights.
+                // mousemove, not mouseenter: rows scrolled under a still
+                // pointer by arrow keys must not steal the selection back.
+                onMouseMove={() => { if (idx !== activeIdx) setActiveIdx(idx); }}
+              >
                 <PaletteItem
                   item={item}
                   isActive={idx === activeIdx}
@@ -803,35 +857,19 @@ export default function CommandPalette() {
 
         {/* Footer hint */}
         <div
-          className="flex items-center gap-3 px-4 py-2"
-          style={{ borderTop: '1px solid var(--bg-surface)', backgroundColor: 'var(--bg-mantle)' }}
-          {...tokenAttrs('bgMantle', 'bg')}
+          className="flex items-center gap-4 px-4 py-2.5"
+          style={{ borderTop: '1px solid var(--surface-hairline)' }}
         >
-          <span className="text-xs text-[var(--text-muted)]">
-            <kbd
-              className="px-1 py-0.5 rounded mr-0.5"
-              style={{ border: '1px solid var(--bg-overlay)', fontFamily: 'monospace' }}
-            >
-              ↑↓
-            </kbd>{' '}
+          <span className="ui-note flex items-center gap-1.5">
+            <kbd className="ui-kbd">↑↓</kbd>
             {t('palette.navigate')}
           </span>
-          <span className="text-xs text-[var(--text-muted)]">
-            <kbd
-              className="px-1 py-0.5 rounded mr-0.5"
-              style={{ border: '1px solid var(--bg-overlay)', fontFamily: 'monospace' }}
-            >
-              Enter
-            </kbd>{' '}
+          <span className="ui-note flex items-center gap-1.5">
+            <kbd className="ui-kbd">Enter</kbd>
             {t('palette.select')}
           </span>
-          <span className="text-xs text-[var(--text-muted)]">
-            <kbd
-              className="px-1 py-0.5 rounded mr-0.5"
-              style={{ border: '1px solid var(--bg-overlay)', fontFamily: 'monospace' }}
-            >
-              Esc
-            </kbd>{' '}
+          <span className="ui-note flex items-center gap-1.5">
+            <kbd className="ui-kbd">Esc</kbd>
             {t('palette.close')}
           </span>
         </div>

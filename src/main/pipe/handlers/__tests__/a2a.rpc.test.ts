@@ -4,6 +4,8 @@ import { RpcRouter } from '../../RpcRouter';
 import { registerA2aRpc } from '../a2a.rpc';
 import type { ClaudeWorker } from '../../../a2a/ClaudeWorker';
 import type { RpcContext } from '../../../../shared/rpc';
+import { EXECUTE_SEND_MAIN_TIMEOUT_MS } from '../../../../shared/executeApprovalBounds';
+import { FRESH_CONTEXT_TIMEOUT_MS, NEW_TASK_SEND_MAIN_TIMEOUT_MS } from '../../../../shared/freshContext';
 
 const { sendToRendererMock } = vi.hoisted(() => ({
   sendToRendererMock: vi.fn(),
@@ -19,6 +21,12 @@ vi.mock('../_bridge', () => ({
 vi.mock('../../../../shared/constants', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../../shared/constants')>()),
   getPidMapDir: () => '/tmp/wmux-test-pidmap',
+}));
+
+const hqRef = vi.hoisted(() => ({ current: null as string | null }));
+vi.mock('../../../deck/deckHqStore', () => ({ getHqWorkspaceId: () => hqRef.current }));
+vi.mock('../../../deck/taskLedgerHost', () => ({
+  getTaskLedger: () => ({ list: (f: { ownerWorkspaceId?: string }) => (f.ownerWorkspaceId === 'ws-hq' ? [{ taskWorkspaceId: 'ws-task-1' }] : []) }),
 }));
 
 const fakeWindow = {} as BrowserWindow;
@@ -98,6 +106,34 @@ describe('a2a.rpc — execute confirmation gate', () => {
     expect(methods).toEqual(['a2a.task.send']);
   });
 
+  // #1462 — the renderer holds an execute reply until the user answers the
+  // approval prompt (30 s auto-deny). The 5 s bridge default gave up first.
+  it('waits past the approval window for a new execute send, past a fresh-context step for a new task (#1680)', async () => {
+    sendToRendererMock
+      .mockResolvedValueOnce({ ok: false, error: 'denied' })
+      .mockResolvedValueOnce({ ok: true, taskId: 't', toWorkspaceId: 'ws-to' });
+    const router = setupRouter(makeWorker());
+
+    await router.dispatch({
+      id: 'rpc-exec',
+      method: 'a2a.task.send',
+      params: { workspaceId: 'ws-from', to: 'ws-to', message: 'run this', execute: true },
+    });
+    const execOptions = sendToRendererMock.mock.calls[0][3] as { timeoutMs?: number } | undefined;
+    expect(execOptions?.timeoutMs).toBe(EXECUTE_SEND_MAIN_TIMEOUT_MS);
+
+    await router.dispatch({
+      id: 'rpc-plain',
+      method: 'a2a.task.send',
+      params: { workspaceId: 'ws-from', to: 'ws-to', message: 'hi' },
+    });
+    // A plain NEW task may run the target pane's fresh-context step first.
+    expect((sendToRendererMock.mock.calls[1][3] as { timeoutMs?: number }).timeoutMs).toBe(
+      NEW_TASK_SEND_MAIN_TIMEOUT_MS,
+    );
+    expect(NEW_TASK_SEND_MAIN_TIMEOUT_MS).toBeGreaterThan(FRESH_CONTEXT_TIMEOUT_MS + 5_000);
+  });
+
   it('skips worker and does not cancel when renderer denies before task creation', async () => {
     sendToRendererMock.mockResolvedValueOnce({ ok: false, error: 'a2a.task.send: execute approval denied' });
     const worker = makeWorker();
@@ -144,6 +180,8 @@ describe('a2a.rpc — execute confirmation gate', () => {
     expect(worker.execute).not.toHaveBeenCalled();
     const methods = sendToRendererMock.mock.calls.map((c) => c[1]);
     expect(methods).toEqual(['a2a.task.send']);
+    // A reply is never a task boundary: the bridge default applies (#1680).
+    expect(sendToRendererMock.mock.calls[0][3]).toBeUndefined();
   });
 
   it('ignores truthy non-boolean execute values', async () => {
@@ -346,6 +384,8 @@ describe('a2a.task.send — commander binding is stamped, never trusted from the
       expect.anything(),
       'a2a.task.send',
       expect.objectContaining({ commanderWorkspaceId: 'ws-brain' }),
+      // A new task's budget (#1680).
+      { timeoutMs: NEW_TASK_SEND_MAIN_TIMEOUT_MS },
     );
   });
 
@@ -403,5 +443,102 @@ describe('a2a.task.send — commander binding is stamped, never trusted from the
 
     const forwarded = sendToRendererMock.mock.calls[0]?.[2] as Record<string, unknown>;
     expect(forwarded.commanderWorkspaceId).toBe('ws-brain');
+  });
+});
+
+// The renderer gates every A2A pane write on the approval guard unless main
+// says the call came from the human operator's own surface. That flag must be
+// main's to set: a pipe caller naming it would skip the gate.
+describe('a2a delivery methods — operator origin is stamped, never trusted from the wire', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  function capture(method: string): TaskSendHandler {
+    let handler: TaskSendHandler | undefined;
+    const capturing = {
+      register: (m: string, fn: TaskSendHandler) => {
+        if (m === method) handler = fn;
+      },
+    };
+    registerA2aRpc(capturing as unknown as RpcRouter, () => fakeWindow, makeWorker());
+    if (!handler) throw new Error(`${method} handler was not registered`);
+    return handler;
+  }
+
+  const CASES: Array<[string, Record<string, unknown>]> = [
+    ['a2a.task.send', { workspaceId: 'ws-a', to: 'ws-b', message: 'hi' }],
+    ['a2a.task.update', { workspaceId: 'ws-a', taskId: 't-1', message: 'hi' }],
+    ['a2a.broadcast', { workspaceId: 'ws-a', message: 'hi' }],
+  ];
+
+  it.each(CASES)('%s drops a caller-supplied operatorOrigin', async (method, params) => {
+    sendToRendererMock.mockResolvedValueOnce({ ok: true });
+    await capture(method)({ ...params, operatorOrigin: true }, { origin: 'local' } as unknown as RpcContext);
+    const forwarded = sendToRendererMock.mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(forwarded).not.toHaveProperty('operatorOrigin');
+  });
+
+  it.each(CASES)('%s stamps operatorOrigin for the operator surface', async (method, params) => {
+    sendToRendererMock.mockResolvedValueOnce({ ok: true });
+    await capture(method)(params, { origin: 'local', operator: true } as unknown as RpcContext);
+    const forwarded = sendToRendererMock.mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(forwarded.operatorOrigin).toBe(true);
+  });
+});
+
+describe('a2a.task.send — main-only delivery fields', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const fields = { deliveryGuardKey: 'moa-auto-1', presetTaskId: 'task-00000000-0000-4000-8000-000000000000' };
+  const sentParams = (): Record<string, unknown> =>
+    sendToRendererMock.mock.calls.find((c) => c[1] === 'a2a.task.send')![2] as Record<string, unknown>;
+
+  it('forwards the guard key and preset task id on the operator lane with a gated delivery', async () => {
+    sendToRendererMock.mockResolvedValue({ ok: true, taskId: fields.presetTaskId });
+    const send = captureTaskSend(makeWorker());
+    await send({ workspaceId: 'ws-human', to: 'ws-to', message: 'hi', gatedDelivery: true, ...fields }, { origin: 'local', operator: true } as RpcContext);
+    expect(sentParams()).toMatchObject(fields);
+  });
+
+  it('strips both off the operator lane, and the guard key without a gated delivery', async () => {
+    sendToRendererMock.mockResolvedValue({ ok: true, taskId: 't' });
+    const send = captureTaskSend(makeWorker());
+    await send({ workspaceId: 'ws-a', to: 'ws-to', message: 'hi', gatedDelivery: true, ...fields }, { origin: 'local' } as RpcContext);
+    expect(sentParams()).not.toHaveProperty('deliveryGuardKey');
+    expect(sentParams()).not.toHaveProperty('presetTaskId');
+
+    vi.clearAllMocks();
+    sendToRendererMock.mockResolvedValue({ ok: true, taskId: 't' });
+    await send({ workspaceId: 'ws-human', to: 'ws-to', message: 'hi', ...fields }, { origin: 'local', operator: true } as RpcContext);
+    expect(sentParams()).not.toHaveProperty('deliveryGuardKey');
+  });
+});
+
+
+describe('a2a.task.send — Moa sends work to another workspace only by hand-off', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    hqRef.current = 'ws-hq';
+  });
+  const sentParams = (): Record<string, unknown> =>
+    sendToRendererMock.mock.calls.find((c) => c[1] === 'a2a.task.send')![2] as Record<string, unknown>;
+
+  it('a new task from the HQ brain carries its allowed targets (its own workspace and fan-out tasks)', async () => {
+    sendToRendererMock.mockResolvedValue({ ok: true, taskId: 't' });
+    const send = captureTaskSend(makeWorker());
+    await send({ to: 'wseal', message: 'audit' }, { origin: 'local', commanderWorkspace: 'ws-hq' } as RpcContext);
+    expect(sentParams().hqHandoffOnly).toEqual({ allowedTargets: ['ws-hq', 'ws-task-1'] });
+  });
+
+  it('nobody else gets it, and the wire cannot set or clear it', async () => {
+    sendToRendererMock.mockResolvedValue({ ok: true, taskId: 't' });
+    const send = captureTaskSend(makeWorker());
+    await send({ workspaceId: 'ws-a', to: 'wseal', message: 'x', hqHandoffOnly: { allowedTargets: ['wseal'] } }, { origin: 'local' } as RpcContext);
+    expect(sentParams()).not.toHaveProperty('hqHandoffOnly');
+    vi.clearAllMocks();
+    sendToRendererMock.mockResolvedValue({ ok: true, taskId: 't' });
+    await send({ to: 'wseal', message: 'x' }, { origin: 'local', commanderWorkspace: 'ws-other' } as RpcContext);
+    expect(sentParams()).not.toHaveProperty('hqHandoffOnly');
   });
 });

@@ -1,36 +1,64 @@
-import { describe, it, expect } from 'vitest';
-import { initAtlasWakeRecovery, WAKE_RECOVER_THROTTLE_MS } from '../atlasWakeRecovery';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import {
+  initAtlasWakeRecovery,
+  WAKE_RECOVER_THROTTLE_MS,
+  CONTEXT_RESTORED_DEBOUNCE_MS,
+} from '../atlasWakeRecovery';
 
 type Listener = () => void;
 
 function makeFakeDocument(initial: DocumentVisibilityState = 'hidden') {
-  const listeners = new Set<Listener>();
+  const listeners = new Map<string, Set<EventListener>>();
+  const of = (type: string): Set<EventListener> => {
+    let set = listeners.get(type);
+    if (!set) listeners.set(type, (set = new Set()));
+    return set;
+  };
   return {
     visibilityState: initial,
-    addEventListener: (_type: string, cb: EventListener) => { listeners.add(cb as Listener); },
-    removeEventListener: (_type: string, cb: EventListener) => { listeners.delete(cb as Listener); },
+    addEventListener: (type: string, cb: EventListener) => { of(type).add(cb); },
+    removeEventListener: (type: string, cb: EventListener) => { of(type).delete(cb); },
+    fire(): void {
+      for (const cb of [...of('visibilitychange')]) cb(new Event('visibilitychange'));
+    },
+    /** A pane's canvas restoring its WebGL context; `inXterm` = inside `.xterm`. */
+    fireContextRestored(inXterm = true): void {
+      const target = { closest: (sel: string) => (inXterm && sel === '.xterm' ? {} : null) };
+      for (const cb of [...of('webglcontextrestored')]) cb({ target } as unknown as Event);
+    },
     show(): void {
       this.visibilityState = 'visible';
-      for (const cb of [...listeners]) cb();
+      this.fire();
     },
-    listenerCount: () => listeners.size,
+    hide(): void {
+      this.visibilityState = 'hidden';
+      this.fire();
+    },
+    listenerCount: () => [...listeners.values()].reduce((n, set) => n + set.size, 0),
   };
 }
 
-function setup(nowStart = 0) {
+function setup(
+  nowStart = 0,
+  initial: DocumentVisibilityState = 'hidden',
+  platform = 'win32',
+) {
   let now = nowStart;
   let resumeCb: Listener | null = null;
   let unsubscribed = 0;
   const recovered: string[] = [];
-  const doc = makeFakeDocument();
+  const doc = makeFakeDocument(initial);
   const teardown = initAtlasWakeRecovery({
     onSystemResumed: (cb) => {
       resumeCb = cb;
       return () => { unsubscribed++; };
     },
     recoverNow: (reason) => recovered.push(reason),
+    platform,
     documentRef: doc,
     now: () => now,
+    setTimeoutFn: (cb, ms) => setTimeout(cb, ms),
+    clearTimeoutFn: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
   });
   return {
     doc,
@@ -43,27 +71,180 @@ function setup(nowStart = 0) {
 }
 
 describe('atlasWakeRecovery', () => {
-  it('rebuilds once when resume and visibility fire together (real wake), again after the throttle', () => {
+  it('recovers on resume, and again on the unlock that follows it (the latched backstop)', () => {
     const s = setup();
-    // A real wake: powerMonitor resume and visibilitychange land within ms.
+    // A real wake behind the lock screen: resume lands while hidden.
     s.fireResume();
+    expect(s.recovered).toEqual(['system-resumed']);
+    // Unlock. The latched rebuild is the effective one — Chromium can undo the
+    // one above before first present — so it fires even inside the throttle.
     s.doc.show();
-    expect(s.recovered).toEqual(['system-resumed']); // second trigger throttled
+    expect(s.recovered).toEqual(['system-resumed', 'visibility']);
     // Next wake, past the throttle window → recovers again.
     s.advance(WAKE_RECOVER_THROTTLE_MS);
     s.fireResume();
-    expect(s.recovered).toEqual(['system-resumed', 'system-resumed']);
+    expect(s.recovered).toEqual(['system-resumed', 'visibility', 'system-resumed']);
   });
 
-  it('visibility trigger only fires on becoming visible; teardown detaches both triggers', () => {
+  it('holds the latch however long the unlock takes, then consumes it exactly once', () => {
     const s = setup();
-    s.doc.visibilityState = 'hidden';
+    s.fireResume();
+    s.advance(120_000); // a slow password entry: no time window could cover this
+    s.doc.show();
+    expect(s.recovered).toEqual(['system-resumed', 'visibility']);
+    // One rebuild per resume: an alt-tab storm right after the wake adds none.
+    for (let i = 0; i < 5; i++) {
+      s.advance(WAKE_RECOVER_THROTTLE_MS * 5);
+      s.doc.hide();
+      s.doc.show();
+    }
+    expect(s.recovered).toEqual(['system-resumed', 'visibility']);
+  });
+
+  // #1234: on Windows, native occlusion flips visibilityState on every
+  // alt-tab. An unarmed visibility change must not wipe the shared atlas.
+  it('ignores unarmed visibility once a resume has been delivered (Windows alt-tab)', () => {
+    const s = setup();
+    s.fireResume();
+    s.doc.show(); // consumes the latch
+    const baseline = [...s.recovered];
+    for (let i = 0; i < 10; i++) {
+      s.advance(WAKE_RECOVER_THROTTLE_MS * 5);
+      s.doc.hide();
+      s.doc.show();
+    }
+    expect(s.recovered).toEqual(baseline);
+  });
+
+  it('does not arm the latch for a resume delivered while already visible', () => {
+    const s = setup(0, 'visible');
+    s.fireResume();
+    expect(s.recovered).toEqual(['system-resumed']);
+    // The visibilitychange that may follow ms later must not add a second wipe.
+    s.doc.show();
+    expect(s.recovered).toEqual(['system-resumed']);
+  });
+
+  // #1234's reporter logged 15 minutes of ordinary alt-tabbing with no reason
+  // to think the machine had ever slept in that session. On the platform where
+  // the fix is required, that must be zero atlas wipes -- a fix that waits for
+  // a suspend to take effect is not a fix.
+  it('recovers nothing across repeated visibility transitions with no resume ever delivered (win32)', () => {
+    const s = setup(0, 'hidden', 'win32');
+    for (let i = 0; i < 20; i++) {
+      s.advance(30_000);
+      s.doc.hide();
+      s.advance(5_000);
+      s.doc.show();
+    }
+    expect(s.recovered).toEqual([]);
+  });
+
+  it('requires the latch immediately on darwin too', () => {
+    const s = setup(0, 'hidden', 'darwin');
+    s.doc.show();
+    expect(s.recovered).toEqual([]);
+    // A real wake still recovers, latched.
+    s.doc.hide();
+    s.fireResume();
+    s.doc.show();
+    expect(s.recovered).toEqual(['system-resumed', 'visibility']);
+  });
+
+  // Electron's powerMonitor 'resume' exists everywhere but is not reliably
+  // emitted on some Linux setups; gating on API presence would remove wake
+  // recovery there forever, so on linux the gate closes on first DELIVERY.
+  it('keeps unconditional visibility recovery on linux until a resume is ever delivered', () => {
+    const s = setup(0, 'hidden', 'linux');
     s.doc.show();
     expect(s.recovered).toEqual(['visibility']);
+    s.advance(WAKE_RECOVER_THROTTLE_MS);
+    s.doc.hide();
+    s.doc.show();
+    expect(s.recovered).toEqual(['visibility', 'visibility']);
+    // First delivery proves the signal works — from here the latch is required.
+    s.advance(WAKE_RECOVER_THROTTLE_MS);
+    s.doc.hide(); // a real sleep: the resume lands on a hidden window
+    s.fireResume();
+    s.doc.show(); // consumes the latch armed by that resume
+    s.advance(WAKE_RECOVER_THROTTLE_MS);
+    s.doc.hide();
+    s.doc.show();
+    expect(s.recovered).toEqual([
+      'visibility', 'visibility', 'system-resumed', 'visibility',
+    ]);
+  });
+
+  it('treats an unknown platform like linux — recovery kept, not dropped', () => {
+    const s = setup(0, 'hidden', 'freebsd');
+    s.doc.show();
+    expect(s.recovered).toEqual(['visibility']);
+  });
+
+  it('treats an absent platform (no preload bridge) the same way', () => {
+    const recovered: string[] = [];
+    const doc = makeFakeDocument();
+    initAtlasWakeRecovery({
+      onSystemResumed: () => () => { /* never delivers */ },
+      platform: undefined,
+      recoverNow: (reason) => recovered.push(reason),
+      documentRef: doc,
+      now: () => 0,
+    });
+    doc.show();
+    expect(recovered).toEqual(['visibility']);
+  });
+
+  it('teardown detaches both triggers', () => {
+    const s = setup();
     s.teardown();
     expect(s.unsubscribes()).toBe(1);
-    s.advance(WAKE_RECOVER_THROTTLE_MS);
+    expect(s.doc.listenerCount()).toBe(0);
     s.doc.show();
-    expect(s.recovered).toEqual(['visibility']); // detached — no further recovery
+    expect(s.recovered).toEqual([]);
+  });
+
+  describe('context restored', () => {
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('recovers exactly once per restore burst, after xterm\'s own handler', () => {
+      vi.useFakeTimers();
+      const s = setup(0, 'visible', 'darwin');
+      // Two panes restore together (the field log: two events in the same second).
+      s.doc.fireContextRestored();
+      s.doc.fireContextRestored();
+      // Deferred: the capture listener runs BEFORE xterm rebuilds its GL state.
+      expect(s.recovered).toEqual([]);
+      vi.advanceTimersByTime(CONTEXT_RESTORED_DEBOUNCE_MS);
+      expect(s.recovered).toEqual(['context-restored']);
+      vi.advanceTimersByTime(CONTEXT_RESTORED_DEBOUNCE_MS * 10);
+      expect(s.recovered).toEqual(['context-restored']);
+    });
+
+    it('is not swallowed by the wake throttle', () => {
+      vi.useFakeTimers();
+      const s = setup(0, 'visible', 'darwin');
+      s.fireResume();
+      s.doc.fireContextRestored();
+      vi.advanceTimersByTime(CONTEXT_RESTORED_DEBOUNCE_MS);
+      expect(s.recovered).toEqual(['system-resumed', 'context-restored']);
+    });
+
+    it('ignores canvases outside a terminal', () => {
+      vi.useFakeTimers();
+      const s = setup(0, 'visible', 'darwin');
+      s.doc.fireContextRestored(false);
+      vi.advanceTimersByTime(CONTEXT_RESTORED_DEBOUNCE_MS);
+      expect(s.recovered).toEqual([]);
+    });
+
+    it('teardown cancels a pending recovery', () => {
+      vi.useFakeTimers();
+      const s = setup(0, 'visible', 'darwin');
+      s.doc.fireContextRestored();
+      s.teardown();
+      vi.advanceTimersByTime(CONTEXT_RESTORED_DEBOUNCE_MS);
+      expect(s.recovered).toEqual([]);
+    });
   });
 });

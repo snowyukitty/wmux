@@ -92,7 +92,11 @@ describe('browser RPC workspace-scope coverage (#810)', () => {
     const offenders = blocks
       .filter((b) => b.kind === 'plain')
       .filter((b) => TARGET_RESOLVERS.some((call) => b.body.includes(call)))
-      .filter((b) => !b.body.includes('scopeFor('))
+      // `helpWorkspace(` is the help store's own scoper: the same `callerScope`
+      // decision, fail-closed in both enforcement modes (stricter than
+      // `scopeFor`, which keeps the shadow-mode fallback). A help handler that
+      // resolves a surface after it has made that decision is covered.
+      .filter((b) => !b.body.includes('scopeFor(') && !b.body.includes('helpWorkspace('))
       .map((b) => b.method);
 
     // Failure means a handler resolves a browser surface without deciding which
@@ -123,10 +127,10 @@ describe('browser RPC workspace-scope coverage (#810)', () => {
     //
     // One thing folding `browser.tabs` did NOT close, recorded so the next
     // reader does not assume it did: it is `wmux.internal`, which no plugin can
-    // declare, but the enforcer allows an envelope-less caller before it checks
-    // the capability. Ruling (c) leaves the legacy lane accepting the workspace
-    // such a caller names, so that one caller class is unchanged here. It
-    // closes with the grandfather, on #1111.
+    // declare, and ruling (c) leaves this table's legacy lane accepting the
+    // workspace such a caller names, so that one caller class is unchanged
+    // here. It was closed at the gate instead: #1111 made the enforcer refuse
+    // an envelope-less caller before it checks the capability.
     const ALLOWED: string[] = [];
 
     const readers = blocks

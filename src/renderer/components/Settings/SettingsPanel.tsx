@@ -1,13 +1,17 @@
-import { useEffect, useMemo, useRef, useState, useCallback, type ReactNode } from 'react';
+import { QuickCommandsSection } from './QuickCommandsSection';
+import { createContext, useContext, useEffect, useMemo, useRef, useState, useCallback, type ReactNode } from 'react';
 import { BROWSER_BACKENDS, isBrowserBackend } from '../../../shared/browserBackend';
+import { isWslShellPath } from '../../../shared/wslDistro';
 import type { ImagePasteMode } from '../../../shared/imagePaste';
 import { useShallow } from 'zustand/react/shallow';
+import { isMoaHqWorkspace } from '../../stores/slices/moaSlice';
+import { workspaceCloseRefusal } from '../Moa/moaHqGuard';
 import { useStore } from '../../stores';
 import { selectWorkspaceMuteRows } from '../../stores/selectors/workspaceProjections';
 import { LOCALE_OPTIONS, type Locale } from '../../i18n';
 import { useT } from '../../hooks/useT';
 import { useIpc } from '../../hooks/useIpc';
-import { THEME_OPTIONS, XTERM_PALETTE_OPTIONS, XTERM_PALETTES, builtinToCustom, DEFAULT_CUSTOM_THEME, deriveBuiltinPalette, deriveFullPalette, tokenAttrs, type BuiltinThemeId, type ThemeId, type XtermPaletteId, type UIThemeTokenKey, type TokenRole, type FullCssPalette } from '../../themes';
+import { THEME_OPTIONS, THEME_STYLES, type ThemeStyle, XTERM_PALETTE_OPTIONS, XTERM_PALETTES, builtinToCustom, DEFAULT_CUSTOM_THEME, deriveBuiltinPalette, deriveFullPalette, tokenAttrs, type BuiltinThemeId, type ThemeId, type XtermPaletteId, type UIThemeTokenKey, type TokenRole, type FullCssPalette } from '../../themes';
 import {
   TAILWIND_PALETTE,
   TAILWIND_SHADES,
@@ -27,26 +31,71 @@ import type { CustomThemeColors, NotificationCategory, Workspace, XtermThemeColo
 import { getWorkspacePtyIds } from '../../../shared/paneUtils';
 import { destroyWorkspaceRemoteSessions } from '../../utils/remoteSessionTeardown';
 import type { ChromePreset } from '../../../shared/chromePresets';
+import { ROLE_PRESET_SPECS, applyRolePreset, hasRolePreset, rolePresetApplied, rolePresetSkipsPermissions } from '../../../shared/rolePresets';
 import { NOTIFICATION_CATEGORIES } from '../../../shared/types';
-import { ORCH_ROLES, launcherSupportsModelFlag } from '../../../shared/orchestratorRole';
-import { ADVERTISED_SHORTCUTS, builtinCombosFor, macDisplayCombo, type KeymapEntry } from '../../../shared/keymap';
-import { MODEL_OPTIONS } from '../Deck/OrchestratorModelChip';
+import { ORCH_ROLES, applyRoleBinding, launcherSupportsModelFlag, type RoleBinding } from '../../../shared/orchestratorRole';
+import {
+  DEFAULT_FANOUT_WORKER_PERMISSION_MODE,
+  FANOUT_WORKER_PERMISSION_MODES,
+  isFanoutWorkerPermissionMode,
+  type FanoutWorkerPermissionMode,
+} from '../../../shared/workerLaunch';
+import {
+  ADVERTISED_SHORTCUTS,
+  builtinCombosFor,
+  comboFromEvent,
+  concreteCombo,
+  defaultRowsFor,
+  displayCombo,
+  effectiveBindings,
+  rebindProblem,
+  type ShortcutActionId,
+} from '../../../shared/keymap';
+import { shortcutPressGuard } from '../../utils/shortcutBindings';
+import { CLAUDE_EFFORT_LEVELS } from '../../../shared/claudeModels';
+import {
+  agyEffortOf,
+  agyFamilyOf,
+  CATALOG_AGENTS,
+  staticClaudeModels,
+  type CatalogModel,
+  type ModelCatalogResult,
+} from '../../../shared/modelCatalog';
+import { freshContextGrammarFor, launchGrammarFor } from '../../../shared/agentLaunchOptions';
+import { ModelCombobox } from './ModelCombobox';
 import { MULTIVIEW_ARRANGEMENTS } from '../../utils/multiviewGrid';
 import type { NicInfo, LanLinkNic, LanLinkStatus, LanLinkPeerSummary } from '../../../shared/lanlink';
 import type { FirstRunCheckResult } from '../../../shared/firstRun';
 import { FIRST_RUN_REOPEN_EVENT } from '../../../shared/firstRun';
-import { notifyBriefingConfigChanged } from '../Deck/deckBriefingConfigBus';
 import { ClaudeIntegrationSection } from './ClaudeIntegrationSection';
-import { IntegrationSetupSectionContainer } from './IntegrationSetupSection';
+import { IntegrationSetupSectionContainer, MCP_STATUS_CHANGED_EVENT } from './IntegrationSetupSection';
+import { McpStatusSection } from './McpStatusSection';
 import { AccountsSection } from './AccountsSection';
+import { FanoutPresetsSection } from './FanoutPresetsSection';
 import { terminalFontFamilyCss } from '../../utils/terminalFont';
 import { hasBareFunctionKeyBinding } from '../../utils/functionKeyBinding';
-import { Icon, IconX, IconCheck, IconChevron, IconExternalLink } from '../icons';
+import { Icon, IconX, IconCheck, IconChevron, IconExternalLink, IconBrowser, IconComputer, IconUsers, IconRobot, IconRemoteDevices, IconPlus, IconWarning } from '../icons';
+import { TabComputerUse } from './ComputerUseSection';
+import { QuickLaunchSection } from './QuickLaunchSection';
+import PairedDevicesModal from '../StatusBar/PairedDevicesModal';
 import { FOCUS_RING } from '../focusRing';
-import { SETTINGS_CATALOG, SETTINGS_NAV_GROUPS, type SettingsTabId } from '../../settings/catalog';
+import { SETTINGS_CATALOG, SETTINGS_NAV_GROUPS, resolveSettingsTab, type SettingsTabId } from '../../settings/catalog';
 import { matchSettings, tabHitCount } from '../../settings/searchSettings';
 import { CursorShapePicker } from './CursorShapePicker';
 import { SettingsSearchResults } from './SettingsSearchResults';
+import UiButton from '../ui/Button';
+import Switch from '../ui/Switch';
+import Checkbox from '../ui/Checkbox';
+import Select from '../ui/Select';
+import Input from '../ui/Input';
+import SegmentedControl from '../ui/SegmentedControl';
+import Badge from '../ui/Badge';
+import TokenUsageTab from './tabs/TokenUsageTab';
+import './settings.css';
+import { SettingsSection, SettingRow, SettingNote } from './SettingsLayout';
+import { MAX_WORKSPACE_IDLE_DAYS, MIN_WORKSPACE_IDLE_DAYS } from '../../../shared/workspaceSettle';
+import { sendWorkspaceSettleIdleDays } from '../../hooks/useWorkspaceSettleBridge';
+import { TabMoa } from './MoaTab';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -55,10 +104,10 @@ type ShellInfo = { name: string; path: string; args?: string[] };
 
 // ─── Card primitive ────────────────────────────────────────────────────────────
 //
-// The `rounded-[7px] + bg-mantle + 1px bg-surface border` surface was copy-pasted
-// ~25× inline. One component now owns it — change the surface treatment once and
-// it propagates everywhere. Callers pass layout via className and may override
-// individual style properties (e.g. maxHeight) via `style`.
+// A free-form quiet container (12px radius, surface hairline + fill) for the
+// few blocks that are not a list of rows: the About header, the role-binding
+// grid, the custom theme editor's panels. Lists of settings use
+// SettingsSection, which draws ONE container around its rows.
 
 function Card({
   className = '',
@@ -68,8 +117,8 @@ function Card({
 }: React.HTMLAttributes<HTMLDivElement>) {
   return (
     <div
-      className={`rounded-[7px] ${className}`}
-      style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)', ...style }}
+      className={`rounded-[12px] ${className}`}
+      style={{ backgroundColor: 'var(--surface-fill)', border: '1px solid var(--surface-hairline)', ...style }}
       {...rest}
     >
       {children}
@@ -78,38 +127,24 @@ function Card({
 }
 
 // ─── Button primitive ──────────────────────────────────────────────────────────
+//
+// The shared ui/Button at the row size (32px, 13px). Settings is a quiet
+// surface: secondary is flat, and a tab carries at most one primary — the
+// action that unblocks the user first (DESIGN.md "One primary per surface").
 
-type ButtonVariant = 'secondary' | 'primary' | 'destructive' | 'accent';
-
-const BUTTON_VARIANT_STYLE: Record<ButtonVariant, React.CSSProperties> = {
-  secondary:   { backgroundColor: 'var(--bg-surface)', color: 'var(--text-main)',  border: '1px solid var(--bg-overlay)' },
-  primary:     { backgroundColor: 'var(--accent-blue)', color: 'var(--bg-base)',    border: '1px solid transparent' },
-  destructive: { backgroundColor: 'var(--accent-red)',  color: 'var(--bg-base)',    border: '1px solid transparent' },
-  accent:      { backgroundColor: 'var(--bg-surface)',  color: 'var(--accent-blue)', border: '1px solid var(--bg-overlay)' },
-};
+type ButtonVariant = 'secondary' | 'primary' | 'destructive' | 'ghost';
 
 function Button({
   variant = 'secondary',
-  className = '',
-  style,
-  children,
   ...rest
 }: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: ButtonVariant }) {
-  return (
-    <button
-      className={`px-3 py-1.5 rounded-[5px] text-xs font-medium transition-colors ${FOCUS_RING} ${className}`}
-      style={{ ...BUTTON_VARIANT_STYLE[variant], ...style }}
-      {...rest}
-    >
-      {children}
-    </button>
-  );
+  return <UiButton variant={variant} size="md" {...rest} />;
 }
 
 // ─── Status badge ──────────────────────────────────────────────────────────────
 //
-// A check (ok) / cross (fail) status dot. Replaces the inline ✓/✗ glyphs and
-// carries an aria-label so the state is exposed to assistive tech.
+// A check (ok) / cross (fail) status mark. Carries an aria-label so the state
+// is exposed to assistive tech.
 
 function StatusBadge({ ok, okLabel = 'OK', failLabel = 'Not OK' }: { ok: boolean; okLabel?: string; failLabel?: string }) {
   return (
@@ -117,7 +152,7 @@ function StatusBadge({ ok, okLabel = 'OK', failLabel = 'Not OK' }: { ok: boolean
       role="img"
       aria-label={ok ? okLabel : failLabel}
       className="shrink-0 inline-flex items-center justify-center"
-      style={{ color: ok ? 'var(--accent-green)' : 'var(--accent-red)', width: 14, height: 14 }}
+      style={{ color: ok ? 'var(--accent-green)' : 'var(--text-muted)', width: 14, height: 14 }}
     >
       {ok ? <IconCheck /> : <IconX />}
     </span>
@@ -300,56 +335,10 @@ interface ToggleProps {
   disabled?: boolean;
 }
 
+/** ui/Switch with an explicit name, so a switch outside a SettingRow (a
+ *  keybinding row) is still named. Inside a row the Field label names it too. */
 function Toggle({ checked, onChange, label, disabled }: ToggleProps) {
-  return (
-    <button
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 disabled:opacity-40 disabled:cursor-not-allowed ${FOCUS_RING}`}
-      style={{ backgroundColor: checked ? 'var(--accent-blue)' : 'var(--bg-overlay)' }}
-    >
-      <span
-        className="inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform"
-        style={{ transform: checked ? 'translateX(18px)' : 'translateX(2px)' }}
-      />
-    </button>
-  );
-}
-
-// ─── Row layout helper ────────────────────────────────────────────────────────
-
-function SettingRow({
-  id,
-  label,
-  description,
-  highlight,
-  children,
-}: {
-  id?: string;
-  label: string;
-  description?: string;
-  highlight?: boolean;
-  children: React.ReactNode;
-}) {
-  return (
-    <Card
-      data-setting-id={id}
-      className="flex items-center justify-between px-3 py-2.5 scroll-mt-4"
-      style={highlight ? {
-        borderColor: 'var(--accent-blue)',
-        boxShadow: '0 0 0 3px color-mix(in srgb, var(--accent-blue) 22%, transparent)',
-      } : undefined}
-    >
-      <div className="min-w-0 mr-3">
-        <p className="text-sm text-[color:var(--text-main)]">{label}</p>
-        {description && <p className="text-[11px] text-[color:var(--text-muted)] mt-0.5">{description}</p>}
-      </div>
-      {children}
-    </Card>
-  );
+  return <Switch checked={checked} onCheckedChange={onChange} aria-label={label} disabled={disabled} />;
 }
 
 // ─── Select dropdown ──────────────────────────────────────────────────────────
@@ -368,25 +357,19 @@ function SettingSelect({
   disabled?: boolean;
 }) {
   return (
-    <select
+    <Select
       aria-label={label}
       value={value}
       disabled={disabled}
       onChange={(e) => onChange(e.target.value)}
-      className="text-xs rounded-md px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[color:var(--accent-blue)] font-mono"
-      style={{
-        backgroundColor: 'var(--bg-surface)',
-        color: 'var(--text-main)',
-        border: '1px solid var(--bg-overlay)',
-        minWidth: 130,
-      }}
+      className="settings-select"
     >
       {options.map((o) => (
         <option key={o.value} value={o.value}>
           {o.label}
         </option>
       ))}
-    </select>
+    </Select>
   );
 }
 
@@ -406,7 +389,7 @@ function SettingNumberInput({
   label: string;
 }) {
   return (
-    <input
+    <Input
       type="number"
       aria-label={label}
       value={value}
@@ -416,13 +399,8 @@ function SettingNumberInput({
         const n = parseInt(e.target.value, 10);
         if (!isNaN(n) && n >= min && n <= max) onChange(n);
       }}
-      className="text-xs rounded-md px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[color:var(--accent-blue)] font-mono tabular-nums text-center"
-      style={{
-        backgroundColor: 'var(--bg-surface)',
-        color: 'var(--text-main)',
-        border: '1px solid var(--bg-overlay)',
-        width: 64,
-      }}
+      className="settings-input tabular-nums text-center"
+      style={{ width: 96 }}
     />
   );
 }
@@ -443,7 +421,7 @@ function SettingPathInput({
   const [draft, setDraft] = useState(value);
   useEffect(() => { setDraft(value); }, [value]);
   return (
-    <input
+    <Input
       type="text"
       aria-label={label}
       value={draft}
@@ -454,81 +432,84 @@ function SettingPathInput({
       onChange={(e) => setDraft(e.target.value)}
       onBlur={() => onCommit(draft)}
       onKeyDown={(e) => { if (e.key === 'Enter') onCommit(draft); }}
-      className="text-xs rounded-md px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[color:var(--accent-blue)] font-mono"
-      style={{
-        backgroundColor: 'var(--bg-surface)',
-        color: 'var(--text-main)',
-        border: '1px solid var(--bg-overlay)',
-        width: 200,
-      }}
+      // A path is machine evidence: mono, per DESIGN.md Type.
+      className="settings-input font-mono"
+      style={{ width: 240 }}
     />
-  );
-}
-
-// ─── Section divider label ────────────────────────────────────────────────────
-
-/**
- * `id` makes the heading a jump target for settings search. Several catalog
- * entries name a whole section (custom keybindings, MCP servers, LanLink
- * pairing) rather than one row, and without an anchor `jumpTo`'s
- * `querySelector(...)?.scrollIntoView()` optional-chains into a silent no-op:
- * the tab switches and nothing else happens. `scroll-mt-4` matches SettingRow
- * so a jumped-to heading is not flush against the panel edge.
- */
-function SectionLabel({ id, label }: { id?: string; label: string }) {
-  return (
-    <p
-      data-setting-id={id}
-      className="text-[10px] font-semibold uppercase tracking-widest text-[color:var(--text-muted)] mb-2 mt-1 px-1 scroll-mt-4"
-    >
-      {label}
-    </p>
   );
 }
 
 // ─── Keyboard shortcut badge ──────────────────────────────────────────────────
 
-function KbdRow({ keys, description, disabled, onToggleDisabled, toggleTitle }: {
+function KbdRow({
+  keys, description, disabled, onToggleDisabled, toggleTitle,
+  onChangeKey, changeKeyTitle, onReset, resetLabel, note,
+}: {
   keys: string;
   description: string;
   /** #1152 — undefined hides the toggle (rows that cannot be disabled). */
   disabled?: boolean;
   onToggleDisabled?: () => void;
   toggleTitle?: string;
+  /** #1455 — makes the key badge a button that records a new combo. */
+  onChangeKey?: () => void;
+  changeKeyTitle?: string;
+  /** Shown only while the row differs from its default. */
+  onReset?: () => void;
+  resetLabel?: string;
+  /** Why the last change was refused, under the row. */
+  note?: string;
 }) {
+  const badgeStyle = {
+    backgroundColor: 'var(--bg-surface)',
+    color: disabled ? 'var(--text-subtle)' : 'var(--accent-blue)',
+    border: '1px solid var(--bg-overlay)',
+    ...(disabled ? { textDecoration: 'line-through' } : {}),
+  };
   return (
-    <div className="flex items-center justify-between py-1.5 px-3 rounded-[7px] hover:bg-[color:var(--bg-mantle)] transition-colors">
+    <div className="settings-row settings-kbd-row" style={{ flexWrap: 'wrap' }}>
       <span
-        className="text-[12px] text-[color:var(--text-sub)]"
+        className="settings-kbd-desc"
         style={disabled ? { textDecoration: 'line-through', opacity: 0.5 } : undefined}
       >
         {description}
       </span>
-      <span className="flex items-center gap-2">
-        <span
-          className="text-[10px] font-mono tabular-nums px-2 py-0.5 rounded"
-          style={{
-            backgroundColor: 'var(--bg-surface)',
-            color: disabled ? 'var(--text-subtle)' : 'var(--accent-blue)',
-            border: '1px solid var(--bg-overlay)',
-            ...(disabled ? { textDecoration: 'line-through' } : {}),
-          }}
-        >
-          {keys}
-        </span>
+      <span className="flex items-center gap-3">
+        {onReset !== undefined && (
+          <UiButton variant="ghost" size="sm" onClick={onReset} aria-label={`${resetLabel ?? ''}: ${description}`}>
+            {resetLabel}
+          </UiButton>
+        )}
+        {onChangeKey !== undefined ? (
+          <button
+            type="button"
+            className={`settings-kbd settings-kbd-hint ${FOCUS_RING}`}
+            data-disabled={disabled || undefined}
+            onClick={onChangeKey}
+            title={changeKeyTitle}
+            aria-label={`${description} (${keys}) — ${changeKeyTitle ?? ''}`}
+          >
+            {keys}
+          </button>
+        ) : (
+          <kbd className="ui-kbd settings-kbd-hint" data-disabled={disabled || undefined}>
+            {keys}
+          </kbd>
+        )}
         {onToggleDisabled !== undefined && (
-          <input
-            type="checkbox"
+          <Checkbox
             checked={!disabled}
-            onChange={onToggleDisabled}
+            onCheckedChange={() => onToggleDisabled()}
             title={toggleTitle}
-            // Unique per row — thirteen checkboxes all reading the same hint
+            // Unique per row — a list of checkboxes all reading the same hint
             // would be indistinguishable to a screen reader.
             aria-label={`${description} (${keys})`}
-            className="cursor-pointer"
           />
         )}
       </span>
+      {note && (
+        <p role="status" className="settings-note" style={{ flexBasis: '100%', textAlign: 'right', color: 'var(--accent-yellow)' }}>{note}</p>
+      )}
     </div>
   );
 }
@@ -592,19 +573,18 @@ function ResetSection() {
   const { invoke: ipcInvoke } = useIpc();
 
   const handleReset = useCallback(async () => {
-    const workspaces = useStore.getState().workspaces;
-    // Dispose all PTYs across all workspaces
-    for (const ws of workspaces) {
-      disposeWorkspacePtys(ws);
-    }
-
-    // Remove all workspaces except the last one (store requires at least 1)
-    const ids = workspaces.map((w) => w.id);
-    // Add a fresh workspace first
+    // Moa's HQ workspace is app-owned and survives a reset (the store refuses
+    // to remove it), so its sessions are left alone too.
+    const workspaces = useStore.getState().workspaces.filter((w) => !isMoaHqWorkspace(useStore.getState(), w.id));
+    // Add a fresh workspace first, so every old one passes the shared close
+    // check (the operator always keeps one workspace of their own).
     addWorkspace('Workspace 1');
-    // Then remove all old ones
-    for (const id of ids) {
-      removeWorkspace(id);
+    // Then dispose and remove each old one, asking the close check before any
+    // dispose so a refused removal never leaves a dead, empty workspace.
+    for (const ws of workspaces) {
+      if (workspaceCloseRefusal(useStore.getState(), ws.id)) continue;
+      disposeWorkspacePtys(ws);
+      removeWorkspace(ws.id);
     }
 
     // Save the clean session — surface IPC errors via toast (daemon may be down).
@@ -619,37 +599,25 @@ function ResetSection() {
   }, [removeWorkspace, addWorkspace, setVisible, ipcInvoke]);
 
   return (
-    <div>
-      <SectionLabel id="reset" label={t('settings.reset')} />
-      <div
-        className="px-3 py-2.5 rounded-[7px] flex items-center justify-between"
-        style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-      >
-        <div>
-          <p className="text-sm text-[color:var(--text-main)]">{t('settings.resetWorkspaces')}</p>
-          <p className="text-[11px] text-[color:var(--text-muted)] mt-0.5">{t('settings.resetWorkspacesDesc')}</p>
-        </div>
+    <SettingsSection id="reset" title={t('settings.reset')}>
+      <SettingRow label={t('settings.resetWorkspaces')} description={t('settings.resetWorkspacesDesc')}>
         {confirming ? (
-          <div className="flex items-center gap-2 shrink-0 ml-3">
-            <Button variant="destructive" onClick={handleReset}>
-              {t('settings.resetButton')}
-            </Button>
-            <Button variant="secondary" onClick={() => setConfirming(false)}>
+          <div className="flex items-center gap-2 shrink-0">
+            <Button variant="ghost" onClick={() => setConfirming(false)}>
               {t('settings.close')}
             </Button>
+            {/* The final confirm of a destructive flow: solid red. */}
+            <UiButton variant="danger" size="md" onClick={handleReset}>
+              {t('settings.resetButton')}
+            </UiButton>
           </div>
         ) : (
-          <Button
-            variant="secondary"
-            className="shrink-0 ml-3"
-            style={{ color: 'var(--accent-red)' }}
-            onClick={() => setConfirming(true)}
-          >
+          <Button variant="destructive" onClick={() => setConfirming(true)}>
             {t('settings.resetButton')}
           </Button>
         )}
-      </div>
-    </div>
+      </SettingRow>
+    </SettingsSection>
   );
 }
 
@@ -671,12 +639,6 @@ function disposeWorkspacePtys(ws: Workspace) {
 // between turns: main swaps the brain adapter on the next send after a change —
 // the conversation itself survives via the persisted session id.
 
-const ORCHESTRATOR_MODEL_OPTIONS = [
-  { value: '',       labelKey: 'settings.orchestratorModelDefault' },
-  { value: 'opus',   labelKey: '' }, // product names — no translation
-  { value: 'sonnet', labelKey: '' },
-  { value: 'haiku',  labelKey: '' },
-];
 
 // D2 — global role→model enforcement editor. One compact row per built-in role
 // (v1 binds only the 4 fixed roles; a custom-role combobox is deferred): an
@@ -689,24 +651,32 @@ const ORCHESTRATOR_MODEL_OPTIONS = [
 // but a row that cannot do what it looks like it does says so INLINE rather than
 // no-op'ing silently. Model entry is a datalist combobox, not a <select>: only
 // claude's aliases are known to us, and a codex model id (`gpt-5.5`) must be
-// typeable.
-const ROLE_BINDING_AGENTS = ['claude', 'codex', 'opencode', 'gemini'] as const;
+// typeable. agy takes its fan-out prompt through `-i` (applyRoleAgent) and its
+// task folder is pre-trusted by main (main/agents/agyTrust).
+const ROLE_BINDING_AGENTS = ['claude', 'codex', 'opencode', 'gemini', 'agy'] as const;
 
-const ROLE_BINDING_FIELD_CLASS =
-  'text-[11px] rounded px-1.5 py-1 font-mono bg-[color:var(--bg-surface)] ' +
-  'text-[color:var(--text-main)] border border-[color:var(--border-soft)] outline-none';
+// Model ids and CLI args are machine evidence, so the free-text fields are mono.
+const ROLE_BINDING_FIELD_CLASS = 'settings-input font-mono';
 
 /** The one honest thing to say about a row's current state, or none when the
  *  row does exactly what it appears to. Keeps a mis-set binding from looking
  *  bound while enforcing nothing. */
-export function roleBindingHint(b: { agent?: string; model?: string; args?: string }):
+export function roleBindingHint(b: RoleBinding):
   | { key: string; params?: Record<string, string> }
   | undefined {
   if (b.model && !b.agent) return { key: 'settings.roleBindingHintNoAgent' };
   if (b.model && b.agent && !launcherSupportsModelFlag(b.agent)) {
     return { key: 'settings.roleBindingHintNoGrammar', params: { agent: b.agent } };
   }
-  if (b.agent && !b.model && !b.args) return { key: 'settings.roleBindingHintInert' };
+  // #1680 — the checkbox is only offered for an agent with a verified command,
+  // so a stored `freshContext` left behind by an agent change is invisible
+  // unless the row says so.
+  if (b.freshContext && !freshContextGrammarFor(b.agent)) {
+    return { key: 'settings.roleBindingHintFreshContextInert' };
+  }
+  if (b.agent && !b.model && !b.args && !b.effort && !b.skipPermissions && !b.freshContext) {
+    return { key: 'settings.roleBindingHintInert' };
+  }
   return undefined;
 }
 
@@ -743,7 +713,7 @@ function DraftTextInput({
 }) {
   const [draft, setDraft] = useState<string | null>(null);
   return (
-    <input
+    <Input
       {...rest}
       value={draft ?? value}
       onChange={(e) => {
@@ -762,86 +732,220 @@ function DraftTextInput({
 }
 
 export interface RoleBindingsViewProps {
-  bindings: Record<string, { agent?: string; model?: string; args?: string }>;
+  bindings: Record<string, RoleBinding>;
   /** Called with the FULL next binding for a role (the view merges the patch). */
-  onChange: (role: string, next: { agent?: string; model?: string; args?: string }) => void;
+  onChange: (role: string, next: RoleBinding) => void;
   t: (key: string, vars?: Record<string, string | number>) => string;
+  /** Discovered models per agent (ModelCatalog); absent = none loaded yet. */
+  catalog?: Record<string, ModelCatalogResult>;
+  /** Re-run an agent's model discovery (the refresh button). */
+  onRefreshModels?: (agent: string) => void;
+  /** Ask before a preset that turns on skip permissions (default window.confirm). */
+  confirm?: (message: string) => boolean;
+}
+
+/** Models to offer for an agent: the discovered list, or claude's static one. */
+function modelsFor(agent: string | undefined, catalog: RoleBindingsViewProps['catalog']): CatalogModel[] {
+  if (!agent) return [];
+  return catalog?.[agent]?.models ?? (agent === 'claude' ? staticClaudeModels() : []);
+}
+
+/** Effort choices for a binding, per agent grammar. agy: the suffixes its
+ *  catalog offers for the chosen model family (the effort IS the id suffix). */
+export function effortChoicesFor(b: RoleBinding, models: readonly CatalogModel[]): string[] {
+  if (b.agent === 'claude') return [...CLAUDE_EFFORT_LEVELS];
+  if (b.agent === 'codex') {
+    const m = models.find((x) => x.id === b.model);
+    if (m?.efforts?.length) return m.efforts;
+    const all = new Set(models.flatMap((x) => x.efforts ?? []));
+    return all.size ? [...all] : ['low', 'medium', 'high', 'xhigh'];
+  }
+  if (b.agent === 'agy' && b.model && agyEffortOf(b.model)) {
+    const family = agyFamilyOf(b.model);
+    return models
+      .filter((x) => agyFamilyOf(x.id) === family && agyEffortOf(x.id))
+      .map((x) => agyEffortOf(x.id) as string);
+  }
+  return [];
 }
 
 /** Presentational half — the container below owns the store. Split so the view
  *  is renderable (and assertable) without a live store, matching NotificationsView. */
-export function RoleBindingsView({ bindings, onChange, t }: RoleBindingsViewProps) {
-  const update = (role: string, patch: { agent?: string; model?: string; args?: string }) => {
+export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshModels, confirm }: RoleBindingsViewProps) {
+  const update = (role: string, patch: Partial<RoleBinding>) => {
     onChange(role, { ...(bindings[role] ?? {}), ...patch });
   };
 
   return (
-    <Card data-setting-id="roles" className="flex flex-col gap-2 px-3 py-2.5 scroll-mt-4">
-      <div className="min-w-0">
-        <p className="text-sm text-[color:var(--text-main)]">{t('settings.roleBindings')}</p>
-        <p className="text-[11px] text-[color:var(--text-muted)] mt-0.5">{t('settings.roleBindingsDesc')}</p>
-      </div>
-      <div className="flex flex-col gap-1.5 mt-1">
-        {ORCH_ROLES.map((role) => {
-          const b = bindings[role] ?? {};
-          const hint = roleBindingHint(b);
-          const listId = `role-binding-models-${role}`;
-          return (
-            <div key={role} className="flex flex-col gap-0.5" data-role-binding-row={role}>
-              <div className="flex items-center gap-2">
-                <span className="text-[12px] text-[color:var(--text-sub)] w-[64px] shrink-0">{role}</span>
-                <select
-                  aria-label={t('settings.roleBindingAgentLabel', { role })}
-                  value={b.agent ?? ''}
-                  onChange={(e) => update(role, { agent: e.target.value })}
-                  className={`${ROLE_BINDING_FIELD_CLASS} ${FOCUS_RING}`}
-                  style={{ minWidth: 92 }}
-                >
-                  <option value="">{t('settings.roleBindingAgentPlaceholder')}</option>
-                  {ROLE_BINDING_AGENTS.map((a) => (
-                    <option key={a} value={a}>{a}</option>
-                  ))}
-                </select>
-                <DraftTextInput
-                  aria-label={t('settings.roleBindingModelLabel', { role })}
-                  type="text"
-                  list={listId}
-                  value={b.model ?? ''}
-                  placeholder={t('settings.roleBindingModelPlaceholder')}
-                  onChange={(e) => update(role, { model: e.target.value })}
-                  className={`${ROLE_BINDING_FIELD_CLASS} ${FOCUS_RING}`}
-                  style={{ minWidth: 92, width: 116 }}
-                />
-                {/* Suggestions only — free text is required for codex model ids.
-                    We only know claude's aliases, so that is all we suggest. */}
-                <datalist id={listId}>
-                  {b.agent === 'claude' &&
-                    MODEL_OPTIONS.filter((o) => o.value).map((o) => (
-                      <option key={o.value} value={o.value}>{o.label}</option>
-                    ))}
-                </datalist>
-                <DraftTextInput
-                  aria-label={t('settings.roleBindingArgsLabel', { role })}
-                  type="text"
-                  value={b.args ?? ''}
-                  placeholder={t('settings.roleBindingArgsPlaceholder')}
-                  onChange={(e) => update(role, { args: e.target.value })}
-                  className={`flex-1 min-w-0 ${ROLE_BINDING_FIELD_CLASS} ${FOCUS_RING}`}
-                />
-              </div>
-              {hint && (
-                <p
-                  className="text-[10px] text-[color:var(--text-muted)] pl-[72px]"
-                  data-role-binding-hint={role}
-                >
-                  {t(hint.key, hint.params)}
-                </p>
-              )}
+    <SettingsSection id="roles" title={t('settings.roleBindings')} description={t('settings.roleBindingsDesc')} overflowVisible>
+      {ORCH_ROLES.map((role) => {
+        const b = bindings[role] ?? {};
+        const hint = roleBindingHint(b);
+        const models = modelsFor(b.agent, catalog);
+        const efforts = effortChoicesFor(b, models);
+        const grammar = launchGrammarFor(b.agent);
+        // agy's effort is the model id suffix: show it as the selected effort.
+        const effortValue =
+          b.agent === 'agy' ? (b.model ? agyEffortOf(b.model) ?? '' : '') : b.effort ?? '';
+        // What a bare launch of the bound agent becomes (machine evidence, mono).
+        const preview = b.agent ? applyRoleBinding(b.agent, b, { spawnedProcess: true }).command : '';
+        return (
+          <div key={role} className="settings-row" data-role-binding-row={role}>
+            <div className="flex items-center gap-2">
+              <span className="ui-field-label w-[76px] shrink-0">{role}</span>
+              <Select
+                aria-label={t('settings.roleBindingAgentLabel', { role })}
+                value={b.agent ?? ''}
+                onChange={(e) => update(role, { agent: e.target.value })}
+                className="settings-role-agent"
+              >
+                <option value="">{t('settings.roleBindingAgentPlaceholder')}</option>
+                {ROLE_BINDING_AGENTS.map((a) => (
+                  <option key={a} value={a}>{a}</option>
+                ))}
+              </Select>
+              {/* Discovered models (ModelCatalog); free text stays allowed. */}
+              <ModelCombobox
+                aria-label={t('settings.roleBindingModelLabel', { role })}
+                value={b.model ?? ''}
+                models={models}
+                placeholder={t('settings.roleBindingModelPlaceholder')}
+                onChange={(model) => update(role, { model })}
+                className={ROLE_BINDING_FIELD_CLASS}
+                style={{ width: 200 }}
+              />
+              <DraftTextInput
+                aria-label={t('settings.roleBindingArgsLabel', { role })}
+                type="text"
+                value={b.args ?? ''}
+                placeholder={t('settings.roleBindingArgsPlaceholder')}
+                onChange={(e) => update(role, { args: e.target.value })}
+                className={`flex-1 min-w-0 ${ROLE_BINDING_FIELD_CLASS}`}
+              />
             </div>
-          );
-        })}
-      </div>
-    </Card>
+            {b.agent && (
+              <div className="flex items-center gap-3 mt-1.5 pl-[84px]" data-role-binding-options={role}>
+                {efforts.length > 0 && (
+                  <Select
+                    aria-label={t('settings.roleBindingEffortLabel', { role })}
+                    value={effortValue}
+                    onChange={(e) => {
+                      const next = e.target.value;
+                      if (b.agent === 'agy' && b.model) {
+                        update(role, { model: `${agyFamilyOf(b.model)}-${next}` });
+                      } else {
+                        update(role, { effort: next || undefined });
+                      }
+                    }}
+                    className="settings-role-effort"
+                  >
+                    {b.agent !== 'agy' && <option value="">{t('settings.roleBindingEffortDefault')}</option>}
+                    {efforts.map((e) => (
+                      <option key={e} value={e}>{e}</option>
+                    ))}
+                  </Select>
+                )}
+                {grammar?.skipPermissionsFlag && (
+                  <label className="flex items-center gap-1.5 text-[12px] text-[var(--text-sub)]">
+                    <Checkbox
+                      checked={!!b.skipPermissions}
+                      onCheckedChange={(v) => update(role, { skipPermissions: v || undefined })}
+                      aria-label={t('settings.roleBindingSkipPermissions')}
+                    />
+                    {t('settings.roleBindingSkipPermissions')}
+                  </label>
+                )}
+                {/* #1680 — only for an agent whose fresh-context command is verified. */}
+                {grammar?.freshContext && (
+                  <label
+                    className="flex items-center gap-1.5 text-[12px] text-[var(--text-sub)]"
+                    title={t('settings.roleBindingFreshContextTooltip', { command: grammar.freshContext.command })}
+                    data-role-binding-fresh-context={role}
+                  >
+                    <Checkbox
+                      checked={!!b.freshContext}
+                      onCheckedChange={(v) => update(role, { freshContext: v || undefined })}
+                      aria-label={t('settings.roleBindingFreshContext')}
+                    />
+                    {t('settings.roleBindingFreshContext')}
+                  </label>
+                )}
+                {onRefreshModels && b.agent !== 'claude' && (
+                  <UiButton
+                    variant="ghost"
+                    size="sm"
+                    className="ml-auto"
+                    onClick={() => onRefreshModels(b.agent as string)}
+                    data-role-binding-refresh={role}
+                  >
+                    {t('settings.roleBindingRefreshModels')}
+                  </UiButton>
+                )}
+              </div>
+            )}
+            {hasRolePreset(role) && (() => {
+              // Bypass is part of the preset: the label names it and a click
+              // asks first, so one click cannot silently turn every launch of
+              // this role (role-routed fan-out included) to skip permissions.
+              const skips = rolePresetSkipsPermissions(role, bindings[role]);
+              const applied = rolePresetApplied(role, bindings);
+              const tier = ROLE_PRESET_SPECS[role].tier;
+              return (
+                <div className="mt-1.5 pl-[84px]" data-role-binding-preset={role}>
+                  <UiButton
+                    variant="secondary"
+                    size="sm"
+                    disabled={applied}
+                    title={skips
+                      ? t('settings.rolePresetTooltip', { tier, role })
+                      : t('settings.rolePresetTooltipNoSkip', { tier })}
+                    data-role-preset-bypass={skips ? 'true' : undefined}
+                    onClick={() => {
+                      if (skips) {
+                        const ask = confirm ?? ((m: string) => window.confirm(m));
+                        if (!ask(t('settings.rolePresetConfirmBypass', { role }))) return;
+                      }
+                      onChange(role, applyRolePreset(role, bindings[role]));
+                    }}
+                  >
+                    {applied
+                      ? t('settings.rolePresetApplied', { role })
+                      : skips
+                        ? t('settings.rolePresetApplyBypass', { role })
+                        : t('settings.rolePresetApply', { role })}
+                  </UiButton>
+                </div>
+              );
+            })()}
+            {preview && (
+              <p
+                className="ui-code m-0 mt-1 pl-[84px] text-[11px] text-[var(--text-sub)]"
+                data-role-binding-preview={role}
+              >
+                {preview}
+              </p>
+            )}
+            {hint && (
+              <p
+                className="ui-field-description m-0 mt-1 pl-[84px]"
+                data-role-binding-hint={role}
+              >
+                {t(hint.key, hint.params)}
+              </p>
+            )}
+            {/* Owner decision C: wmux cannot mitigate it, so say it where agy is picked. */}
+            {b.agent === 'agy' && (
+              <p
+                className="ui-field-description m-0 mt-1 pl-[84px] text-[var(--accent-red)]"
+                data-role-binding-agy-warning={role}
+              >
+                {t('fanout.agyReadsIgnoredFiles')}
+              </p>
+            )}
+          </div>
+        );
+      })}
+    </SettingsSection>
   );
 }
 
@@ -849,234 +953,30 @@ function RoleBindingEditor() {
   const t = useT();
   const bindings = useStore((s) => s.orchestratorRoleBindings);
   const setBinding = useStore((s) => s.setOrchestratorRoleBinding);
-  return <RoleBindingsView bindings={bindings} onChange={setBinding} t={t} />;
-}
-
-function OrchestratorSection() {
-  const t = useT();
-  const deckBrainModel = useStore((s) => s.deckBrainModel);
-  const setDeckBrainModel = useStore((s) => s.setDeckBrainModel);
-  const deckBrainFullPower = useStore((s) => s.deckBrainFullPower);
-  const setDeckBrainFullPower = useStore((s) => s.setDeckBrainFullPower);
-  const deckBrainVendor = useStore((s) => s.deckBrainVendor);
-  const setDeckBrainVendor = useStore((s) => s.setDeckBrainVendor);
-  const channelsTabVisible = useStore((s) => s.channelsTabVisible);
-  const setChannelsTabVisible = useStore((s) => s.setChannelsTabVisible);
-  // Global auto-wake switch — persisted in MAIN (deck-autowake.json) because
-  // the event-push coalescer that spends the tokens lives there. Read on
-  // mount; optimistic toggle with echo reconciliation.
-  const [autoWake, setAutoWake] = useState(true);
-  useEffect(() => {
-    let cancelled = false;
-    window.electronAPI.deck?.autoWake
-      ?.get()
-      .then((r) => { if (!cancelled) setAutoWake(r.enabled); })
-      .catch(() => undefined); // keep the default-on rendering
-    return () => { cancelled = true; };
+  const [catalog, setCatalog] = useState<Record<string, ModelCatalogResult>>({});
+  const load = useCallback((agent: string, refresh = false) => {
+    window.electronAPI.agentModels
+      ?.list(agent, refresh)
+      .then((r) => setCatalog((c) => ({ ...c, [agent]: r })))
+      .catch(() => undefined); // free text still works without a list
   }, []);
-  const onAutoWakeChange = (enabled: boolean) => {
-    setAutoWake(enabled);
-    window.electronAPI.deck?.autoWake
-      ?.set(enabled)
-      .then((r) => setAutoWake(r.enabled))
-      .catch(() => setAutoWake(!enabled));
-  };
-  // `deck.ledgerGate` — persisted in MAIN (deck-ledger-gate.json), the same
-  // file the Stop gate reads, so the toggle and the gate can never disagree and
-  // the choice survives a restart. Default OFF; same optimistic-toggle-with-
-  // echo shape as auto-wake, except the default rendering is off, so a failed
-  // read leaves the switch showing the behaviour actually in force.
-  const [ledgerGate, setLedgerGate] = useState(false);
+  // Discover only for the agents a role actually uses.
+  const agentsKey = [...new Set(Object.values(bindings).map((b) => b.agent).filter((a): a is string => !!a))]
+    .sort()
+    .join(',');
   useEffect(() => {
-    let cancelled = false;
-    window.electronAPI.deck?.ledgerGate
-      ?.get()
-      .then((r) => { if (!cancelled) setLedgerGate(r.enabled); })
-      .catch(() => undefined); // keep the default-off rendering
-    return () => { cancelled = true; };
-  }, []);
-  const onLedgerGateChange = (enabled: boolean) => {
-    setLedgerGate(enabled);
-    window.electronAPI.deck?.ledgerGate
-      ?.set(enabled)
-      .then((r) => setLedgerGate(r.enabled))
-      .catch(() => setLedgerGate(!enabled));
-  };
-  // D1 briefing toggles — persisted in MAIN (deck-briefing.json). Read on mount;
-  // optimistic toggle with echo reconciliation (mirrors auto-wake).
-  const [briefingEnabled, setBriefingEnabled] = useState(true);
-  const [briefingAutoShow, setBriefingAutoShow] = useState(true);
-  useEffect(() => {
-    let cancelled = false;
-    window.electronAPI.deck?.briefing
-      ?.getConfig()
-      .then((c) => {
-        if (cancelled) return;
-        setBriefingEnabled(c.enabled);
-        setBriefingAutoShow(c.autoShow);
-      })
-      .catch(() => undefined); // keep the default-on rendering
-    return () => { cancelled = true; };
-  }, []);
-  // A mounted DeckBriefingCard reads its config from main, not from this
-  // component's state, so every confirmed change is broadcast — otherwise a card
-  // that is already on screen stays visible after the operator turns it off.
-  const onBriefingEnabledChange = (enabled: boolean) => {
-    setBriefingEnabled(enabled);
-    window.electronAPI.deck?.briefing
-      ?.setConfig({ enabled })
-      .then((c) => {
-        setBriefingEnabled(c.enabled);
-        setBriefingAutoShow(c.autoShow);
-        notifyBriefingConfigChanged();
-      })
-      .catch(() => setBriefingEnabled(!enabled));
-  };
-  const onBriefingAutoShowChange = (autoShow: boolean) => {
-    setBriefingAutoShow(autoShow);
-    window.electronAPI.deck?.briefing
-      ?.setConfig({ autoShow })
-      .then((c) => {
-        setBriefingEnabled(c.enabled);
-        setBriefingAutoShow(c.autoShow);
-        notifyBriefingConfigChanged();
-      })
-      .catch(() => setBriefingAutoShow(!autoShow));
-  };
-  const options = ORCHESTRATOR_MODEL_OPTIONS.map((o) => ({
-    value: o.value,
-    label: o.labelKey
-      ? t(o.labelKey)
-      : o.value.charAt(0).toUpperCase() + o.value.slice(1),
-  }));
+    for (const a of agentsKey.split(',')) {
+      if ((CATALOG_AGENTS as readonly string[]).includes(a)) load(a);
+    }
+  }, [agentsKey, load]);
   return (
-    <div className="flex flex-col gap-3 mt-4" data-testid="orchestrator-section">
-      <SectionLabel label={t('settings.orchestrator')} />
-      <SettingRow id="brain"
-        label={t('settings.orchestratorBrain')}
-        description={t('settings.orchestratorBrainDesc')}
-      >
-        <SettingSelect
-          value={deckBrainVendor}
-          onChange={(v) =>
-            setDeckBrainVendor(v === 'claude' || v === 'hermes' ? v : 'claude-pty')
-          }
-          options={[
-            { value: 'claude', label: t('settings.orchestratorBrainClaude') },
-            { value: 'claude-pty', label: t('settings.orchestratorBrainClaudePty') },
-            { value: 'hermes', label: t('settings.orchestratorBrainHermes') },
-          ]}
-          label={t('settings.orchestratorBrain')}
-        />
-      </SettingRow>
-      {/* Picking the terminal runtime does not only swap the agent behind the
-          orchestrator: the panel itself becomes an embedded Claude Code TUI
-          instead of the chat surface. That is the change people actually
-          notice, and nothing said so before they picked it. */}
-      {deckBrainVendor === 'claude-pty' && (
-        <div
-          className="-mt-2 text-[11px] text-[var(--text-muted)]"
-          data-testid="orchestrator-claude-pty-note"
-        >
-          {t('settings.orchestratorBrainClaudePtyNote')}
-        </div>
-      )}
-      <SettingRow id="model"
-        label={t('settings.orchestratorModel')}
-        description={t('settings.orchestratorModelDesc')}
-      >
-        <SettingSelect
-          value={deckBrainModel}
-          onChange={setDeckBrainModel}
-          options={options}
-          label={t('settings.orchestratorModel')}
-        />
-      </SettingRow>
-      <RoleBindingEditor />
-      {/* Full power tunes settingSources/canUseTool — both SDK-only knobs. The
-          terminal brain (an interactive TUI) and ACP brains ignore the flag
-          entirely (see createAdapter in deck.handler), so with the terminal
-          brain now the default the row would otherwise read as a toggle that
-          does nothing when clicked. Inert + a reason instead of hidden: the
-          setting still exists, it just belongs to the other vendor. */}
-      <SettingRow
-        label={t('settings.orchestratorFullPower')}
-        description={
-          deckBrainVendor === 'claude'
-            ? t('settings.orchestratorFullPowerDesc')
-            : t('settings.orchestratorFullPowerSdkOnly')
-        }
-      >
-        <Toggle
-          checked={deckBrainFullPower}
-          onChange={setDeckBrainFullPower}
-          label={t('settings.orchestratorFullPower')}
-          disabled={deckBrainVendor !== 'claude'}
-        />
-      </SettingRow>
-      <SettingRow id="autowake"
-        label={t('settings.autoWake')}
-        description={t('settings.autoWakeDesc')}
-      >
-        <Toggle
-          checked={autoWake}
-          onChange={onAutoWakeChange}
-          label={t('settings.autoWake')}
-        />
-      </SettingRow>
-      {/* Experimental on purpose: this replaces the shipped Stop gate's
-          snapshot inference with the task ledger, and the ledger has not run a
-          full dogfood yet (orchestrator track, 2026-09). */}
-      <SettingRow id="ledgergate"
-        label={t('settings.ledgerGate')}
-        description={t('settings.ledgerGateDesc')}
-      >
-        <div className="flex items-center gap-2">
-          <span
-            className="text-[10px] px-1 py-0.5 rounded"
-            style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--text-muted)' }}
-            title={t('settings.ledgerGateDesc')}
-          >
-            {t('settings.mcpExperimental')}
-          </span>
-          <Toggle
-            checked={ledgerGate}
-            onChange={onLedgerGateChange}
-            label={t('settings.ledgerGate')}
-          />
-        </div>
-      </SettingRow>
-      <SettingRow
-        label={t('settings.briefing')}
-        description={t('settings.briefingDesc')}
-      >
-        <Toggle
-          checked={briefingEnabled}
-          onChange={onBriefingEnabledChange}
-          label={t('settings.briefing')}
-        />
-      </SettingRow>
-      <SettingRow
-        label={t('settings.briefingAutoShow')}
-        description={t('settings.briefingAutoShowDesc')}
-      >
-        <Toggle
-          checked={briefingAutoShow}
-          onChange={onBriefingAutoShowChange}
-          label={t('settings.briefingAutoShow')}
-        />
-      </SettingRow>
-      <SettingRow
-        label={t('settings.channelsTabVisible')}
-        description={t('settings.channelsTabVisibleDesc')}
-      >
-        <Toggle
-          checked={channelsTabVisible}
-          onChange={setChannelsTabVisible}
-          label={t('settings.channelsTabVisible')}
-        />
-      </SettingRow>
-    </div>
+    <RoleBindingsView
+      bindings={bindings}
+      onChange={setBinding}
+      t={t}
+      catalog={catalog}
+      onRefreshModels={(a) => load(a, true)}
+    />
   );
 }
 
@@ -1101,191 +1001,7 @@ interface McpStatusPayload {
   targets: McpTargetStatusPayload[];
 }
 
-interface ElectronMcpApi {
-  check: () => Promise<McpStatusPayload>;
-  reregister: () => Promise<McpStatusPayload>;
-  unregister: () => Promise<McpStatusPayload>;
-}
 
-/**
- * MCP servers panel in Settings → General. Surfaces whether each agent config
- * has the wmux MCP entry, plus Re-register / Unregister buttons.
- *
- * Mirrors the `wmux mcp check` CLI output so users have a one-stop way to
- * verify Claude Code can discover the wmux MCP bridge — DX D4 decision.
- */
-function McpStatusSection() {
-  const t = useT();
-  const [status, setStatus] = useState<McpStatusPayload | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [confirmingUnregister, setConfirmingUnregister] = useState(false);
-  const [pending, setPending] = useState<'reregister' | 'unregister' | null>(null);
-  // NOT_FOUND is expected when running the dev shell with no main wired up;
-  // silence those toasts so the empty state renders cleanly.
-  const { invoke: ipcInvoke } = useIpc({ silent: ['NOT_FOUND', 'UNKNOWN'] });
-
-  // Lazily access the API so this component is safe to render in tests where
-  // the preload has not exposed mcp yet.
-  const mcpApi = (window.electronAPI as unknown as { mcp?: ElectronMcpApi }).mcp;
-
-  const refresh = useCallback(async () => {
-    if (!mcpApi) {
-      setLoading(false);
-      return;
-    }
-    const result = await ipcInvoke(() => mcpApi.check());
-    if (result.ok) setStatus(result.data);
-    setLoading(false);
-  }, [ipcInvoke, mcpApi]);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  const handleReregister = useCallback(async () => {
-    if (!mcpApi) return;
-    setPending('reregister');
-    const result = await ipcInvoke(() => mcpApi.reregister());
-    if (result.ok) setStatus(result.data);
-    setPending(null);
-  }, [ipcInvoke, mcpApi]);
-
-  const handleUnregister = useCallback(async () => {
-    if (!mcpApi) return;
-    setPending('unregister');
-    const result = await ipcInvoke(() => mcpApi.unregister());
-    if (result.ok) setStatus(result.data);
-    setPending(null);
-    setConfirmingUnregister(false);
-  }, [ipcInvoke, mcpApi]);
-
-  // Section is hidden entirely when the preload doesn't expose the API —
-  // keeps older dev builds clean and avoids "phantom" buttons that error.
-  if (!mcpApi && !loading) return null;
-
-  const renderRow = (
-    label: string,
-    server: { registered: boolean; path: string | null },
-  ) => (
-    <div
-      className="px-3 py-2 rounded-[7px] flex items-center justify-between gap-3"
-      style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-    >
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <StatusBadge ok={server.registered} okLabel={t('settings.mcpRegistered')} failLabel={t('settings.mcpNotRegistered')} />
-          <span className="text-sm text-[color:var(--text-main)] font-mono">{label}</span>
-        </div>
-        {server.path && (
-          <p
-            className="text-[10px] text-[color:var(--text-muted)] mt-0.5 font-mono truncate"
-            title={server.path}
-          >
-            {server.path}
-          </p>
-        )}
-      </div>
-    </div>
-  );
-
-  // Per-target group: agent name + config path/state, and (when the config
-  // exists) the two server rows. Non-existent targets render as "not detected"
-  // (the agent isn't installed — wmux never creates its config).
-  const renderTarget = (target: McpTargetStatusPayload) => (
-    <div key={target.id} className="flex flex-col gap-1.5">
-      <div className="flex items-center gap-2">
-        <span className="text-[11px] font-semibold text-[color:var(--text-sub)]">{target.displayName}</span>
-        {!target.verified && (
-          <span
-            className="text-[10px] px-1 py-0.5 rounded"
-            style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--text-muted)' }}
-            title={t('settings.mcpExperimentalTitle')}
-          >
-            {t('settings.mcpExperimental')}
-          </span>
-        )}
-      </div>
-      {target.configExists ? (
-        <>
-          {renderRow('wmux', target.wmux)}
-          <p className="text-[10px] text-[color:var(--text-muted)] font-mono truncate" title={target.configPath}>
-            {target.configPath}
-            {target.configModified ? ` ${t('settings.mcpModified', { date: new Date(target.configModified).toLocaleString() })}` : ''}
-          </p>
-        </>
-      ) : (
-        <div
-          className="px-3 py-2 rounded-[7px] text-[11px] text-[color:var(--text-muted)]"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-        >
-          {t('settings.mcpNotDetected')}<span className="font-mono">{target.configPath}</span>
-        </div>
-      )}
-    </div>
-  );
-
-  return (
-    <div className="flex flex-col gap-3">
-      <SectionLabel id="mcp" label={t('settings.mcpServers')} />
-      {loading ? (
-        <div
-          className="px-3 py-2 rounded-[7px] text-[11px] text-[color:var(--text-muted)]"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-        >
-          {t('settings.mcpChecking')}
-        </div>
-      ) : status ? (
-        <>
-          {status.targets.map((t) => renderTarget(t))}
-          <div className="flex items-center justify-end gap-2 shrink-0">
-            <Button
-              variant="accent"
-              onClick={() => void handleReregister()}
-              disabled={pending !== null}
-              style={{ opacity: pending ? 0.5 : 1 }}
-            >
-              {pending === 'reregister' ? '…' : t('settings.mcpReregister')}
-            </Button>
-            {confirmingUnregister ? (
-              <>
-                <Button
-                  variant="destructive"
-                  onClick={() => void handleUnregister()}
-                  disabled={pending !== null}
-                >
-                  {pending === 'unregister' ? '…' : t('settings.mcpConfirm')}
-                </Button>
-                <Button
-                  variant="secondary"
-                  onClick={() => setConfirmingUnregister(false)}
-                  disabled={pending !== null}
-                >
-                  {t('common.cancel')}
-                </Button>
-              </>
-            ) : (
-              <Button
-                variant="secondary"
-                onClick={() => setConfirmingUnregister(true)}
-                disabled={pending !== null}
-                style={{ color: 'var(--accent-red)' }}
-              >
-                {t('settings.mcpUnregister')}
-              </Button>
-            )}
-          </div>
-        </>
-      ) : (
-        <div
-          className="px-3 py-2 rounded-[7px] text-[11px] text-[color:var(--text-muted)]"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-        >
-          {t('settings.mcpUnavailable')}
-        </div>
-      )}
-    </div>
-  );
-}
 
 // ─── LanLink control plane (PR-3) ───────────────────────────────────────────────
 //
@@ -1301,7 +1017,7 @@ export const LANLINK_NIC_NONE = '';
 
 /** Stable select-value key for a NIC identity (US separator can't appear in a name/MAC). */
 function nicKey(nic: LanLinkNic): string {
-  return `${nic.name}${nic.mac}`;
+  return `${nic.name}\x1f${nic.mac}`;
 }
 
 export interface NicOption {
@@ -1367,8 +1083,7 @@ export function LanLinkView({
   t,
 }: LanLinkViewProps) {
   return (
-    <div className="flex flex-col gap-3" data-testid="lanlink-section">
-      <SectionLabel label={t('settings.lanlink')} />
+    <SettingsSection title={t('settings.lanlink')} data-testid="lanlink-section">
       <SettingRow id="lanenable" label={t('settings.lanlinkEnable')} description={t('settings.lanlinkEnableDesc')}>
         <Toggle checked={enabled} onChange={onToggleEnabled} label={t('settings.lanlinkEnable')} />
       </SettingRow>
@@ -1380,13 +1095,13 @@ export function LanLinkView({
           label={t('settings.lanlinkNic')}
         />
       </SettingRow>
-      <p className="text-[11px] text-[color:var(--text-muted)] leading-relaxed px-1" data-testid="lanlink-warning">
+      <SettingNote data-testid="lanlink-warning">
         {t('settings.lanlinkWarning')}
-      </p>
+      </SettingNote>
       {busy && (
-        <p className="text-[10px] text-[color:var(--text-subtle)] px-1">{t('settings.lanlinkApplying')}</p>
+        <SettingNote>{t('settings.lanlinkApplying')}</SettingNote>
       )}
-    </div>
+    </SettingsSection>
   );
 }
 
@@ -1459,28 +1174,16 @@ function LanLinkSection() {
   // message is the section's resting state instead of an empty panel.
   if (unavailable) {
     return (
-      <div className="flex flex-col gap-3">
-        <SectionLabel label={t('settings.lanlink')} />
-        <div
-          className="px-3 py-2 rounded-[7px] text-[11px] text-[color:var(--text-muted)]"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-        >
-          {t('settings.lanlinkUnavailable')}
-        </div>
-      </div>
+      <SettingsSection title={t('settings.lanlink')}>
+        <SettingNote>{t('settings.lanlinkUnavailable')}</SettingNote>
+      </SettingsSection>
     );
   }
   if (loading || !status) {
     return (
-      <div className="flex flex-col gap-3">
-        <SectionLabel label={t('settings.lanlink')} />
-        <div
-          className="px-3 py-2 rounded-[7px] text-[11px] text-[color:var(--text-muted)]"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-        >
-          {t('settings.lanlinkLoading')}
-        </div>
-      </div>
+      <SettingsSection title={t('settings.lanlink')}>
+        <SettingNote>{t('settings.lanlinkLoading')}</SettingNote>
+      </SettingsSection>
     );
   }
 
@@ -1555,141 +1258,117 @@ export function LanLinkPairingView(props: LanLinkPairingViewProps) {
   // actionable-but-dead form.
   if (!enabled) {
     return (
-      <div className="flex flex-col gap-3" data-testid="lanlink-pairing-section">
-        <SectionLabel id="lanpair" label={t('settings.lanlinkPair')} />
-        <div
-          className="px-3 py-2 rounded-[7px] text-[11px] text-[color:var(--text-muted)]"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-        >
-          {t('settings.lanlinkPairDisabled')}
-        </div>
-      </div>
+      <SettingsSection id="lanpair" title={t('settings.lanlinkPair')} data-testid="lanlink-pairing-section">
+        <SettingNote>{t('settings.lanlinkPairDisabled')}</SettingNote>
+      </SettingsSection>
     );
   }
 
   return (
-    <div className="flex flex-col gap-3" data-testid="lanlink-pairing-section">
-      <SectionLabel label={t('settings.lanlinkPair')} />
-
-      {/* Pair this machine: mint a PIN + live countdown. */}
-      <SettingRow label={t('settings.lanlinkPairStart')} description={t('settings.lanlinkPairStartDesc')}>
-        {pin ? (
-          <div className="flex items-center gap-2">
-            <span
-              data-testid="lanlink-pair-pin"
-              className="text-sm font-mono tabular-nums px-2 py-0.5 rounded tracking-widest"
-              style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--accent-blue)', border: '1px solid var(--bg-overlay)' }}
-            >
-              {pin}
-            </span>
-            <span className="text-[10px] font-mono tabular-nums" style={{ color: 'var(--text-subtle)' }}>
-              {countdownSec != null && countdownSec > 0
-                ? t('settings.lanlinkPairCountdown', { seconds: countdownSec })
-                : t('settings.lanlinkPairExpired')}
-            </span>
-            <Button variant="secondary" onClick={onCancelPair}>{t('settings.lanlinkPairCancel')}</Button>
-          </div>
-        ) : (
-          <Button variant="primary" onClick={onBeginPair} disabled={pairBusy}>
-            {t('settings.lanlinkPairStartButton')}
-          </Button>
+    <>
+      <SettingsSection id="lanpair" title={t('settings.lanlinkPair')} data-testid="lanlink-pairing-section">
+        {/* Pair this machine: mint a PIN + live countdown. Starting a pairing
+            window is what unblocks a second machine, so it is the tab's one
+            primary; Join is secondary. */}
+        <SettingRow label={t('settings.lanlinkPairStart')} description={t('settings.lanlinkPairStartDesc')}>
+          {pin ? (
+            <div className="flex items-center gap-3">
+              <span data-testid="lanlink-pair-pin" className="settings-kbd tracking-widest" style={{ fontSize: 13, minHeight: 28 }}>
+                {pin}
+              </span>
+              <span className="ui-field-description tabular-nums">
+                {countdownSec != null && countdownSec > 0
+                  ? t('settings.lanlinkPairCountdown', { seconds: countdownSec })
+                  : t('settings.lanlinkPairExpired')}
+              </span>
+              <Button variant="secondary" onClick={onCancelPair}>{t('settings.lanlinkPairCancel')}</Button>
+            </div>
+          ) : (
+            <Button variant="primary" onClick={onBeginPair} disabled={pairBusy}>
+              {t('settings.lanlinkPairStartButton')}
+            </Button>
+          )}
+        </SettingRow>
+        {pin && selfAddress && (
+          <SettingNote data-testid="lanlink-pair-self" className="font-mono">
+            {t('settings.lanlinkPairSelfAddress', { address: selfAddress })}
+          </SettingNote>
         )}
-      </SettingRow>
-      {pin && selfAddress && (
-        <p data-testid="lanlink-pair-self" className="text-[10px] font-mono px-1" style={{ color: 'var(--text-subtle)' }}>
-          {t('settings.lanlinkPairSelfAddress', { address: selfAddress })}
-        </p>
-      )}
-      {failCount > 0 && (
-        <p className="text-[10px] font-mono px-1" style={{ color: 'var(--accent-yellow)' }}>
-          {t('settings.lanlinkPairFailCount', { count: failCount })}
-        </p>
-      )}
+        {failCount > 0 && (
+          <SettingNote tone="warning">
+            {t('settings.lanlinkPairFailCount', { count: failCount })}
+          </SettingNote>
+        )}
 
-      {/* Join a machine: enter a remote host/port/PIN. */}
-      <SettingRow label={t('settings.lanlinkPairJoin')} description={t('settings.lanlinkPairJoinDesc')}>
-        <Button variant="primary" onClick={onJoin} disabled={joinBusy}>
-          {t('settings.lanlinkPairJoinButton')}
-        </Button>
-      </SettingRow>
-      {/* Join inputs commit on EVERY keystroke (not commit-on-blur like SettingPathInput)
-          so clicking Join with focus still in a field submits the current value, not a
-          stale empty draft (codex P2). */}
-      <div className="flex flex-wrap items-center gap-2 px-1">
-        <input
-          type="text"
-          value={joinHost}
-          placeholder={t('settings.lanlinkPairJoinHostPlaceholder')}
-          aria-label={t('settings.lanlinkPairJoinHost')}
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-          onChange={(e) => onJoinHost(e.target.value)}
-          className="text-xs rounded-md px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[color:var(--accent-blue)] font-mono"
-          style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--text-main)', border: '1px solid var(--bg-overlay)', width: 180 }}
-        />
-        <SettingNumberInput value={joinPort} onChange={onJoinPort} min={1} max={65535} label={t('settings.lanlinkPairJoinPort')} />
-        <input
-          type="text"
-          value={joinPin}
-          placeholder={t('settings.lanlinkPairJoinPinPlaceholder')}
-          aria-label={t('settings.lanlinkPairJoinPin')}
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-          onChange={(e) => onJoinPin(e.target.value)}
-          className="text-xs rounded-md px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[color:var(--accent-blue)] font-mono"
-          style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--text-main)', border: '1px solid var(--bg-overlay)', width: 110 }}
-        />
-      </div>
+        {/* Join a machine: enter a remote host/port/PIN. Join inputs commit on
+            EVERY keystroke (not commit-on-blur like SettingPathInput) so clicking
+            Join with focus still in a field submits the current value, not a
+            stale empty draft (codex P2). */}
+        <SettingRow label={t('settings.lanlinkPairJoin')} description={t('settings.lanlinkPairJoinDesc')} layout="stacked">
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              type="text"
+              value={joinHost}
+              placeholder={t('settings.lanlinkPairJoinHostPlaceholder')}
+              aria-label={t('settings.lanlinkPairJoinHost')}
+              spellCheck={false}
+              autoCapitalize="off"
+              autoCorrect="off"
+              onChange={(e) => onJoinHost(e.target.value)}
+              className="settings-input font-mono"
+              style={{ width: 200 }}
+            />
+            <SettingNumberInput value={joinPort} onChange={onJoinPort} min={1} max={65535} label={t('settings.lanlinkPairJoinPort')} />
+            <Input
+              type="text"
+              value={joinPin}
+              placeholder={t('settings.lanlinkPairJoinPinPlaceholder')}
+              aria-label={t('settings.lanlinkPairJoinPin')}
+              spellCheck={false}
+              autoCapitalize="off"
+              autoCorrect="off"
+              onChange={(e) => onJoinPin(e.target.value)}
+              className="settings-input font-mono"
+              style={{ width: 120 }}
+            />
+            <Button variant="secondary" onClick={onJoin} disabled={joinBusy}>
+              {t('settings.lanlinkPairJoinButton')}
+            </Button>
+          </div>
+        </SettingRow>
+        {error && <SettingNote data-testid="lanlink-pair-error" tone="danger">{error}</SettingNote>}
+      </SettingsSection>
 
       {/* Paired peers + live revoke. */}
-      <SectionLabel label={t('settings.lanlinkPeers')} />
-      {peers.length === 0 ? (
-        <div
-          className="px-3 py-2 rounded-[7px] text-[11px] text-[color:var(--text-muted)]"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-        >
-          {t('settings.lanlinkPeersEmpty')}
-        </div>
-      ) : (
-        <div className="flex flex-col gap-1" data-testid="lanlink-peers">
-          {peers.map((p) => (
-            <div
-              key={p.peerUuid}
-              className="flex items-center gap-2 px-3 py-2 rounded-[7px]"
-              style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--bg-overlay)' }}
-            >
-              <span
-                className="text-[10px] font-mono px-2 py-0.5 rounded shrink-0"
-                style={{ backgroundColor: 'var(--bg-mantle)', color: 'var(--accent-blue)', border: '1px solid var(--bg-overlay)' }}
-              >
-                {t('settings.lanlinkPeerBadge')}
-              </span>
-              <span className="text-xs font-mono truncate" style={{ color: 'var(--text-main)' }}>{p.peerName}</span>
-              {p.burned && (
-                <span className="text-[10px] font-mono shrink-0" style={{ color: 'var(--accent-red)' }}>
-                  {t('settings.lanlinkPeerBurned')}
-                </span>
-              )}
-              <div className="flex-1" />
-              {confirmingRevoke === p.peerUuid ? (
-                <div className="flex items-center gap-2 shrink-0">
-                  <Button variant="destructive" onClick={() => onConfirmRevoke(p.peerUuid)}>{t('settings.lanlinkPeerRevoke')}</Button>
-                  <Button variant="secondary" onClick={onCancelRevoke}>{t('settings.close')}</Button>
-                </div>
-              ) : (
-                <Button variant="secondary" className="shrink-0" style={{ color: 'var(--accent-red)' }} onClick={() => onAskRevoke(p.peerUuid)}>
-                  {t('settings.lanlinkPeerRevoke')}
-                </Button>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {error && <p data-testid="lanlink-pair-error" className="text-[10px] font-mono px-1" style={{ color: 'var(--accent-red)' }}>{error}</p>}
-    </div>
+      <SettingsSection title={t('settings.lanlinkPeers')}>
+        {peers.length === 0 ? (
+          <SettingNote>{t('settings.lanlinkPeersEmpty')}</SettingNote>
+        ) : (
+          <div className="contents" data-testid="lanlink-peers">
+            {peers.map((p) => (
+              <div key={p.peerUuid} className="settings-row ui-row" style={{ flexDirection: 'row' }}>
+                <Badge>{t('settings.lanlinkPeerBadge')}</Badge>
+                <span className="ui-field-label truncate">{p.peerName}</span>
+                {p.burned && (
+                  <Badge tone="danger">{t('settings.lanlinkPeerBurned')}</Badge>
+                )}
+                <div className="flex-1" />
+                {confirmingRevoke === p.peerUuid ? (
+                  <div className="flex items-center gap-2 shrink-0">
+                    <Button variant="ghost" onClick={onCancelRevoke}>{t('settings.close')}</Button>
+                    <UiButton variant="danger" size="md" onClick={() => onConfirmRevoke(p.peerUuid)}>{t('settings.lanlinkPeerRevoke')}</UiButton>
+                  </div>
+                ) : (
+                  <Button variant="destructive" className="shrink-0" onClick={() => onAskRevoke(p.peerUuid)}>
+                    {t('settings.lanlinkPeerRevoke')}
+                  </Button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </SettingsSection>
+    </>
   );
 }
 
@@ -1823,15 +1502,9 @@ function LanLinkPairingSection() {
 
   if (unavailable) {
     return (
-      <div className="flex flex-col gap-3">
-        <SectionLabel label={t('settings.lanlinkPair')} />
-        <div
-          className="px-3 py-2 rounded-[7px] text-[11px] text-[color:var(--text-muted)]"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-        >
-          {t('settings.lanlinkUnavailable')}
-        </div>
-      </div>
+      <SettingsSection id="lanpair" title={t('settings.lanlinkPair')}>
+        <SettingNote>{t('settings.lanlinkUnavailable')}</SettingNote>
+      </SettingsSection>
     );
   }
 
@@ -1999,85 +1672,83 @@ function UpdateStatus() {
       case 'downloading':
       case 'downloaded': return 'var(--accent-green)';
       case 'error': return 'var(--accent-red)';
-      default: return 'var(--text-muted)';
+      default: return 'var(--text-sub)';
     }
   })();
 
   return (
-    <div
-      className="px-3 py-2.5 rounded-[7px] flex items-center justify-between"
-      style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-    >
-      <div>
-        <p className="text-sm text-[color:var(--text-main)]">{t('settings.wmuxUpdates')}</p>
-        {/* Current and latest on their own lines. The old copy put the running
-            version and a status word on one line and never named the version
-            you would be moving TO, so "update ready" could not be reconciled
-            against anything — #897's reporters were comparing exactly those two
-            numbers by hand (winget list vs the app). */}
-        <p className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
-          {t('settings.currentVersion')} v{__APP_VERSION__}
-        </p>
-        {releaseName && (
-          <p className="text-[11px] mt-0.5" style={{ color: statusColor }}>
-            {t('settings.latestVersion')} {releaseName}
-            {statusText ? ` — ${statusText}` : ''}
-          </p>
-        )}
-        {!releaseName && statusText && (
-          <p className="text-[11px] mt-0.5" style={{ color: statusColor }}>{statusText}</p>
-        )}
-        {state === 'error' && errorMsg && (
-          <p className="text-[10px] mt-0.5" style={{ color: 'var(--text-muted)' }}>{errorMsg}</p>
-        )}
-        {/* #866: the Windows install has to run against a dead tree, so the
-            daemon goes down with the app and live panes do not survive it.
-            Said before the button is pressed, not after — the old copy
-            promised the opposite ("sessions persist in the daemon"). */}
-        {state === 'downloaded' && (
-          <p className="text-[10px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
-            {t('settings.updateEndsSessions')}
-          </p>
-        )}
-        {state === 'downloading' && (
-          <div className="mt-1.5 h-1 w-40 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--bg-surface)' }}>
-            <div
-              className="h-full rounded-full transition-all"
-              style={{
-                width: percent === null ? '100%' : `${percent}%`,
-                backgroundColor: 'var(--accent-green)',
-                opacity: percent === null ? 0.4 : 1,
-              }}
-            />
-          </div>
-        )}
-      </div>
-      <div className="flex gap-2 shrink-0 ml-3">
-        {/* "Check" stays visible while an install is staged. It used to be
-            replaced by "Install now", so once one update was downloaded there
-            was no way to ask for a newer one — a staged 3.49.2 hid the 3.49.3
-            published minutes later until the 30-minute poll got around to it.
-            A check always offers the latest, so re-checking over a staged
-            install is safe. */}
-        <Button
-          variant="secondary"
-          onClick={handleCheck}
-          disabled={state === 'checking' || state === 'downloading'}
-          style={{ border: 'none', opacity: state === 'checking' || state === 'downloading' ? 0.5 : 1 }}
-        >
-          {t('settings.checkUpdate')}
-        </Button>
-        {state === 'downloaded' && (
+    <div data-setting-id="checkupdate" className="settings-row scroll-mt-4">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0 flex flex-col gap-0.5">
+          <span className="ui-field-label">{t('settings.wmuxUpdates')}</span>
+          {/* Current and latest on their own lines. The old copy put the running
+              version and a status word on one line and never named the version
+              you would be moving TO, so "update ready" could not be reconciled
+              against anything — #897's reporters were comparing exactly those two
+              numbers by hand (winget list vs the app). */}
+          <span className="ui-field-description">
+            {t('settings.currentVersion')} v{__APP_VERSION__}
+          </span>
+          {releaseName && (
+            <span className="ui-field-description" style={{ color: statusColor }}>
+              {t('settings.latestVersion')} {releaseName}
+              {statusText ? ` — ${statusText}` : ''}
+            </span>
+          )}
+          {!releaseName && statusText && (
+            <span className="ui-field-description" style={{ color: statusColor }}>{statusText}</span>
+          )}
+          {state === 'error' && errorMsg && (
+            <span className="ui-field-description font-mono">{errorMsg}</span>
+          )}
+          {/* #866: the Windows install has to run against a dead tree, so the
+              daemon goes down with the app and live panes do not survive it.
+              Said before the button is pressed, not after — the old copy
+              promised the opposite ("sessions persist in the daemon"). */}
+          {state === 'downloaded' && (
+            <span className="ui-field-description">
+              {t('settings.updateEndsSessions')}
+            </span>
+          )}
+          {state === 'downloading' && (
+            <div className="mt-1.5 h-1 w-40 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--surface-fill-hover)' }}>
+              <div
+                className="h-full rounded-full transition-all"
+                style={{
+                  width: percent === null ? '100%' : `${percent}%`,
+                  backgroundColor: 'var(--text-sub)',
+                  opacity: percent === null ? 0.4 : 1,
+                }}
+              />
+            </div>
+          )}
+        </div>
+        <div className="flex gap-2 shrink-0">
+          {/* "Check" stays visible while an install is staged. It used to be
+              replaced by "Install now", so once one update was downloaded there
+              was no way to ask for a newer one — a staged 3.49.2 hid the 3.49.3
+              published minutes later until the 30-minute poll got around to it.
+              A check always offers the latest, so re-checking over a staged
+              install is safe. */}
           <Button
-            onClick={handleInstall}
-            style={{ backgroundColor: 'var(--accent-green)', color: 'var(--bg-base)', border: 'none' }}
+            variant="secondary"
+            onClick={handleCheck}
+            disabled={state === 'checking' || state === 'downloading'}
+            data-settings-check-update
           >
-            {/* An action, not a status. This said "Update ready", which is what
-                the line above already reports — a button labelled with a state
-                does not tell you what pressing it does. */}
-            {t('update.installNow')}
+            {t('settings.checkUpdate')}
           </Button>
-        )}
+          {/* A staged, verified installer is what unblocks the user on this
+              tab, so it is the tab's one primary. */}
+          {state === 'downloaded' && (
+            <Button onClick={handleInstall} variant="primary">
+              {/* An action, not a status. This said "Update ready", which is what
+                  the line above already reports — a button labelled with a state
+                  does not tell you what pressing it does. */}
+              {t('update.installNow')}
+            </Button>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -2108,12 +1779,11 @@ function StartupSection() {
       .catch(() => setEnabled(!next));
   };
   return (
-    <div className="flex flex-col gap-2">
-      <SectionLabel label={t('settings.startup')} />
+    <SettingsSection title={t('settings.startup')}>
       <SettingRow id="startup" label={t('settings.startOnLogin')} description={t('settings.startOnLoginDesc')}>
         <Toggle checked={enabled} onChange={onChange} label={t('settings.startOnLogin')} />
       </SettingRow>
-    </div>
+    </SettingsSection>
   );
 }
 
@@ -2129,32 +1799,22 @@ function TabGeneral() {
   };
 
   return (
-    <div className="flex flex-col gap-4">
-      {/* Language */}
-      <div data-setting-id="language" className="scroll-mt-4">
-        <SectionLabel label={t('settings.language')} />
-        <div className="grid grid-cols-2 gap-2">
-          {LOCALE_OPTIONS.map(({ value, label }) => (
-            <button
-              key={value}
-              onClick={() => setLocale(value as Locale)}
-              className={`px-3 py-2 rounded-[5px] text-sm transition-colors text-left ${FOCUS_RING}`}
-              style={{
-                backgroundColor: locale === value ? 'var(--bg-surface)' : 'transparent',
-                color: locale === value ? 'var(--text-main)' : 'var(--text-subtle)',
-                border: `1px solid ${locale === value ? 'var(--accent-blue)' : 'var(--bg-surface)'}`,
-              }}
-            >
-              <span className="mr-2">{localeFlag(value as Locale)}</span>
-              {label}
-            </button>
-          ))}
-        </div>
-      </div>
+    <div className="settings-page">
+      {/* Language — native names in one Select; no flags (DESIGN.md: no
+          emoji in chrome, and a flag is not a language). */}
+      <SettingsSection>
+        <SettingRow id="language" label={t('settings.language')}>
+          <SettingSelect
+            label={t('settings.language')}
+            value={locale}
+            onChange={(v) => setLocale(v as Locale)}
+            options={LOCALE_OPTIONS.map(({ value, label }) => ({ value, label }))}
+          />
+        </SettingRow>
+      </SettingsSection>
 
       {/* Updates */}
-      <div data-setting-id="checkupdate" className="flex flex-col gap-2 scroll-mt-4">
-        <SectionLabel label={t('settings.updates')} />
+      <SettingsSection title={t('settings.updates')}>
         <SettingRow id="autoupdate" label={t('settings.autoUpdate')} description={t('settings.autoUpdateDesc')}>
           <Toggle
             checked={autoUpdateEnabled}
@@ -2163,7 +1823,7 @@ function TabGeneral() {
           />
         </SettingRow>
         <UpdateStatus />
-      </div>
+      </SettingsSection>
 
       {/* Startup — win32(레지스트리 Run 키) + darwin(로그인 항목). 그 외 숨김. */}
       {(window.electronAPI.platform === 'win32' || window.electronAPI.platform === 'darwin') && (
@@ -2171,13 +1831,10 @@ function TabGeneral() {
       )}
 
       {/* Tutorial */}
-      <div className="flex flex-col gap-2">
-        <SectionLabel label={t('settings.tutorial')} />
+      <SettingsSection title={t('settings.tutorial')}>
         <SettingRow id="tutorial" label={t('settings.restartTutorial')} description={t('settings.restartTutorialDesc')}>
           <Button
             variant="secondary"
-            className="shrink-0"
-            style={{ color: 'var(--text-subtle)' }}
             onClick={() => {
               useStore.getState().startOnboarding();
               useStore.getState().setSettingsPanelVisible(false);
@@ -2186,7 +1843,10 @@ function TabGeneral() {
             {t('settings.restartTutorial')}
           </Button>
         </SettingRow>
-      </div>
+      </SettingsSection>
+
+      {/* First-run setup — the wizard and cheat sheet re-entry points. */}
+      <TabFirstRunSetup />
 
       {/* Reset */}
       <ResetSection />
@@ -2213,23 +1873,12 @@ export function ImagePasteModeView({
   t: (key: string) => string;
 }) {
   return (
-    <div className="flex rounded-lg overflow-hidden" style={{ border: '1px solid var(--bg-overlay)' }}>
-      {IMAGE_PASTE_MODE_LABELS.map(({ mode, labelKey }) => (
-        <button
-          key={mode}
-          data-image-paste-mode={mode}
-          onClick={() => onChange(mode)}
-          aria-pressed={value === mode}
-          className="px-3 py-1 text-xs font-mono transition-colors"
-          style={{
-            backgroundColor: value === mode ? 'var(--accent-blue)' : 'var(--bg-surface)',
-            color: value === mode ? 'var(--bg-base)' : 'var(--text-subtle)',
-          }}
-        >
-          {t(labelKey)}
-        </button>
-      ))}
-    </div>
+    <SegmentedControl
+      value={value}
+      onValueChange={onChange}
+      options={IMAGE_PASTE_MODE_LABELS.map(({ mode, labelKey }) => ({ value: mode, label: t(labelKey) }))}
+      data-testid="image-paste-mode"
+    />
   );
 }
 
@@ -2251,17 +1900,45 @@ function TabTerminal() {
   const setHiddenPaneRetentionEnabled = useStore((s) => s.setHiddenPaneRetentionEnabled);
   const coldParkEnabled = useStore((s) => s.coldParkEnabled);
   const setColdParkEnabled = useStore((s) => s.setColdParkEnabled);
-  const browserLightweightMode = useStore((s) => s.browserLightweightMode);
-  const setBrowserLightweightMode = useStore((s) => s.setBrowserLightweightMode);
-  const browserDiscardHidden = useStore((s) => s.browserDiscardHidden);
-  const setBrowserDiscardHidden = useStore((s) => s.setBrowserDiscardHidden);
-  const browserBackend = useStore((s) => s.browserBackend);
-  const setBrowserBackend = useStore((s) => s.setBrowserBackend);
-  const browserBackendHydrated = useStore((s) => s.browserBackendHydrated);
+  const inlineImagesEnabled = useStore((s) => s.inlineImagesEnabled);
+  const setInlineImagesEnabled = useStore((s) => s.setInlineImagesEnabled);
   const startupDirectory = useStore((s) => s.startupDirectory);
   const setStartupDirectory = useStore((s) => s.setStartupDirectory);
   const [detectedShells, setDetectedShells] = useState<ShellInfo[]>([]);
   const shellOptions = detectedShells.map((shell) => ({ value: shell.path, label: shell.name }));
+
+  // #1103 — WSL distro picker: shown only when the default terminal IS WSL
+  // and more than one distro exists (a single-distro machine has nothing to
+  // choose). '' = the system default (today's behaviour).
+  const defaultWslDistro = useStore((s) => s.defaultWslDistro);
+  const setDefaultWslDistro = useStore((s) => s.setDefaultWslDistro);
+  const [wslDistros, setWslDistros] = useState<string[]>([]);
+  const selectedIsWsl = detectedShells.some(
+    (shell) => shell.path === defaultShell && isWslShellPath(shell.path),
+  );
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedIsWsl) return;
+    void window.electronAPI.shell.wslDistros()
+      .then((distros) => {
+        if (cancelled) return;
+        setWslDistros(distros);
+        // Reconcile a stale choice: a distro that was uninstalled/renamed on
+        // the host must not keep injecting `-d <gone>` into every new pane
+        // while the picker (built from the live list) shows "System default".
+        const stored = useStore.getState().defaultWslDistro;
+        if (stored && distros.length > 0 && !distros.includes(stored)) {
+          useStore.getState().setDefaultWslDistro(null);
+          window.electronAPI.settings.setDefaultWslDistro(null);
+        }
+      })
+      .catch(() => { if (!cancelled) setWslDistros([]); });
+    return () => { cancelled = true; };
+  }, [selectedIsWsl]);
+  const onWslDistroChange = useCallback((value: string) => {
+    setDefaultWslDistro(value === '' ? null : value);
+    window.electronAPI.settings.setDefaultWslDistro(value === '' ? null : value);
+  }, [setDefaultWslDistro]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2281,9 +1958,8 @@ function TabTerminal() {
   }, [setDefaultShell]);
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="flex flex-col gap-2">
-        <SectionLabel label={t('settings.terminal')} />
+    <div className="settings-page">
+      <SettingsSection title={t('settings.sectionShell')}>
         <SettingRow id="shell" label={t('settings.defaultShell')}>
           <SettingSelect
             label={t('settings.defaultShell')}
@@ -2292,6 +1968,21 @@ function TabTerminal() {
             options={shellOptions}
           />
         </SettingRow>
+        {selectedIsWsl && wslDistros.length > 1 && (
+          <SettingRow
+            id="wsl-distro"
+            label={t('settings.wslDistro')}
+            description={t('settings.wslDistroDesc')}
+          >
+            <SettingSelect
+              label={t('settings.wslDistro')}
+              value={defaultWslDistro ?? ''}
+              onChange={onWslDistroChange}
+              options={[{ value: '', label: t('settings.wslDistroDefault') }]
+                .concat(wslDistros.map((name) => ({ value: name, label: name })))}
+            />
+          </SettingRow>
+        )}
         <SettingRow id="startdir" label={t('settings.startupDirectory')} description={t('settings.startupDirectoryDesc')}>
           <SettingPathInput
             label={t('settings.startupDirectory')}
@@ -2307,6 +1998,8 @@ function TabTerminal() {
             label={t('settings.splitInheritsCwd')}
           />
         </SettingRow>
+      </SettingsSection>
+      <SettingsSection title={t('settings.sectionInput')}>
         <SettingRow id="ime" label={t('settings.imeResidueGuard')} description={t('settings.imeResidueGuardDesc')}>
           <Toggle
             checked={imeResidueGuardEnabled}
@@ -2314,6 +2007,11 @@ function TabTerminal() {
             label={t('settings.imeResidueGuard')}
           />
         </SettingRow>
+        <SettingRow id="imagepaste" label={t('settings.imagePaste')} description={t('settings.imagePasteDesc')}>
+          <ImagePasteModeView value={imagePasteMode} onChange={setImagePasteMode} t={t} />
+        </SettingRow>
+      </SettingsSection>
+      <SettingsSection title={t('settings.sectionPerformance')}>
         <SettingRow id="retention" label={t('settings.hiddenPaneRetention')} description={t('settings.hiddenPaneRetentionDesc')}>
           <Toggle
             checked={hiddenPaneRetentionEnabled}
@@ -2328,6 +2026,54 @@ function TabTerminal() {
             label={t('settings.coldPark')}
           />
         </SettingRow>
+        <SettingRow id="inlineimages" label={t('settings.inlineImages')} description={t('settings.inlineImagesDesc')}>
+          <Toggle
+            checked={inlineImagesEnabled}
+            onChange={setInlineImagesEnabled}
+            label={t('settings.inlineImages')}
+          />
+        </SettingRow>
+      </SettingsSection>
+      <SettingsSection title={t('settings.sectionScrollback')}>
+        <SettingRow id="scrollback" label={t('settings.scrollbackLines')} description={t('settings.scrollbackDesc')}>
+          <SettingNumberInput
+            label={t('settings.scrollbackLines')}
+            value={scrollbackLines}
+            onChange={setScrollbackLines}
+            min={1000}
+            max={100000}
+          />
+        </SettingRow>
+        <SettingRow id="restore" label={t('settings.scrollbackRestore')} description={t('settings.scrollbackRestoreDesc')}>
+          <Toggle
+            checked={scrollbackRestoreEnabled}
+            onChange={setScrollbackRestoreEnabled}
+            label={t('settings.scrollbackRestore')}
+          />
+        </SettingRow>
+      </SettingsSection>
+    </div>
+  );
+}
+
+// ─── Browser tab — agent browser runtime and what agents learn about sites ───
+function TabBrowser() {
+  const t = useT();
+  const browserLightweightMode = useStore((s) => s.browserLightweightMode);
+  const setBrowserLightweightMode = useStore((s) => s.setBrowserLightweightMode);
+  const browserDiscardHidden = useStore((s) => s.browserDiscardHidden);
+  const setBrowserDiscardHidden = useStore((s) => s.setBrowserDiscardHidden);
+  const siteMemoryEnabled = useStore((s) => s.siteMemoryEnabled);
+  const setSiteMemoryEnabled = useStore((s) => s.setSiteMemoryEnabled);
+  const siteGuidesEnabled = useStore((s) => s.siteGuidesEnabled);
+  const setSiteGuidesEnabled = useStore((s) => s.setSiteGuidesEnabled);
+  const browserBackend = useStore((s) => s.browserBackend);
+  const setBrowserBackend = useStore((s) => s.setBrowserBackend);
+  const browserBackendHydrated = useStore((s) => s.browserBackendHydrated);
+
+  return (
+    <div className="settings-page">
+      <SettingsSection title={t('settings.browserSectionRuntime')}>
         <SettingRow id="browserbackend" label={t('settings.browserBackend')} description={t('settings.browserBackendDesc')}>
           <SettingSelect
             label={t('settings.browserBackend')}
@@ -2364,48 +2110,172 @@ function TabTerminal() {
             />
           </SettingRow>
         )}
-        <SettingRow id="scrollback" label={t('settings.scrollbackLines')} description={t('settings.scrollbackDesc')}>
-          <SettingNumberInput
-            label={t('settings.scrollbackLines')}
-            value={scrollbackLines}
-            onChange={setScrollbackLines}
-            min={1000}
-            max={100000}
-          />
-        </SettingRow>
-        <SettingRow id="restore" label={t('settings.scrollbackRestore')} description={t('settings.scrollbackRestoreDesc')}>
+      </SettingsSection>
+      <SettingsSection title={t('settings.browserSectionKnowledge')}>
+        <SettingRow id="sitememory" label={t('settings.siteMemory')} description={t('settings.siteMemoryDesc')}>
           <Toggle
-            checked={scrollbackRestoreEnabled}
-            onChange={setScrollbackRestoreEnabled}
-            label={t('settings.scrollbackRestore')}
+            checked={siteMemoryEnabled}
+            onChange={setSiteMemoryEnabled}
+            label={t('settings.siteMemory')}
           />
         </SettingRow>
-        <SettingRow id="imagepaste" label={t('settings.imagePaste')} description={t('settings.imagePasteDesc')}>
-          <ImagePasteModeView value={imagePasteMode} onChange={setImagePasteMode} t={t} />
+        <SettingRow id="siteguides" label={t('settings.siteGuides')} description={t('settings.siteGuidesDesc')}>
+          <Toggle
+            checked={siteGuidesEnabled}
+            onChange={setSiteGuidesEnabled}
+            label={t('settings.siteGuides')}
+          />
         </SettingRow>
-      </div>
+      </SettingsSection>
     </div>
   );
 }
 
-// ─── Agents tab — orchestrator, A2A, agent toolbar, MCP ──────────────────────
-function TabAgents() {
+// ─── Fan-out workers — permission mode + allow-list button ───────────────────
+// The mode is main-side (it can loosen what an unattended worker may do), so
+// it is read and written over IPC, never through the renderer store.
+function FanoutWorkersSection() {
+  const t = useT();
+  // Main-side too: main makes the approval decision, so the switch it reads
+  // is the one this row writes.
+  const [requireApproval, setRequireApprovalState] = useState(false);
+  // Main-side as well: main refuses the agy trust write while this is off.
+  const [trustAgyFolders, setTrustAgyFoldersState] = useState(false);
+  const [mode, setMode] = useState<FanoutWorkerPermissionMode>(DEFAULT_FANOUT_WORKER_PERMISSION_MODE);
+  // Shown as its own line under the row, not in the (one-line) description,
+  // so a failure's text is never cut off behind Learn more.
+  const [allowResult, setAllowResult] = useState<{ text: string; failed: boolean } | null>(null);
+  const [allowing, setAllowing] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    window.electronAPI?.fanout?.getWorkerPermissionMode?.()
+      .then((m) => {
+        if (!cancelled && isFanoutWorkerPermissionMode(m)) setMode(m);
+      })
+      .catch(() => undefined);
+    window.electronAPI?.fanout?.getRequireApproval?.()
+      .then((v) => {
+        if (!cancelled && typeof v === 'boolean') setRequireApprovalState(v);
+      })
+      .catch(() => undefined);
+    window.electronAPI?.fanout?.getTrustAgyFolders?.()
+      .then((v) => {
+        if (!cancelled && typeof v === 'boolean') setTrustAgyFoldersState(v);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const onModeChange = (next: string) => {
+    if (!isFanoutWorkerPermissionMode(next)) return;
+    window.electronAPI.fanout
+      .setWorkerPermissionMode(next)
+      .then((stored) => setMode(stored))
+      .catch(() => undefined);
+  };
+
+  const onRequireApprovalChange = (next: boolean) => {
+    window.electronAPI.fanout
+      .setRequireApproval(next)
+      .then((stored) => setRequireApprovalState(stored))
+      .catch(() => undefined);
+  };
+
+  const onTrustAgyFoldersChange = (next: boolean) => {
+    window.electronAPI.fanout
+      .setTrustAgyFolders(next)
+      .then((stored) => setTrustAgyFoldersState(stored))
+      .catch(() => undefined);
+  };
+
+  const onAllow = async () => {
+    setAllowing(true);
+    try {
+      const out = await window.electronAPI.deck.hooksBridge.allowWorkerTools();
+      if (!out.ok) setAllowResult({ text: t('settings.fanoutAllowWorkerToolsFailed', { error: out.error ?? '' }), failed: true });
+      else if (out.added.length === 0) setAllowResult({ text: t('settings.fanoutAllowWorkerToolsAlready'), failed: false });
+      else setAllowResult({ text: t('settings.fanoutAllowWorkerToolsDone', { count: String(out.added.length) }), failed: false });
+    } catch (err) {
+      setAllowResult({ text: t('settings.fanoutAllowWorkerToolsFailed', { error: err instanceof Error ? err.message : String(err) }), failed: true });
+    } finally {
+      setAllowing(false);
+    }
+  };
+
+  return (
+    <SettingsSection title={t('settings.fanoutWorkers')}>
+      <SettingRow
+        id="fanoutapproval"
+        label={t('settings.fanoutRequireApproval')}
+        description={t('settings.fanoutRequireApprovalDesc')}
+      >
+        <Toggle
+          checked={requireApproval}
+          onChange={onRequireApprovalChange}
+          label={t('settings.fanoutRequireApproval')}
+        />
+      </SettingRow>
+      <SettingRow
+        id="fanoutagytrust"
+        label={t('settings.fanoutTrustAgyFolders')}
+        description={t('settings.fanoutTrustAgyFoldersDesc')}
+      >
+        <Toggle
+          checked={trustAgyFolders}
+          onChange={onTrustAgyFoldersChange}
+          label={t('settings.fanoutTrustAgyFolders')}
+        />
+      </SettingRow>
+      <SettingRow
+        id="fanoutworkers"
+        label={t('settings.fanoutWorkerPermissionMode')}
+        description={t('settings.fanoutWorkerPermissionModeDesc')}
+      >
+        <SettingSelect
+          value={mode}
+          onChange={onModeChange}
+          label={t('settings.fanoutWorkerPermissionMode')}
+          options={FANOUT_WORKER_PERMISSION_MODES.map((m) => ({ value: m, label: t(`settings.fanoutWorkerMode.${m}`) }))}
+        />
+      </SettingRow>
+      {mode === 'bypassPermissions' && (
+        <SettingNote tone="warning">
+          {t('settings.fanoutWorkerBypassWarning')}
+        </SettingNote>
+      )}
+      <SettingRow
+        id="fanoutallowtools"
+        label={t('settings.fanoutAllowWorkerTools')}
+        description={t('settings.fanoutAllowWorkerToolsDesc')}
+      >
+        <Button variant="secondary" onClick={onAllow} disabled={allowing}>
+          {t('settings.fanoutAllowWorkerToolsButton')}
+        </Button>
+      </SettingRow>
+      {allowResult && (
+        <SettingNote tone={allowResult.failed ? 'danger' : 'muted'} role="status" data-testid="fanout-allow-result">
+          {allowResult.text}
+        </SettingNote>
+      )}
+    </SettingsSection>
+  );
+}
+
+// ─── Roles & fan-out tab — who runs each role, and what workers may do ───────
+function TabRoles() {
   const t = useT();
   const a2aAutoApproveExecute = useStore((s) => s.a2aAutoApproveExecute);
   const setA2aAutoApproveExecute = useStore((s) => s.setA2aAutoApproveExecute);
-  const agentToolbarEnabled = useStore((s) => s.agentToolbarEnabled);
-  const setAgentToolbarEnabled = useStore((s) => s.setAgentToolbarEnabled);
-  const newConversationCommand = useStore((s) => s.newConversationCommand);
-  const setNewConversationCommand = useStore((s) => s.setNewConversationCommand);
 
   return (
-    <div className="flex flex-col gap-4">
-      {/* Orchestrator (moved out of Claude integration) */}
-      <OrchestratorSection />
+    <div className="settings-page">
+      <RoleBindingEditor />
 
       {/* A2A execution */}
-      <div className="flex flex-col gap-2">
-        <SectionLabel label={t('settings.a2aExecution')} />
+      <SettingsSection title={t('settings.a2aExecution')}>
         <SettingRow id="a2a" label={t('settings.a2aAutoApproveExecute')} description={t('settings.a2aAutoApproveExecuteDesc')}>
           <Toggle
             checked={a2aAutoApproveExecute}
@@ -2413,36 +2283,86 @@ function TabAgents() {
             label={t('settings.a2aAutoApproveExecute')}
           />
         </SettingRow>
-      </div>
+      </SettingsSection>
 
-      {/* Agent toolbar */}
-      <div className="flex flex-col gap-2">
-        <SectionLabel label={t('settings.agentToolbar')} />
-        <SettingRow id="toolbar" label={t('settings.agentToolbarShow')} description={t('settings.agentToolbarShowDesc')}>
-          <Toggle
-            checked={agentToolbarEnabled}
-            onChange={setAgentToolbarEnabled}
-            label={t('settings.agentToolbarShow')}
-          />
-        </SettingRow>
-        <SettingRow label={t('settings.agentToolbarNewCommand')}>
-          <input
-            type="text"
-            value={newConversationCommand}
-            onChange={(e) => setNewConversationCommand(e.target.value)}
-            className="text-xs rounded-md px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[color:var(--accent-blue)] font-mono"
-            style={{
-              backgroundColor: 'var(--bg-surface)',
-              color: 'var(--text-main)',
-              border: '1px solid var(--bg-overlay)',
-              width: 200,
-            }}
-          />
-        </SettingRow>
-      </div>
+      {/* Fan-out workers */}
+      <FanoutWorkersSection />
 
-      {/* MCP integration */}
+      {/* Fan-out presets */}
+      <FanoutPresetsSection />
+    </div>
+  );
+}
+
+// ─── Agent toolbar rows (Appearance) ─────────────────────────────────────────
+// Moved out of the Agents tab: whether the inject toolbar is pinned is a
+// question about what the window shows, not about how agents run.
+function AgentToolbarSection() {
+  const t = useT();
+  const agentToolbarEnabled = useStore((s) => s.agentToolbarEnabled);
+  const setAgentToolbarEnabled = useStore((s) => s.setAgentToolbarEnabled);
+  const newConversationCommand = useStore((s) => s.newConversationCommand);
+  const setNewConversationCommand = useStore((s) => s.setNewConversationCommand);
+
+  return (
+    <SettingsSection title={t('settings.agentToolbar')}>
+      <SettingRow id="toolbar" label={t('settings.agentToolbarShow')} description={t('settings.agentToolbarShowDesc')}>
+        <Toggle
+          checked={agentToolbarEnabled}
+          onChange={setAgentToolbarEnabled}
+          label={t('settings.agentToolbarShow')}
+        />
+      </SettingRow>
+      <SettingRow label={t('settings.agentToolbarNewCommand')}>
+        <Input
+          type="text"
+          aria-label={t('settings.agentToolbarNewCommand')}
+          value={newConversationCommand}
+          onChange={(e) => setNewConversationCommand(e.target.value)}
+          spellCheck={false}
+          // A command line is machine evidence: mono.
+          className="settings-input font-mono"
+          style={{ width: 240 }}
+        />
+      </SettingRow>
+    </SettingsSection>
+  );
+}
+
+// ─── Claude Code tab — what wmux installs into Claude Code, and its health ───
+function TabClaudeCode() {
+  return (
+    <div className="settings-page">
+      <IntegrationSetupSectionContainer />
+      <ClaudeIntegrationSection />
+      {/* Per-client MCP registration. It lives with the setup card because it
+          is the same question — is wmux wired into the agent's config — asked
+          for every client wmux knows, not an agent-facing preference. */}
       <McpStatusSection />
+    </div>
+  );
+}
+
+// ─── Remote & phone tab — devices that hold a credential, shared snippets ────
+// The live serve toggle stays in the sidebar Remote popover; this tab is where
+// you manage what persists once the server is off.
+function TabRemote() {
+  const t = useT();
+  const [devicesOpen, setDevicesOpen] = useState(false);
+  useOwnedDialog(devicesOpen);
+  return (
+    <div className="settings-page">
+      <SettingsSection>
+        <SettingRow id="paireddevices" label={t('web.devicesTitle')} description={t('web.devicesSubtitle')}>
+          <Button variant="secondary" onClick={() => setDevicesOpen(true)}>
+            {t('web.devicesLink')}
+          </Button>
+        </SettingRow>
+      </SettingsSection>
+      <div data-setting-id="quickcommands" className="scroll-mt-4">
+        <QuickCommandsSection />
+      </div>
+      {devicesOpen && <PairedDevicesModal onClose={() => setDevicesOpen(false)} />}
     </div>
   );
 }
@@ -2473,8 +2393,8 @@ function TailwindSwatchPicker({ value, onChange, hueScope = 'all' }: TailwindSwa
 
   return (
     <div
-      className="w-full rounded-[7px] p-2 flex flex-col gap-2"
-      style={{ backgroundColor: 'var(--bg-base)', border: '1px solid var(--bg-overlay)' }}
+      className="w-full rounded-[12px] p-2 flex flex-col gap-2"
+      style={{ backgroundColor: 'var(--bg-base)', border: '1px solid var(--surface-hairline)', boxShadow: 'var(--surface-shadow)' }}
     >
       {/* Hue tabs */}
       <div className="flex flex-wrap gap-0.5">
@@ -2526,7 +2446,7 @@ function TailwindSwatchPicker({ value, onChange, hueScope = 'all' }: TailwindSwa
             if (/^#[0-9a-fA-F]{6}$/.test(v)) onChange(v);
           }}
           className="text-[10px] font-mono tabular-nums px-1.5 py-0.5 rounded flex-1"
-          style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--text-main)', border: '1px solid var(--bg-overlay)' }}
+          style={{ backgroundColor: 'var(--surface-fill)', color: 'var(--text-main)', border: '1px solid var(--surface-hairline)' }}
           spellCheck={false}
         />
         <input
@@ -2742,6 +2662,13 @@ const UI_TOKEN_GROUPS: { label: string; tokens: UITokenSpec[] }[] = [
 ];
 
 const BASE_ON_OPTIONS: { value: BuiltinThemeId; label: string }[] = [
+  { value: 'tint', label: 'Tint' },
+  { value: 'zinc', label: 'Zinc' },
+  { value: 'graphite', label: 'Graphite' },
+  { value: 'paper', label: 'Paper' },
+  { value: 'amber-line', label: 'Amber Line' },
+  { value: 'mono', label: 'Mono' },
+  { value: 'mono-light', label: 'Mono Light' },
   { value: 'amber', label: 'Amber' },
   { value: 'catppuccin-mocha', label: 'Catppuccin' },
   { value: 'stars-and-stripes', label: 'Stars & Stripes' },
@@ -2850,8 +2777,7 @@ function CustomThemeEditor() {
   };
 
   return (
-    <div className="flex flex-col gap-2">
-      <SectionLabel label={t('settings.customTheme')} />
+    <SettingsSection title={t('settings.customTheme')}>
 
       {/* Point-and-style entry: shrink Settings to a bar and let the user click
           a region on screen to edit its color (D-settings / D-hover). */}
@@ -2860,9 +2786,9 @@ function CustomThemeEditor() {
         data-testid="inspect-start"
         onClick={() => enterInspect()}
         className={`flex items-center gap-2 w-full px-3 py-2 rounded-[5px] text-left transition-colors ${FOCUS_RING}`}
-        style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--text-main)', border: '1px solid var(--accent-blue)' }}
+        style={{ backgroundColor: 'var(--surface-fill)', color: 'var(--text-main)', border: '1px solid var(--surface-hairline)' }}
       >
-        <span className="inline-flex items-center shrink-0" style={{ color: 'var(--accent-blue)' }}>
+        <span className="inline-flex items-center shrink-0" style={{ color: 'var(--text-sub)' }}>
           {/* Eyedropper-ish target glyph (shares the 14px line-icon grid). */}
           <Icon><circle cx="7" cy="7" r="3" /><line x1="7" y1="1.5" x2="7" y2="3.5" /><line x1="7" y1="10.5" x2="7" y2="12.5" /><line x1="1.5" y1="7" x2="3.5" y2="7" /><line x1="10.5" y1="7" x2="12.5" y2="7" /></Icon>
         </span>
@@ -2871,15 +2797,15 @@ function CustomThemeEditor() {
 
       {/* Header: "Custom (based on …)" + Reset-to-preset control */}
       <div
-        className="flex items-center justify-between px-3 py-2 rounded-[7px] gap-2"
-        style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
+        className="flex items-center justify-between px-3 py-2 rounded-[12px] gap-2"
+        style={{ backgroundColor: 'var(--surface-fill)', border: '1px solid var(--surface-hairline)' }}
       >
         <span className="text-[11px] text-[color:var(--text-sub)] truncate" data-testid="custom-theme-based-on">
           {t('settings.theme.basedOn', { preset: baseLabel })}
         </span>
         <select
-          className={`text-[11px] rounded px-2 py-0.5 font-mono shrink-0 ${FOCUS_RING}`}
-          style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--text-main)', border: '1px solid var(--bg-overlay)' }}
+          className={`text-[13px] rounded-[8px] px-2 py-1 shrink-0 ${FOCUS_RING}`}
+          style={{ backgroundColor: 'var(--surface-fill)', color: 'var(--text-main)', border: '1px solid var(--surface-hairline)' }}
           aria-label={t('settings.theme.resetToPreset')}
           data-testid="reset-to-preset-select"
           onChange={(e) => {
@@ -2899,11 +2825,11 @@ function CustomThemeEditor() {
       {UI_TOKEN_GROUPS.map((group) => (
         <div
           key={group.label}
-          className="rounded-[7px] overflow-hidden"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
+          className="rounded-[12px] overflow-hidden"
+          style={{ backgroundColor: 'var(--surface-fill)', border: '1px solid var(--surface-hairline)' }}
         >
           <div
-            className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider"
+            className="px-3 py-1.5 text-[13px] font-medium"
             style={{ color: 'var(--text-muted)' }}
           >
             {t(`settings.tokenGroup.${group.label.toLowerCase()}`) || group.label}
@@ -2944,8 +2870,8 @@ function CustomThemeEditor() {
 
       {/* Terminal palette preset */}
       <div
-        className="flex items-center justify-between px-3 py-2 rounded-[7px]"
-        style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
+        className="flex items-center justify-between px-3 py-2 rounded-[12px]"
+        style={{ backgroundColor: 'var(--surface-fill)', border: '1px solid var(--surface-hairline)' }}
       >
         <div className="flex flex-col">
           <span className="text-[11px] text-[color:var(--text-sub)]">{t('settings.xtermPalette') || 'Terminal Palette'}</span>
@@ -2954,8 +2880,8 @@ function CustomThemeEditor() {
           </span>
         </div>
         <select
-          className={`text-[11px] rounded px-2 py-0.5 font-mono ${FOCUS_RING}`}
-          style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--text-main)', border: '1px solid var(--bg-overlay)' }}
+          className={`text-[13px] rounded-[8px] px-2 py-1 ${FOCUS_RING}`}
+          style={{ backgroundColor: 'var(--surface-fill)', color: 'var(--text-main)', border: '1px solid var(--surface-hairline)' }}
           value={customThemeColors.xtermPaletteId}
           onChange={(e) => updateCustomThemeColor('xtermPaletteId', e.target.value as XtermPaletteId)}
         >
@@ -2967,7 +2893,7 @@ function CustomThemeEditor() {
 
       {/* Per-slot terminal color overrides on top of the preset */}
       <XtermOverrideEditor />
-    </div>
+    </SettingsSection>
   );
 }
 
@@ -3051,8 +2977,8 @@ function XtermOverrideEditor() {
 
   return (
     <div
-      className="rounded-[7px] overflow-hidden"
-      style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
+      className="rounded-[12px] overflow-hidden"
+      style={{ backgroundColor: 'var(--surface-fill)', border: '1px solid var(--surface-hairline)' }}
     >
       <button
         type="button"
@@ -3083,7 +3009,7 @@ function XtermOverrideEditor() {
           {XTERM_SLOT_GROUPS.map((group) => (
             <div key={group.labelKey}>
               <div
-                className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider"
+                className="px-3 py-1 text-[13px] font-medium"
                 style={{ color: 'var(--text-muted)' }}
               >
                 {t(group.labelKey) || group.fallback}
@@ -3109,12 +3035,9 @@ function XtermOverrideEditor() {
                           {t(labelKey) || fallback}
                         </span>
                         {isOverridden && (
-                          <span
-                            className="text-[10px] uppercase tracking-wider rounded px-1"
-                            style={{ color: 'var(--accent-blue)', border: '1px solid var(--accent-blue)' }}
-                          >
+                          <Badge>
                             {t('settings.xtermSlotOverridden') || 'custom'}
-                          </span>
+                          </Badge>
                         )}
                       </div>
                       <span className="text-[10px] text-[color:var(--text-muted)] font-mono tabular-nums">{effective.toUpperCase()}</span>
@@ -3152,7 +3075,7 @@ function XtermOverrideEditor() {
                 type="button"
                 onClick={clearXtermOverrides}
                 className="px-2 py-1 rounded text-[10px] font-medium transition-colors"
-                style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--accent-red)', border: '1px solid var(--bg-overlay)' }}
+                style={{ backgroundColor: 'var(--surface-fill)', color: 'var(--accent-red)', border: '1px solid var(--surface-hairline)' }}
               >
                 {t('settings.xtermResetAll') || 'Reset all to preset'}
               </button>
@@ -3166,18 +3089,6 @@ function XtermOverrideEditor() {
 
 // ─── Theme preview thumbnail ─────────────────────────────────────────────────
 
-// Hover/lift for the theme cards. The lift shadow uses `filter: drop-shadow`
-// (not box-shadow) so it never collides with FOCUS_RING or the selected card's
-// box-shadow ring, and the whole thing collapses under prefers-reduced-motion.
-const THEME_CARD_STYLE = `
-.theme-card { transition: transform 140ms ease-out, filter 140ms ease-out; }
-.theme-card:hover { transform: translateY(-1px); filter: drop-shadow(0 4px 8px rgba(0,0,0,0.35)); }
-@media (prefers-reduced-motion: reduce) {
-  .theme-card { transition: none; }
-  .theme-card:hover { transform: none; }
-}
-`;
-
 /**
  * A miniature "fake app slice" rendered from a theme's REAL derived palette —
  * deriveBuiltinPalette(id) for built-ins, deriveFullPalette(customThemeColors)
@@ -3185,28 +3096,39 @@ const THEME_CARD_STYLE = `
  * of an abstract dot cluster or a hand-maintained tuple. Because the custom
  * card's palette is derived on each render, it tracks the user's live edits.
  */
-function ThemeThumbnail({ palette }: { palette: FullCssPalette }) {
+function ThemeThumbnail({ palette, look }: { palette: FullCssPalette; look?: ThemeStyle }) {
+  // A miniature of the window in this theme: a sidebar with a selected row
+  // (drawn the theme's way — fill, fill + ring, or a left bar), a sample of
+  // its UI face, and a chip with its radius. Older themes without style
+  // knobs draw the plain fill.
+  const selectionFill = look?.selectionFill ?? palette.bgSurface;
+  const ring = look?.selection === 'fill-ring'
+    ? `inset 0 0 0 1px ${look.selectionRing ?? look.stroke ?? palette.textMuted}`
+    : look?.selection === 'left-bar' ? `inset 2px 0 0 ${palette.accent}` : 'none';
+  const chipRadius = Math.min(look?.chipRadius ?? 6, 999);
   return (
     <div
-      className="w-full flex flex-col gap-1 p-1.5"
-      style={{ height: 52, backgroundColor: palette.bgBase, borderTopLeftRadius: 7, borderTopRightRadius: 7 }}
+      className="w-full flex gap-1.5 p-1.5"
+      style={{ height: 64, backgroundColor: palette.bgBase, fontFamily: look?.uiFont }}
       aria-hidden="true"
     >
-      {/* Top row: an accent-glow "cursor" dot + a primary-text title bar. */}
-      <div className="flex items-center gap-1">
+      <div className="flex flex-col gap-1 rounded p-1" style={{ width: '42%', backgroundColor: palette.bgMantle }}>
+        <span className="rounded-full" style={{ height: 3, width: '70%', backgroundColor: palette.textMuted }} />
         <span
-          className="rounded-full shrink-0"
-          style={{ width: 6, height: 6, backgroundColor: palette.accentCursor, boxShadow: `0 0 4px ${palette.accentCursor}` }}
+          className="rounded-sm"
+          style={{ height: 10, width: '100%', backgroundColor: selectionFill, boxShadow: ring }}
         />
-        <span className="rounded-full" style={{ height: 3, width: '55%', backgroundColor: palette.textMain }} />
+        <span className="rounded-full" style={{ height: 3, width: '55%', backgroundColor: palette.textSub }} />
       </div>
-      {/* Elevated surface block. */}
-      <span className="rounded" style={{ height: 9, width: '100%', backgroundColor: palette.bgSurface }} />
-      {/* Bottom row: a secondary-text bar + two status dots (success / danger). */}
-      <div className="flex items-center gap-1 mt-auto">
-        <span className="rounded-full" style={{ height: 3, width: '40%', backgroundColor: palette.textSub }} />
-        <span className="rounded-full shrink-0 ml-auto" style={{ width: 5, height: 5, backgroundColor: palette.accentGreen }} />
-        <span className="rounded-full shrink-0" style={{ width: 5, height: 5, backgroundColor: palette.accentRed }} />
+      <div className="flex flex-1 flex-col gap-1 min-w-0">
+        <span className="text-[13px] leading-none font-semibold" style={{ color: palette.textMain }}>Aa</span>
+        <span className="rounded-full" style={{ height: 3, width: '80%', backgroundColor: palette.textSub }} />
+        <div className="mt-auto flex items-center gap-1">
+          <span style={{ height: 9, width: 22, borderRadius: chipRadius, backgroundColor: palette.bgSurface }} />
+          <span className="rounded-full shrink-0" style={{ width: 5, height: 5, backgroundColor: palette.accent }} />
+          <span className="rounded-full shrink-0 ml-auto" style={{ width: 5, height: 5, backgroundColor: palette.accentGreen }} />
+          <span className="rounded-full shrink-0" style={{ width: 5, height: 5, backgroundColor: palette.accentRed }} />
+        </div>
       </div>
     </div>
   );
@@ -3387,42 +3309,34 @@ function FontFamilyField() {
             placeholder={t('settings.fontCustomPlaceholder')}
             spellCheck={false}
             autoComplete="off"
-            className="text-xs rounded-md px-2 py-1 flex-1 focus:outline-none focus:ring-1 focus:ring-[color:var(--accent-blue)] font-mono"
-            style={{
-              backgroundColor: 'var(--bg-surface)',
-              color: 'var(--text-main)',
-              border: '1px solid var(--bg-overlay)',
-              minWidth: 120,
-            }}
+            className="ui-input settings-input font-mono flex-1"
+            style={{ minWidth: 120 }}
           />
-          <button
-            type="button"
+          <UiButton
+            variant="icon"
             onClick={applyCustom}
             aria-label={t('settings.fontApply')}
             title={t('settings.fontApply')}
-            className="text-xs rounded-md px-1.5 py-1 shrink-0 focus:outline-none focus:ring-1 focus:ring-[color:var(--accent-blue)]"
-            style={{ backgroundColor: 'var(--accent-blue)', color: 'var(--bg-base)' }}
+            className="shrink-0"
           >
-            ✓
-          </button>
-          <button
-            type="button"
+            <IconCheck size={12} />
+          </UiButton>
+          <UiButton
+            variant="icon"
             onClick={exitCustom}
             aria-label={t('settings.fontCancel')}
             title={t('settings.fontCancel')}
-            className="text-xs rounded-md px-1.5 py-1 shrink-0 focus:outline-none focus:ring-1 focus:ring-[color:var(--accent-blue)]"
-            style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--text-sub)', border: '1px solid var(--bg-overlay)' }}
+            className="shrink-0"
           >
-            ✕
-          </button>
+            <IconX size={12} />
+          </UiButton>
         </div>
         <div
           className="text-xs rounded-md px-2 py-1 w-full text-right truncate"
           style={{
             fontFamily: terminalFontFamilyCss(customText),
             color: 'var(--text-sub)',
-            backgroundColor: 'var(--bg-base)',
-            border: '1px solid var(--bg-surface)',
+            border: '1px solid var(--surface-hairline)',
             minWidth: 180,
           }}
           aria-hidden="true"
@@ -3489,30 +3403,27 @@ function FontFamilyField() {
           placeholder={open && terminalFontFamily ? terminalFontFamily : t('settings.fontFamilyPlaceholder')}
           spellCheck={false}
           autoComplete="off"
-          className="text-xs rounded-md pl-2 pr-6 py-1 w-full focus:outline-none focus:ring-1 focus:ring-[color:var(--accent-blue)] font-mono"
-          style={{
-            backgroundColor: 'var(--bg-surface)',
-            color: 'var(--text-main)',
-            border: '1px solid var(--bg-overlay)',
-          }}
+          className="ui-input settings-input font-mono w-full"
+          style={{ paddingRight: 28 }}
         />
         {/* Chevron affordance — signals this is a dropdown, not a plain field. */}
         <span
-          className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px]"
-          style={{ color: 'var(--text-muted)' }}
+          className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 inline-flex"
+          style={{ color: 'var(--text-sub)' }}
           aria-hidden="true"
         >
-          ▼
+          <Icon size={12}><polyline points="3.5,5.5 7,9 10.5,5.5" /></Icon>
         </span>
         {open && (
           <ul
             ref={listRef}
             id="terminal-font-listbox"
             role="listbox"
-            className="absolute right-0 z-50 mt-1 max-h-60 w-full overflow-y-auto rounded-md py-1 shadow-lg"
+            className="absolute right-0 z-50 mt-1 max-h-60 w-full overflow-y-auto rounded-[10px] p-1"
             style={{
-              backgroundColor: 'var(--bg-surface)',
-              border: '1px solid var(--bg-overlay)',
+              backgroundColor: 'var(--bg-base)',
+              border: '1px solid var(--surface-hairline)',
+              boxShadow: 'var(--surface-shadow)',
             }}
           >
             {filtered.map((f, i) => {
@@ -3531,12 +3442,12 @@ function FontFamilyField() {
                     selectFont(f);
                   }}
                   onMouseEnter={() => setHighlight(i)}
-                  className="flex items-center justify-between gap-2 px-2 py-1 text-xs cursor-pointer"
+                  className="flex items-center justify-between gap-2 px-2 py-1.5 text-xs cursor-pointer rounded-[6px]"
                   style={{
                     // Greyed when not installed (renders via fallback anyway).
                     fontFamily: terminalFontFamilyCss(f),
                     color: installed ? 'var(--text-main)' : 'var(--text-muted)',
-                    backgroundColor: isHi ? 'var(--bg-overlay)' : 'transparent',
+                    backgroundColor: isHi ? 'var(--surface-fill-hover)' : 'transparent',
                   }}
                 >
                   <span className="truncate">{f}</span>
@@ -3547,8 +3458,8 @@ function FontFamilyField() {
                       </span>
                     )}
                     {isCurrent && (
-                      <span style={{ color: 'var(--accent-blue)' }} aria-hidden="true">
-                        ✓
+                      <span className="inline-flex" style={{ color: 'var(--text-main)' }} aria-hidden="true">
+                        <IconCheck size={12} />
                       </span>
                     )}
                   </span>
@@ -3570,12 +3481,12 @@ function FontFamilyField() {
               }}
               className="sticky bottom-0 flex items-center gap-1.5 px-2 py-1.5 text-xs cursor-pointer border-t"
               style={{
-                backgroundColor: 'var(--bg-surface)',
-                borderColor: 'var(--bg-overlay)',
-                color: 'var(--accent-blue)',
+                backgroundColor: 'var(--bg-base)',
+                borderColor: 'var(--surface-hairline)',
+                color: 'var(--text-main)',
               }}
             >
-              <span aria-hidden="true">＋</span>
+              <span aria-hidden="true" className="inline-flex"><IconPlus size={12} /></span>
               <span>{t('settings.fontCustom')}</span>
             </li>
           </ul>
@@ -3588,8 +3499,7 @@ function FontFamilyField() {
         style={{
           fontFamily: terminalFontFamilyCss(previewTarget),
           color: 'var(--text-sub)',
-          backgroundColor: 'var(--bg-base)',
-          border: '1px solid var(--bg-surface)',
+          border: '1px solid var(--surface-hairline)',
           minWidth: 180,
         }}
         aria-hidden="true"
@@ -3641,14 +3551,19 @@ function TabAppearance() {
   const setTerminalCursorStyle = useStore((s) => s.setTerminalCursorStyle);
 
   const sidebarPosition = useStore((s) => s.sidebarPosition);
-  const sidebarAttentionFirst = useStore((s) => s.sidebarAttentionFirst);
-  const setSidebarAttentionFirst = useStore((s) => s.setSidebarAttentionFirst);
+  const sidebarSortMode = useStore((s) => s.sidebarSortMode);
+  const setSidebarSortMode = useStore((s) => s.setSidebarSortMode);
+  const sidebarShowPaneCoordinates = useStore((s) => s.sidebarShowPaneCoordinates);
+  const setSidebarShowPaneCoordinates = useStore((s) => s.setSidebarShowPaneCoordinates);
+  const workspaceSettleIdleDays = useStore((s) => s.workspaceSettle.idleDays);
   const setSidebarPosition = useStore((s) => s.setSidebarPosition);
   const multiviewArrangement = useStore((s) => s.multiviewArrangement);
   const setMultiviewArrangement = useStore((s) => s.setMultiviewArrangement);
 
   const paneActionsVisible = useStore((s) => s.paneActionsVisible);
   const setPaneActionsVisible = useStore((s) => s.setPaneActionsVisible);
+  const chatViewEnabled = useStore((s) => s.chatViewEnabled);
+  const setChatViewEnabled = useStore((s) => s.setChatViewEnabled);
   const titlebarClockVisible = useStore((s) => s.titlebarClockVisible);
   const setTitlebarClockVisible = useStore((s) => s.setTitlebarClockVisible);
   const paneNewTerminalButton = useStore((s) => s.paneNewTerminalButton);
@@ -3673,12 +3588,14 @@ function TabAppearance() {
   const customThemeColors = useStore((s) => s.customThemeColors) ?? DEFAULT_CUSTOM_THEME;
 
   return (
-    <div className="flex flex-col gap-4">
-      {/* Theme */}
-      <div data-setting-id="theme" className="flex flex-col gap-2 scroll-mt-4">
-        <SectionLabel label={t('settings.theme')} />
-        <style>{THEME_CARD_STYLE}</style>
-        <div className="grid grid-cols-3 gap-2" role="radiogroup" aria-label={t('settings.theme')}>
+    <div className="settings-page">
+      {/* Theme — visual cards on the surface radii and hairlines. Selection is
+          a neutral outline + check, never steel (steel is focus only). */}
+      <section data-setting-id="theme" className="settings-section scroll-mt-4">
+        <div className="settings-section-head">
+          <h3 className="ui-group-label settings-section-title">{t('settings.theme')}</h3>
+        </div>
+        <div className="grid grid-cols-3 gap-3" role="radiogroup" aria-label={t('settings.theme')}>
           {THEME_OPTIONS.map(({ value, label }) => {
             const selected = currentTheme === value;
             const palette = value === 'custom'
@@ -3687,27 +3604,25 @@ function TabAppearance() {
             return (
               <button
                 key={value}
+                type="button"
                 onClick={() => setTheme(value)}
                 role="radio"
                 aria-checked={selected}
                 aria-label={label}
-                className={`theme-card rounded-[7px] overflow-hidden text-left ${FOCUS_RING}`}
-                style={{
-                  border: `1px solid ${selected ? 'var(--accent-blue)' : 'var(--bg-surface)'}`,
-                  // Ring + a soft lift shadow on the selected card. Uses inline
-                  // box-shadow because the selected card always equals the live
-                  // theme, so its own accent-blue == var(--accent-blue).
-                  boxShadow: selected ? '0 0 0 2px var(--accent-blue), 0 4px 12px rgba(0,0,0,0.28)' : undefined,
-                }}
+                className={`settings-theme-card ${FOCUS_RING}`}
               >
-                <ThemeThumbnail palette={palette} />
+                <ThemeThumbnail palette={palette} look={value === 'custom' ? undefined : THEME_STYLES[value as BuiltinThemeId]} />
                 <div
-                  className="flex items-center justify-between gap-1 px-2 py-1"
-                  style={{ backgroundColor: palette.bgMantle, color: selected ? palette.textMain : palette.textSub }}
+                  className="flex items-center justify-between gap-1 px-2.5 py-1.5"
+                  style={{
+                    backgroundColor: palette.bgMantle,
+                    color: selected ? palette.textMain : palette.textSub,
+                    fontFamily: value === 'custom' ? undefined : THEME_STYLES[value as BuiltinThemeId]?.uiFont,
+                  }}
                 >
-                  <span className="text-[11px] truncate">{label}</span>
+                  <span className="text-[13px] truncate">{label}</span>
                   {selected && (
-                    <span className="shrink-0 inline-flex" style={{ color: 'var(--accent-blue)' }} aria-hidden="true">
+                    <span className="shrink-0 inline-flex" style={{ color: palette.textMain }} aria-hidden="true">
                       <IconCheck size={12} />
                     </span>
                   )}
@@ -3716,143 +3631,12 @@ function TabAppearance() {
             );
           })}
         </div>
-      </div>
+      </section>
 
       {/* Custom theme editor — shown when custom theme selected */}
       {currentTheme === 'custom' && <CustomThemeEditor />}
 
-      <div className="flex flex-col gap-2">
-        <SectionLabel label={t('settings.terminal')} />
-        <SettingRow id="fontsize" label={t('settings.fontSize')} description={`${terminalFontSize}px — ${t('settings.fontSizeRange')}`}>
-          <div className="flex items-center gap-2">
-            <input
-              type="range"
-              min={12}
-              max={24}
-              value={terminalFontSize}
-              onChange={(e) => setTerminalFontSize(Number(e.target.value))}
-              aria-label={t('settings.fontSize')}
-              className="w-24 accent-[color:var(--accent-blue)]"
-            />
-            <span className="text-xs font-mono tabular-nums text-[color:var(--text-sub)] w-6 text-right">{terminalFontSize}</span>
-          </div>
-        </SettingRow>
-        <SettingRow id="fontfamily" label={t('settings.fontFamily')} description={t('settings.fontFamilyDesc')}>
-          <FontFamilyField />
-        </SettingRow>
-        <Card data-setting-id="cursorshape" className="flex flex-col px-3 py-2.5 scroll-mt-4">
-          <p className="text-sm text-[color:var(--text-main)]">{t('settings.cursorShape')}</p>
-          <p className="text-[11px] text-[color:var(--text-muted)] mt-0.5">{t('settings.cursorShapeDesc')}</p>
-          <CursorShapePicker value={terminalCursorStyle} onChange={setTerminalCursorStyle} t={t} />
-        </Card>
-      </div>
-
-      <div className="flex flex-col gap-2">
-        <SectionLabel label={t('settings.layout')} />
-        <SettingRow id="chrome" label={t('settings.chromePreset')} description={t('settings.chromePresetDesc')}>
-          <ChromePresetActionsView onApply={applyChromePresetWithFeedback} />
-        </SettingRow>
-        <SettingRow id="sidebarpos" label={t('settings.sidebarPosition')} description={t('settings.sidebarPositionDesc')}>
-          <div className="flex rounded-[5px] overflow-hidden" style={{ border: '1px solid var(--bg-overlay)' }}>
-            {(['left', 'right'] as const).map((pos) => (
-              <button
-                key={pos}
-                onClick={() => setSidebarPosition(pos)}
-                className="px-3 py-1 text-xs font-mono transition-colors"
-                style={{
-                  backgroundColor: sidebarPosition === pos ? 'var(--accent-blue)' : 'var(--bg-surface)',
-                  color: sidebarPosition === pos ? 'var(--bg-base)' : 'var(--text-subtle)',
-                }}
-              >
-                {pos === 'left' ? t('settings.sidebarLeft') : t('settings.sidebarRight')}
-              </button>
-            ))}
-          </div>
-        </SettingRow>
-        {/* Off by default on purpose: a list that reorders itself under the
-            user's eyes costs more than the scan it saves. */}
-        <SettingRow
-          id="sidebarattention"
-          label={t('settings.sidebarAttentionFirst')}
-          description={t('settings.sidebarAttentionFirstDesc')}
-        >
-          <Toggle
-            checked={sidebarAttentionFirst}
-            onChange={setSidebarAttentionFirst}
-            label={t('settings.sidebarAttentionFirst')}
-          />
-        </SettingRow>
-        <SettingRow
-          id="multiview"
-          label={t('settings.multiviewArrangement')}
-          description={t('settings.multiviewArrangementDesc')}
-        >
-          <div
-            role="group"
-            aria-label={t('settings.multiviewArrangement')}
-            className="flex rounded-[5px] overflow-hidden"
-            style={{ border: '1px solid var(--bg-overlay)' }}
-          >
-            {MULTIVIEW_ARRANGEMENTS.map((mode) => (
-              <button
-                key={mode}
-                onClick={() => setMultiviewArrangement(mode)}
-                // Selection is colour-only otherwise, so a screen reader hears
-                // three plain buttons with no way to tell which one is active.
-                aria-pressed={multiviewArrangement === mode}
-                className="px-3 py-1 text-xs font-mono transition-colors"
-                style={{
-                  backgroundColor: multiviewArrangement === mode ? 'var(--accent-blue)' : 'var(--bg-surface)',
-                  color: multiviewArrangement === mode ? 'var(--bg-base)' : 'var(--text-subtle)',
-                }}
-              >
-                {mode === 'auto'
-                  ? t('settings.multiviewAuto')
-                  : mode === 'columns'
-                    ? t('settings.multiviewColumns')
-                    : t('settings.multiviewRows')}
-              </button>
-            ))}
-          </div>
-        </SettingRow>
-        <SettingRow label={t('settings.paneActionsVisible')} description={t('settings.paneActionsVisibleDesc')}>
-          <Toggle
-            checked={paneActionsVisible}
-            onChange={setPaneActionsVisible}
-            label={t('settings.paneActionsVisible')}
-          />
-        </SettingRow>
-        {/* Off by default — the OS draws a clock already, and a permanent
-            reading in the titlebar is the dead gauge DESIGN.md rules out. */}
-        <SettingRow label={t('settings.titlebarClock')} description={t('settings.titlebarClockDesc')}>
-          <Toggle
-            checked={titlebarClockVisible}
-            onChange={setTitlebarClockVisible}
-            label={t('settings.titlebarClock')}
-          />
-        </SettingRow>
-        {/* Labelled experimental on purpose: this is the one toggle here that
-            changes what wmux RECOMMENDS, not just what it shows. See the
-            uiSlice note. */}
-        <SettingRow
-          label={t('settings.paneNewTerminalButton')}
-          description={t('settings.paneNewTerminalButtonDesc')}
-        >
-          <div className="flex items-center gap-2">
-            <span
-              className="text-[10px] px-1 py-0.5 rounded"
-              style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--text-muted)' }}
-              title={t('settings.paneNewTerminalButtonDesc')}
-            >
-              experimental
-            </span>
-            <Toggle
-              checked={paneNewTerminalButton}
-              onChange={setPaneNewTerminalButton}
-              label={t('settings.paneNewTerminalButton')}
-            />
-          </div>
-        </SettingRow>
+      <SettingsSection title={t('settings.sectionInterface')}>
         <SettingRow id="uiscale" label={t('settings.uiScale')} description={t('settings.uiScaleDesc')}>
           <div className="flex items-center gap-2">
             <input
@@ -3863,14 +3647,170 @@ function TabAppearance() {
               value={uiScale}
               onChange={(e) => setUiScale(Number(e.target.value))}
               aria-label={t('settings.uiScale')}
-              className="w-24 accent-[color:var(--accent-blue)]"
+              className={`settings-range ${FOCUS_RING}`}
             />
-            <span className="text-xs font-mono tabular-nums text-[color:var(--text-sub)] w-8 text-right">
+            <span className="settings-range-value">
               {Math.round(uiScale * 100)}%
             </span>
           </div>
         </SettingRow>
-      </div>
+        <SettingRow id="chrome" label={t('settings.chromePreset')} description={t('settings.chromePresetDesc')}>
+          <ChromePresetActionsView onApply={applyChromePresetWithFeedback} />
+        </SettingRow>
+        {/* Off by default — the OS draws a clock already, and a permanent
+            reading in the titlebar is the dead gauge DESIGN.md rules out. */}
+        <SettingRow label={t('settings.titlebarClock')} description={t('settings.titlebarClockDesc')}>
+          <Toggle
+            checked={titlebarClockVisible}
+            onChange={setTitlebarClockVisible}
+            label={t('settings.titlebarClock')}
+          />
+        </SettingRow>
+      </SettingsSection>
+
+      <SettingsSection title={t('settings.sectionSidebar')}>
+        <SettingRow id="sidebarpos" label={t('settings.sidebarPosition')} description={t('settings.sidebarPositionDesc')}>
+          <SegmentedControl
+            value={sidebarPosition}
+            onValueChange={setSidebarPosition}
+            options={[
+              { value: 'left', label: t('settings.sidebarLeft') },
+              { value: 'right', label: t('settings.sidebarRight') },
+            ]}
+          />
+        </SettingRow>
+        {/* Manual by default on purpose: a list that reorders itself under the
+            user's eyes costs more than the scan it saves. #1481 adds "Recent
+            activity" beside needs-you-first; the row id stays for deep links. */}
+        <SettingRow
+          id="sidebarattention"
+          label={t('settings.sidebarSort')}
+          description={t('settings.sidebarSortDesc')}
+        >
+          <SegmentedControl
+            value={sidebarSortMode}
+            onValueChange={setSidebarSortMode}
+            options={[
+              { value: 'attention', label: t('settings.sidebarSortAttention') },
+              { value: 'manual', label: t('settings.sidebarSortManual') },
+              { value: 'recent', label: t('settings.sidebarSortRecent') },
+            ]}
+          />
+        </SettingRow>
+        {/* #1326 — on by default: turning it off is an explicit opt-out, not a
+            behavior change nobody asked for. */}
+        <SettingRow
+          id="sidebarpanecoordinates"
+          label={t('settings.sidebarShowPaneCoordinates')}
+          description={t('settings.sidebarShowPaneCoordinatesDesc')}
+        >
+          <Toggle
+            checked={sidebarShowPaneCoordinates}
+            onChange={setSidebarShowPaneCoordinates}
+            label={t('settings.sidebarShowPaneCoordinates')}
+          />
+        </SettingRow>
+        {/* Main owns the value (it runs the idle rule while the window is
+            closed). The field shows it at once and main's reply confirms it. */}
+        <SettingRow
+          id="workspacesettleidle"
+          label={t('settings.workspaceSettleIdleDays')}
+          description={t('settings.workspaceSettleIdleDaysDesc')}
+        >
+          <SettingNumberInput
+            value={workspaceSettleIdleDays}
+            min={MIN_WORKSPACE_IDLE_DAYS}
+            max={MAX_WORKSPACE_IDLE_DAYS}
+            label={t('settings.workspaceSettleIdleDays')}
+            onChange={(days) => {
+              useStore.getState().setWorkspaceSettleIdleDays(days);
+              sendWorkspaceSettleIdleDays(days);
+            }}
+          />
+        </SettingRow>
+      </SettingsSection>
+
+      <SettingsSection title={t('settings.sectionPanes')}>
+        <SettingRow
+          id="multiview"
+          label={t('settings.multiviewArrangement')}
+          description={t('settings.multiviewArrangementDesc')}
+        >
+          <SegmentedControl
+            value={multiviewArrangement}
+            onValueChange={setMultiviewArrangement}
+            options={MULTIVIEW_ARRANGEMENTS.map((mode) => ({
+              value: mode,
+              label: mode === 'auto'
+                ? t('settings.multiviewAuto')
+                : mode === 'columns'
+                  ? t('settings.multiviewColumns')
+                  : t('settings.multiviewRows'),
+            }))}
+          />
+        </SettingRow>
+        <SettingRow label={t('settings.paneActionsVisible')} description={t('settings.paneActionsVisibleDesc')}>
+          <Toggle
+            checked={paneActionsVisible}
+            onChange={setPaneActionsVisible}
+            label={t('settings.paneActionsVisible')}
+          />
+        </SettingRow>
+        {/* Labelled experimental on purpose: this is the one toggle here that
+            changes what wmux RECOMMENDS, not just what it shows. See the
+            uiSlice note. */}
+        <SettingRow
+          label={t('settings.paneNewTerminalButton')}
+          description={t('settings.paneNewTerminalButtonDesc')}
+        >
+          <div className="flex items-center gap-3">
+            <Badge title={t('settings.paneNewTerminalButtonDesc')}>{t('settings.mcpExperimental')}</Badge>
+            <Toggle
+              checked={paneNewTerminalButton}
+              onChange={setPaneNewTerminalButton}
+              label={t('settings.paneNewTerminalButton')}
+            />
+          </div>
+        </SettingRow>
+        {/* Off by default while experimental (PR #1440): markdown coverage is
+            incomplete and the send path is still being tested in the field. */}
+        <SettingRow label={t('settings.chatView')} description={t('settings.chatViewDesc')}>
+          <Toggle
+            checked={chatViewEnabled}
+            onChange={setChatViewEnabled}
+            label={t('settings.chatView')}
+          />
+        </SettingRow>
+      </SettingsSection>
+
+      <SettingsSection title={t('settings.terminal')} overflowVisible>
+        <SettingRow id="fontsize" label={t('settings.fontSize')} description={`${terminalFontSize}px — ${t('settings.fontSizeRange')}`}>
+          <div className="flex items-center gap-2">
+            <input
+              type="range"
+              min={12}
+              max={24}
+              value={terminalFontSize}
+              onChange={(e) => setTerminalFontSize(Number(e.target.value))}
+              aria-label={t('settings.fontSize')}
+              className={`settings-range ${FOCUS_RING}`}
+            />
+            <span className="settings-range-value">{terminalFontSize}</span>
+          </div>
+        </SettingRow>
+        <SettingRow id="fontfamily" label={t('settings.fontFamily')} description={t('settings.fontFamilyDesc')}>
+          <FontFamilyField />
+        </SettingRow>
+        <div data-setting-id="cursorshape" className="settings-block scroll-mt-4">
+          <div className="flex flex-col gap-0.5">
+            <span className="ui-field-label">{t('settings.cursorShape')}</span>
+            <span className="ui-field-description">{t('settings.cursorShapeDesc')}</span>
+          </div>
+          <CursorShapePicker value={terminalCursorStyle} onChange={setTerminalCursorStyle} t={t} />
+        </div>
+      </SettingsSection>
+
+      <AgentToolbarSection />
     </div>
   );
 }
@@ -3890,6 +3830,10 @@ export interface NotificationsViewWorkspaceRow {
   id: string;
   name: string;
   muted: boolean;
+  /** "Wake the agent on PR events" — absent reads as on (the default). */
+  prWake?: boolean;
+  /** Its "checks passed" pointer — absent reads as off (the default). */
+  prWakeChecksPassed?: boolean;
 }
 
 export interface NotificationsViewProps {
@@ -3921,6 +3865,9 @@ export interface NotificationsViewProps {
   // T12 — per-workspace mute list
   workspaces: NotificationsViewWorkspaceRow[];
   onChangeWorkspaceMuted: (workspaceId: string, muted: boolean) => void;
+  /** Per-workspace "Wake the agent on PR events"; absent hides the section. */
+  onChangeWorkspacePrWake?: (workspaceId: string, enabled: boolean) => void;
+  onChangeWorkspacePrWakeChecksPassed?: (workspaceId: string, enabled: boolean) => void;
 
   // Translator — injected so the pure view can render with the live
   // `useT()` translator in production and a static stub in tests.
@@ -3945,15 +3892,14 @@ export function NotificationsView(props: NotificationsViewProps) {
     taskbarFlashEnabled, onChangeTaskbarFlashEnabled,
     notificationSoundChoice, onChangeNotificationSoundChoice,
     mutedNotificationCategories, onChangeCategoryMuted,
-    workspaces, onChangeWorkspaceMuted,
+    workspaces, onChangeWorkspaceMuted, onChangeWorkspacePrWake, onChangeWorkspacePrWakeChecksPassed,
     t,
   } = props;
 
   return (
-    <div className="flex flex-col gap-4" data-testid="notifications-settings-section">
+    <div className="settings-page" data-testid="notifications-settings-section">
       {/* Global behavior */}
-      <div className="flex flex-col gap-2">
-        <SectionLabel label={t('settings.notificationBehavior')} />
+      <SettingsSection title={t('settings.notificationBehavior')}>
         <SettingRow id="sound" label={t('settings.sound')} description={t('settings.soundDesc')}>
           <Toggle
             checked={notificationSoundEnabled}
@@ -4000,9 +3946,9 @@ export function NotificationsView(props: NotificationsViewProps) {
               onChange={(e) => onChangePaneGlowOpacity(Number(e.target.value) / 100)}
               disabled={!paneRingEnabled}
               aria-label={t('settings.paneGlowDim')}
-              className="w-24 accent-[color:var(--accent-blue)] disabled:opacity-40"
+              className={`settings-range disabled:opacity-40 ${FOCUS_RING}`}
             />
-            <span className="text-xs font-mono tabular-nums text-[color:var(--text-sub)] w-9 text-right">{Math.round(paneGlowOpacity * 100)}%</span>
+            <span className="settings-range-value">{Math.round(paneGlowOpacity * 100)}%</span>
           </div>
         </SettingRow>
 
@@ -4025,30 +3971,23 @@ export function NotificationsView(props: NotificationsViewProps) {
         </SettingRow>
 
         {/* T12 — Notification sound choice (radio group, not a toggle) */}
-        <div
-          className="px-3 py-2.5 rounded-[7px]"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-          data-testid="notification-sound-choice-row"
-        >
-          <div className="flex items-center justify-between gap-3">
-            <div className="min-w-0 mr-3">
-              <p className="text-sm text-[color:var(--text-main)]" id="notification-sound-choice-label">
+        <div className="settings-row" data-testid="notification-sound-choice-row">
+          <div className="flex items-center justify-between gap-4">
+            <div className="min-w-0 flex flex-col gap-0.5">
+              <span className="ui-field-label" id="notification-sound-choice-label">
                 {t('settings.notificationSoundChoice')}
-              </p>
-              <p
-                className="text-[11px] text-[color:var(--text-muted)] mt-0.5"
-                id="notification-sound-choice-desc"
-              >
+              </span>
+              <span className="ui-field-description" id="notification-sound-choice-desc">
                 {t('settings.notificationSoundChoiceDesc')}
-              </p>
+              </span>
             </div>
             <div
               role="radiogroup"
               aria-labelledby="notification-sound-choice-label"
               aria-describedby="notification-sound-choice-desc"
-              className="flex items-center gap-3 shrink-0"
+              className="flex items-center gap-4 shrink-0"
             >
-              <label className="flex items-center gap-1.5 text-xs text-[color:var(--text-sub)] cursor-pointer">
+              <label className="settings-radio">
                 <input
                   type="radio"
                   name="notification-sound-choice"
@@ -4059,7 +3998,7 @@ export function NotificationsView(props: NotificationsViewProps) {
                 />
                 {t('settings.notificationSoundChoiceDefault')}
               </label>
-              <label className="flex items-center gap-1.5 text-xs text-[color:var(--text-sub)] cursor-pointer">
+              <label className="settings-radio">
                 <input
                   type="radio"
                   name="notification-sound-choice"
@@ -4073,15 +4012,16 @@ export function NotificationsView(props: NotificationsViewProps) {
             </div>
           </div>
         </div>
-      </div>
+      </SettingsSection>
 
       {/* #516 — Per-category mute. Muted categories still reach the
           notification panel; only toast/sound/ring/flash are suppressed. */}
-      <div className="flex flex-col gap-2" data-setting-id="catmute" data-testid="notification-category-section">
-        <SectionLabel label={t('settings.notificationCategories')} />
-        <p className="text-[11px] text-[color:var(--text-muted)] px-1">
-          {t('settings.notificationCategoriesDesc')}
-        </p>
+      <SettingsSection
+        id="catmute"
+        title={t('settings.notificationCategories')}
+        description={t('settings.notificationCategoriesDesc')}
+        data-testid="notification-category-section"
+      >
         {NOTIFICATION_CATEGORIES.map((category) => (
           <SettingRow
             key={category}
@@ -4095,32 +4035,21 @@ export function NotificationsView(props: NotificationsViewProps) {
             />
           </SettingRow>
         ))}
-      </div>
+      </SettingsSection>
 
       {/* T12 — Per-workspace mute list */}
-      <div className="flex flex-col gap-2" data-setting-id="wsmute" data-testid="per-workspace-mute-section">
-        <SectionLabel label={t('settings.perWorkspaceNotifications')} />
-        <p className="text-[11px] text-[color:var(--text-muted)] px-1">
-          {t('settings.perWorkspaceNotificationsDesc')}
-        </p>
+      <SettingsSection
+        id="wsmute"
+        title={t('settings.perWorkspaceNotifications')}
+        description={t('settings.perWorkspaceNotificationsDesc')}
+        data-testid="per-workspace-mute-section"
+      >
         {workspaces.length === 0 ? (
-          <p
-            className="text-[11px] text-[color:var(--text-muted)] px-3 py-2 rounded-[7px]"
-            style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-            data-testid="per-workspace-mute-empty"
-          >
+          <SettingNote data-testid="per-workspace-mute-empty">
             {t('settings.perWorkspaceNotificationsEmpty')}
-          </p>
+          </SettingNote>
         ) : (
-          <div
-            className="rounded-[7px] overflow-hidden flex flex-col"
-            style={{
-              backgroundColor: 'var(--bg-mantle)',
-              border: '1px solid var(--bg-surface)',
-              maxHeight: 240,
-              overflowY: 'auto',
-            }}
-          >
+          <div className="flex flex-col" style={{ maxHeight: 240, overflowY: 'auto' }}>
             {workspaces.map((ws, idx) => {
               const labelId = `workspace-mute-label-${ws.id}`;
               const descId = `workspace-mute-desc-${ws.id}`;
@@ -4128,19 +4057,22 @@ export function NotificationsView(props: NotificationsViewProps) {
                 <label
                   key={ws.id}
                   htmlFor={`workspace-mute-${ws.id}`}
-                  className="flex items-center justify-between px-3 py-2 cursor-pointer hover:bg-[color:var(--bg-surface)] transition-colors"
+                  className="settings-row cursor-pointer hover:bg-[color:var(--surface-fill-hover)] transition-colors"
                   style={{
-                    borderTop: idx === 0 ? 'none' : '1px solid var(--bg-surface)',
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    borderTop: idx === 0 ? 'none' : '1px solid var(--surface-hairline)',
                   }}
                   data-testid={`per-workspace-mute-row-${ws.id}`}
                 >
-                  <div className="min-w-0 mr-3">
-                    <p className="text-sm text-[color:var(--text-main)] truncate" id={labelId}>
+                  <div className="min-w-0 mr-3 flex flex-col gap-0.5">
+                    <span className="ui-field-label truncate" id={labelId}>
                       {t('settings.muteWorkspace', { name: ws.name })}
-                    </p>
-                    <p className="text-[10px] text-[color:var(--text-muted)] font-mono truncate" id={descId}>
+                    </span>
+                    <span className="ui-field-description truncate" id={descId}>
                       {ws.name}
-                    </p>
+                    </span>
                   </div>
                   <input
                     id={`workspace-mute-${ws.id}`}
@@ -4150,15 +4082,77 @@ export function NotificationsView(props: NotificationsViewProps) {
                     aria-describedby={descId}
                     onChange={(e) => onChangeWorkspaceMuted(ws.id, e.target.checked)}
                     data-testid={`per-workspace-mute-checkbox-${ws.id}`}
-                    className="shrink-0 accent-[color:var(--accent-blue)] cursor-pointer"
-                    style={{ width: 16, height: 16 }}
+                    className="settings-native-check shrink-0 cursor-pointer"
                   />
                 </label>
               );
             })}
           </div>
         )}
-      </div>
+      </SettingsSection>
+
+      {/* Per-workspace "Wake the agent on PR events" (renderer/hooks/fanoutCallerNudge.ts) */}
+      {onChangeWorkspacePrWake && workspaces.length > 0 && (
+        <SettingsSection
+          id="wsprwake"
+          title={t('settings.prWake')}
+          description={t('settings.prWakeDesc')}
+          data-testid="per-workspace-pr-wake-section"
+        >
+          <div className="flex flex-col" style={{ maxHeight: 240, overflowY: 'auto' }}>
+            {workspaces.map((ws, idx) => {
+              const labelId = `workspace-pr-wake-label-${ws.id}`;
+              const enabled = ws.prWake !== false;
+              return (
+                <div
+                  key={ws.id}
+                  className="settings-row"
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    borderTop: idx === 0 ? 'none' : '1px solid var(--surface-hairline)',
+                  }}
+                  data-testid={`per-workspace-pr-wake-row-${ws.id}`}
+                >
+                  <span className="ui-field-label truncate min-w-0 mr-3" id={labelId}>
+                    {ws.name}
+                  </span>
+                  <div className="flex items-center gap-4 shrink-0">
+                    <label className="flex items-center gap-2 cursor-pointer ui-field-description">
+                      {t('settings.prWakeFailures')}
+                      <input
+                        id={`workspace-pr-wake-${ws.id}`}
+                        type="checkbox"
+                        checked={enabled}
+                        aria-describedby={labelId}
+                        onChange={(e) => onChangeWorkspacePrWake(ws.id, e.target.checked)}
+                        data-testid={`per-workspace-pr-wake-checkbox-${ws.id}`}
+                        className="settings-native-check cursor-pointer"
+                      />
+                    </label>
+                    {onChangeWorkspacePrWakeChecksPassed && (
+                      <label className="flex items-center gap-2 cursor-pointer ui-field-description">
+                        {t('settings.prWakeChecksPassed')}
+                        <input
+                          id={`workspace-pr-wake-passed-${ws.id}`}
+                          type="checkbox"
+                          checked={enabled && ws.prWakeChecksPassed === true}
+                          disabled={!enabled}
+                          aria-describedby={labelId}
+                          onChange={(e) => onChangeWorkspacePrWakeChecksPassed(ws.id, e.target.checked)}
+                          data-testid={`per-workspace-pr-wake-passed-checkbox-${ws.id}`}
+                          className="settings-native-check cursor-pointer"
+                        />
+                      </label>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </SettingsSection>
+      )}
     </div>
   );
 }
@@ -4198,6 +4192,8 @@ function TabNotifications() {
       id: ws.id,
       name: ws.name,
       muted: ws.notificationsMuted,
+      prWake: ws.wakeOnPrEvents,
+      prWakeChecksPassed: ws.wakeOnPrChecksPassed,
     })),
     [muteRows],
   );
@@ -4225,20 +4221,68 @@ function TabNotifications() {
       onChangeCategoryMuted={setNotificationCategoryMuted}
       workspaces={workspaceRows}
       onChangeWorkspaceMuted={(id, muted) => updateWorkspaceMetadata(id, { notificationsMuted: muted })}
+      onChangeWorkspacePrWake={(id, enabled) => updateWorkspaceMetadata(id, { wakeOnPrEvents: enabled })}
+      onChangeWorkspacePrWakeChecksPassed={(id, enabled) => updateWorkspaceMetadata(id, { wakeOnPrChecksPassed: enabled })}
     />
   );
 }
 
+// ─── Dialogs Settings owns ───────────────────────────────────────────────────
+//
+// A modal opened FROM Settings (key capture, paired devices) is the top-most
+// layer: Escape closes only it and Ctrl/Cmd+F must not pull focus to the
+// search box behind it. Settings' own key handler runs first (window,
+// capture), so it has to know when one is open. Each owner registers while it
+// is open; a DOM query for any aria-modal dialog would also match dialogs
+// Settings does not own (the floating terminal stays mounted, hidden).
+const OwnedDialogContext = createContext<(delta: number) => void>(() => undefined);
+
+function useOwnedDialog(open: boolean): void {
+  const register = useContext(OwnedDialogContext);
+  useEffect(() => {
+    if (!open) return;
+    register(1);
+    return () => register(-1);
+  }, [open, register]);
+}
+
 // ─── Key capture overlay ──────────────────────────────────────────────────────
 
-function KeyCaptureOverlay({ label, onCapture, onCancel }: { label: string; onCapture: (key: string, code: string) => void; onCancel: () => void }) {
+function KeyCaptureOverlay({ label, onCapture, onCancel, record }: {
+  label: string;
+  onCapture: (key: string, code: string) => void;
+  onCancel: () => void;
+  /**
+   * How to spell the pressed combo. Default: the custom-keybinding form
+   * (literal Ctrl/Shift/Alt, no ⌘). Built-in shortcuts pass comboFromEvent,
+   * which also records ⌘ and names the key the way the resolver matches it.
+   */
+  record?: (e: KeyboardEvent) => string | null;
+}) {
   const t = useT();
+  const setKeyCaptureActive = useStore((s) => s.setKeyCaptureActive);
+  // While recording, useKeyboard stands down so a combo that is already a
+  // shortcut reaches this recorder instead of running (and being eaten).
+  useEffect(() => {
+    setKeyCaptureActive(true);
+    return () => setKeyCaptureActive(false);
+  }, [setKeyCaptureActive]);
+  useOwnedDialog(true);
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
       if (e.key === 'Escape') { onCancel(); return; }
 
+      if (record) {
+        const combo = record(e);
+        if (combo === null) return;
+        // Recorded on an IME `Process` keydown, the follow-up keydown would
+        // otherwise arrive after the recorder closed and run the new binding.
+        shortcutPressGuard.noteActed(e);
+        onCapture(combo, e.code);
+        return;
+      }
       const parts: string[] = [];
       if (e.ctrlKey) parts.push('Ctrl');
       if (e.shiftKey) parts.push('Shift');
@@ -4252,21 +4296,24 @@ function KeyCaptureOverlay({ label, onCapture, onCancel }: { label: string; onCa
     };
     window.addEventListener('keydown', handler, true);
     return () => window.removeEventListener('keydown', handler, true);
-  }, [onCapture, onCancel]);
+  }, [onCapture, onCancel, record]);
 
   return (
     <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={label}
       className="fixed inset-0 z-[var(--z-modal)] flex items-center justify-center"
       style={{ backgroundColor: 'rgba(0,0,0,0.7)' }}
       onClick={onCancel}
     >
       <div
-        className="px-8 py-6 rounded-xl text-center"
-        style={{ backgroundColor: 'var(--bg-base)', border: '2px solid var(--accent-blue)', boxShadow: '0 0 30px rgba(137,180,250,0.3)' }}
+        className="px-8 py-6 rounded-[14px] text-center"
+        style={{ backgroundColor: 'var(--bg-base)', border: '1px solid var(--surface-hairline)', boxShadow: 'var(--surface-shadow)' }}
         onClick={(e) => e.stopPropagation()}
       >
-        <p className="text-lg text-[color:var(--text-main)] font-mono mb-2">{label}</p>
-        <p className="text-xs text-[color:var(--text-muted)]">{t('settings.escToCancel')}</p>
+        <p className="text-[16px] font-semibold text-[color:var(--text-main)] mb-2">{label}</p>
+        <p className="text-[13px] text-[color:var(--text-sub)]">{t('settings.escToCancel')}</p>
       </div>
     </div>
   );
@@ -4290,22 +4337,6 @@ function keyCodeToDisplay(code: string): string {
   return KEY_CODE_DISPLAY[code] || code;
 }
 
-/**
- * Render a "Ctrl+…" key combo using the host OS convention.
- *
- * On macOS most shortcuts are mapped to ⌘ in {@link useKeyboard}; mirror that
- * here so the catalog shows what the user actually has to press.
- *
- * tmux-convention combos (Ctrl+B prefix, Ctrl+M / Ctrl+Shift+M bookmark family)
- * stay on literal Ctrl across every OS, so we never substitute ⌘ for those.
- */
-function shortcutLabel(entry: KeymapEntry): string {
-  const isMac = window.electronAPI.platform === 'darwin';
-  // literalCtrl entries (tmux prefix, bookmark family) stay literal on macOS —
-  // the flag lives in WMUX_KEYMAP so this and useKeyboard.ts can't drift.
-  return isMac ? macDisplayCombo(entry) : entry.combo;
-}
-
 const PREFIX_ACTION_IDS = [
   'splitHorizontal', 'splitVertical', 'closePane',
   'newWorkspace', 'nextWorkspace', 'prevWorkspace',
@@ -4323,15 +4354,16 @@ function prefixActionLabel(actionId: string, t: (key: string) => string): string
 
 // ─── Shortcuts tab ────────────────────────────────────────────────────────────
 
-function TabShortcuts() {
+export function TabShortcuts() {
   const t = useT();
 
   const customKeybindings = useStore((s) => s.customKeybindings);
   const addKeybinding = useStore((s) => s.addKeybinding);
   const updateKeybinding = useStore((s) => s.updateKeybinding);
   const removeKeybinding = useStore((s) => s.removeKeybinding);
-  const disabledShortcuts = useStore((s) => s.disabledShortcuts);
-  const toggleShortcutDisabled = useStore((s) => s.toggleShortcutDisabled);
+  const shortcutOverrides = useStore((s) => s.shortcutOverrides);
+  const setShortcutOverride = useStore((s) => s.setShortcutOverride);
+  const resetShortcut = useStore((s) => s.resetShortcut);
   const prefixConfig = useStore((s) => s.prefixConfig);
   const setPrefixKey = useStore((s) => s.setPrefixKey);
   const setPrefixBinding = useStore((s) => s.setPrefixBinding);
@@ -4341,138 +4373,200 @@ function TabShortcuts() {
   const [capturingPrefixKey, setCapturingPrefixKey] = useState(false);
   const [capturingBindingKey, setCapturingBindingKey] = useState<string | null>(null);
   const [addingBinding, setAddingBinding] = useState(false);
+  // #1455 — the built-in being moved to a new key, and why the last change
+  // to a row was refused.
+  const [rebinding, setRebinding] = useState<ShortcutActionId | null>(null);
+  const [shortcutNote, setShortcutNote] = useState<{ action: ShortcutActionId; text: string } | null>(null);
 
-  // Was a hand-copied subset that had drifted — Ctrl+Shift+A / Ctrl+Shift+G /
-  // Ctrl+M / Ctrl+Tab and the zoom keys are all bound but were missing, so a
-  // custom keybinding on one of them got no conflict warning and then silently
-  // never fired. Derived from WMUX_KEYMAP now (#818), and resolved for the
-  // running platform — on macOS a built-in that fires on ⌘ cannot collide with
-  // a custom binding, which is matched on literal Ctrl.
-  // #1152 — a disabled built-in no longer claims its combo, so a custom
-  // keybinding on it is a deliberate rebind, not a conflict to warn about.
-  const BUILTIN_KEYS = new Set(
-    [...builtinCombosFor(window.electronAPI?.platform === 'darwin' ? 'darwin' : 'win32')]
-      .filter((c) => !disabledShortcuts.includes(c)),
-  );
+  const platform: NodeJS.Platform = window.electronAPI?.platform === 'darwin'
+    ? 'darwin'
+    : window.electronAPI?.platform === 'linux' ? 'linux' : 'win32';
+  const bindings = effectiveBindings(platform, shortcutOverrides);
 
+  // The combos custom keybindings can lose to: every built-in in force, in
+  // the concrete form (on macOS a ⌘ built-in cannot collide with a custom
+  // binding, which is matched on literal Ctrl). A switched-off or moved
+  // built-in no longer claims its old combo, so a custom keybinding there is
+  // a deliberate rebind, not a conflict to warn about (#818, #1152). The
+  // prefix trigger claims its key too.
   const prefixKeyDisplay = `Ctrl+${keyCodeToDisplay(prefixConfig.key)}`;
+  const BUILTIN_KEYS = new Set([...builtinCombosFor(platform, shortcutOverrides), prefixKeyDisplay]);
+
   const bindingEntries = Object.entries(prefixConfig.bindings);
 
-  // OS-aware labels — macOS shows ⌘ for the cmdOrCtrl family, literal Ctrl for
-  // tmux/bookmark family. prefixKeyDisplay always renders as literal Ctrl
-  // because the prefix combo stays on Ctrl across every OS.
-  const shortcuts = [
-    // The prefix row keeps its own config below — no toggle (combo: undefined).
-    { keys: prefixKeyDisplay, description: t('settings.prefixMode'), combo: undefined as string | undefined },
-    ...ADVERTISED_SHORTCUTS.map((entry) => ({
-      keys: shortcutLabel(entry),
-      description: t(entry.descriptionKey as Parameters<typeof t>[0]),
-      // #1152 — the storage-form combo keys the disable toggle.
-      combo: entry.combo as string | undefined,
-    })),
-  ];
+  const describe = (action: ShortcutActionId): string => {
+    const row = ADVERTISED_SHORTCUTS.find((e) => e.action === action);
+    return row ? t(row.descriptionKey as Parameters<typeof t>[0], row.descriptionVars) : action;
+  };
+  // Why `combo` cannot run `action`, as a sentence — or null when it can.
+  const problemText = (action: ShortcutActionId, combo: string): string | null => {
+    const problem = rebindProblem(action, combo, bindings, platform, prefixConfig.key);
+    if (!problem) return null;
+    const shown = displayCombo(combo, platform);
+    switch (problem.kind) {
+      case 'needsModifier': return t('settings.sc.needsModifier');
+      case 'clipboard': return t('settings.sc.reservedKey', { combo: shown });
+      case 'prefix': return t('settings.sc.prefixConflict', { combo: shown });
+      case 'taken': return t('settings.sc.conflict', { name: describe(problem.by) });
+    }
+  };
+  const moveShortcut = (action: ShortcutActionId, combo: string) => {
+    const text = problemText(action, combo);
+    setShortcutNote(text ? { action, text } : null);
+    if (!text) setShortcutOverride(action, combo);
+  };
+  // Back to the default combo(s) — unless something else took one of them
+  // meanwhile, which would leave two actions on one key.
+  const restoreShortcut = (action: ShortcutActionId) => {
+    const defaults = defaultRowsFor(action).map((row) => concreteCombo(row, platform));
+    for (const combo of defaults) {
+      const text = problemText(action, combo);
+      if (text) { setShortcutNote({ action, text }); return; }
+    }
+    setShortcutNote(null);
+    resetShortcut(action);
+  };
+
+  const hasOverrides = Object.keys(shortcutOverrides).length > 0;
 
   return (
-    <div className="flex flex-col gap-1">
-      <SectionLabel label={t('settings.shortcuts')} />
-      <div
-        className="rounded-[7px] overflow-hidden py-1"
-        style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
+    <div className="settings-page">
+      <QuickLaunchSection
+        renderCapture={({ label, record, onCapture, onCancel }) => (
+          <KeyCaptureOverlay label={label} record={record} onCapture={(accelerator) => onCapture(accelerator)} onCancel={onCancel} />
+        )}
+      />
+      <SettingsSection
+        title={t('settings.shortcuts')}
+        action={hasOverrides ? (
+          <Button
+            variant="ghost"
+            onClick={() => {
+              if (!confirm(t('settings.sc.resetAllConfirm'))) return;
+              setShortcutNote(null);
+              for (const action of Object.keys(shortcutOverrides) as ShortcutActionId[]) resetShortcut(action);
+            }}
+          >
+            {t('settings.sc.resetAll')}
+          </Button>
+        ) : undefined}
       >
-        {shortcuts.map((s) => (
-          <KbdRow
-            key={s.keys}
-            keys={s.keys}
-            description={s.description}
-            // #1152 — advertised built-ins can be switched off; the key then
-            // passes through to the terminal (Codex Ctrl+T et al.).
-            disabled={s.combo ? disabledShortcuts.includes(s.combo) : undefined}
-            onToggleDisabled={s.combo ? () => toggleShortcutDisabled(s.combo as string) : undefined}
-            toggleTitle={t('settings.shortcutDisableHint')}
-          />
-        ))}
-      </div>
+        {/* The prefix row keeps its own config below — no toggle. */}
+        <KbdRow keys={prefixKeyDisplay} description={t('settings.prefixMode')} />
+        {ADVERTISED_SHORTCUTS.map((entry) => {
+          const override = shortcutOverrides[entry.action];
+          const disabled = override === null;
+          const combo = typeof override === 'string' ? override : concreteCombo(entry, platform);
+          return (
+            <KbdRow
+              key={entry.action}
+              keys={displayCombo(combo, platform)}
+              description={describe(entry.action)}
+              // #1152 — a built-in can be switched off; the key then passes
+              // through to the terminal (Codex Ctrl+T, a TUI's Alt+Up, …).
+              disabled={disabled}
+              onToggleDisabled={() => {
+                if (disabled) restoreShortcut(entry.action);
+                else { setShortcutNote(null); setShortcutOverride(entry.action, null); }
+              }}
+              toggleTitle={t('settings.shortcutDisableHint')}
+              // #1455 — or moved to any other combo.
+              onChangeKey={() => setRebinding(entry.action)}
+              changeKeyTitle={t('settings.sc.changeKey')}
+              onReset={entry.action in shortcutOverrides ? () => restoreShortcut(entry.action) : undefined}
+              resetLabel={t('settings.sc.reset')}
+              note={shortcutNote?.action === entry.action ? shortcutNote.text : undefined}
+            />
+          );
+        })}
+      </SettingsSection>
+      {rebinding && (
+        <KeyCaptureOverlay
+          label={t('settings.sc.pressNewKey', { name: describe(rebinding) })}
+          record={comboFromEvent}
+          onCapture={(combo) => {
+            moveShortcut(rebinding, combo);
+            setRebinding(null);
+          }}
+          onCancel={() => setRebinding(null)}
+        />
+      )}
+
       {/* Prefix mode configuration */}
-      <SectionLabel label={t('settings.prefixMode')} />
-
-      {/* Prefix trigger key */}
-      <div
-        className="flex items-center gap-3 px-3 py-2.5 rounded-[7px]"
-        style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
+      <SettingsSection
+        title={t('settings.prefixMode')}
+        action={(
+          <Button
+            variant="ghost"
+            onClick={() => { if (confirm(t('settings.prefixResetConfirm'))) resetPrefixConfig(); }}
+          >
+            {t('settings.prefixReset')}
+          </Button>
+        )}
       >
-        <span data-setting-id="prefix" className="text-[11px] text-[color:var(--text-sub)] font-mono flex-1 scroll-mt-4">
-          {t('settings.prefixKey')}
-        </span>
-        <span className="text-[10px] text-[color:var(--text-muted)]">{t('settings.prefixKeyDesc')}</span>
-        <button
-          className={`text-[11px] font-mono tabular-nums px-3 py-1 rounded shrink-0 ${FOCUS_RING}`}
-          style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--accent-blue)', border: '1px solid var(--bg-overlay)', minWidth: 50, textAlign: 'center' }}
-          onClick={() => setCapturingPrefixKey(true)}
-        >
-          {keyCodeToDisplay(prefixConfig.key)}
-        </button>
-      </div>
+        {/* Prefix trigger key */}
+        <SettingRow id="prefix" label={t('settings.prefixKey')} description={t('settings.prefixKeyDesc')}>
+          <button
+            type="button"
+            className={`settings-kbd ${FOCUS_RING}`}
+            style={{ minWidth: 50, justifyContent: 'center', minHeight: 28 }}
+            onClick={() => setCapturingPrefixKey(true)}
+          >
+            {keyCodeToDisplay(prefixConfig.key)}
+          </button>
+        </SettingRow>
 
-      {/* Prefix bindings list */}
-      <div className="text-[10px] text-[color:var(--text-muted)] mt-1 mb-1 px-1 flex items-center justify-between">
-        <span>{t('settings.prefixBindings')}</span>
-        <button
-          className={`text-[10px] px-1.5 py-0.5 rounded text-[color:var(--accent-yellow)] hover:text-[color:var(--text-main)] transition-colors ${FOCUS_RING}`}
-          onClick={() => { if (confirm(t('settings.prefixResetConfirm'))) resetPrefixConfig(); }}
-        >
-          {t('settings.prefixReset')}
-        </button>
-      </div>
-      <div
-        className="rounded-[7px] overflow-hidden"
-        style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-      >
+        {/* Prefix bindings list */}
+        <p className="settings-note" style={{ paddingBottom: 4 }}>{t('settings.prefixBindings')}</p>
         {bindingEntries.length === 0 ? (
-          <p className="text-[11px] text-[color:var(--text-muted)] px-3 py-2">{t('settings.kb.noBindings')}</p>
+          <SettingNote>{t('settings.kb.noBindings')}</SettingNote>
         ) : (
           bindingEntries.map(([key, actionId]) => (
-            <div key={key} className="flex items-center gap-2 px-3 py-1.5" style={{ borderBottom: '1px solid var(--bg-surface)' }}>
-              <button
-                className={`text-[10px] font-mono tabular-nums px-2 py-0.5 rounded shrink-0 ${FOCUS_RING}`}
-                style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--accent-green)', border: '1px solid var(--bg-overlay)', minWidth: 50, textAlign: 'center' }}
-                onClick={() => setCapturingBindingKey(key)}
-              >
-                {key}
-              </button>
-              <span className="text-[color:var(--text-muted)] shrink-0"><IconChevron /></span>
-              <select
-                className={`flex-1 bg-transparent text-[11px] text-[color:var(--text-sub)] font-mono outline-none cursor-pointer rounded ${FOCUS_RING}`}
-                value={actionId}
-                onChange={(e) => {
-                  removePrefixBinding(key);
-                  setPrefixBinding(key, e.target.value);
-                }}
-              >
-                {PREFIX_ACTION_IDS.map((aid) => (
-                  <option key={aid} value={aid}>{prefixActionLabel(aid, t)}</option>
-                ))}
-              </select>
-              <button
-                className={`inline-flex items-center text-[color:var(--text-subtle)] hover:text-[color:var(--accent-red)] transition-colors shrink-0 rounded ${FOCUS_RING}`}
+            <div key={key} className="settings-row settings-kbd-row">
+              <div className="flex items-center gap-3 min-w-0 flex-1">
+                <button
+                  type="button"
+                  className={`settings-kbd ${FOCUS_RING}`}
+                  // Fixed width so the action selects line up down the list.
+                  style={{ width: 88, justifyContent: 'center' }}
+                  onClick={() => setCapturingBindingKey(key)}
+                >
+                  {key}
+                </button>
+                <span className="text-[color:var(--text-muted)] shrink-0 inline-flex"><IconChevron /></span>
+                <Select
+                  aria-label={`${t('settings.prefixAction')} (${key})`}
+                  className="flex-1 min-w-0"
+                  value={actionId}
+                  onChange={(e) => {
+                    removePrefixBinding(key);
+                    setPrefixBinding(key, e.target.value);
+                  }}
+                >
+                  {PREFIX_ACTION_IDS.map((aid) => (
+                    <option key={aid} value={aid}>{prefixActionLabel(aid, t)}</option>
+                  ))}
+                </Select>
+              </div>
+              <UiButton
+                variant="icon"
+                className="shrink-0"
                 onClick={() => removePrefixBinding(key)}
                 title={t('settings.kb.delete')}
                 aria-label={t('settings.kb.delete')}
               >
-                <Icon size={12}><line x1="3" y1="3" x2="11" y2="11" /><line x1="11" y1="3" x2="3" y2="11" /></Icon>
-              </button>
+                <IconX size={12} />
+              </UiButton>
             </div>
           ))
         )}
-      </div>
-
-      {/* Add prefix binding */}
-      <button
-        className={`mt-1 px-3 py-1.5 rounded-[5px] text-xs font-mono transition-colors ${FOCUS_RING}`}
-        style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--accent-green)', border: '1px solid var(--bg-overlay)' }}
-        onClick={() => setAddingBinding(true)}
-      >
-        + {t('settings.prefixAddBinding')}
-      </button>
+        {/* Add prefix binding */}
+        <div className="settings-row" style={{ minHeight: 0 }}>
+          <Button variant="secondary" className="self-start" onClick={() => setAddingBinding(true)}>
+            <IconPlus size={12} /> {t('settings.prefixAddBinding')}
+          </Button>
+        </div>
+      </SettingsSection>
 
       {/* Prefix key capture overlay */}
       {capturingPrefixKey && (
@@ -4519,27 +4613,22 @@ function TabShortcuts() {
       )}
 
       {/* Custom keybindings */}
-      <SectionLabel id="customkeys" label={t('settings.customKeybindings')} />
+      <SettingsSection id="customkeys" title={t('settings.customKeybindings')}>
+        {/* macOS 기본 설정에서 F1–F12는 미디어 키로 동작해 F키 단독 바인딩이 발동하지 않음 → 안내 */}
+        {window.electronAPI.platform === 'darwin' && hasBareFunctionKeyBinding(customKeybindings) && (
+          <SettingNote>{t('settings.kb.macFnHint')}</SettingNote>
+        )}
 
-      {/* macOS 기본 설정에서 F1–F12는 미디어 키로 동작해 F키 단독 바인딩이 발동하지 않음 → 안내 */}
-      {window.electronAPI.platform === 'darwin' && hasBareFunctionKeyBinding(customKeybindings) && (
-        <p className="text-[11px] text-[color:var(--text-muted)] px-1">{t('settings.kb.macFnHint')}</p>
-      )}
-
-      {customKeybindings.length === 0 ? (
-        <p className="text-[11px] text-[color:var(--text-muted)] px-1">{t('settings.kb.noBindings')}</p>
-      ) : (
-        <div className="flex flex-col gap-1.5">
-          {customKeybindings.map((kb) => (
-            <div
-              key={kb.id}
-              className="flex items-center gap-2 px-3 py-2 rounded-[7px]"
-              style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-            >
+        {customKeybindings.length === 0 ? (
+          <SettingNote>{t('settings.kb.noBindings')}</SettingNote>
+        ) : (
+          customKeybindings.map((kb) => (
+            <div key={kb.id} className="settings-row settings-kbd-row">
               {/* Key badge */}
               <button
-                className={`text-[10px] font-mono tabular-nums px-2 py-0.5 rounded shrink-0 ${FOCUS_RING}`}
-                style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--accent-blue)', border: '1px solid var(--bg-overlay)', minWidth: 60, textAlign: 'center' }}
+                type="button"
+                className={`settings-kbd shrink-0 ${FOCUS_RING}`}
+                style={{ minWidth: 60, justifyContent: 'center' }}
                 onClick={() => setCapturingFor(kb.id)}
               >
                 {kb.key}
@@ -4547,25 +4636,35 @@ function TabShortcuts() {
 
               {/* Conflict warning */}
               {BUILTIN_KEYS.has(kb.key) && (
-                <span className="text-[10px] text-[color:var(--accent-yellow)] shrink-0" title={t('settings.kb.conflict')}>!</span>
+                <span
+                  role="img"
+                  aria-label={t('settings.kb.conflict')}
+                  title={t('settings.kb.conflict')}
+                  className="inline-flex shrink-0"
+                  style={{ color: 'var(--accent-yellow)' }}
+                >
+                  <IconWarning size={12} />
+                </span>
               )}
 
               {/* Label */}
-              <input
-                className="flex-1 bg-transparent text-xs text-[color:var(--text-main)] outline-none min-w-0 font-mono"
-                style={{ maxWidth: 100 }}
+              <Input
+                className="settings-input min-w-0"
+                style={{ maxWidth: 140 }}
                 value={kb.label}
                 onChange={(e) => updateKeybinding(kb.id, { label: e.target.value })}
                 placeholder={t('settings.kb.label')}
+                aria-label={t('settings.kb.label')}
                 onClick={(e) => e.stopPropagation()}
               />
 
               {/* Command */}
-              <input
-                className="flex-[2] bg-transparent text-xs text-[color:var(--text-sub2)] outline-none min-w-0 font-mono"
+              <Input
+                className="settings-input font-mono flex-[2] min-w-0"
                 value={kb.command}
                 onChange={(e) => updateKeybinding(kb.id, { command: e.target.value })}
                 placeholder={t('settings.kb.command')}
+                aria-label={t('settings.kb.command')}
                 onClick={(e) => e.stopPropagation()}
               />
 
@@ -4577,27 +4676,26 @@ function TabShortcuts() {
               />
 
               {/* Delete */}
-              <button
-                className={`inline-flex items-center text-[color:var(--text-subtle)] hover:text-[color:var(--accent-red)] transition-colors shrink-0 rounded ${FOCUS_RING}`}
+              <UiButton
+                variant="icon"
+                className="shrink-0"
                 onClick={() => removeKeybinding(kb.id)}
                 title={t('settings.kb.delete')}
                 aria-label={t('settings.kb.delete')}
               >
-                <Icon size={12}><line x1="3" y1="3" x2="11" y2="11" /><line x1="11" y1="3" x2="3" y2="11" /></Icon>
-              </button>
+                <IconX size={12} />
+              </UiButton>
             </div>
-          ))}
-        </div>
-      )}
+          ))
+        )}
 
-      {/* Add button */}
-      <button
-        className={`mt-2 px-3 py-1.5 rounded-[5px] text-xs font-mono transition-colors ${FOCUS_RING}`}
-        style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--accent-green)', border: '1px solid var(--bg-overlay)' }}
-        onClick={() => setCapturingFor('new')}
-      >
-        + {t('settings.kb.add')}
-      </button>
+        {/* Add button */}
+        <div className="settings-row" style={{ minHeight: 0 }}>
+          <Button variant="secondary" className="self-start" onClick={() => setCapturingFor('new')}>
+            <IconPlus size={12} /> {t('settings.kb.add')}
+          </Button>
+        </div>
+      </SettingsSection>
 
       {/* Key capture overlay */}
       {capturingFor && (
@@ -4625,8 +4723,8 @@ function TabShortcuts() {
 //   - "Open setup wizard"  → dispatches FIRST_RUN_REOPEN_EVENT window event
 //                            (T8a's AppLayout listens and re-mounts the wizard
 //                            in mode='reopen').
-//   - "Show keyboard cheat sheet" → flips `cheatSheetDismissed` to false in
-//                            uiSlice; T8a's effect remounts the cheat sheet.
+//   - "Show keyboard cheat sheet" → force-shows the cheat sheet (as the `?`
+//                            prefix action does) and closes Settings.
 //
 // Section name is "First-run setup" (D7-C4 — avoids collision with the
 // existing "Onboarding" spotlight tutorial).
@@ -4692,75 +4790,68 @@ export function FirstRunStatusView({ status, onOpenWizard, onShowCheatSheet }: F
   });
 
   return (
-    <div className="flex flex-col gap-4" data-testid="first-run-setup-section">
-      {/* Status */}
-      <div className="flex flex-col gap-2">
-        <SectionLabel id="firstrun" label={t('settings.firstRunSetup')} />
-
-        <div
-          className="px-3 py-2.5 rounded-[7px]"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-          data-testid="first-run-setup-last-completed"
-        >
-          <p className="text-sm text-[color:var(--text-main)]">{lastCompleted}</p>
-          <p className="text-[11px] text-[color:var(--text-muted)] mt-0.5">
-            {t('settings.firstRunSetupDesc')}
-          </p>
+    <SettingsSection id="firstrun" title={t('settings.firstRunSetup')} data-testid="first-run-setup-section">
+      <div className="settings-row" data-testid="first-run-setup-last-completed">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0 flex flex-col gap-0.5">
+            <span className="ui-field-label">{lastCompleted}</span>
+            <span className="ui-field-description">{t('settings.firstRunSetupDesc')}</span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <Button
+              variant="secondary"
+              onClick={onShowCheatSheet}
+              data-testid="first-run-setup-show-cheat-sheet"
+            >
+              {t('settings.firstRunSetup.showCheatSheet')}
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={onOpenWizard}
+              data-testid="first-run-setup-open-wizard"
+            >
+              {t('settings.firstRunSetup.openWizard')}
+            </Button>
+          </div>
         </div>
-
-        <div
-          className="px-3 py-2 rounded-[7px] flex items-center gap-2"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-          data-testid="first-run-setup-claude-row"
-        >
-          <StatusBadge ok={claudeFound} okLabel="detected" failLabel="not detected" />
-          <span className="text-sm text-[color:var(--text-main)] font-mono">{claudeStatusText}</span>
-        </div>
-
-        <div
-          className="px-3 py-2 rounded-[7px] flex items-center gap-2"
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
-          data-testid="first-run-setup-mcp-row"
-        >
-          <StatusBadge ok={mcpRegistered} okLabel="registered" failLabel="not registered" />
-          <span className="text-sm text-[color:var(--text-main)] font-mono">{mcpStatusText}</span>
-        </div>
-
-        {status?.status.claudeJsonPath && (
-          <p
-            className="text-[10px] text-[color:var(--text-muted)] mt-0.5 font-mono truncate px-3"
-            title={status.status.claudeJsonPath}
-            data-testid="first-run-setup-claude-path"
-          >
-            {status.status.claudeJsonPath}
-          </p>
-        )}
       </div>
 
-      {/* Actions */}
-      <div className="flex items-center gap-2">
-        <Button
-          variant="accent"
-          onClick={onOpenWizard}
-          data-testid="first-run-setup-open-wizard"
-        >
-          {t('settings.firstRunSetup.openWizard')}
-        </Button>
-        <Button
-          variant="secondary"
-          onClick={onShowCheatSheet}
-          data-testid="first-run-setup-show-cheat-sheet"
-        >
-          {t('settings.firstRunSetup.showCheatSheet')}
-        </Button>
+      <div className="settings-row settings-kbd-row" style={{ justifyContent: 'flex-start' }} data-testid="first-run-setup-claude-row">
+        <StatusBadge ok={claudeFound} okLabel="detected" failLabel="not detected" />
+        <span className="settings-kbd-desc">{claudeStatusText}</span>
       </div>
-    </div>
+
+      <div className="settings-row settings-kbd-row" style={{ justifyContent: 'flex-start' }} data-testid="first-run-setup-mcp-row">
+        <StatusBadge ok={mcpRegistered} okLabel="registered" failLabel="not registered" />
+        <span className="settings-kbd-desc">{mcpStatusText}</span>
+      </div>
+
+      {status?.status.claudeJsonPath && (
+        <SettingNote
+          className="font-mono truncate"
+          title={status.status.claudeJsonPath}
+          data-testid="first-run-setup-claude-path"
+        >
+          {status.status.claudeJsonPath}
+        </SettingNote>
+      )}
+    </SettingsSection>
   );
+}
+
+/**
+ * Settings › First-run setup › "Show keyboard cheat sheet": shown now, like the
+ * `?` prefix action, with Settings out of the way (the sheet sits under it).
+ * The first-boot queue only auto-shows it after the tour, which this button
+ * must not wait for.
+ */
+export function showCheatSheetFromSettings(): void {
+  useStore.getState().setCheatSheetForceShown(true);
+  useStore.getState().setSettingsPanelVisible(false);
 }
 
 function TabFirstRunSetup() {
   const [status, setStatus] = useState<FirstRunCheckResult | null>(null);
-  const setCheatSheetDismissed = useStore((s) => s.setCheatSheetDismissed);
 
   useEffect(() => {
     const api = firstRunBridgeOrNull();
@@ -4785,17 +4876,13 @@ function TabFirstRunSetup() {
     window.dispatchEvent(new CustomEvent(FIRST_RUN_REOPEN_EVENT));
   }, []);
 
-  const handleShowCheatSheet = useCallback(() => {
-    // Approach A (per task brief): flip uiSlice flag back to false. T8a's
-    // AppLayout effect on cheatSheetDismissed → false re-mounts the cheat sheet.
-    setCheatSheetDismissed(false);
-  }, [setCheatSheetDismissed]);
+
 
   return (
     <FirstRunStatusView
       status={status}
       onOpenWizard={handleOpenWizard}
-      onShowCheatSheet={handleShowCheatSheet}
+      onShowCheatSheet={showCheatSheetFromSettings}
     />
   );
 }
@@ -4804,57 +4891,53 @@ function TabAbout() {
   const t = useT();
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="settings-page">
       {/* Product header — left-aligned, name + version inline (no centered hero) */}
-      <Card className="flex items-center gap-3 px-4 py-3.5">
+      <Card className="flex items-center gap-3 px-4 py-4">
         <span
-          className="grid place-items-center rounded-md shrink-0"
-          style={{ width: 40, height: 40, backgroundColor: 'var(--bg-surface)', color: 'var(--accent-blue)' }}
+          className="grid place-items-center rounded-[10px] shrink-0"
+          style={{ width: 40, height: 40, backgroundColor: 'var(--surface-fill-hover)', color: 'var(--text-main)' }}
         >
           <Icon size={22}><path d="M7 1.5 L8 6 L12.5 7 L8 8 L7 12.5 L6 8 L1.5 7 L6 6 Z" /></Icon>
         </span>
         <div className="min-w-0">
           <div className="flex items-baseline gap-2">
-            <span className="text-base font-semibold font-mono tracking-wide text-[color:var(--text-main)]">wmux</span>
-            <span className="text-[11px] font-mono tabular-nums text-[color:var(--accent-blue)]">v{__APP_VERSION__}</span>
+            <span className="text-[16px] font-semibold text-[color:var(--text-main)]">wmux</span>
+            {/* The version string is machine evidence. */}
+            <span className="text-[11px] font-mono tabular-nums text-[color:var(--text-sub)]">v{__APP_VERSION__}</span>
           </div>
-          <p data-setting-id="version" className="text-[11px] text-[color:var(--text-muted)] mt-0.5 truncate scroll-mt-4">
+          <p data-setting-id="version" className="ui-field-description m-0 mt-0.5 truncate scroll-mt-4">
             {t('settings.aboutTagline')}
           </p>
         </div>
       </Card>
 
-      <div className="flex flex-col gap-2">
-        <SectionLabel label={t('settings.builtWith')} />
-        <Card className="px-3 py-2.5 flex flex-col gap-1.5">
-          {[
-            'Electron 41',
-            'React 19 + TypeScript 5.9',
-            'xterm.js 6 + node-pty',
-            'Vite 5 + Tailwind CSS 3',
-            'Zustand 5 + Immer',
-          ].map((item) => (
-            <div key={item} className="flex items-center gap-2">
-              <span className="shrink-0 rounded-full" style={{ width: 4, height: 4, backgroundColor: 'var(--text-muted)' }} />
-              <span className="text-[12px] text-[color:var(--text-sub)] font-mono">{item}</span>
-            </div>
-          ))}
-        </Card>
-      </div>
+      <SettingsSection title={t('settings.builtWith')}>
+        {[
+          'Electron 41',
+          'React 19 + TypeScript 5.9',
+          'xterm.js 6 + node-pty',
+          'Vite 5 + Tailwind CSS 3',
+          'Zustand 5 + Immer',
+        ].map((item) => (
+          <div key={item} className="settings-row settings-kbd-row" style={{ minHeight: 36 }}>
+            <span className="settings-kbd-desc">{item}</span>
+          </div>
+        ))}
+      </SettingsSection>
 
-      <div>
-        <SectionLabel label={t('settings.links')} />
+      <SettingsSection title={t('settings.links')}>
         <a
           href="https://github.com/openwong2kim/wmux"
           target="_blank"
           rel="noopener noreferrer"
-          className={`flex items-center gap-2 px-3 py-2.5 rounded-[5px] text-sm text-[color:var(--accent-blue)] hover:text-[color:var(--text-main)] transition-colors ${FOCUS_RING}`}
-          style={{ backgroundColor: 'var(--bg-mantle)', border: '1px solid var(--bg-surface)' }}
+          className={`settings-row settings-kbd-row justify-start gap-2 text-[13px] text-[color:var(--accent-blue)] hover:underline ${FOCUS_RING}`}
+          style={{ justifyContent: 'flex-start' }}
         >
           <IconExternalLink />
           <span>{t('settings.githubRepo')}</span>
         </a>
-      </div>
+      </SettingsSection>
     </div>
   );
 }
@@ -4957,7 +5040,7 @@ export function InspectMinimizedBar({
   );
 }
 
-export default function SettingsPanel() {
+export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
   const t = useT();
   const visible   = useStore((s) => s.settingsPanelVisible);
   const setVisible = useStore((s) => s.setSettingsPanelVisible);
@@ -4986,7 +5069,21 @@ export default function SettingsPanel() {
   }, [inspectTargetToken, inspectXtermTarget, hasTarget]);
   const showBar = shouldShowInspectBar(inspectMinimized, hasTarget, dismissedTarget);
 
-  const [activeTab, setActiveTab] = useState<TabId>('general');
+  // Every id that reaches the state goes through resolveSettingsTab, so a
+  // retired or unknown id (an old deep link) opens a real tab, never nothing.
+  // A tab asked for from elsewhere (`openSettingsTab`) wins over the default.
+  const [activeTab, setActiveTabState] = useState<TabId>(
+    () => resolveSettingsTab(initialTab ?? useStore.getState().settingsInitialTab),
+  );
+  const setActiveTab = useCallback((id: string) => setActiveTabState(resolveSettingsTab(id)), []);
+  const requestedTab = useStore((s) => s.settingsInitialTab);
+  useEffect(() => {
+    if (!requestedTab) return;
+    setActiveTab(requestedTab);
+    useStore.getState().clearSettingsInitialTab();
+  }, [requestedTab, setActiveTab]);
+  const ownedDialogs = useRef(0);
+  const registerOwnedDialog = useCallback((delta: number) => { ownedDialogs.current += delta; }, []);
   const [searchQuery, setSearchQuery] = useState('');
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -5004,7 +5101,7 @@ export default function SettingsPanel() {
     setSearchQuery('');
     setActiveTab(entry.tab);
     setHighlightId(id);
-  }, []);
+  }, [setActiveTab]);
 
   useEffect(() => {
     if (!highlightId || searching) return;
@@ -5022,18 +5119,24 @@ export default function SettingsPanel() {
   // tab so the auto-opened TokenRow / xterm slot is actually on screen.
   useEffect(() => {
     if (hasTarget && !dismissedTarget) setActiveTab('appearance');
-  }, [hasTarget, dismissedTarget]);
+  }, [hasTarget, dismissedTarget, setActiveTab]);
 
   const TAB_META: Record<TabId, { label: string; icon: ReactNode }> = {
-    general:            { label: t('settings.tabGeneral'),      icon: <IconGeneral /> },
-    terminal:           { label: t('settings.tabTerminal'),     icon: <IconTerminal /> },
-    appearance:         { label: t('settings.tabAppearance'),   icon: <IconAppearance /> },
-    notifications:      { label: t('settings.tabNotifications'), icon: <IconNotifications /> },
-    shortcuts:          { label: t('settings.tabShortcuts'),    icon: <IconShortcuts /> },
-    'claude-integration': { label: t('settings.tabAccounts'),   icon: <IconClaude /> },
-    agents:             { label: t('settings.tabAgents'),      icon: <IconAgents /> },
-    lanlink:            { label: t('settings.tabNetwork'),     icon: <IconLanLink /> },
-    about:              { label: t('settings.tabAbout'),       icon: <IconAbout /> },
+    general:              { label: t('settings.tabGeneral'),       icon: <IconGeneral /> },
+    appearance:           { label: t('settings.tabAppearance'),    icon: <IconAppearance /> },
+    terminal:             { label: t('settings.tabTerminal'),      icon: <IconTerminal /> },
+    shortcuts:            { label: t('settings.tabKeyboard'),      icon: <IconShortcuts /> },
+    notifications:        { label: t('settings.tabNotifications'), icon: <IconNotifications /> },
+    'claude-integration': { label: t('settings.tabClaudeCode'),    icon: <IconClaude /> },
+    accounts:             { label: t('settings.tabAccounts'),      icon: <IconUsers /> },
+    moa:                  { label: t('settings.tabMoa'),           icon: <IconAgents /> },
+    roles:                { label: t('settings.tabRoles'),         icon: <IconRobot /> },
+    tokens:               { label: t('settings.tabTokens'),        icon: <IconAgents /> },
+    browser:              { label: t('settings.tabBrowser'),       icon: <IconBrowser /> },
+    'computer-use':       { label: t('settings.tabComputerUse'),   icon: <IconComputer /> },
+    remote:               { label: t('settings.tabRemote'),        icon: <IconRemoteDevices /> },
+    lanlink:              { label: t('settings.tabLan'),           icon: <IconLanLink /> },
+    about:                { label: t('settings.tabAbout'),         icon: <IconAbout /> },
   };
 
   // Close on Escape (D-esc). While inspect is active the overlay owns ESC
@@ -5043,6 +5146,12 @@ export default function SettingsPanel() {
   useEffect(() => {
     if (!visible) return;
     const handler = (e: KeyboardEvent) => {
+      // A dialog Settings opened owns the keyboard (see useOwnedDialog).
+      if (ownedDialogs.current > 0) return;
+      // The palette and the notification panel float above every page and
+      // own their keys: Escape closes them first, never Settings underneath.
+      const above = useStore.getState();
+      if (above.commandPaletteVisible || above.notificationPanelVisible) return;
       if ((e.metaKey || e.ctrlKey) && (e.key === 'f' || e.key === 'F')) {
         e.preventDefault();
         e.stopPropagation();
@@ -5093,14 +5202,16 @@ export default function SettingsPanel() {
   };
 
   return (
-    // Full-bleed surface under the 36px custom titlebar (DESIGN.md Window
-    // Chrome). Settings fills the whole terminal area instead of floating as a
-    // small centered modal: no scrim, no rounding/shadow/border, opaque
-    // bg-base — it reads as an app screen, not a dialog stacked on top. Closed
-    // via Esc (keydown handler above) or the header X / footer Close.
+    // A rail page: Settings fills the sheet in place of the Workspaces page
+    // (RailPage), with its own section nav on the left — an app screen, not a
+    // dialog stacked on top. Esc (keydown handler above) or the header X go
+    // back to Workspaces. `ui-surface` scopes the quiet-surface tokens
+    // (hairlines, flat buttons, 10px inputs) to it.
+    <OwnedDialogContext.Provider value={registerOwnedDialog}>
     <div
-      className="fixed inset-x-0 bottom-0 z-50 flex flex-col"
-      style={{ top: 36, backgroundColor: 'var(--bg-base)' }}
+      className="ui-surface settings-screen wmux-page flex flex-col"
+      data-rail-page="settings"
+      style={{ backgroundColor: 'var(--bg-base)' }}
     >
       {/* Panel — fills the full-bleed surface */}
       <div
@@ -5109,33 +5220,24 @@ export default function SettingsPanel() {
         style={{ backgroundColor: 'var(--bg-base)' }}
       >
         {/* Header */}
-        <div
-          className="flex items-center justify-between px-5 py-3 shrink-0"
-          style={{ borderBottom: '1px solid var(--bg-surface)' }}
-        >
-          <span className="text-title text-[color:var(--text-main)] font-mono tracking-wide">{t('settings.title')}</span>
-          <button
-            className={`inline-flex items-center rounded p-0.5 text-[color:var(--text-subtle)] hover:text-[color:var(--text-main)] transition-colors ${FOCUS_RING}`}
+        <div className="settings-header shrink-0">
+          <h2 className="settings-header-title">{t('settings.title')}</h2>
+          <UiButton
+            variant="icon"
+            className="settings-header-close"
             onClick={handleClose}
             aria-label={t('settings.close')}
           >
             <IconX />
-          </button>
+          </UiButton>
         </div>
 
         {/* Body: left nav + right content */}
         <div className="flex flex-1 min-h-0">
           {/* Left tab navigation */}
-          <nav
-            className="flex flex-col shrink-0"
-            style={{
-              width: 200,
-              borderRight: '1px solid var(--bg-surface)',
-              backgroundColor: 'var(--bg-mantle)',
-            }}
-          >
-            <div className="px-2.5 pt-2.5 pb-1.5">
-              <input
+          <nav className="settings-nav" aria-label={t('settings.title')}>
+            <div className="settings-nav-search">
+              <Input
                 ref={searchRef}
                 type="search"
                 value={searchQuery}
@@ -5143,15 +5245,8 @@ export default function SettingsPanel() {
                 placeholder={t('settings.searchPlaceholder')}
                 aria-label={t('settings.searchPlaceholder')}
                 data-testid="settings-search"
-                className={`w-full h-7 px-2.5 rounded-md text-xs ${FOCUS_RING}`}
-                style={{
-                  backgroundColor: 'color-mix(in srgb, var(--bg-base) 80%, #000)',
-                  color: 'var(--text-main)',
-                  border: '1px solid transparent',
-                  boxShadow: 'inset 0 1px 2px rgba(0,0,0,.28)',
-                }}
               />
-              <p className="h-4 mt-1 px-0.5 text-[10px] font-mono" style={{ color: 'var(--text-muted)' }}>
+              <p className="settings-nav-count" aria-live="polite">
                 {searching
                   ? (searchHits.length
                     ? t('settings.searchMatches', { n: searchHits.length })
@@ -5159,15 +5254,12 @@ export default function SettingsPanel() {
                   : ''}
               </p>
             </div>
-            <div className="flex-1 overflow-y-auto px-2 pb-3">
+            <div className="settings-nav-list">
               {SETTINGS_NAV_GROUPS.map((group) => (
-                <div key={group.id} className="mt-2 first:mt-0">
-                  <div
-                    className="px-2 pt-1 pb-1 text-[10px] font-semibold uppercase tracking-[0.09em]"
-                    style={{ color: 'var(--text-muted)' }}
-                  >
-                    {t(group.labelKey)}
-                  </div>
+                <div key={group.id} className="settings-nav-group">
+                  {group.labelKey && (
+                    <div className="settings-nav-heading">{t(group.labelKey)}</div>
+                  )}
                   {group.tabs.map((tabId) => {
                     const tab = TAB_META[tabId];
                     const isActive = !searching && activeTab === tabId;
@@ -5175,25 +5267,22 @@ export default function SettingsPanel() {
                     return (
                       <button
                         key={tabId}
+                        type="button"
+                        data-settings-tab={tabId}
                         onClick={() => {
                           setSearchQuery('');
                           setActiveTab(tabId);
                         }}
                         aria-current={isActive ? 'page' : undefined}
-                        className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-[5px] text-left transition-colors text-[12px] ${!isActive ? 'hover:bg-[color:var(--bg-surface)]' : ''} ${FOCUS_RING}`}
-                        style={{
-                          backgroundColor: isActive ? 'var(--bg-surface)' : 'transparent',
-                          color: isActive ? 'var(--text-main)' : 'var(--text-subtle)',
-                          fontWeight: isActive ? 600 : 400,
-                          opacity: searching && hits === 0 ? 0.38 : 1,
-                        }}
+                        data-dim={searching && hits === 0 ? 'true' : undefined}
+                        className={`settings-nav-row ${FOCUS_RING}`}
                       >
-                        <span className="inline-flex items-center leading-none shrink-0" style={{ color: isActive ? 'var(--accent-blue)' : 'var(--text-muted)' }}>
+                        <span className="settings-nav-icon inline-flex items-center leading-none">
                           {tab.icon}
                         </span>
                         <span className="flex-1 truncate">{tab.label}</span>
                         {searching && hits > 0 && (
-                          <span className="font-mono text-[10px]" style={{ color: 'var(--accent-blue)' }}>{hits}</span>
+                          <span className="settings-nav-hits">{hits}</span>
                         )}
                       </button>
                     );
@@ -5206,9 +5295,8 @@ export default function SettingsPanel() {
           {/* Right content — scrolls full-width, but the content column is
               centered at a readable max-width so full-bleed doesn't stretch
               toggle rows across the whole screen. */}
-          <div className="flex-1 overflow-y-auto px-5 py-4">
-            <div className="mx-auto w-full max-w-[820px]">
-              <style>{`.settings-flash{border-color:var(--accent-blue)!important;box-shadow:0 0 0 3px color-mix(in srgb,var(--accent-blue) 22%,transparent)!important}`}</style>
+          <div className="settings-content">
+            <div className="settings-column">
               {searching ? (
                 <SettingsSearchResults
                   query={searchQuery}
@@ -5219,65 +5307,31 @@ export default function SettingsPanel() {
                 />
               ) : (
                 <>
-                  {activeTab === 'general'            && <TabGeneral />}
-                  {activeTab === 'terminal'           && <TabTerminal />}
-                  {activeTab === 'appearance'         && <TabAppearance />}
-                  {activeTab === 'notifications'      && <TabNotifications />}
-                  {activeTab === 'shortcuts'          && <TabShortcuts />}
-                  {activeTab === 'claude-integration' && <><IntegrationSetupSectionContainer /><ClaudeIntegrationSection /><AccountsSection /></>}
-                  {activeTab === 'agents'             && <TabAgents />}
-                  {activeTab === 'lanlink'            && <><LanLinkSection /><LanLinkPairingSection /></>}
-                  {activeTab === 'about'              && <><TabAbout /><TabFirstRunSetup /></>}
+                  <h1 className="settings-page-title" data-testid="settings-page-title">{TAB_META[activeTab].label}</h1>
+                  <div className="settings-page" data-settings-page={activeTab}>
+                    {activeTab === 'general'            && <TabGeneral />}
+                    {activeTab === 'appearance'         && <TabAppearance />}
+                    {activeTab === 'terminal'           && <TabTerminal />}
+                    {activeTab === 'shortcuts'          && <TabShortcuts />}
+                    {activeTab === 'notifications'      && <TabNotifications />}
+                    {activeTab === 'claude-integration' && <TabClaudeCode />}
+                    {activeTab === 'accounts'           && <AccountsSection />}
+                    {activeTab === 'moa'                && <TabMoa registerDialog={registerOwnedDialog} />}
+                    {activeTab === 'roles'              && <TabRoles />}
+          {activeTab === 'tokens'             && <TokenUsageTab onOpenTab={setActiveTab} />}
+                    {activeTab === 'browser'            && <TabBrowser />}
+                    {activeTab === 'computer-use'       && <TabComputerUse />}
+                    {activeTab === 'remote'             && <TabRemote />}
+                    {activeTab === 'lanlink'            && <><LanLinkSection /><LanLinkPairingSection /></>}
+                    {activeTab === 'about'              && <TabAbout />}
+                  </div>
                 </>
               )}
             </div>
           </div>
         </div>
-
-        {/* Footer */}
-        <div
-          className="flex items-center justify-between px-5 py-2.5 shrink-0"
-          style={{ borderTop: '1px solid var(--bg-surface)', backgroundColor: 'var(--bg-mantle)' }}
-        >
-          <span className="text-[10px] text-[color:var(--text-muted)] font-mono">{t('settings.toggleHint')}</span>
-          <button
-            className={`text-xs px-2 py-1 rounded text-[color:var(--text-subtle)] hover:text-[color:var(--text-main)] transition-colors ${FOCUS_RING}`}
-            onClick={handleClose}
-          >
-            {t('settings.close')}
-          </button>
-        </div>
       </div>
     </div>
+    </OwnedDialogContext.Provider>
   );
-}
-
-// ─── Locale flag helper ───────────────────────────────────────────────────────
-
-function localeFlag(locale: Locale): string {
-  switch (locale) {
-    case 'en': return '🇺🇸';
-    case 'ko': return '🇰🇷';
-    case 'ja': return '🇯🇵';
-    case 'zh': return '🇨🇳';
-    case 'zh-TW': return '🇹🇼';
-    case 'ar': return '🇸🇦';
-    case 'bs': return '🇧🇦';
-    case 'da': return '🇩🇰';
-    case 'de': return '🇩🇪';
-    case 'es': return '🇪🇸';
-    case 'fr': return '🇫🇷';
-    case 'hi': return '🇮🇳';
-    case 'id': return '🇮🇩';
-    case 'it': return '🇮🇹';
-    case 'ms': return '🇲🇾';
-    case 'nb': return '🇳🇴';
-    case 'pl': return '🇵🇱';
-    case 'pt-BR': return '🇧🇷';
-    case 'ru': return '🇷🇺';
-    case 'th': return '🇹🇭';
-    case 'tr': return '🇹🇷';
-    case 'uk': return '🇺🇦';
-    case 'vi': return '🇻🇳';
-  }
 }

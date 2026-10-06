@@ -61,15 +61,19 @@ export type CloseTaskResult =
 export interface TaskCloseServiceOptions {
   daemon: CloseDaemonPort;
   worktrees: TaskWorktreeManager;
+  /** Stops the panes running inside the worktree; called only after the unpushed and dirty checks pass. */
+  stopPanesIn?: (worktreePath: string) => Promise<void>;
 }
 
 export class TaskCloseService {
   private readonly daemon: CloseDaemonPort;
   private readonly worktrees: TaskWorktreeManager;
+  private readonly stopPanesIn?: (worktreePath: string) => Promise<void>;
 
   constructor(opts: TaskCloseServiceOptions) {
     this.daemon = opts.daemon;
     this.worktrees = opts.worktrees;
+    this.stopPanesIn = opts.stopPanesIn;
   }
 
   async closeTask(input: CloseTaskInput): Promise<CloseTaskResult> {
@@ -89,7 +93,7 @@ export class TaskCloseService {
         ok: false,
         taskId,
         reason: 'unpushed',
-        error: `close: ${ahead.count}개 커밋이 push되지 않았습니다 — PR 생성 또는 push 후 다시 close하세요`,
+        error: `close: ${ahead.count} commit(s) are not pushed — open a PR or push, then close again.`,
         aheadCount: ahead.count,
       };
     }
@@ -99,23 +103,31 @@ export class TaskCloseService {
         ok: false,
         taskId,
         reason: 'unpushed',
-        error: `close: push되지 않은 브랜치에 커밋 ${ahead.count}개가 있습니다 — PR 생성 또는 push 후 다시 close하세요`,
+        error: `close: the branch has ${ahead.count} commit(s) that were never pushed — open a PR or push, then close again.`,
         aheadCount: ahead.count,
       };
     }
 
     // ① worktree remove — 내부 porcelain 재검사가 dirty 정본 게이트(G1).
     if (!input.repoRoot || !input.repoHash) {
-      return { ok: false, taskId, reason: 'error', error: 'close: repoRoot/repoHash 부재(물질화 정보 불완전)' };
+      return { ok: false, taskId, reason: 'error', error: 'close: the task is missing repoRoot/repoHash (incomplete worktree record).' };
     }
-    const removed = await this.worktrees.removeWorktree(input.repoRoot, input.repoHash, input.worktreePath);
+    const removed = await this.worktrees.removeWorktree(
+      input.repoRoot,
+      input.repoHash,
+      input.worktreePath,
+      this.stopPanesIn,
+    );
     if (!removed.ok) {
       if (removed.preserved) {
         // dirty 보존 — close 보류(태스크 open 유지, §1 계약).
+        // A failed status check is preserved too, but it is not known to be
+        // dirty: report it as an error so callers do not suggest discarding
+        // changes that may not exist.
         return {
           ok: false,
           taskId,
-          reason: 'dirty',
+          reason: removed.dirty ? 'dirty' : 'error',
           error: removed.error,
           preservedWorktree: input.worktreePath,
         };

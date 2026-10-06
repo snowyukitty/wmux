@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // wmux-managed: codex-lifecycle-bridge
 // wmux ↔ Codex CLI notify bridge (lifecycle + resume-binding capture).
 //
@@ -9,44 +8,71 @@
 // `{ type, thread-id, turn-id, cwd, input-messages, last-assistant-message }`;
 // older Codex builds may use
 // `{ session_id, transcript_path, cwd, hook_event_name, model, ... }`.
-// The spawned process inherits the pane env, so WMUX_PTY_ID pins the capture to
-// the exact pane and WMUX_DATA_SUFFIX pins every endpoint/file to that instance.
+// Pane-side SessionStart records thread ownership in the account's
+// wmux-thread-owners directory. Shared app-server notifications use that
+// record's pane and instance, never the server's inherited identity. Unknown
+// shared threads are dropped, with no cwd fallback or resume spool.
 //
 // This script:
 //   1. Parses the LAST argv as the Codex notify JSON payload.
 //   2. Ignores unrelated official lifecycle event types.
-//   3. Builds a canonical, metadata-only AgentSignal envelope
-//      (agent:'codex', kind:'agent.stop'); prompt and assistant content is never
+//   3. Resolves shared-server notifications through recorded TUI ownership.
+//   4. Builds a canonical, metadata-only AgentSignal envelope
+//      (agent:'codex', kind:'agent.stop', or 'agent.subagent_stop' without a
+//      resume-binding id for a sub-agent thread); prompt and assistant content is never
 //      logged or forwarded.
-//   4. Sends the envelope to the first wmux endpoint that owns the request: the
+//   5. Sends the envelope to the first wmux endpoint that owns the request: the
 //      DAEMON control pipe (`daemon.hooks.signal`, suffix-scoped daemon token —
 //      the always-on process, so this still lands with the GUI closed), else the
 //      MAIN pipe (`hooks.signal`, suffix-scoped main token). Either side builds
 //      the resume binding from signal.agent + agentSessionId + cwd + optional
 //      transcript_path; both paths are fully agent-agnostic.
 //      WMUX_HOOKS_TO_MAIN=1 forces main-only.
-//   5. On failure, spools a suffix-scoped resume-binding record for daemon boot.
-//   6. Exits 0 ALWAYS, under a hard timeout, so a wmux problem never stalls Codex.
+//   6. On failure, spools a suffix-scoped resume-binding record for daemon boot.
+//   7. Exits 0 ALWAYS, under a hard timeout, so a wmux problem never stalls Codex.
 //
-// SELF-CONTAINED: JS-only, Node built-ins only — no imports from src/ or
+// JS-only with a sibling wmux-codex-thread.mjs; no imports from src/ or
 // integrations/shared/ (mirrors integrations/claude/bin/wmux-bridge.mjs; the
 // Claude bridge's plugin constraint blocks a shared import, so full DRY across
 // the two is impossible — the shared infra is duplicated by design). This
 // bridge is leaner than the Claude one: Codex supplies an official thread id (or
 // legacy session_id) directly and has no permission-mode / usage to extract.
+//
+// NO SHEBANG, deliberately — same reason as the Codex hooks bridge: every
+// launcher runs this as `node "<path>"`, and Vitest cannot parse a `.mjs` that
+// starts with one, which would leave the origin classifier testable only
+// through a subprocess.
 
-import { readFileSync, existsSync, mkdirSync, appendFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
+import {
+  readFileSync, existsSync, mkdirSync, appendFileSync, writeFileSync, renameSync, unlinkSync,
+  realpathSync,
+} from 'node:fs';
 import { homedir, userInfo } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createConnection } from 'node:net';
 import { randomUUID } from 'node:crypto';
+import {
+  classifyCodexThread, codexSessionsRoot, notifierOrigin, attributeThread,
+} from './wmux-codex-thread.mjs';
 
 const HOOK_TIMEOUT_MS = 2000; // hard cap so we never stall a Codex turn
 const AGENT_TURN_COMPLETE = 'agent-turn-complete';
 // Stamped on every codex-notify.log line; bump on behavior changes.
 //   0.2.0 — daemon-first targeting (daemon.hooks.signal → hooks.signal).
 //   0.3.0 — official payload routing + suffix-isolated endpoint/state paths.
-const BRIDGE_VERSION = '0.3.0';
+//   0.4.0 — refuse a notification spawned by a shared Codex app-server whose
+//           env claims a wmux pane (#1523).
+//   0.5.0 — a sub-agent thread's turn-complete is sent as agent.subagent_stop
+//           under its root thread's id, not as the pane's own turn (#1696).
+//   0.6.0 — #1697 review: a root is only ever a CONFIRMED top-level thread
+//           (own id verified in its own session_meta, cycle-guarded) — never
+//           an unresolved or unverified intermediate; a sub-agent completion
+//           carries no agentSessionId and is never spooled, so an imperfect
+//           root can no longer rebind or replace a pane's resume binding
+//           either way; the rollout scan runs after the shared-server origin
+//           check and reads a bounded number of directory entries.
+const BRIDGE_VERSION = '0.6.0';
 const CONNECT_RETRY_BACKOFFS_MS = [100, 250];
 const TRANSIENT_CONNECT_CODES = new Set([
   'EPERM', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EBUSY', 'EAGAIN',
@@ -58,6 +84,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Keep these formulas in lockstep with src/shared/constants.ts. A non-empty
 // suffix is an instance boundary: this bridge never probes production paths as
 // a fallback when its selected namespace is suffixed.
+// #1111: the envelope-less `legacy` grandfather these hook RPCs used to ride
+// closes in the first release on or after 2026-09-30. `hooks.signal` on the
+// MAIN pipe is `wmux.internal`, so no declaration can ever grant it; the
+// enforcer instead recognises this exact clientName and allows that ONE method
+// (src/main/mcp/hookBridge.ts). Keep it in lockstep with
+// WMUX_HOOK_BRIDGE_CLIENT_NAME in src/shared/rpc.ts. Harmless on the daemon
+// control pipe, which has no enforcer and ignores the extra envelope field.
+const WMUX_CLIENT_NAME = 'wmux-hook-bridge';
+
 function dataSuffix() {
   return process.env.WMUX_DATA_SUFFIX || '';
 }
@@ -308,10 +343,27 @@ async function sendToTargets(targets, buildRequest) {
   return { result, target };
 }
 
+// Origin and rollout classification are shared with the hooks bridge.
+export {
+  classifyNotifierOrigin, isSharedServerArgv, claimsPaneIdentity, tokenizeCommandLine,
+  parseProcEntry, parsePsEntry, parseHandedArgv,
+  uuidV7Millis, findRolloutFile, parseSessionMeta, classifyCodexThread,
+} from './wmux-codex-thread.mjs';
+
 // ----- Main ---------------------------------------------------------------
 
 function nonEmptyStr(v) {
   return typeof v === 'string' && v.length > 0 ? v : undefined;
+}
+
+/**
+ * #1727 — set only by the WSL Codex hook: which Linux process this Codex is
+ * (boot id + ancestors). Opaque here and bounded like the Claude bridge's; the
+ * daemon validates it and uses it only for the exact pane. Exported for tests.
+ */
+export function wslAgentProcessFromEnv(env) {
+  const value = nonEmptyStr(env.WMUX_WSL_AGENT_PROC);
+  return value && value.length <= 8192 ? value : undefined;
 }
 
 async function main() {
@@ -353,33 +405,62 @@ async function main() {
   }
   const turnId = nonEmptyStr(payload['turn-id']);
   const cwd = nonEmptyStr(payload.cwd) ?? process.cwd();
-  const transcriptPath = nonEmptyStr(payload.transcript_path);
+  const transcriptPathClaimed = nonEmptyStr(payload.transcript_path);
 
+  const origin = notifierOrigin();
+
+  // #1696/#1697: a sub-agent thread reports as agent.subagent_stop with no
+  // agentSessionId (see "Sub-agent threads" above) — never agent.stop under
+  // its own id, which would replace the pane's resume binding with a thread
+  // the user cannot type into.
+  let thread = { subagent: false, rootId: sessionId };
+  try {
+    thread = classifyCodexThread(sessionId, codexSessionsRoot(process.env));
+  } catch {
+    // Fail open: an unreadable history is today's agent.stop.
+  }
+  if (!await attributeThread(origin, thread)) return;
   const envPtyId = nonEmptyStr(process.env.WMUX_PTY_ID);
   const envWorkspaceId = nonEmptyStr(process.env.WMUX_WORKSPACE_ID);
   const envSurfaceId = nonEmptyStr(process.env.WMUX_SURFACE_ID);
+  const wslAgentProcess = origin !== 'shared-server' ? wslAgentProcessFromEnv(process.env) : undefined;
+
+  // A sub-agent's own transcript_path (legacy payloads) names the sub-agent's
+  // rollout and must never ride along under any other thread's signal.
+  const transcriptPath = thread.subagent ? undefined : transcriptPathClaimed;
+  const signalKind = thread.subagent ? 'agent.subagent_stop' : 'agent.stop';
+  const threadLog = thread.subagent
+    ? { subagent: true, ...(thread.rootId ? { rootSessionId: thread.rootId } : {}) }
+    : {};
 
   // Endpoints to try, daemon first (see resolveTargets).
   const targets = resolveTargets();
   if (targets.length === 0) {
-    logEvent('no-auth-token', { paths: [getDaemonAuthTokenPath(), getAuthTokenPath()] });
-    // Still spool so a later daemon boot reconciles the capture.
-    if (envPtyId) spoolResumeBinding({ ptyId: envPtyId, agent: 'codex', sessionId, cwd, transcriptPath, ts: Date.now() });
+    logEvent('no-auth-token', { origin, ...threadLog, paths: [getDaemonAuthTokenPath(), getAuthTokenPath()] });
+    // Still spool so a later daemon boot reconciles the capture. A sub-agent
+    // completion carries no id to spool (#1697 review, "should fix" #5): it
+    // must never replace an older, valid agent.stop spool for this pane.
+    if (envPtyId && !thread.subagent) {
+      spoolResumeBinding({ ptyId: envPtyId, agent: 'codex', sessionId, cwd, transcriptPath, ts: Date.now() });
+    }
     return;
   }
 
   // Canonical AgentSignal envelope. kind 'agent.stop' = a turn completed (the
   // strongest "task done" signal); it triggers the agent-agnostic resume-binding
-  // capture in hooks.rpc.ts. Only non-sensitive, allowlisted metadata rides in
+  // capture in hooks.rpc.ts. A sub-agent thread's turn is 'agent.subagent_stop'
+  // with no agentSessionId (see "Sub-agent threads" above), so it binds
+  // nothing. Only non-sensitive, allowlisted metadata rides in
   // signal.payload: official turn-id and the legacy transcript_path used by the
   // binding's D5 liveness probe. Native input/assistant content is never copied.
   const envelope = {
-    kind: 'agent.stop',
+    kind: signalKind,
     agent: 'codex',
-    agentSessionId: sessionId,
+    ...(thread.subagent ? {} : { agentSessionId: sessionId }),
     ...(envWorkspaceId ? { workspaceId: envWorkspaceId } : {}),
     ...(envSurfaceId ? { surfaceId: envSurfaceId } : {}),
     ...(envPtyId ? { ptyId: envPtyId } : {}),
+    ...(wslAgentProcess ? { wslAgentProcess } : {}),
     cwd,
     payload: {
       ...(turnId ? { 'turn-id': turnId } : {}),
@@ -396,27 +477,60 @@ async function main() {
     method: t.method,
     params: envelope,
     token: t.token,
+    clientName: WMUX_CLIENT_NAME,
   }));
   const outerOk = rpcResult && rpcResult.ok === true;
   const innerOk = outerOk && rpcResult.result && rpcResult.result.ok === true;
 
   if (innerOk) {
-    logEvent('ok', { sessionId, target: target?.name });
+    logEvent('ok', { sessionId, ...threadLog, target: target?.name, origin });
   } else {
     logEvent(outerOk ? 'rpc-rejected' : 'rpc-failed', {
+      origin,
+      ...threadLog,
       target: target?.name,
       reason: rpcResult?.result?.reason,
       error: rpcResult?.error,
       detail: rpcResult?.detail,
     });
     // Anything but a durable success would lose the capture. Spool it (needs
-    // the exact per-pane key) so the daemon reconciles it on its next boot.
-    if (envPtyId) {
+    // the exact per-pane key) so the daemon reconciles it on its next boot —
+    // except a sub-agent completion, which carries nothing to spool and must
+    // never replace an older, valid agent.stop spool for this pane.
+    if (envPtyId && !thread.subagent) {
       spoolResumeBinding({ ptyId: envPtyId, agent: 'codex', sessionId, cwd, transcriptPath, ts: envelope.ts });
     }
   }
 }
 
-main()
-  .catch((err) => logEvent('uncaught', { error: String(err) }))
-  .finally(() => process.exit(0));
+// Run only when launched as a script. Under `import` (the unit tests, which
+// exercise the pure origin classifier directly) the module must stay inert.
+// Fails OPEN: anything it cannot determine is treated as a real launch,
+// because a bridge that silently declines to run is the worse failure.
+// Mirrors wmux-codex-hooks-bridge.mjs.
+function invokedAsScript() {
+  try {
+    if (!process.argv[1]) return true;
+    const self = fileURLToPath(import.meta.url);
+    const entry = resolve(process.argv[1]);
+    // realpath both sides: a symlinked install, an 8.3 short path or a `subst`
+    // drive would otherwise read as a different file.
+    const real = (p) => {
+      try {
+        return realpathSync.native ? realpathSync.native(p) : realpathSync(p);
+      } catch {
+        return p;
+      }
+    };
+    const norm = (p) => (process.platform === 'win32' ? real(p).toLowerCase() : real(p));
+    return norm(self) === norm(entry);
+  } catch {
+    return true;
+  }
+}
+
+if (invokedAsScript()) {
+  main()
+    .catch((err) => logEvent('uncaught', { error: String(err) }))
+    .finally(() => process.exit(0));
+}

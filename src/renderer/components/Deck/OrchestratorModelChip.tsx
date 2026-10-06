@@ -1,3 +1,6 @@
+// Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/features/sessions/ui/ModelPicker.tsx), MIT License, Copyright (c) 2026 Nick
+// The chip is the filled 26px picker chip with a turning chevron; the menu is
+// a 12px popover with rounded-lg rows.
 // ─── Orchestrator model chip ────────────────────────────────────────────────
 //
 // A compact badge in the deck header showing which model the orchestrator brain
@@ -17,15 +20,12 @@ import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
 import { tokenAttrs } from '../../themes';
 import { FOCUS_RING } from '../focusRing';
+import { IconCheck, IconChevron } from '../icons';
+import { CLAUDE_MODEL_OPTIONS, claudeModelLabel, type ClaudeModelOption } from '../../../shared/claudeModels';
 
-// Display names track the shipped model ids (Opus 4.8 / Sonnet 5 / Haiku 4.5).
-// Exported so the Agent 탭 인라인 드롭다운(DeckTabs)이 같은 목록·라벨을 재사용한다.
-export const MODEL_OPTIONS: { value: string; label: string }[] = [
-  { value: '', label: 'Default' },
-  { value: 'opus', label: 'Opus 4.8' },
-  { value: 'sonnet', label: 'Sonnet 5' },
-  { value: 'haiku', label: 'Haiku 4.5' },
-];
+// The list lives in shared/claudeModels (one source for every Claude picker).
+// Re-exported under the old name so DeckTabs / ChannelDock keep their import.
+export const MODEL_OPTIONS: readonly ClaudeModelOption[] = CLAUDE_MODEL_OPTIONS;
 
 export function OrchestratorModelChip({ openUp = false }: { openUp?: boolean } = {}): React.ReactElement {
   const t = useT();
@@ -50,7 +50,6 @@ export function OrchestratorModelChip({ openUp = false }: { openUp?: boolean } =
     };
   }, [open]);
 
-  const current = MODEL_OPTIONS.find((o) => o.value === model) ?? MODEL_OPTIONS[0];
 
   return (
     <div ref={ref} className="relative" data-orchestrator-model-chip>
@@ -61,20 +60,24 @@ export function OrchestratorModelChip({ openUp = false }: { openUp?: boolean } =
         aria-expanded={open}
         title={t('deck.orchestratorModelTitle')}
         data-model-chip-button
-        className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium text-[var(--text-sub)] hover:text-[var(--text-main)] transition-colors ${FOCUS_RING}`}
-        {...tokenAttrs('textSub', 'text')}
+        className={`ui-chip-boxless inline-flex h-[26px] max-w-[160px] items-center gap-1 px-1.5 text-[11px] ${FOCUS_RING}`}
+        {...tokenAttrs('textMain', 'text')}
       >
-        <span>{current.value === '' ? t('deck.orchestratorModelDefault') : current.label}</span>
-        <span aria-hidden="true" className="text-[10px] opacity-70">▾</span>
+        <span className="truncate">{model === '' ? t('deck.orchestratorModelDefault') : claudeModelLabel(model)}</span>
+        <span
+          aria-hidden="true"
+          className={`inline-flex shrink-0 text-[color-mix(in_srgb,var(--text-main)_50%,transparent)] transition-transform ${open ? '-rotate-90' : 'rotate-90'}`}
+        >
+          <IconChevron size={12} />
+        </span>
       </button>
       {open && (
         <div
           role="listbox"
           aria-label={t('deck.orchestratorModelTitle')}
           // 컨트롤 바(하단)에 살 땐 위로 열어 composer를 덮지 않게 한다.
-          className={`absolute right-0 ${openUp ? 'bottom-full mb-1' : 'top-full mt-1'} z-50 min-w-[128px] rounded-md border py-1 shadow-lg bg-[var(--bg-surface)]`}
-          style={{ borderColor: 'var(--border-soft)' }}
-          {...tokenAttrs('bgSurface', 'bg')}
+          className={`absolute right-0 ${openUp ? 'bottom-full mb-1' : 'top-full mt-1'} z-50 min-w-[160px] rounded-xl border border-[var(--line)] bg-[var(--bg-base)] shadow-[var(--shadow-popover)] p-1.5`}
+          {...tokenAttrs('bgBase', 'bg')}
         >
           {MODEL_OPTIONS.map((o) => {
             const sel = o.value === model;
@@ -88,20 +91,14 @@ export function OrchestratorModelChip({ openUp = false }: { openUp?: boolean } =
                   setModel(o.value);
                   setOpen(false);
                 }}
-                className={`flex items-center justify-between w-full px-2.5 py-1 text-left text-[11px] transition-colors ${
-                  sel
-                    ? 'text-[var(--text-main)] font-semibold'
-                    : 'text-[var(--text-sub)] hover:text-[var(--text-main)]'
+                className={`flex items-center justify-between w-full rounded-lg px-2 py-1.5 text-left text-[13px] text-[var(--text-main)] transition-colors ${
+                  sel ? 'bg-[var(--selection)]' : 'hover:bg-[var(--selection)]'
                 }`}
               >
                 <span>{o.value === '' ? t('deck.orchestratorModelDefault') : o.label}</span>
                 {sel && (
-                  <span
-                    aria-hidden="true"
-                    className="text-[var(--accent-blue)] text-[10px]"
-                    {...tokenAttrs('accent', 'text')}
-                  >
-                    ●
+                  <span aria-hidden="true" className="inline-flex text-[var(--accent)]" {...tokenAttrs('accent', 'text')}>
+                    <IconCheck size={14} />
                   </span>
                 )}
               </button>

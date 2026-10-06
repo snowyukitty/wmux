@@ -1,10 +1,15 @@
+import { createOsc8LinkHandler } from '../terminal/osc8LinkHandler';
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { FixedGeometryFitAddon, type FixedGeometry } from '../terminal/fixedGeometryFit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { SearchAddon } from '@xterm/addon-search';
 import { applyUnicodeWidthModel } from '../../shared/terminalUnicode';
-import { matchesDisabledShortcut } from '../../shared/keymap';
+import { isSafeGeometry } from '../../shared/terminalGeometry';
+import { isPrefixTrigger, resolveShortcut } from '../../shared/keymap';
+import { mentionKeyClaim } from '../utils/agentMention';
+import { currentShortcutBindings, defaultShortcutBindings, shortcutPressGuard } from '../utils/shortcutBindings';
 import { xtermWindowsBuildNumber } from '../../shared/conptyWindows';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { useStore } from '../stores';
@@ -17,6 +22,10 @@ import { pasteClipboardImage } from '../utils/imagePaste';
 import { openTerminalUrl } from '../utils/browserPaneActions';
 import { runCopyWithFeedback } from '../utils/copyWithFeedback';
 import { claimFit } from '../utils/fitGuard';
+import { createFitScheduler } from '../utils/layoutTransitionGate';
+import { installAltClickTrackingGuard } from '../utils/altClickUnderMouseTracking';
+import { createMouseOwnedHint } from '../utils/mouseOwnedHint';
+import { resizeOrderFor, runOrderedFit, type CancelOrderedFit } from '../utils/resizeOrder';
 import { createAutoSelectionCopy } from '../utils/autoSelectionCopy';
 import { createOsc52Handler } from '../utils/osc52Clipboard';
 import {
@@ -26,21 +35,29 @@ import {
 } from '../terminal/replayMute';
 import { terminalFontFamilyCss } from '../utils/terminalFont';
 import { createPathLinkProvider } from '../terminal/pathLinkProvider';
-import { resolveNewlineKeyByte } from '../terminal/newlineKeys';
+import { resolveNewlineKeyByte, wantsAltEnterNewline, foldAtPromptCarry, noteCodexEndedByPrompt } from '../terminal/newlineKeys';
+import { isWslShell } from '../../shared/imagePaste';
+import { encodeEscape, isBareEscape } from '../terminal/escapeKeys';
 import { resolveCtrlLetterByte } from '../terminal/ctrlLetterKeys';
+import { isComposeChord, composeOwnerHost, TERMINAL_PTY_ATTR, COMPOSE_OWNER_ATTR } from '../terminal/composeChord';
 import { foldRemoteKeyboardState, INITIAL_REMOTE_KEYBOARD_STATE, type RemoteKeyboardState } from '../components/Remote/keyboardProtocol';
 import { attachImeAnchor } from '../terminal/imeAnchor';
 import { attachImeResidueGuard } from '../terminal/imeResidueGuard';
 import { attachImeStormGuard } from '../terminal/imeStormGuard';
+import { attachCompositionCommitGate } from '../terminal/compositionCommitGate';
 import { webglContextPool } from '../terminal/webglContextPool';
 import { teardownWebglAddon } from '../terminal/webglTeardown';
+import { syncInlineImages } from '../terminal/inlineImages';
+import { forceCharSizeMeasure, onCharSizeChange } from '../terminal/charSizeRefit';
 import { createGlyphRepaintScheduler, type GlyphRepaintScheduler } from '../terminal/glyphRepaint';
 import { atlasGuard } from '../terminal/atlasGuard';
 import { decideViewerVisibility } from '../terminal/viewerVisibility';
 import { useWindowDisplayed } from './useWindowDisplayed';
 import { createDeadInputWatchdog } from '../terminal/deadInputWatchdog';
 import { awaitParseBarrier } from '../terminal/parseBarrier';
-import { STALE_REPLAY_INPUT_MODE_RESETS, STALE_REPLAY_ALIVE_SHELL_RESETS, STALE_REPLAY_DISPLAY_RESETS, staleReplayResetLevel } from '../terminal/staleReplayModeReset';
+import { STALE_REPLAY_INPUT_MODE_RESETS, STALE_REPLAY_ALIVE_SHELL_RESETS, STALE_REPLAY_DISPLAY_RESETS, staleReplayResetLevel } from '../../shared/terminal/staleReplayModeReset';
+import { installShellPromptModeReset, shellPromptModeResetFor } from '../../shared/terminal/shellPromptModeReset';
+import { paneForegroundProbe } from '../terminal/paneForegroundProbe';
 import { attachAltScreenWheel, PAGE_SCROLL_AGENTS } from '../terminal/altScreenWheel';
 import { RestingCursorGuard } from '../terminal/restingCursor';
 import { restoreSeam } from '../../shared/restoreSeam';
@@ -84,6 +101,30 @@ export function onTerminalRegistered(listener: (ptyId: string) => void): () => v
   terminalRegistrationListeners.add(listener);
   return () => terminalRegistrationListeners.delete(listener);
 }
+// #1694: ptyId → whether the pane's shell enters WSL, from the pty list's
+// `shell` (the same predicate the clipboard route uses, #1196). Learned once
+// per pane on a Windows host; a pane missing here counts as WSL, which keeps
+// the old newline bytes. Requests queue behind each other, and one that finds
+// its pane already learned (a restore mounts many at once) asks nothing.
+const wslByPtyId = new Map<string, boolean>();
+let ptyShellsQueue: Promise<void> = Promise.resolve();
+/** A failed lookup is retried, so one transient error doesn't leave a pane unknown. */
+const PTY_SHELLS_RETRY_MS = [1_000, 3_000, 10_000];
+function learnPtyShells(ptyId: string, attempt = 0): void {
+  if (wslByPtyId.has(ptyId)) return;
+  ptyShellsQueue = ptyShellsQueue
+    .then(async () => {
+      if (wslByPtyId.has(ptyId)) return;
+      for (const s of await window.electronAPI.pty.list()) {
+        wslByPtyId.set(s.id, isWslShell(s.shell));
+      }
+    })
+    .catch(() => {
+      const delay = PTY_SHELLS_RETRY_MS[attempt];
+      if (delay !== undefined) window.setTimeout(() => learnPtyShells(ptyId, attempt + 1), delay);
+    });
+}
+
 function registerTerminal(ptyId: string, terminal: Terminal): void {
   terminalRegistry.set(ptyId, terminal);
   for (const listener of [...terminalRegistrationListeners]) listener(ptyId);
@@ -395,6 +436,32 @@ function writePtyDataImmediately(
   else term.write(payload.data);
 }
 
+/**
+ * #1255: the dimensions a fit() would apply right now, or null when the fit
+ * must be skipped — container not measurable, or the proposal is below the
+ * shared geometry floor. Applying a sub-floor fit reflows the entire
+ * scrollback at that width and permanently garbles the pane; the daemon
+ * would clamp the PTY side to MIN_SAFE_COLS anyway, splitting the two sides
+ * of the pipe. Callers skip; a later resize tick (layout settled, pane
+ * revealed, font swapped) re-proposes.
+ */
+function proposedSafeDimensions(
+  addon: FitAddon | null | undefined,
+): { cols: number; rows: number } | null {
+  if (!addon) return null;
+  try {
+    const dims = addon.proposeDimensions();
+    if (!dims) return null;
+    // A fixed grid is the owner's size, not a transient measurement: the
+    // floor protects against mid-layout fits, which this never is.
+    if (addon instanceof FixedGeometryFitAddon) return dims;
+    if (!isSafeGeometry(dims.cols, dims.rows)) return null;
+    return dims;
+  } catch {
+    return null; // disposed addon — caller's other guards own teardown
+  }
+}
+
 function hiddenRetentionActive(): boolean {
   return isDaemonModeActive() && useStore.getState().hiddenPaneRetentionEnabled;
 }
@@ -491,9 +558,10 @@ export const WEBGL_HIDDEN_DISPOSE_DELAY_MS = 5_000;
 
 // RCA A1 — reconnect-with-retry policy lives in its own module so it can be
 // unit-tested without xterm/zustand/electron. Bound to the live deps here.
-function reconnectPtyWithRetry(ptyId: string, isCurrent: () => boolean): Promise<void> {
+function reconnectPtyWithRetry(ptyId: string, isCurrent: () => boolean, onRecoveryError?: (message: string | null, info?: { cwdMissing?: boolean }) => void): Promise<void> {
   return reconnectPtyWithRetryImpl(ptyId, isCurrent, {
     reconnect: (id) => window.electronAPI.pty.reconnect(id),
+    onRecoveryError,
     clearPtyId: (id, recovery) => useStore.getState().clearSurfacePtyIdByPty(id, recovery),
   });
 }
@@ -515,6 +583,12 @@ function reportViewerVisibility(ptyId: string | null | undefined, visible: boole
 // Lightweight copy feedback toast — injects/removes a DOM element
 let copyToastTimer: ReturnType<typeof setTimeout> | null = null;
 function showCopyToast() {
+  showCopyToastText(t('terminal.copied'));
+}
+
+/** The success toast with caller-supplied text — a remote mirror names the
+ *  host a clipboard write came from, so it is never silent. */
+export function showCopyToastText(text: string) {
   let el = document.getElementById('wmux-copy-toast');
   if (!el) {
     el = document.createElement('div');
@@ -522,7 +596,7 @@ function showCopyToast() {
     el.style.cssText = 'position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:var(--accent-green);color:var(--bg-base);font-family:monospace;font-size:11px;font-weight:600;padding:3px 12px;border-radius:4px;z-index:9999;pointer-events:none;opacity:0;transition:opacity 0.2s';
     document.body.appendChild(el);
   }
-  el.textContent = t('terminal.copied');
+  el.textContent = text;
   el.style.opacity = '1';
   if (copyToastTimer) clearTimeout(copyToastTimer);
   copyToastTimer = setTimeout(() => { el!.style.opacity = '0'; }, 1200);
@@ -569,6 +643,34 @@ function showCopyErrorToast() {
   el.style.opacity = '1';
   if (copyErrorToastTimer) clearTimeout(copyErrorToastTimer);
   copyErrorToastTimer = setTimeout(() => { el!.style.opacity = '0'; }, 1800);
+}
+
+// The pane's foreground app has mouse tracking on, so a plain left-drag never
+// reaches xterm's SelectionService and no highlight appears. The override is
+// the one xterm already implements in `shouldForceSelection`: `event.shiftKey`
+// off macOS (what Windows Terminal / iTerm2 teach, and what wmux uses for
+// Shift+right-click paste), `event.altKey` on macOS — so the hint has to name
+// the key for THIS platform, or it sends the user to a modifier that does
+// nothing. Longer-lived than the copy toasts because this one is
+// instructional, not an acknowledgement.
+let mouseOwnedToastTimer: ReturnType<typeof setTimeout> | null = null;
+function showMouseOwnedHintToast() {
+  let el = document.getElementById('wmux-mouse-owned-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'wmux-mouse-owned-toast';
+    el.style.cssText = 'position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:var(--accent-yellow);color:var(--bg-base);font-family:monospace;font-size:11px;font-weight:600;padding:3px 12px;border-radius:4px;z-index:9999;pointer-events:none;opacity:0;transition:opacity 0.2s';
+    document.body.appendChild(el);
+  }
+  const node = el;
+  node.textContent = t(
+    window.electronAPI?.platform === 'darwin'
+      ? 'terminal.mouseOwnedSelectHintMac'
+      : 'terminal.mouseOwnedSelectHint',
+  );
+  node.style.opacity = '1';
+  if (mouseOwnedToastTimer) clearTimeout(mouseOwnedToastTimer);
+  mouseOwnedToastTimer = setTimeout(() => { node.style.opacity = '0'; }, 3200);
 }
 
 /**
@@ -625,12 +727,42 @@ interface UseTerminalOptions {
   scrollbackFile?: string;
   /** Called once when the first chunk of PTY data is received (useful for hiding restore overlays) */
   onFirstData?: () => void;
+  onRecoveryError?: (message: string | null, info?: { cwdMissing?: boolean }) => void;
   /** Called on right-click to show context menu */
   onContextMenu?: (e: ContextMenuEvent) => void;
+  /**
+   * Does this surface own the Rich Input chord (⌘G / Ctrl+G)?
+   *
+   * `useComposeShortcut` acts on the ACTIVE LEAF's pty, so only the terminal
+   * that is the active surface can honour the key. A non-owning xterm —
+   * FloatingPane (Ctrl+`), Deck's BrainTerminalEmbed — must keep encoding
+   * 0x07, or the chord is swallowed here and declined there: a dead key, or a
+   * popover aimed at a different pane (#1280 review). Defaults to false so a
+   * future embed is dead-key-safe until it opts in.
+   */
+  ownsComposeShortcut?: boolean;
+  /**
+   * The pane's grid is owned elsewhere (wmux web mirrors a desktop pane, and
+   * the daemon answers any other viewer's resize with `409 desk-owns-size`).
+   * When set, the grid is pinned to these cols/rows, the font size is fitted
+   * to the container instead of the grid, and `pty.resize` is never called.
+   * Absent (the desktop) → the normal fit, unchanged.
+   */
+  fixedGeometry?: FixedGeometry | null;
 }
 
 export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>, options: UseTerminalOptions) {
   const terminalRef = useRef<Terminal | null>(null);
+  // #1256: the live instance, published as STATE. The ref is populated by
+  // mutation inside the mount effect (fresh Terminal or an adopted parked
+  // one) — no re-render follows, so a consumer that captured
+  // `terminalRef.current` at render time keeps a null (before the instance
+  // exists) or a detached instance (after adoption swapped it) for as long as
+  // nothing else happens to re-render. Terminal.tsx passes this state to the
+  // scroll-to-bottom button and the bookmark indicator; their subscriptions
+  // and click handlers now track the real instance because identity changes
+  // re-render.
+  const [terminalInstance, setTerminalInstance] = useState<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   /**
    * A fit() that the selection guard skipped, and nobody re-ran (#747).
@@ -664,9 +796,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
   // Glyph-corruption repair scheduler (issue #166) — created by the main
   // effect, also poked by the visibility effect on regain.
   const glyphRepaintRef = useRef<GlyphRepaintScheduler | null>(null);
-  const { ptyId, isVisible = true, scrollbackFile, onFirstData, onContextMenu } = options;
+  const { ptyId, isVisible = true, scrollbackFile, onFirstData, onContextMenu, ownsComposeShortcut = false } = options;
   const ptyIdRef = useRef(ptyId);
   ptyIdRef.current = ptyId;
+  const fixedGeometryRef = useRef<FixedGeometry | null>(options.fixedGeometry ?? null);
+  fixedGeometryRef.current = options.fixedGeometry ?? null;
+  const fixedCols = options.fixedGeometry?.cols;
+  const fixedRows = options.fixedGeometry?.rows;
   // Live visibility for long-lived callbacks (the burst repaint below) — the
   // closure value captured at mount would go stale across workspace switches.
   const isVisibleRef = useRef(isVisible);
@@ -687,6 +823,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
   // to skip its active-at-mount reconnect: the session pipe never detached, so
   // asking for one only buys the ring-buffer replay adoption exists to avoid.
   const adoptedAtMountRef = useRef(false);
+  const retryReconnectRef = useRef<(() => Promise<void> | undefined) | null>(null);
+  const onRecoveryErrorRef = useRef(options.onRecoveryError);
+  onRecoveryErrorRef.current = options.onRecoveryError;
   const onFirstDataRef = useRef(onFirstData);
   onFirstDataRef.current = onFirstData;
   const onContextMenuRef = useRef(onContextMenu);
@@ -695,6 +834,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
   const terminalFontFamily = useStore((s) => s.terminalFontFamily);
   const terminalCursorStyle = useStore((s) => s.terminalCursorStyle);
   const scrollbackLines = useStore((s) => s.scrollbackLines);
+  const inlineImagesEnabled = useStore((s) => s.inlineImagesEnabled);
   const theme = useStore((s) => s.theme) as ThemeId;
   const customThemeColors = useStore((s) => s.customThemeColors);
   const xtermTheme = theme === 'custom' && customThemeColors
@@ -723,8 +863,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
   //     once after the window clears (~1.1 s) so the size self-heals.
   //   • "not found" — the session was swapped/disposed mid-resize; the main
   //     pty:resize handler already retries-then-logs this, so we swallow it.
-  const sendResize = useCallback((targetPtyId: string, cols: number, rows: number) => {
-    window.electronAPI.pty.resize(targetPtyId, cols, rows).catch((err: unknown) => {
+  // Returns the in-flight resize so a caller that must not touch xterm before
+  // the daemon has applied the geometry (#1436's shrink path) can wait on it.
+  // Every other caller ignores it, exactly as before.
+  const sendResize = useCallback((targetPtyId: string, cols: number, rows: number): Promise<void> => {
+    // The grid belongs to someone else (see `fixedGeometry`): never resize the
+    // PTY. Gated here, not at the callers, so no fit path can get around it.
+    if (fixedGeometryRef.current) return Promise.resolve();
+    return window.electronAPI.pty.resize(targetPtyId, cols, rows).catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.includes('rate limited')) return; // not-found / other: handled upstream
       window.setTimeout(() => {
@@ -824,8 +970,15 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       try {
         const bytes = Uint8Array.from(atob(payloadBase64), (c) => c.charCodeAt(0));
         console.log(`[wmux:reveal] ptyId=${ptyIdRef.current} mechanism=dead-snapshot payload=${bytes.length}`);
+        // #1256: reset() snaps the viewport to the bottom, and this repaint
+        // used to ship that snap — a user scrolled up in a hidden pane was
+        // yanked down on reveal. Capture the distance from the bottom BEFORE
+        // the reset (rows, the same convention terminalPark uses, so the
+        // restore stays proportional if the repaint reflows line counts).
+        const fromBottom = Math.max(0, term.buffer.active.baseY - term.buffer.active.viewportY);
         discardTerminalOutput(term);
         term.reset();
+        shellPromptModeResetFor(term)?.reset();
         // Historical bytes — clipboard bridge muted (#998).
         writeReplayed(term, bytes, replayMuteRef.current);
         term.write(STALE_REPLAY_INPUT_MODE_RESETS);
@@ -836,6 +989,18 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           writePtyDataImmediately(term, chunk, replayMuteRef.current);
         }
         markTerminalClean(term);
+        if (fromBottom > 0) {
+          // Everything above went through term.write, and xterm invokes write
+          // callbacks in write order — so an empty trailing write's callback
+          // fires only after the repaint has fully parsed and the buffer's
+          // baseY is final. That is the one moment a scrollToLine lands
+          // where the user was. (Same parse-barrier shape as hydrateForRead.)
+          term.write('', () => {
+            try {
+              term.scrollToLine(Math.max(0, term.buffer.active.baseY - fromBottom));
+            } catch { /* disposed mid-restore — teardown owns cleanup */ }
+          });
+        }
       } catch { /* disposed mid-paint — teardown owns cleanup */ }
     }
     st.buffer.length = 0;
@@ -950,6 +1115,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // Calling fit() on a display:none element produces 0 cols/rows which
     // corrupts the xterm buffer and causes the "infinite copy downward" bug.
     if (container.offsetWidth === 0 || container.offsetHeight === 0) return;
+    // #1255: skip sub-floor fits. A mid-split/restoring container can measure
+    // small-but-nonzero; fit() would APPLY those columns to the buffer and
+    // the reflow re-wraps the whole scrollback at that width — damage a later
+    // correct fit does not undo. The ResizeObserver re-fires when the layout
+    // settles, so skipping is self-healing.
+    if (!proposedSafeDimensions(fitAddonRef.current)) return;
     try {
       fitAddonRef.current.fit();
       // This path fits and resizes too, so it settles any deferred debt (#747) —
@@ -968,6 +1139,29 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // ignore fit errors during unmount
     }
   }, [ptyId, containerRef]);
+
+  // #1280 — publish this terminal's identity and chord ownership on the DOM,
+  // so the document-level Rich Input listener can tell WHICH terminal a
+  // keydown came from. Without it that gate fired for any terminal's keydown
+  // and toggled the popover on the active leaf: pressing Ctrl+G in the
+  // floating pane opened Rich Input over a background pane while the floating
+  // pty got nothing (live dogfood on b4135076).
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    if (!ptyId) {
+      container.removeAttribute(TERMINAL_PTY_ATTR);
+      container.removeAttribute(COMPOSE_OWNER_ATTR);
+      return;
+    }
+    container.setAttribute(TERMINAL_PTY_ATTR, ptyId);
+    if (ownsComposeShortcut) container.setAttribute(COMPOSE_OWNER_ATTR, '');
+    else container.removeAttribute(COMPOSE_OWNER_ATTR);
+    return () => {
+      container.removeAttribute(TERMINAL_PTY_ATTR);
+      container.removeAttribute(COMPOSE_OWNER_ATTR);
+    };
+  }, [ptyId, ownsComposeShortcut, containerRef]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -993,6 +1187,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     console.log(`[wmux:pane-adopt] ptyId=${ptyId} mount=${adopted ? 'adopted' : 'fresh'}`);
 
     const terminal = adopted ? adopted.terminal : new Terminal({
+      // A fixed grid is applied at construction, before the first byte of the
+      // pane's screen is parsed — a TUI frame parsed at 80x24 and reflowed
+      // later is not repaired by any resize.
+      ...(fixedGeometryRef.current ? { cols: fixedGeometryRef.current.cols, rows: fixedGeometryRef.current.rows } : {}),
       cursorBlink: true,
       cursorStyle: terminalCursorStyle,
       fontSize: terminalFontSize,
@@ -1002,6 +1200,15 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       theme: xtermTheme,
       minimumContrastRatio,
       allowProposedApi: true,
+      // #1437: when the foreground app enables mouse tracking (Claude Code
+      // does around its input box), a plain drag goes to the app and nothing
+      // gets selected. Off macOS, xterm forces a selection on Shift+drag; on
+      // macOS it only does so for Option+drag, and only with this flag on —
+      // without it a Mac user has no way to select in such a pane. Cost: on
+      // macOS, Option+drag no longer does column selection (iTerm2 makes the
+      // same trade). Option+click-to-move-cursor stays at shell prompts; see
+      // installAltClickTrackingGuard for why it is off under mouse tracking.
+      macOptionClickForcesSelection: true,
       // Enable xterm 6's Windows-aware ConPTY handling. ConPTY emits spurious
       // row-change events on resize; on a build where the reflow path is taken
       // that logic suppresses them, which in turn keeps SelectionService from
@@ -1049,20 +1256,45 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // in-flight replay cannot become live-authorized during that handoff.
     replayMuteRef.current = getTerminalReplayMute(terminal);
 
-    const fitAddon = new FitAddon();
+    // #1792: a TUI agent killed mid-run leaves mouse / focus reporting armed,
+    // and the shell that takes the prompt back gets every report as typed
+    // junk. The guard watches this pane's own OSC 133 prompt marks and clears
+    // those modes terminal-side once the shell owns the pane again. Once per
+    // terminal, not per mount: an adopted terminal keeps the state it folded.
+    // #1794: on the desktop the reset also waits for process truth, so a TUI
+    // still alive behind the prompt (background launch, Ctrl+Z) keeps its
+    // mouse. Each mount binds its own probe (an adopting mount replaces it).
+    // The browser build (wmux web, the only one exposing `hostPlatform`) has
+    // no process-truth channel (`pty.resources` is denied there), so it keeps
+    // the prompt-mark-only behaviour, like the phone page and the mirror.
+    const hasProcessTruth = typeof (window.electronAPI as { hostPlatform?: unknown }).hostPlatform !== 'function';
+    const promptModeGuard = installShellPromptModeReset(terminal, hasProcessTruth
+      ? { isForegroundGone: paneForegroundProbe(ptyId, window.electronAPI.pty) }
+      : undefined);
+
+    const fitAddon = fixedGeometryRef.current
+      ? new FixedGeometryFitAddon(() => fixedGeometryRef.current)
+      : new FitAddon();
     const searchAddon = new SearchAddon();
     // Smart link routing (X3): localhost URLs open in the embedded browser
     // pane, external ones in the system browser; Ctrl/Cmd+click inverts. The
     // ptyId identifies the owning workspace (multiview-safe reverse lookup).
-    const webLinksAddon = new WebLinksAddon((event, uri) => {
+    const activateTerminalUrl = (event: MouseEvent, uri: string) => {
       openTerminalUrl(uri, {
         modifierHeld: event.ctrlKey || event.metaKey,
         ptyId: ptyIdRef.current || undefined,
       });
-    });
+    };
+    // Rebind adopted terminals too, so the callback uses the current pane ref.
+    terminal.options.linkHandler = createOsc8LinkHandler(activateTerminalUrl);
+    const webLinksAddon = new WebLinksAddon(activateTerminalUrl);
     terminal.loadAddon(fitAddon);
     terminal.loadAddon(searchAddon);
     terminal.loadAddon(webLinksAddon);
+    // #1641: sixel / iTerm2 inline images. Bound to the terminal instance (an
+    // adopted terminal keeps its addon and images), attached here — before the
+    // replay below is parsed — and re-synced by the setting effect.
+    syncInlineImages(terminal, useStore.getState().inlineImagesEnabled);
     // Path link provider — Ctrl+click an absolute filesystem path to open
     // it in Explorer / Finder. Coexists with WebLinksAddon (URLs); the two
     // detect disjoint token shapes so a single span never claims both.
@@ -1186,6 +1418,11 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // 그 밖의 native paste는 그대로 흘려보내 xterm 자체 처리에 맡긴다. 윈도우 크기는 이
     // 파일의 기존 RIGHT_CLICK_PASTE_SUPPRESS_MS와 동일한 관례(최근 이벤트 판별용 300ms)를 따른다.
     const isMac = window.electronAPI?.platform === 'darwin';
+    // The browser build (wmux web) pastes through the browser's own paste
+    // event: its clipboard bridge cannot read the clipboard outside a secure
+    // context, and xterm's paste handler already brackets the text. The
+    // desktop preload never sets this, so the desktop keeps its IPC paste.
+    const nativePaste = (window.clipboardAPI as { nativePaste?: boolean } | undefined)?.nativePaste === true;
     let lastPasteKeydownAt = 0;
     const NATIVE_PASTE_RACE_WINDOW_MS = 300;
     const blockNativePaste = (e: Event): void => {
@@ -1197,6 +1434,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // 레이스할 두 번째 네이티브 writer가 없고(Electron paste role registerAccelerator:false),
     // Linux는 middle-click PRIMARY-selection paste 오검출 위험까지 있어 등록에서 제외한다.
     if (isMac) { container.addEventListener('paste', blockNativePaste, true); }
+    // #1437: Option+drag now forces a selection under mouse tracking, so a
+    // short Option+click would reach xterm's click-to-move-cursor and type
+    // arrow keys into the app. Keep that feature to shell prompts.
+    const detachAltClickGuard = installAltClickTrackingGuard(container, terminal);
 
     // Issue #167: keep the hidden IME textarea empty while idle. xterm only
     // clears it on blur, so IME-committed text accumulates there after it was
@@ -1229,6 +1470,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         useStore.getState().pushToast({ message: t('terminal.imeInputRecovered'), level: 'info' });
       },
     });
+
+    // #1361: keep a byte we write ourselves behind an IME commit that is still
+    // in flight. Chromium ends the composition before delivering a key it does
+    // not consume, and xterm's CompositionHelper then sends the composed text
+    // from a `setTimeout(…, 0)` — so a synchronous write from the custom key
+    // handler overtakes it and the newline lands in front of the last Korean
+    // syllable. See terminal/compositionCommitGate.ts.
+    const compositionCommitGate = attachCompositionCommitGate(terminal);
 
     // #874/#942: keep the IME candidate window on the cursor. xterm anchors
     // its hidden helper textarea at the ybase-relative cursor row while the
@@ -1448,7 +1697,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // hidden workspace — an agent splitting a background pane, say) has no
     // valid fit to restore against. Hold the parked viewport until one runs.
     let pendingAdoptViewport: ParkedTerminal | null = null;
-    if (container.offsetWidth > 0 && container.offsetHeight > 0) {
+    // #1255: sub-floor proposals (mid-split/restoring container) are treated
+    // exactly like a hidden container — no fit, and an adoption holds its
+    // parked viewport until a real fit runs.
+    if (container.offsetWidth > 0 && container.offsetHeight > 0 && proposedSafeDimensions(fitAddon)) {
       fitAddon.fit();
       // #1002: the fit runs AFTER the adopted element is back in the DOM and
       // can change how many rows the viewport holds, which moves what "the
@@ -1466,8 +1718,15 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // so the WebGL atlas may contain glyphs measured with wrong metrics.
     // A simple refresh() doesn't rebuild the atlas — we must dispose and
     // recreate the WebGL addon to force a full atlas rebuild.
+    //
+    // #1497: the cell itself was measured with the fallback font too, and xterm
+    // never re-measures a size it considers valid — so re-measure here, before
+    // the hidden-container bail (the measurement is layout-independent, and a
+    // hidden pane would otherwise reveal with the stale cell). A changed cell
+    // fires onCharSizeChange, whose subscription below refits.
     document.fonts.ready.then(() => {
       if (!terminalRef.current || terminalRef.current !== terminal) return;
+      forceCharSizeMeasure(terminal);
       if (container.offsetWidth === 0 || container.offsetHeight === 0) return;
       if (webglAddonRef.current) {
         // [#191/#197] Release the old context (not just dispose) before
@@ -1478,17 +1737,18 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         webglAddonRef.current = null;
         loadWebgl();
       }
-      // Selection-preservation guard — this is mostly defensive (fonts.ready
-      // resolves on mount before the user can select anything), but pinning
-      // the contract here prevents future regressions if anything triggers
-      // a font load mid-session.
-      if (!claimFit(terminalRef.current, pendingFitRef)) {
-        console.debug('[Terminal] fonts.ready fit deferred — active selection');
-        return;
-      }
-      fitAddon.fit();
+      // runFit carries the selection guard, the #1255 floor gate and — unlike
+      // a direct addon fit — the sendResize, which a re-measured cell needs:
+      // cols/rows change here, and the PTY must hear about it.
+      runFit();
       terminal.refresh(0, terminal.rows - 1);
     });
+    // fonts.ready can settle before the webfont is even requested; a load that
+    // finishes later is caught here. measure() is a no-op for an unchanged cell.
+    const onFontsLoadingDone = () => {
+      if (terminalRef.current === terminal) forceCharSizeMeasure(terminal);
+    };
+    document.fonts.addEventListener('loadingdone', onFontsLoadingDone);
 
     // pendingFitRef lives at hook scope so every guarded site can reach it, so a
     // debt left by the PREVIOUS terminal (ptyId change re-runs this effect) would
@@ -1498,7 +1758,6 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // Track last sent dimensions to avoid redundant resizes
     let lastSentCols = 0;
     let lastSentRows = 0;
-    let resizeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
     // The container-resize fit, extracted so the selection-release retry below
     // runs the SAME path — including scroll preservation and sendResize —
@@ -1512,6 +1771,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // a queued fit at teardown nor stop several selection events in the same
     // debt window from each scheduling their own.
     let pendingFitRaf: number | null = null;
+    // #1436: a shrink hands the PTY its new geometry BEFORE xterm shrinks, so
+    // the handle for that deferred local fit lives here — teardown and a newer
+    // resize both have to be able to drop it.
+    let cancelOrderedFit: CancelOrderedFit | null = null;
     const runFit = () => {
       try {
         const term = terminalRef.current;
@@ -1525,6 +1788,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
 
         if (container.offsetWidth === 0 || container.offsetHeight === 0) return;
 
+        // #1255: floor gate BEFORE the selection guard — a sub-floor proposal
+        // records no fit debt: layout settling re-fires the ResizeObserver,
+        // which is the retry. (Checked before claimFit so the debt mechanism
+        // stays reserved for selection-deferred fits.)
+        const proposed = proposedSafeDimensions(fitAddon);
+        if (!proposed) return;
+
         // Selection-preservation guard: xterm's SelectionService clears the
         // active selection on any rowsChanged event from fit(). While the user
         // is dragging out a selection (or while one is live waiting to be
@@ -1536,34 +1806,75 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         }
         pendingFitRef.current = false;
 
-        const prevYBase = term.buffer.active.baseY;
-        const prevYDisp = term.buffer.active.viewportY;
-        const wasScrolledUp = prevYDisp < prevYBase;
-        const distFromBottom = prevYBase - prevYDisp;
+        // Everything that must happen locally, in one place, so the shrink path
+        // can run the SAME body one IPC round trip later instead of a thinner
+        // copy that drifts (the lesson of #747).
+        const applyLocalFit = () => {
+          const live = terminalRef.current;
+          // Re-check on the deferred path: the wait is short, but a ptyId change
+          // or an unmount inside it must not fit the NEW terminal against the
+          // OLD container/addon.
+          if (!live || live !== terminal) return;
+          if (container.offsetWidth === 0 || container.offsetHeight === 0) return;
 
-        fitAddon.fit();
+          const prevYBase = live.buffer.active.baseY;
+          const prevYDisp = live.buffer.active.viewportY;
+          const wasScrolledUp = prevYDisp < prevYBase;
+          const distFromBottom = prevYBase - prevYDisp;
 
-        if (wasScrolledUp) {
-          const newYBase = term.buffer.active.baseY;
-          const targetYDisp = Math.max(0, newYBase - distFromBottom);
-          term.scrollToLine(targetYDisp);
-        }
+          fitAddon.fit();
 
-        // #1002: first real fit after adopting into a hidden container. The
-        // park's own reading wins over the one taken above, which was measured
-        // against a viewport that had no size to be scrolled in.
-        if (pendingAdoptViewport) {
-          restoreParkedViewport(pendingAdoptViewport);
-          pendingAdoptViewport = null;
-        }
+          if (wasScrolledUp) {
+            const newYBase = live.buffer.active.baseY;
+            const targetYDisp = Math.max(0, newYBase - distFromBottom);
+            live.scrollToLine(targetYDisp);
+          }
 
-        const { cols, rows } = term;
+          // #1002: first real fit after adopting into a hidden container. The
+          // park's own reading wins over the one taken above, which was measured
+          // against a viewport that had no size to be scrolled in.
+          if (pendingAdoptViewport) {
+            restoreParkedViewport(pendingAdoptViewport);
+            pendingAdoptViewport = null;
+          }
+
+          const { cols, rows } = live;
+          const id = ptyIdRef.current;
+          // The shrink path already sent `proposed` and recorded it, so this
+          // stays quiet unless fit() actually landed somewhere else — in which
+          // case the correction is exactly what we want to send.
+          if (id && cols > 0 && rows > 0 && (cols !== lastSentCols || rows !== lastSentRows)) {
+            lastSentCols = cols;
+            lastSentRows = rows;
+            sendResize(id, cols, rows);
+          }
+        };
+
         const currentPtyId = ptyIdRef.current;
-        if (currentPtyId && cols > 0 && rows > 0 && (cols !== lastSentCols || rows !== lastSentRows)) {
-          lastSentCols = cols;
-          lastSentRows = rows;
-          sendResize(currentPtyId, cols, rows);
-        }
+        const order = currentPtyId
+          ? resizeOrderFor(term.rows, proposed.rows)
+          : 'local-first';
+
+        // A newer resize supersedes a deferred one: drop the old handle rather
+        // than let two fits race to apply different geometries.
+        cancelOrderedFit?.();
+        cancelOrderedFit = runOrderedFit({
+          order,
+          sendGeometry: () => {
+            // Only reached on the shrink path, where currentPtyId is non-null.
+            lastSentCols = proposed.cols;
+            lastSentRows = proposed.rows;
+            return sendResize(currentPtyId as string, proposed.cols, proposed.rows);
+          },
+          applyLocalFit: () => {
+            cancelOrderedFit = null;
+            try {
+              applyLocalFit();
+            } catch {
+              // ignore fit errors during unmount, as on the synchronous path
+            }
+          },
+        });
       } catch {
         // ignore fit errors during unmount
       }
@@ -1597,11 +1908,26 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       }
     });
 
+    // #1497: refit whenever xterm's cell changes. xterm also re-measures inside
+    // its own resize (_afterResize), i.e. AFTER FitAddon computed cols/rows from
+    // the old cell; without this the screen overflows its container until the
+    // next resize. Deferred to a frame because the event fires mid-resize. No
+    // loop: the refit re-measures the same cell, and measure() fires only on a
+    // change.
+    const charSizeDisposable = onCharSizeChange(terminal, () => {
+      if (pendingFitRaf !== null) cancelAnimationFrame(pendingFitRaf);
+      pendingFitRaf = requestAnimationFrame(() => {
+        pendingFitRaf = null;
+        runFit();
+      });
+    });
+
     // Keyboard-protocol negotiation folded from this pane's own output
-    // (kitty / win32-input-mode / modifyOtherKeys). Shift+Enter encoding
-    // reads it; unknown = the historical local CSI-u default. An adopted
-    // terminal keeps the state its previous mount parked (#1228 review:
-    // otherwise a workspace switch makes a live Codex fall back to CSI-u) —
+    // (kitty / win32-input-mode / modifyOtherKeys). Shift+Enter / Escape
+    // encoding reads it; unknown = local LF for Shift+Enter, bare ESC for
+    // Escape. An adopted terminal keeps the state its previous mount parked
+    // (#1228 review: otherwise a workspace switch makes a live Codex fall
+    // back to LF / bare ESC instead of win32-input-mode) —
     // unless the pane's foreground command died while it was parked: the
     // alive→dead edge can fire inside the park→adopt window where no
     // subscription observes it, so the seed refuses the same liveness the
@@ -1612,15 +1938,56 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     const keyboardRef = { current: adopted && !parkedKnownGone
       ? parkedKeyboardByTerminal.get(terminal) ?? INITIAL_REMOTE_KEYBOARD_STATE
       : INITIAL_REMOTE_KEYBOARD_STATE };
+    // On Windows `?9001h` says nothing about the app: ConPTY emits it at the
+    // start of every session on its own behalf, so trusting it armed win32 key
+    // records for every pane on the box (#1363). kitty / modifyOtherKeys still
+    // fold normally — an app has to ask for those itself.
+    // The PANE's host decides this, not the machine drawing it: the browser
+    // build reports the daemon's OS through `hostPlatform` (null until known);
+    // the desktop has no such member and is its own host.
+    const hostPlatform = () =>
+      (window.electronAPI as { hostPlatform?: () => string | null }).hostPlatform?.() ?? window.electronAPI.platform;
+    const foldOpts = () => ({ trustWin32Input: hostPlatform() !== 'win32' });
+    // #1694: the Codex newline mapping lives only while the command runs. The
+    // detected slug can outlive Codex, so the pane's own OSC 133;A ends the
+    // mapping at once and 133;C starts it again. The liveness edges above need
+    // no hook here: the same hydrate that flips them clears the slug.
+    const atPromptRef = { current: false };
+    // ...and a command started before that stale slug is dropped must not
+    // re-arm it: the prompt edge that ended Codex latches the mapping off until
+    // the slug goes (subscription below) or the grace window passes.
+    const codexEndedAtRef: { current: number | null } = { current: null };
+    // The unscanned end of the last chunk, so a marker split across two data
+    // events is still seen.
+    const promptTailRef = { current: '' };
+    if (hostPlatform() === 'win32') learnPtyShells(ptyId);
     const noteKeyboard = (data: string | Uint8Array) => {
-      keyboardRef.current = foldRemoteKeyboardState(keyboardRef.current, data);
+      keyboardRef.current = foldRemoteKeyboardState(keyboardRef.current, data, foldOpts());
       parkedKeyboardByTerminal.set(terminal, keyboardRef.current);
+      if (hostPlatform() === 'win32') {
+        const wasAtPrompt = atPromptRef.current;
+        const folded = foldAtPromptCarry(wasAtPrompt, promptTailRef.current, data);
+        atPromptRef.current = folded.atPrompt;
+        promptTailRef.current = folded.tail;
+        codexEndedAtRef.current = noteCodexEndedByPrompt(
+          codexEndedAtRef.current,
+          wasAtPrompt,
+          atPromptRef.current,
+          useStore.getState().surfaceAgent[ptyId]?.slug,
+          Date.now(),
+        );
+      }
     };
     // #1228 review (C1): the fold is liveness-scoped. When process-truth or
     // OSC 133 says the pane's foreground command is gone, any negotiation it
     // armed (?9001h / kitty push) is stale — the next app in the pane starts
     // from a clean slate, not the dead app's encoding. Same edges #1210 uses.
     const unsubscribeKeyboardLiveness = useStore.subscribe((state, prev) => {
+      // #1694: the stale Codex slug is gone, so the end-of-Codex latch has
+      // done its job; a fresh detection arms the mapping straight away.
+      if (codexEndedAtRef.current !== null && state.surfaceAgent[ptyId]?.slug !== 'codex') {
+        codexEndedAtRef.current = null;
+      }
       const gone = (now: boolean | undefined, was: boolean | undefined) =>
         now === false && was !== false;
       if (
@@ -1653,6 +2020,15 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     terminal.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true;
 
+      // The IME's plain-key follow-up of a press already acted on (a
+      // shortcut run, or a released shortcut's byte written below): never
+      // PTY input. useKeyboard swallows it first; this keeps the pane from
+      // encoding it should that ever not happen. See ShortcutPressGuard.
+      if (shortcutPressGuard.isDuplicate(e)) {
+        e.preventDefault();
+        return false;
+      }
+
       // Deterministic newline keys (Shift+Enter, Ctrl+J). Resolved by physical
       // `code` where needed so a CJK IME can't mangle the keystroke: xterm
       // derives Ctrl+<letter> from the deprecated `keyCode`, which becomes 229
@@ -1665,100 +2041,113 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           (kb) => kb.key === 'Ctrl+J',
         ),
         protocol: keyboardRef.current,
-        // Local pane: Claude Code never emits a kitty push but understands
-        // CSI-u. Keep sending it unless the pane asked for win32-input-mode
-        // (Codex on Windows, #1152).
-        shiftEnterFallback: 'csi-u',
+        // Local pane: un-negotiated Shift+Enter is LF (Ctrl+J), not CSI-u.
+        // Claude Code inside wmux never pushes kitty, so the historical CSI-u
+        // default was Escape + garbage and the prompt submitted (#1152).
+        shiftEnterFallback: 'lf',
+        // #1694: native Windows Codex takes Alt+Enter as its newline. Keyed
+        // on the detected agent, not on `?9001h` — ConPTY emits that for
+        // every pane, so the fold ignores it on a Windows host (#1363).
+        altEnterNewline: wantsAltEnterNewline({
+          hostPlatform: hostPlatform(),
+          isWsl: wslByPtyId.get(ptyId),
+          agentSlug: useStore.getState().surfaceAgent[ptyId]?.slug,
+          atPrompt: atPromptRef.current,
+          codexEndedAt: codexEndedAtRef.current,
+        }),
       });
       if (newlineByte !== null) {
         e.preventDefault();
-        window.electronAPI.pty.write(ptyId, newlineByte);
-        noteUserKeystroke(newlineByte);
+        // #1361: ordered behind an IME commit that xterm has queued but not
+        // yet sent. With no IME in play this runs synchronously, exactly as
+        // before.
+        compositionCommitGate.runAfterCommit(() => {
+          window.electronAPI.pty.write(ptyId, newlineByte);
+          noteUserKeystroke(newlineByte);
+        });
         return false;
       }
 
-      // IME-safe Escape (same class of bug as the Ctrl+J newline above).
-      // When a CJK IME is active, Windows/Chromium delivers the Escape
-      // keydown with `keyCode === 229` ("Process"). xterm's CompositionHelper
-      // drops EVERY keyCode-229 keydown (it returns false, so `_keyDown` bails
-      // before emitting), so no `\x1b` ever reaches the PTY — Esc silently does
-      // nothing inside in-pane TUIs (Claude Code's /status dialog, fzf, less, …)
-      // while Tab still works (Tab is keyCode 9, which the IME doesn't claim).
-      // We emit the ESC byte ourselves and bypass xterm. `keyCode === 229` is
-      // exactly the set xterm drops, so this never double-sends on the normal
-      // keyCode-27 path. `!isComposing` defers to the IME while a candidate
-      // window / preedit is open, where Escape legitimately cancels the
-      // composition rather than the foreground app (mirrors newlineKeys).
-      if (e.code === 'Escape' && !e.isComposing && e.keyCode === 229) {
+      // Escape. Written here — not left to xterm — for two reasons:
+      //   1. IME / TSF: xterm's CompositionHelper drops every keyCode-229
+      //      keydown, so a CJK IME (or a desynced TSF context while a TUI
+      //      streams) swallows Escape. Tab still works because it is keyCode 9.
+      //   2. Protocol: a pane that asked for kitty / win32-input-mode will
+      //      wait for CSI-u / a KEY_EVENT_RECORD if we send a bare ESC, and
+      //      Escape then does nothing for the rest of the turn (#1152).
+      // `!isComposing` (inside isBareEscape) defers to the IME while a
+      // candidate window is open, where Escape cancels the preedit.
+      if (isBareEscape(e)) {
+        const escapeByte = encodeEscape(keyboardRef.current);
         e.preventDefault();
-        window.electronAPI.pty.write(ptyId, '\x1b');
-        noteUserKeystroke('\x1b');
+        window.electronAPI.pty.write(ptyId, escapeByte);
+        noteUserKeystroke(escapeByte);
         return false;
       }
 
-      // Pass app shortcuts through to useKeyboard (don't let xterm consume them).
-      // 'd' is the Ctrl+D split-right shortcut — without it xterm sends EOT (0x04)
-      // to the PTY and PowerShell echoes it back as `^D` instead of triggering split.
+      // ─── Shortcuts leave xterm; everything else is terminal input ────
+      // useKeyboard (window capture phase) has already run the shortcut; xterm
+      // must not ALSO encode it — its keydown handler ignores preventDefault,
+      // so without `return false` here Ctrl+D would both split the pane and
+      // send EOT (0x04), echoed by PowerShell as `^D`.
       //
-      // macOS: useKeyboard가 cmdOrCtrl=metaKey로 매칭하므로 Cmd 계열 액션(,/d/k/i/
-      // n/t/`)의 Ctrl 조합은 앱 액션이 아니다 — 삼키면 Ctrl+D(EOF)·Ctrl+I(Tab)·
-      // Ctrl+K(kill-line) 등 readline 컨트롤 문자가 PTY에도 못 가고 죽는다
-      // (owner-reported 2026-07-19). mac에서는 literal-Ctrl 바인딩만(b=프리픽스,
-      // m=북마크, Ctrl+Arrow) 버블시키고 나머지는 xterm→PTY로 통과.
-      // #1152 — a combo the user disabled in Settings → Shortcuts must reach
-      // the PTY like any other terminal byte: return true so xterm PROCESSES
-      // the key (encoding e.g. Ctrl+T as 0x14) instead of bubbling it to
-      // useKeyboard, whose own disabled-gate would drop it without
-      // preventDefault — leaving the key dead in both worlds. Same shared
-      // matcher as that gate, so the two can never disagree about which
-      // combos are off.
-      if (matchesDisabledShortcut(
-        useStore.getState().disabledShortcuts, e, isMac ? 'darwin' : 'win32',
-      )) {
+      // #1455 — which keys are shortcuts is not listed here. It is answered by
+      // the SAME resolver useKeyboard dispatches with, over the SAME effective
+      // bindings (shared/keymap.ts + the user's overrides). The hand-kept
+      // bubble lists this replaced disagreed with useKeyboard in both
+      // directions: they swallowed bare Ctrl+Up/Down that nothing handled,
+      // missed a moved prefix key, and needed a second copy of the modifier
+      // rules to honour a disabled built-in (#1152). On macOS the ⌘ family is
+      // simply not Ctrl, so Ctrl+D (EOF), Ctrl+K (kill-line) and friends reach
+      // readline there (owner-reported 2026-07-19).
+      const bindings = currentShortcutBindings();
+      const shortcut = resolveShortcut(e, bindings);
+      // A built-in the user switched off or moved away (Settings → Shortcuts)
+      // is the pane's again: xterm PROCESSES it — Ctrl+T reaches Codex's
+      // transcript, Alt+Up reaches a TUI — instead of the combo bubbling to a
+      // useKeyboard that no longer claims it and dying in both worlds.
+      if (shortcut === null && resolveShortcut(e, defaultShortcutBindings()) !== null) {
         // #1227 — xterm encodes Ctrl+letter from keyCode (QWERTY position).
         // Write the logical control byte ourselves so a disabled Ctrl+T on
         // Dvorak still delivers 0x14 instead of whatever physical keyCode says.
-        const disabledCtrl = resolveCtrlLetterByte(e);
-        if (disabledCtrl) {
+        const releasedCtrl = resolveCtrlLetterByte(e);
+        if (releasedCtrl) {
           e.preventDefault();
-          window.electronAPI.pty.write(ptyId, disabledCtrl);
-          noteUserKeystroke(disabledCtrl);
+          shortcutPressGuard.noteActed(e);
+          window.electronAPI.pty.write(ptyId, releasedCtrl);
+          noteUserKeystroke(releasedCtrl);
           return false;
         }
         return true;
       }
-      const bubbleKeys = isMac
-        ? ['b', 'm', 'ArrowUp', 'ArrowDown']
-        : [',', 'b', 'd', 'k', 'i', 'n', 't', 'm', 'ArrowUp', 'ArrowDown', '`'];
-      const bubbleCodes = isMac
-        ? ['KeyB', 'KeyM', 'ArrowUp', 'ArrowDown']
-        : ['KeyB', 'KeyD', 'KeyK', 'KeyI', 'KeyN', 'KeyT', 'KeyM', 'Comma', 'ArrowUp', 'ArrowDown'];
-      if (e.ctrlKey && !e.shiftKey && bubbleKeys.includes(e.key)) {
+      // #1280 — the Rich Input chord bubbles from HERE, instead of merely
+      // being preventDefault'd downstream: xterm's own encode path calls
+      // stopPropagation (its `cancel()`), so otherwise the chord never reaches
+      // useComposeShortcut's document listener — or it reaches it after the
+      // ctrl encoder below wrote BEL (0x07): `^G` in the shell plus the
+      // popover, the reported bug. Same predicate as the popover gate, so the
+      // two cannot disagree about which keydown is the chord.
+      //
+      // Ownership is the other half: the popover acts on the active leaf's
+      // pty, so a floating pane / brain embed would see the key swallowed
+      // here and declined there. Those surfaces keep encoding 0x07.
+      if (shortcut === 'richInput') {
+        if (composeOwnerHost(e.target).owns && isComposeChord(e, bindings)
+            && !useStore.getState().inspectModeActive) {
+          return false; // let DOM bubble to useComposeShortcut
+        }
+      } else if (shortcut === 'mentionAgent') {
+        // Same gate as useKeyboard: claimed only in the active agent pane's own
+        // terminal. In a shell — or a floating pane / brain embed while a leaf
+        // agent is active — the key is this terminal's (F2 → mc / htop / vim),
+        // unless it is a ⌘ chord on macOS, which bubbles for the toast.
+        if (mentionKeyClaim(useStore.getState(), e, window.electronAPI?.platform) !== null) return false;
+      } else if (shortcut !== null) {
         return false; // let DOM bubble to useKeyboard
       }
-      // Cross-layout / IME-safe fallback: when a Hangul or other non-Latin layout
-      // is active, e.key is the composed letter (e.g. 'ㅇ') or 'Process', and the
-      // allowlist above misses. Match by physical key code so the split shortcut
-      // still works under any layout/IME state.
-      if (e.ctrlKey && !e.shiftKey && bubbleCodes.includes(e.code)) {
+      // The prefix trigger (Ctrl+B by default, whatever key the user set).
+      if (isPrefixTrigger(e, useStore.getState().prefixConfig.key)) {
         return false;
-      }
-      // Ctrl+` by code (cross-layout) — mac은 Cmd+`가 액션이므로 Ctrl+`(NUL)는 PTY로.
-      if (!isMac && e.ctrlKey && !e.shiftKey && e.code === 'Backquote') {
-        return false;
-      }
-      // Terminal font zoom: Ctrl+= / Ctrl+- / Ctrl+0 (#171). Let these bubble to
-      // useKeyboard instead of feeding '=' / '-' / '0' bytes to the PTY. Match by
-      // physical code as well so zoom survives a Hangul / non-Latin IME. The
-      // Ctrl++ (Shift+=) and numpad variants are already covered: the Ctrl+Shift
-      // catch-all below bubbles the former, and useKeyboard maps NumpadAdd etc.
-      // mac 줌은 Cmd+=/-/0 — Ctrl 조합은 앱 액션이 아니므로 xterm/PTY로 통과.
-      if (!isMac && e.ctrlKey && !e.shiftKey && (
-        e.key === '=' || e.key === '-' || e.key === '0' ||
-        e.code === 'Equal' || e.code === 'Minus' || e.code === 'Digit0' ||
-        e.code === 'NumpadAdd' || e.code === 'NumpadSubtract' || e.code === 'Numpad0'
-      )) {
-        return false; // let DOM bubble to useKeyboard's zoom handlers
       }
       // Ctrl+Shift+C / Ctrl+Shift+V are explicit copy/paste, handled below.
       // Let them fall through; bubble every OTHER Ctrl+Shift combo to app
@@ -1798,6 +2187,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         return true; // no selection → let the OS handle ⌘C
       }
       if (isMac && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === 'v' || e.code === 'KeyV')) {
+        if (nativePaste) return false;
         e.preventDefault();
         lastPasteKeydownAt = Date.now(); // blockNativePaste 위: 곧 같이 뜰 native paste를 레이스로 잡는다
         void (async () => {
@@ -1840,6 +2230,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // mac은 Cmd+V가 붙여넣기 전담(위 분기) — Ctrl+V는 readline quoted-insert
       // (verbatim)이므로 PTY로 통과시킨다.
       if (!isMac && resolveCtrlLetterByte(e) === '\x16') {
+        if (nativePaste) return false;
         e.preventDefault();
         // isMac 게이트: blockNativePaste 리스너가 비-macOS에선 등록조차 안 되므로(위 참고)
         // 스탬프도 macOS에서만 찍는다 — 안 그러면 나중에 등록 게이트를 넓힐 때 값이 이미
@@ -1886,6 +2277,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       }
       // Ctrl+Shift+V: paste fallback
       if (e.ctrlKey && e.shiftKey && (e.key === 'V' || e.code === 'KeyV')) {
+        if (nativePaste) return false;
         e.preventDefault();
         if (isMac) lastPasteKeydownAt = Date.now(); // isMac 게이트 이유는 Ctrl+V 분기 주석 참고
         void (async () => {
@@ -2044,6 +2436,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // own bracketed-paste markers if it pre-wrapped the payload.
     let inputBuffer = '';
     const onDataDisposable = terminal.onData((data) => {
+      // #1794: a reset is owed for leaked mouse / focus modes but has not
+      // applied yet (process truth pending, or queued behind output): the
+      // reports are the dead TUI's, not the shell's. Before anything else.
+      if (promptModeGuard.dropsReport(data)) return;
       // X6 ②: the user is driving this shell themselves — retract any pending
       // resume offer so the pill can't fire into a session they've moved on in.
       //
@@ -2122,7 +2518,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     let pendingFlushReset = false;
     let lastFlushRecoveredBytes: number | null = null;
     let removeFlushListener: (() => void) | null = null;
-    // Stale-replay mode reset (see ../terminal/staleReplayModeReset.ts): a
+    // Stale-replay mode reset (see ../../shared/terminal/staleReplayModeReset.ts): a
     // recovered session's ring replay re-executes the dead agent's DECSET
     // arming (mouse/focus/paste reporting) into xterm, so the fresh shell's
     // pane emits mouse reports that both dismiss the resume pill (onData
@@ -2165,16 +2561,38 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       const mechanism = st.viaRawFallback ? 'dirty-raw-fallback' : 'dirty-snapshot';
       st.viaRawFallback = false;
       console.log(`[wmux:reveal] ptyId=${ptyId} mechanism=${mechanism} recoveredBytes=${recoveredBytes} buffered=${st.bufferedChars} chunks=${st.buffer.length}`);
+      // #1256: same viewport-preservation contract as paintDeadSnapshot —
+      // the reset below snaps to bottom, and a user scrolled up in the pane
+      // must stay where they were after the recovered screen lands.
+      const fromBottom = Math.max(0, terminal.buffer.active.baseY - terminal.buffer.active.viewportY);
       discardTerminalOutput(terminal); // stale retained backlog + dirty flag
       terminal.reset();
+      shellPromptModeResetFor(terminal)?.reset();
       // The scanner labels every held chunk at its source. Historical bytes
       // are muted for their exact parse lifetime; live output is not muted.
       for (const chunk of st.buffer) {
         writePtyDataImmediately(terminal, chunk, replayMuteRef.current);
       }
+      if (fromBottom > 0) {
+        // Trailing empty write = parse barrier (callbacks fire in write
+        // order); scrollToLine only after the recovered screen is parsed and
+        // baseY is final. See the identical block in paintDeadSnapshot.
+        terminal.write('', () => {
+          try {
+            terminal.scrollToLine(Math.max(0, terminal.buffer.active.baseY - fromBottom));
+          } catch { /* disposed mid-restore — teardown owns cleanup */ }
+        });
+      }
       st.buffer.length = 0;
       st.bufferedChars = 0;
       resetStaleReplayModes(recoveredBytes);
+      // #1255: re-assert DOM-derived geometry past the runFit dedup. The
+      // recovered session must get the real size even if the renderer's
+      // lastSentCols cache already "matches" — a transient sub-floor fit
+      // could have left the daemon pinned at its MIN_SAFE_COLS clamp while
+      // the cache believed otherwise. sendResize carries no dedup.
+      const dims = proposedSafeDimensions(fitAddon);
+      if (dims) sendResize(ptyId, dims.cols, dims.rows);
       st.resolvers.splice(0).forEach((r) => r());
       return true;
     };
@@ -2216,9 +2634,17 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       deliverPtyData({ ...payload, data: restingCursor.process(payload.data) });
     };
     const deliverPtyData = (payload: PtyDataPayload) => {
-      // Fold before the resync buffer so a ?9001h that arrives mid-resync
-      // still arms Shift+Enter encoding (#1152).
-      noteKeyboard(payload.data);
+      // Fold before the resync buffer so a mid-resync negotiation still arms
+      // the encoding (#1152). Replay is history, not a negotiation: it
+      // re-delivers the dead session's `?9001h` on every restart (#1363).
+      if (!payload.replay) noteKeyboard(payload.data);
+      else if (fixedGeometryRef.current) {
+        // A viewer (`fixedGeometry`) never saw the negotiation happen: its
+        // replay is a snapshot of the pane's CURRENT state, so it is the
+        // negotiation to fold — from scratch, as the snapshot starts over.
+        keyboardRef.current = INITIAL_REMOTE_KEYBOARD_STATE;
+        noteKeyboard(payload.data);
+      }
       const st = resyncRef.current;
       if (st.pending) {
         st.buffer.push(payload);
@@ -2328,7 +2754,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         lastFlushRecoveredBytes = recoveredBytes;
         if (pendingFlushReset) {
           pendingFlushReset = false;
-          if (recoveredBytes > 0) terminal.reset();
+          if (recoveredBytes > 0) {
+            terminal.reset();
+            shellPromptModeResetFor(terminal)?.reset();
+          }
         }
         resetStaleReplayModes(recoveredBytes);
       });
@@ -2395,7 +2824,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
               // bytes to xterm before reset() so the byte order xterm sees is
               // identical to the old direct-write path.
               flushTerminalOutput(terminal);
-              if (lastFlushRecoveredBytes > 0) terminal.reset();
+              if (lastFlushRecoveredBytes > 0) {
+                terminal.reset();
+                shellPromptModeResetFor(terminal)?.reset();
+              }
             } else {
               pendingFlushReset = true;
             }
@@ -2488,6 +2920,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     //   - fresh/adopted branch: immediately after connectPty()
 
     terminalRef.current = terminal;
+    // #1256: publish identity as state so snapshot consumers re-render onto
+    // the real instance (fresh or adopted — both swap identity here).
+    setTerminalInstance(terminal);
     fitAddonRef.current = fitAddon;
     searchAddonRef.current = searchAddon;
 
@@ -2516,21 +2951,55 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     };
     if (ptyId) hydrateRegistry.set(ptyId, hydrateForRead);
 
+    // #1437: teach the Shift override when the foreground app owns the mouse.
+    // Claude Code emits `?1000h`/`?1006h` around its input box, so a plain
+    // left-drag there is delivered to the agent and xterm never starts a
+    // selection — the pane looks like it simply cannot be copied from. The
+    // decision (real drag attempt? rate-limited?) is the pure
+    // `createMouseOwnedHint`; this only wires events and reads the live mode.
+    // Nothing is preventDefault'ed or swallowed: the app keeps every event it
+    // owns, we just say why the highlight did not appear.
+    // Which modifier escapes is platform-dependent — see the toast helper.
+    const forcesSelectionOnThisPlatform = window.electronAPI?.platform === 'darwin'
+      ? (e: { altKey?: boolean }) => e.altKey === true
+      : (e: { shiftKey: boolean }) => e.shiftKey;
+    const mouseOwnedHint = createMouseOwnedHint({
+      forcesSelection: forcesSelectionOnThisPlatform,
+      isMouseOwned: () => {
+        const mode = (terminal as unknown as { modes?: { mouseTrackingMode?: string } })
+          .modes?.mouseTrackingMode ?? 'none';
+        return mode !== 'none';
+      },
+      show: showMouseOwnedHintToast,
+    });
+    const onHintMouseDown = (e: MouseEvent) => mouseOwnedHint.onMouseDown(e);
+    // move/up on the document, not the container: a drag that leaves the pane
+    // (the common gesture when grabbing a whole line) must still count, and its
+    // mouseup lands wherever the pointer ended.
+    const onHintMouseMove = (e: MouseEvent) => mouseOwnedHint.onMouseMove(e);
+    const onHintMouseUp = () => mouseOwnedHint.onMouseUp();
+    container.addEventListener('mousedown', onHintMouseDown);
+    document.addEventListener('mousemove', onHintMouseMove);
+    document.addEventListener('mouseup', onHintMouseUp);
+
     // ResizeObserver for auto-fit — preserves user scroll position across resize.
     // IMPORTANT: skip when the container has zero dimensions (display:none workspace).
     // Fitting a hidden terminal produces 0 cols/rows, which corrupts the PTY buffer
     // and manifests as "infinite content duplication" when switching back to it.
-    const resizeObserver = new ResizeObserver(() => {
-      if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
-      resizeDebounceTimer = setTimeout(() => {
-        resizeDebounceTimer = null;
+    // The scheduler debounces ticks and, while an animated layout change (the
+    // sidebar toggle) holds fits, defers them to one fit on release — never a
+    // PTY resize per animation frame.
+    const resizeScheduler = createFitScheduler({
+      debounceMs: 100,
+      fitNextFrame: () => {
         if (pendingFitRaf !== null) cancelAnimationFrame(pendingFitRaf);
         pendingFitRaf = requestAnimationFrame(() => {
           pendingFitRaf = null;
           runFit();
         });
-      }, 100);
+      },
     });
+    const resizeObserver = new ResizeObserver(() => resizeScheduler.onResize());
     resizeObserver.observe(container);
 
     return () => {
@@ -2576,9 +3045,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // inferring it from what the screen did.
       console.log(`[wmux:pane-adopt] ptyId=${ptyId} teardown=${canPark ? 'parked' : `disposed reason=${parkRefusal}`}`);
 
-      if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
+      resizeScheduler.dispose();
       if (pendingFitRaf !== null) cancelAnimationFrame(pendingFitRaf);
       if (isMac) { container.removeEventListener('paste', blockNativePaste, true); }
+      detachAltClickGuard();
       detachAltScreenWheel();
       terminal.textarea?.removeEventListener('focus', onTextareaFocus);
       terminal.textarea?.removeEventListener('keydown', onWatchdogKeyDown);
@@ -2588,10 +3058,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       unregisterAtlasGuard();
       imeResidueGuard?.dispose();
       imeStormGuard.dispose();
+      compositionCommitGate.dispose();
       imeAnchor.dispose();
       deadInputWatchdog.dispose();
       autoCopy.dispose();
       selectionDisposable.dispose();
+      charSizeDisposable?.dispose();
+      document.fonts.removeEventListener('loadingdone', onFontsLoadingDone);
       pathLinkDisposable.dispose();
       osc52Disposable.dispose();
       // #582: dispose the xterm→PTY input listener BEFORE the deferred-
@@ -2602,6 +3075,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // other listeners are already torn down. Dropping this disposable here
       // stops stray input during the defer window.
       onDataDisposable.dispose();
+      container.removeEventListener('mousedown', onHintMouseDown);
+      document.removeEventListener('mousemove', onHintMouseMove);
+      document.removeEventListener('mouseup', onHintMouseUp);
+      cancelOrderedFit?.();
       resizeObserver.disconnect();
       // #929: cancel any pending resting-cursor show before dispose — a late
       // inject into a disposed xterm is the #582 class of bug.
@@ -2680,6 +3157,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       }
       unsubscribeKeyboardLiveness();
       terminalRef.current = null;
+      // #1256: clear the published instance too. On a ptyId re-run the next
+      // effect publishes the new instance; on a true unmount React ignores
+      // the set. Either way consumers never keep a disposed terminal.
+      setTerminalInstance(null);
       fitAddonRef.current = null;
       searchAddonRef.current = null;
     };
@@ -2715,7 +3196,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       inFlight = true;
       reconnectInFlightRef.current = true;
       console.log(`[useTerminal] daemon reattach ptyId=${id} (${reason})`);
-      void reconnectPtyWithRetry(id, () => ptyIdRef.current === id && terminalRef.current !== null)
+      return reconnectPtyWithRetry(id, () => ptyIdRef.current === id && terminalRef.current !== null, (message, info) => onRecoveryErrorRef.current?.(message, info))
         .then(() => {
           // #882 — the daemon starts every managed session at `viewerVisible:
           // true` and resets to true on detach, so a reattach that lands while
@@ -2726,9 +3207,16 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           // last reported value so a reattach cannot silently revert it.
           if (ptyIdRef.current !== id) return;
           reportViewerVisibility(id, viewerVisibleRef.current);
+          // #1255: re-assert DOM-derived geometry after a reconnect — the
+          // daemon session was recreated at its default/clamped size; the
+          // renderer's dedup cache may already "match" that stale value, so
+          // the resize goes out unconditionally via sendResize (no dedup).
+          const dims = proposedSafeDimensions(fitAddonRef.current);
+          if (dims) sendResize(id, dims.cols, dims.rows);
         })
         .finally(() => { inFlight = false; reconnectInFlightRef.current = false; });
     };
+    retryReconnectRef.current = () => reattach('manual-retry');
     // Daemon already connected when we mounted: its daemon:connected fired before
     // the renderer could listen, so we reattach now off the module flag (set by
     // AppLayout's serialized startup before the pane gate opens).
@@ -2766,7 +3254,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       }
       reattach('pty:restarted');
     });
-    return () => { if (off) off(); offRestarted(); };
+    return () => { retryReconnectRef.current = null; if (off) off(); offRestarted(); };
   }, [ptyId]);
 
   // Apply font/theme changes at runtime without recreating the terminal instance.
@@ -2803,8 +3291,21 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       console.debug('[Terminal] font/theme fit skipped — container has zero dimensions');
       return;
     }
+    // #1255: floor gate — a font change re-measures the container; skip
+    // sub-floor proposals instead of reflowing the buffer at a broken width.
+    if (!proposedSafeDimensions(fitAddonRef.current)) {
+      console.debug('[Terminal] font/theme fit skipped — sub-floor dimensions');
+      return;
+    }
     fitAddonRef.current?.fit();
   }, [terminalFontSize, terminalFontFamily, terminalCursorStyle, xtermTheme, minimumContrastRatio, containerRef]);
+
+  // `fixedGeometry`: the owner resized the pane — re-pin the grid and refit
+  // the font. Never runs without the option.
+  useEffect(() => {
+    if (fixedCols === undefined || fixedRows === undefined) return;
+    fit();
+  }, [fixedCols, fixedRows, fit]);
 
   // Manage WebGL lifecycle based on visibility.
   // Load WebGL when visible (GPU-accelerated rendering), dispose when hidden
@@ -2988,6 +3489,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     searchAddonRef.current?.findPrevious(text, { decorations: getSearchDecorations(), regex: useRegex });
   }, [getSearchDecorations]);
 
+  // #1641: the Settings toggle. Off disposes the addon (canvas, image store,
+  // decoder) on every live terminal; on attaches it — idempotent per instance.
+  useEffect(() => {
+    if (terminalInstance) syncInlineImages(terminalInstance, inlineImagesEnabled);
+  }, [terminalInstance, inlineImagesEnabled]);
+
   const clearSearch = useCallback(() => {
     searchAddonRef.current?.clearDecorations();
   }, []);
@@ -3004,5 +3511,5 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     terminalRef.current?.scrollToLine(line);
   }, []);
 
-  return { terminal: terminalRef, fit, searchAddonRef, findNext, findPrevious, clearSearch, getScrollPosition, scrollToLine };
+  return { terminal: terminalRef, terminalInstance, fit, searchAddonRef, findNext, findPrevious, clearSearch, getScrollPosition, scrollToLine, retryConnection: () => retryReconnectRef.current?.() };
 }

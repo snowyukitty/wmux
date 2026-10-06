@@ -184,3 +184,47 @@ describe('capSnapshot — cost', () => {
     expect(out.omittedBytes + out.bytes.length).toBe(buf.length);
   });
 });
+
+describe('capSnapshot — inline image payloads (#1641)', () => {
+  // A payload far longer than the lookbehind: the cut lands deep inside it,
+  // where neither its introducer nor its terminator is within the ESC scans.
+  const payload = 'QUJD'.repeat(10 * 1024); // 40 KB of base64
+
+  it('skips the tail of an OSC 1337 image cut in the middle', () => {
+    const osc = `${ESC}]1337;File=inline=1:${payload}\x07`;
+    const buf = Buffer.from('line\n'.repeat(100) + osc + '\r\nalive\r\n', 'latin1');
+    const out = capSnapshot(buf, { maxBytes: 20 * 1024 }); // naive cut mid-payload
+    const text = out.bytes.toString('latin1');
+    expect(text).not.toContain('QUJD');
+    expect(text).toContain('alive');
+    expect(out.omittedBytes + out.bytes.length).toBe(buf.length);
+  });
+
+  it('skips the tail of a sixel DCS cut in the middle', () => {
+    const sixel = `${ESC}Pq#0;2;100;0;0#0${'~'.repeat(40 * 1024)}${ESC}\\`;
+    const buf = Buffer.from('line\n'.repeat(100) + sixel + '\r\nalive\r\n', 'latin1');
+    const out = capSnapshot(buf, { maxBytes: 20 * 1024 });
+    const text = out.bytes.toString('latin1');
+    expect(text).not.toContain('~');
+    expect(text).toContain('alive');
+  });
+
+  it('keeps history of output without line feeds that reaches a bell much later', () => {
+    // A progress bar redrawn with CR and no LF, then a bell: not a payload.
+    // The skip is bounded by one line's worth, not by where the bell is.
+    const progress = 'progress 42% [=====     ]\r'.repeat(12 * 1024); // ~300 KB
+    const buf = Buffer.from(`${progress}\x07done\r\n`, 'latin1');
+    const maxBytes = 256 * 1024;
+    const out = capSnapshot(buf, { maxBytes });
+    expect(out.bytes.length).toBeGreaterThanOrEqual(maxBytes - 4096);
+    expect(out.bytes.toString('latin1')).toContain('progress');
+  });
+
+  it('leaves ordinary output after the cut alone', () => {
+    // Long lines with colour escapes and newlines: no BEL/ST comes first, so
+    // nothing is mistaken for a payload tail.
+    const buf = Buffer.from(`${'x'.repeat(6000)}${ESC}[31mred${ESC}[0m\n`.repeat(8), 'latin1');
+    const out = capSnapshot(buf, { maxBytes: 20 * 1024 });
+    expect(out.bytes.length).toBeGreaterThan(20 * 1024 - 7000);
+  });
+});

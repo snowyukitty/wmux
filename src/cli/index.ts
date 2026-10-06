@@ -17,6 +17,8 @@ import { handleMcp } from './commands/mcp';
 import { handleSetupHooks } from './commands/setupHooks';
 import { handleSetupStatusline } from './commands/setupStatusline';
 import { handleDoctor } from './commands/doctor';
+import { handleRole } from './commands/role';
+import { handleDeck } from './commands/deck';
 import { handleChannel } from './commands/channel';
 import { handleWeb } from './commands/web';
 import { handleDaemon } from './commands/daemon';
@@ -31,7 +33,8 @@ WORKSPACE COMMANDS
   list-workspaces                   List all workspaces
   new-workspace [--name <name>]     Create a new workspace
   focus-workspace <id>              Focus a workspace by ID
-  close-workspace <id>              Close a workspace by ID
+  close-workspace <id> [--force]    Close a workspace by ID (--force: even your
+                                    own workspace or one with live agent panes)
   current-workspace                 Show the active workspace
 
 SURFACE COMMANDS
@@ -66,6 +69,10 @@ WEB ACCESS (browser / PWA)
   web                               Serve wmux panes to a browser (read-only,
                                     LOCAL-ONLY by default). NOTE: even read-only
                                     exposes a pane's FULL scrollback to viewers.
+                                    Re-running it on a running server keeps
+                                    every option not given (port, scope, allowed
+                                    hosts, TLS, allow-* grants); turn one off
+                                    with --no-allow-<x>, --loopback or --no-tls
         [--port <n>]                Listen port (default 7681)
         [--expose]                  Bind all interfaces (0.0.0.0) for phone
                                     access. Off by default (loopback only).
@@ -78,9 +85,13 @@ WEB ACCESS (browser / PWA)
                                     native HTTPS (requires --tls-key)
         [--tls-key <path>]          Matching PEM private key (requires
                                     --tls-cert; incompatible with --tailscale)
-                                    Re-supply both TLS paths when re-running
-                                    'wmux web' to change other CLI options
+        [--no-tls]                  Drop native HTTPS on a re-run (revokes
+                                    every paired device)
+        [--loopback]                Drop --expose / --host / --tailscale /
+                                    --allow-host on a re-run: loopback only
         [--allow-input]             Enable keyboard input (off by default)
+        [--no-allow-<x>]            Turn a grant off on a re-run: input,
+                                    upload, transcript, dangerous-launch
         [--allow-upload]            Enable photo upload from a paired phone
                                     (JPEG/PNG, 10 MB cap, files kept 24h in
                                     ~/.wmux/uploads/phone). Off by default
@@ -88,6 +99,13 @@ WEB ACCESS (browser / PWA)
                                     paired phone (thinking, tool inputs, and
                                     contents of files the agent read). Off by
                                     default
+        [--allow-dangerous-launch]  Let a phone start Claude/Codex from chat
+                                    with approvals off (bypass/yolo), after
+                                    per-launch confirmation. Off by default
+        [--no-inline-images]        Stop the browser terminal drawing sixel and
+                                    iTerm2 images (on by default; kept across
+                                    re-runs, restarts and --stop;
+                                    --inline-images turns it back on)
         [--allow-host <h1,h2>]      Extra Host names to accept and advertise,
                                     for a reverse proxy or native TLS DNS name
         [--new-token]               Mint a fresh access token, revoking every
@@ -127,6 +145,16 @@ DIAGNOSTICS
          [--performance]            Also print reveal-mechanism performance
                                     stats (last reveal, 5-min + since-boot
                                     counters) from the running app.
+
+ROLES
+  role resolve <Role>               Print what a role is bound to in Settings
+             [--json]               {agent, model, effort, argv, flags}; exit 2 if unbound
+             [--session <path>]     Read another session.json (default: the app's)
+
+COMMAND DECK
+  deck state                        Report or prune orphan Deck state
+             [--orphans]            List orphan workspace IDs across Deck store files
+             [--prune --yes]        Prune orphan state (archives active work records)
 
 BROWSER COMMANDS
   browser navigate <url>            Navigate your workspace's browser surface
@@ -173,6 +201,9 @@ EXAMPLES
   wmux doctor
   wmux doctor --json
   wmux doctor --performance
+  wmux role resolve Builder --json
+  wmux deck state --orphans
+  wmux deck state --prune --yes
 `.trimStart();
 
 const WORKSPACE_CMDS = new Set([
@@ -249,6 +280,10 @@ async function main(): Promise<void> {
       await handleSetupStatusline(rest, jsonMode);
     } else if (cmd === 'doctor') {
       await handleDoctor(rest, jsonMode);
+    } else if (cmd === 'role') {
+      await handleRole(rest, jsonMode);
+    } else if (cmd === 'deck') {
+      await handleDeck(rest, jsonMode);
     } else if (cmd === 'channel') {
       await handleChannel(rest[0], rest.slice(1), jsonMode);
     } else {

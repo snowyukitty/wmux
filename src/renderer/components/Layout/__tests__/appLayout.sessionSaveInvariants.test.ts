@@ -84,6 +84,10 @@ describe('AppLayout — axis A session-save invariants', () => {
     expect(source).toMatch(/anthropicUsageEnabled:\s*state\.anthropicUsageEnabled/);
   });
 
+  it('persists the usage-limit auto-resume setting explicitly, including false', () => {
+    expect(source).toMatch(/usageLimitAutoResume:\s*state\.usageLimitAutoResume/);
+  });
+
   // Fix B — cap-skipped suspended promote. Boot recovery honours a session cap,
   // so a workspace beyond the cap came back with its ptyId absent and reconcile
   // destructively cleared it (losing the pane's scrollback and identity). The
@@ -140,6 +144,20 @@ describe('AppLayout — axis A session-save invariants', () => {
       expect(loopAt).toBeGreaterThanOrEqual(0);
       expect(region.slice(loopAt, loopAt + 200)).toMatch(/if \(signal\?\.aborted\) break;/);
     });
+  });
+
+  it('marks the session restored only on the saved-session path with workspaces (Deck reconcile gate)', () => {
+    const region = startupRegion();
+    const markAt = region.indexOf('markSessionRestored()');
+    expect(markAt, 'markSessionRestored call not found').toBeGreaterThan(0);
+    // After loadSession(saved), guarded on a non-empty saved workspace list…
+    expect(markAt).toBeGreaterThan(region.indexOf('useStore.getState().loadSession(saved)'));
+    expect(region.slice(markAt - 200, markAt)).toMatch(/saved\.workspaces\.length > 0/);
+    // …and never on the null-load early return or in the catch.
+    const nullBranch = region.slice(region.indexOf('if (!saved) {'), region.indexOf('return;', region.indexOf('if (!saved) {')));
+    expect(nullBranch).not.toContain('markSessionRestored');
+    const catchAt = region.indexOf('} catch (err) {');
+    expect(region.slice(catchAt, region.indexOf('} finally {', catchAt))).not.toContain('markSessionRestored');
   });
 
   it('rebind/clear actions CAS-guard on the surface’s current ptyId', () => {

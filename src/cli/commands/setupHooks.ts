@@ -1,7 +1,10 @@
+import { openCodeTerminalChatIntegration } from '../../shared/openCodeTerminalChatIntegration';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { spawnSync } from 'child_process';
 import { writeJsonAtomic } from '../../shared/settingsFile';
+import { FANOUT_WORKER_ALLOWED_TOOLS } from '../../shared/workerLaunch';
 
 /**
  * `wmux setup-hooks` — install the wmux ↔ Claude Code hook bridge directly into
@@ -32,12 +35,18 @@ USAGE
 
 ACTIONS (mutually exclusive; default = install)
   (default)    Install or refresh Claude Code hooks, the Codex notify bridge,
-               and the OpenCode lifecycle plugin. Existing foreign hooks,
-               notify commands, and plugin files are never overwritten.
+               the Codex hooks bridge (config.toml [[hooks.*]] block; requires
+               codex-cli >= 0.141.0 and STILL needs you to approve the hooks
+               inside Codex — written ≠ installed), and the OpenCode lifecycle
+               plugin. Existing foreign hooks, notify commands, and plugin
+               files are never overwritten.
                Re-running KEEPS the hook profile already on disk.
   --remove     Remove only wmux-owned Claude hook entries (legacy behavior;
                Codex/OpenCode files and foreign configuration are untouched).
   --status     Report Claude, Codex, and OpenCode lifecycle integration status.
+               For Codex hooks this includes the trust verdict: WRITTEN (block
+               in place, Codex silently runs nothing until you approve it) vs
+               ACTIVE (the bridge has actually fired).
 
 HOOK PROFILE (install only; mutually exclusive)
   --signals-only  Install the lifecycle signals and the approval card WITHOUT
@@ -90,7 +99,8 @@ const ASK_QUESTION_HOOKS = [
 type HookEvent =
   | (typeof HOOK_EVENTS)[number]
   | (typeof ASK_QUESTION_HOOKS)[number]['event']
-  | 'PreToolUse'; // #783 — permission gate adds a wide PreToolUse
+  | 'PreToolUse' // #783 — permission gate adds a wide PreToolUse
+  | 'PermissionRequest';
 
 /**
  * #783 — the permission-gate hook. A WIDE PreToolUse matcher (every tool) that
@@ -106,8 +116,25 @@ const PERMISSION_GATE_SPEC = {
   extraArgs: '--permission-gate',
 };
 
+/**
+ * Claude Code's own permission dialog (`Do you want to proceed?`). Fires once
+ * per dialog — a human-paced event, not a per-tool-call cost — and the bridge
+ * maps it to `agent.awaiting_input`, so a pane blocked on a permission prompt
+ * reads "needs you" without depending on the screen detector reading the row.
+ *
+ * Not a SIGNAL_SPECS member on purpose: `detectProfile` reads "every signal
+ * spec present, gate absent" as the signals-only profile. An install made
+ * before this hook existed must keep reading as signals-only, not as a broken
+ * 'full' install whose repair would add the wide gate back. Both profiles
+ * install it; it is only ever written by a user-run install.
+ */
+const PERMISSION_REQUEST_SPEC = {
+  event: 'PermissionRequest' as const,
+  matcher: '',
+};
+
 /** One wmux-owned hook entry in settings.json. */
-interface HookSpec {
+export interface HookSpec {
   event: HookEvent;
   matcher: string;
   extraArgs?: string;
@@ -149,11 +176,11 @@ export type HookProfile = 'full' | 'signals-only';
 
 /** Every wmux-owned hook in settings.json as (event, matcher) specs — the
  *  single source `installHooks` writes and `statusHooks` checks against. */
-const HOOK_SPECS: readonly HookSpec[] = [...SIGNAL_SPECS, PERMISSION_GATE_SPEC];
+export const HOOK_SPECS: readonly HookSpec[] = [...SIGNAL_SPECS, PERMISSION_REQUEST_SPEC, PERMISSION_GATE_SPEC];
 
 /** The specs a given profile installs. */
 function specsFor(profile: HookProfile): readonly HookSpec[] {
-  return profile === 'signals-only' ? SIGNAL_SPECS : HOOK_SPECS;
+  return profile === 'signals-only' ? [...SIGNAL_SPECS, PERMISSION_REQUEST_SPEC] : HOOK_SPECS;
 }
 
 /** Stable identity of a spec — event plus argv tail, since the approval pair
@@ -693,6 +720,50 @@ export function installHooks(
     profile,
     events: specs.map((s) => s.event),
   };
+}
+
+// ----- Fan-out worker allow-list (Settings button) ------------------------
+
+export interface AllowWorkerToolsOutcome {
+  ok: boolean;
+  settingsPath: string;
+  /** Entries this call added (already-present ones are not repeated). */
+  added: string[];
+  error: string | null;
+}
+
+/**
+ * Add the minimal fan-out worker tool list to `permissions.allow` in Claude
+ * Code's user settings, so a worker's report-back calls never stop on a prompt.
+ *
+ * Only ever the fixed list in FANOUT_WORKER_ALLOWED_TOOLS — never `mcp__wmux`
+ * as a whole, which would pre-approve every tool wmux exposes. Same load and
+ * atomic write as the hook install: a corrupted settings.json aborts rather
+ * than being overwritten, and every other key and allow entry is kept.
+ */
+export function allowFanoutWorkerTools(paths: Pick<SetupHooksPaths, 'settingsPath'>): AllowWorkerToolsOutcome {
+  const base: AllowWorkerToolsOutcome = { ok: false, settingsPath: paths.settingsPath, added: [], error: null };
+  const load = loadSettings(paths.settingsPath);
+  if (load.corrupted) {
+    return {
+      ...base,
+      error:
+        `settings.json at ${paths.settingsPath} is not valid JSON — aborting to avoid ` +
+        `overwriting your Claude Code config. Fix or remove the file and retry.`,
+    };
+  }
+  const settings = load.settings;
+  const perms =
+    settings.permissions && typeof settings.permissions === 'object' && !Array.isArray(settings.permissions)
+      ? (settings.permissions as Record<string, unknown>)
+      : {};
+  const allow = Array.isArray(perms.allow) ? [...(perms.allow as unknown[])] : [];
+  const added = FANOUT_WORKER_ALLOWED_TOOLS.filter((t) => !allow.includes(t));
+  if (added.length === 0) return { ...base, ok: true };
+  perms.allow = [...allow, ...added];
+  settings.permissions = perms;
+  writeJsonAtomic(paths.settingsPath, settings);
+  return { ...base, ok: true, added };
 }
 
 // ----- Boot-time script refresh -------------------------------------------
@@ -1247,6 +1318,30 @@ interface PrintableAssetStatus {
   error: string | null;
 }
 
+/**
+ * Probe `codex --version` for the #1107 hooks floor (0.141.0, bisected — older
+ * builds parse the hooks block, advertise the feature, and silently fire
+ * nothing). Best-effort: a failed probe returns null and the hooks block is
+ * NOT written, because an unprovable Codex is indistinguishable from one that
+ * would silently ignore the hook. shell:true only on Windows, where npm
+ * installs the CLI as codex.cmd; the args are fixed, so there is nothing to
+ * inject.
+ */
+function probeCodexVersion(): string | null {
+  try {
+    const result = spawnSync('codex', ['--version'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      shell: process.platform === 'win32',
+    });
+    if (result.error || result.status !== 0) return null;
+    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
+    return output || null;
+  } catch {
+    return null;
+  }
+}
+
 function printAssetStatus(label: string, asset: PrintableAssetStatus): void {
   switch (asset.state) {
     case 'current':
@@ -1280,6 +1375,79 @@ function printAssetInstall(
     console.log(`${label}: refreshed → ${asset.destinationPath}`);
   } else {
     printAssetStatus(label, asset);
+  }
+}
+
+/**
+ * The #1107 approve-then-verify print. Codex will not run a hook the operator
+ * has not trusted AND SAYS NOTHING when it hasn't — so a written block must
+ * never read as done. 'active' is the only "working" verdict, and it is
+ * earned by the bridge actually firing, not by the file existing.
+ */
+function printCodexHooksInstall(result: {
+  codexHooks: { configPath: string; skipped: string | null; wrote: boolean } | null;
+}): void {
+  const hooks = result.codexHooks;
+  if (!hooks) {
+    // Not probed (or the bridge asset could not be installed) — say that
+    // rather than implying the lane is set up.
+    console.log('codex hooks: not registered (bridge unavailable or version not probed)');
+    return;
+  }
+  if (hooks.skipped === 'absent') {
+    console.log(`codex hooks: Codex config not found (${hooks.configPath})`);
+  } else if (hooks.skipped === 'foreign') {
+    console.warn(`codex hooks: CONFLICT in ${hooks.configPath}; existing [[hooks]] left untouched`);
+  } else if (hooks.skipped === 'manual') {
+    console.warn(
+      `codex hooks: the wmux block in ${hooks.configPath} cannot be bounded safely (end marker ` +
+      'missing, or other config interleaved with it); remove it by hand and re-run',
+    );
+  } else if (hooks.skipped === 'malformed') {
+    console.warn(`codex hooks: malformed config left untouched (${hooks.configPath})`);
+  } else if (hooks.skipped === 'unsupported-version') {
+    console.warn(
+      'codex hooks: NOT registered — codex-cli is below 0.141.0, the version below which ' +
+      'hooks parse but silently never fire (panes stay on screen detection)',
+    );
+  } else if (hooks.skipped === 'version-unknown') {
+    console.warn(
+      'codex hooks: NOT registered — could not determine the codex-cli version (fail closed)',
+    );
+  } else {
+    console.log(`codex hooks: block ${hooks.wrote ? 'written' : 'already present'} in ${hooks.configPath}`);
+    console.log(
+      'codex hooks: WRITTEN ≠ INSTALLED — start Codex and approve the wmux hooks when it ' +
+      'asks; until then Codex silently runs nothing. Verify with `wmux setup-hooks --status`.',
+    );
+  }
+}
+
+function printCodexHooksStatus(status: {
+  configPath: string;
+  configExists: boolean;
+  state: string;
+  path: string | null;
+  lastFiredAt: string | null;
+}): void {
+  if (!status.configExists || status.state === 'none') {
+    console.log(`codex hooks: not registered (${status.configPath})`);
+  } else if (status.state === 'active') {
+    console.log(`codex hooks: ACTIVE — bridge fired${status.lastFiredAt ? ` (last ${status.lastFiredAt})` : ''}`);
+  } else if (status.state === 'written') {
+    console.warn(
+      'codex hooks: WRITTEN but NOT trusted — Codex will not run them and will not say so. ' +
+      'Start Codex, approve the wmux hooks, then re-check; panes stay on screen detection until then.',
+    );
+  } else if (status.state === 'stale') {
+    console.warn(status.path
+      ? `codex hooks: STALE (${status.path}) — re-run \`wmux setup-hooks\``
+      : `codex hooks: STALE — the wmux block in ${status.configPath} cannot be bounded safely; ` +
+        'remove it by hand and re-run `wmux setup-hooks`');
+  } else if (status.state === 'foreign') {
+    console.warn(`codex hooks: CONFLICT — foreign [[hooks]] in ${status.configPath} left untouched`);
+  } else if (status.state === 'malformed') {
+    console.warn(`codex hooks: MALFORMED config left untouched (${status.configPath})`);
   }
 }
 
@@ -1349,13 +1517,15 @@ export async function handleSetupHooks(args: string[], jsonMode: boolean): Promi
 
   const lifecycle = await import('../../shared/lifecycleIntegrations');
   const lifecyclePaths = lifecycle.resolveLifecycleIntegrationPaths(os.homedir(), __dirname);
+  const terminalChatOptions = { configRoot: path.dirname(path.dirname(lifecyclePaths.opencode.destinationPath)), startDir: __dirname };
 
   if (status) {
     const claude = statusHooks(paths);
     const integrations = lifecycle.statusLifecycleIntegrations(lifecyclePaths);
     // Preserve the legacy Claude-only root fields for scripts while exposing
     // the richer per-integration objects alongside them.
-    const outcome = { ...claude, claude, ...integrations };
+    const opencodeTerminalChat = openCodeTerminalChatIntegration(terminalChatOptions);
+    const outcome = { ...claude, claude, ...integrations, opencodeTerminalChat };
     if (jsonMode) {
       console.log(JSON.stringify(outcome, null, 2));
     } else {
@@ -1378,6 +1548,9 @@ export async function handleSetupHooks(args: string[], jsonMode: boolean): Promi
         console.log(`codex notify: NOT registered (${integrations.codexNotify.configPath})`);
       }
       printAssetStatus('opencode plugin', integrations.opencodePlugin);
+      console.log(`opencode terminal chat: ${opencodeTerminalChat.state} (${opencodeTerminalChat.configPath})`);
+      printAssetStatus('codex hooks bridge', integrations.codexHooksBridge);
+      printCodexHooksStatus(integrations.codexHooks);
     }
     // Keep the existing scripted contract: status is non-zero only when the
     // Claude settings file is corrupt, not merely because an optional CLI is
@@ -1389,10 +1562,13 @@ export async function handleSetupHooks(args: string[], jsonMode: boolean): Promi
   // Run each integration independently so a corrupt Claude settings file does
   // not prevent safe Codex/OpenCode installation (and vice versa).
   const claude = installHooks(paths, requestedProfile);
-  const integrations = lifecycle.installLifecycleIntegrations(lifecyclePaths);
+  const codexVersionOutput = probeCodexVersion();
+  const integrations = lifecycle.installLifecycleIntegrations(lifecyclePaths, { codexVersionOutput });
+  const opencodeTerminalChat = openCodeTerminalChatIntegration({ ...terminalChatOptions, install: true });
   const outcome = {
     ...claude,
     ...integrations,
+    opencodeTerminalChat,
     ok: claude.ok && integrations.ok,
     claude,
   };
@@ -1415,9 +1591,14 @@ export async function handleSetupHooks(args: string[], jsonMode: boolean): Promi
       console.log(`codex notify: already registered in ${integrations.codexNotify.configPath}`);
     }
     printAssetInstall('opencode plugin', integrations.opencodePlugin);
+    console.log(`opencode terminal chat: ${opencodeTerminalChat.state}`);
+    if (opencodeTerminalChat.state === 'manual-config') console.log(`Add ${opencodeTerminalChat.pluginUrl} to the plugin array in ${opencodeTerminalChat.configPath} (or tui.jsonc).`);
+    if (opencodeTerminalChat.state === 'current') console.log('Restart existing OpenCode terminals to enable the same-session Chat view.');
     if (integrations.opencodePlugin.action !== 'none') {
       console.log('Restart existing OpenCode sessions so they load the wmux plugin.');
     }
+    printAssetInstall('codex hooks bridge', integrations.codexHooksBridge);
+    printCodexHooksInstall(integrations);
   }
   if (!outcome.ok) process.exit(1);
 }

@@ -8,11 +8,37 @@ import { StatusClockUsage, StatusClockTime } from './StatusClock';
 import { selectActiveWorkspaceSummary } from '../../stores/selectors/workspaceProjections';
 import { tokenAttrs } from '../../themes';
 import { HIT_TARGET_24 } from '../hitArea';
-import { IconGear } from '../icons';
-import { selectFleetPanes, sortFleetPanes, countNeedsAttention } from '../../stores/selectors/fleet';
+import { IconGear, IconCornerUpLeft } from '../icons';
+import { selectFleetPanes, sortFleetPanes, selectFleetSectionCounts, fleetHqId, type FleetPane } from '../../stores/selectors/fleet';
 import PluginStatusBarWidgets from '../../plugins/PluginStatusBarWidgets';
 import { COMPANY_MODE_ENABLED } from '../../../shared/featureFlags';
-import DeckToggle from '../Deck/DeckToggle';
+import MoaTitlebarButton from '../Moa/MoaTitlebarButton';
+import { FOCUS_RING } from '../focusRing';
+import type { StoreState } from '../../stores';
+import { RAIL_PAGE_TITLE_KEYS, workspaceChromeInTitlebar } from '../Titlebar/railPageTitle';
+import { displayWorkspaceName, resolveTaskLink } from '../../utils/fanoutProvenance';
+import { showWorkspaces } from '../../utils/showWorkspaces';
+
+/**
+ * #1481 — when the active workspace is a fan-out task, the workspace that fanned
+ * it out (for the header's `↰ owner` link) and whether the active one is a task
+ * at all (its name is shown without the `wtask: ` prefix). A detached task, or
+ * one whose owner is gone, has no link.
+ */
+export function selectActiveTaskOwner(s: Pick<StoreState, 'workspaces' | 'activeWorkspaceId' | 'missionByPaneGroup' | 'fanoutLineage' | 'fanoutSpawnOwner'>): {
+  isTask: boolean;
+  ownerId: string;
+  ownerName: string;
+} {
+  const ws = s.workspaces.find((w) => w.id === s.activeWorkspaceId);
+  const none = { isTask: false, ownerId: '', ownerName: '' };
+  if (!ws) return none;
+  const link = resolveTaskLink(s.missionByPaneGroup?.[ws.id], s.fanoutLineage?.[ws.id], s.fanoutSpawnOwner?.[ws.id]);
+  if (!link || link.detached) return none;
+  const owner = link.ownerId ? s.workspaces.find((w) => w.id === link.ownerId) : undefined;
+  if (!owner || owner.id === ws.id) return { ...none, isTask: true };
+  return { isTask: true, ownerId: owner.id, ownerName: displayWorkspaceName(owner.name, false) };
+}
 
 /**
  * Compute the unread notification count, excluding notifications whose
@@ -60,6 +86,13 @@ interface NotificationBellBadgeProps {
 }
 
 /**
+ * Marks the control that toggles the notification panel. The panel's
+ * outside-click handler ignores presses on it, or the bell's own click would
+ * immediately reopen the panel it just closed.
+ */
+export const NOTIFICATION_TOGGLE_ATTR = 'data-notification-toggle';
+
+/**
  * Presentational bell badge. Extracted from StatusBar so the static-markup
  * test in __tests__/StatusBar.test.tsx can assert role / aria-label / focus
  * classes without mounting the full StatusBar tree (vitest runs in `node`
@@ -79,12 +112,26 @@ export function NotificationBellBadgeView({ unreadCount, onActivate }: Notificat
       aria-label={ariaLabel}
       title={ariaLabel}
       data-testid="statusbar-notification-bell"
+      {...{ [NOTIFICATION_TOGGLE_ATTR]: '' }}
       className="text-[var(--text-sub)] hover:text-[var(--text-main)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent-blue)] focus-visible:outline-offset-1 transition-colors px-1.5 py-0.5 min-w-[24px] min-h-[24px] inline-flex items-center justify-center rounded-sm"
       {...tokenAttrs('textSub', 'text')}
     >
       {label}
     </button>
   );
+}
+
+/**
+ * Rows the vitals chip counts as agents.
+ *
+ * A local row needs a spawned PTY on a terminal surface. #1343 — a remote row
+ * has neither: `surfaceType` is 'remote-terminal' and its ptyId is the
+ * synthetic remote key, so it is admitted on `remote` alone. The chip is a
+ * fleet-wide READOUT (and a jump target), not a command surface, which is why
+ * remote agents belong here but not in DeckFleet.
+ */
+function isFleetAgentRow(p: FleetPane): boolean {
+  return p.remote ? true : p.ptyId !== '' && p.surfaceType === 'terminal';
 }
 
 export default function StatusBar() {
@@ -95,6 +142,7 @@ export default function StatusBar() {
   //  - unreadCount: computeUnreadCount를 셀렉터 안으로 옮겨 number를 직접 구독.
   //    number 반환이라 zustand 기본 Object.is 비교로 값이 바뀔 때만 리렌더된다.
   const activeWs = useStore(useShallow(selectActiveWorkspaceSummary));
+  const taskOwner = useStore(useShallow(selectActiveTaskOwner));
   const unreadCount = useStore((s) => computeUnreadCount(s.notifications, s.workspaces));
 
   // E5 — push unread count to main for the dock/tray badge whenever it changes.
@@ -108,22 +156,30 @@ export default function StatusBar() {
   // re-render only when a count actually changes.
   const fleetVitals = useStore(
     useShallow((s) => {
+      // Moa's HQ is the main bot, not a worker: off the vitals as off Fleet.
+      const hqId = fleetHqId(s);
       const panes = selectFleetPanes({
         workspaces: s.workspaces,
         surfaceAgentStatus: s.surfaceAgentStatus,
         surfaceActivity: s.surfaceActivity,
         surfaceAgent: s.surfaceAgent,
         surfacePendingQuestion: s.surfacePendingQuestion,
-      }).filter((p) => p.ptyId !== '' && p.surfaceType === 'terminal');
+        remoteWorkspaces: s.remoteWorkspaces,
+        usageLimitWaiting: s.usageLimitWaiting,
+      }).filter((p) => isFleetAgentRow(p) && p.workspaceId !== hqId);
       return {
         running: panes.filter((p) => p.agentStatus === 'running').length,
-        needsYou: countNeedsAttention(panes),
       };
     }),
   );
+  // One Needs you count everywhere: the same rows the rail badge and Fleet's
+  // chip count (selectFleetSectionCounts) — questions, errors, stopped
+  // supervision and unconfirmed panes — so the three numbers never differ.
+  const needsYouCount = useStore((s) => selectFleetSectionCounts(s).needsYou);
   // Jump to the most urgent pane — computed at click time (no subscription).
   const jumpToUrgent = () => {
     const s = useStore.getState();
+    const hqId = fleetHqId(s);
     const panes = sortFleetPanes(
       selectFleetPanes({
         workspaces: s.workspaces,
@@ -131,7 +187,9 @@ export default function StatusBar() {
         surfaceActivity: s.surfaceActivity,
         surfaceAgent: s.surfaceAgent,
         surfacePendingQuestion: s.surfacePendingQuestion,
-      }).filter((p) => p.ptyId !== '' && p.surfaceType === 'terminal'),
+        remoteWorkspaces: s.remoteWorkspaces,
+        usageLimitWaiting: s.usageLimitWaiting,
+      }).filter((p) => isFleetAgentRow(p) && p.workspaceId !== hqId),
       'attention',
     );
     const target = panes[0];
@@ -143,9 +201,17 @@ export default function StatusBar() {
     // count a pane it cannot take you to and the click would do nothing.
     if (target.stashed) s.unstashPane(target.paneId, target.workspaceId);
     s.setActivePane(target.paneId);
+    showWorkspaces(useStore.getState());
   };
   const toggleNotificationPanel = useStore((s) => s.toggleNotificationPanel);
-  const toggleSettingsPanel = useStore((s) => s.toggleSettingsPanel);
+  // The Fleet page has its own summary line; the titlebar's would repeat it.
+  const onFleetPage = useStore((s) => s.appRoute === 'fleet');
+  // On a rail page the workspace's name, task link and branch belong to the
+  // Workspaces page under it: the titlebar names the page instead.
+  const railPageTitleKey = useStore((s) => RAIL_PAGE_TITLE_KEYS[s.appRoute]);
+  // On the Workspaces page an open sidebar already shows them (the highlighted
+  // row), so the titlebar carries them only while it is hidden.
+  const showWorkspaceChrome = useStore(workspaceChromeInTitlebar);
 
   // Prefix mode (tmux-style Ctrl+B)
   const prefixMode = useStore((s) => s.prefixMode);
@@ -173,11 +239,26 @@ export default function StatusBar() {
   // — rendering it here again would duplicate it 20px away.
   const noDrag = { WebkitAppRegion: 'no-drag' } as CSSProperties;
   return (
-    <div className="flex items-center flex-1 min-w-0 h-full px-3 text-[11px] text-[var(--text-muted)] select-none font-mono" data-onboarding-target="status-bar" {...tokenAttrs('textMuted', 'text')}>
+    <div className="flex items-center flex-1 min-w-0 h-full px-3 text-[11px] text-[var(--text-muted)] select-none font-sans" data-onboarding-target="status-bar" {...tokenAttrs('textMuted', 'text')}>
       {/* Left: current workspace (back at its original status-row spot —
           owner call) + transient indicators (prefix mode, branch, badge) */}
-      <div className="flex items-center gap-3" style={noDrag}>
-        <span className="text-[12px] text-[var(--text-main)] font-medium" {...tokenAttrs('textMain', 'text')}>{activeWs.name || 'wmux'}</span>
+      <div className="flex items-center gap-3 min-w-0" style={noDrag}>
+        {(railPageTitleKey || showWorkspaceChrome) && <span className="text-[13px] text-[var(--text-main)] font-medium truncate" data-titlebar-title {...tokenAttrs('textMain', 'text')}>{railPageTitleKey ? t(railPageTitleKey) : displayWorkspaceName(activeWs.name, taskOwner.isTask) || 'wmux'}</span>}
+        {/* #1481 — inside a fan-out task, one hop back to the workspace that
+            fanned it out. A link, so steel on hover; muted at rest. */}
+        {showWorkspaceChrome && taskOwner.ownerId && (
+          <button
+            type="button"
+            className={`flex min-w-0 items-center gap-1 rounded px-1 min-h-[24px] text-[11px] text-[var(--text-muted)] hover:text-[var(--accent-blue)] transition-colors ${FOCUS_RING}`}
+            onClick={() => useStore.getState().setActiveWorkspace(taskOwner.ownerId)}
+            title={t('sidebar.tasks.backToOwner', { owner: taskOwner.ownerName })}
+            aria-label={t('sidebar.tasks.backToOwner', { owner: taskOwner.ownerName })}
+            data-task-owner-link
+          >
+            <span className="flex-none" aria-hidden="true"><IconCornerUpLeft size={11} /></span>
+            <span className="truncate max-w-[180px]">{taskOwner.ownerName}</span>
+          </button>
+        )}
         {prefixMode && (
           <span className="text-[var(--accent-red)] font-bold animate-pulse" {...tokenAttrs('danger', 'accent')}>
             [PREFIX]
@@ -188,10 +269,18 @@ export default function StatusBar() {
             {prefixError}
           </span>
         )}
-        {branch && (
-          <span>
+        {/* The branch is the shortcut to the Git page (no button of its own). */}
+        {showWorkspaceChrome && branch && (
+          <button
+            type="button"
+            className={`min-w-0 truncate rounded px-1 min-h-[24px] text-[11px] text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--hover-fill)] transition-colors ${FOCUS_RING}`}
+            onClick={() => useStore.getState().setAppRoute('git')}
+            title={t('statusBar.openGit')}
+            aria-label={`${branch} — ${t('statusBar.openGit')}`}
+            data-titlebar-branch
+          >
             <span className="text-[var(--text-muted)]" {...tokenAttrs('textMuted', 'text')}>⎇</span> {branch}
-          </span>
+          </button>
         )}
         {/* Company 모드 배지 */}
         {isCompanyMode && (
@@ -203,13 +292,14 @@ export default function StatusBar() {
         <PluginStatusBarWidgets alignment="left" />
       </div>
 
-      {/* Draggable gap — the titlebar's remaining grab surface. */}
-      <div className="flex-1" />
+      {/* Draggable gap: the titlebar's grab surface. The command palette has
+          no titlebar entry; ⌘K and the rail's More menu open it. */}
+      <div className="flex-1 min-w-0 h-full" data-titlebar-drag-gap />
 
       {/* Right: status indicators */}
-      <div className="flex items-center gap-3" style={noDrag}>
+      <div className="flex items-center shrink-0 gap-2" style={noDrag}>
         {/* Fleet vitals — render only when there is signal (no dead gauges). */}
-        {fleetVitals.running > 0 && (
+        {!onFleetPage && fleetVitals.running > 0 && (
           <span className="flex items-center gap-1.5" data-statusbar-running>
             <span
               aria-hidden="true"
@@ -218,53 +308,37 @@ export default function StatusBar() {
             {(t('strip.running') || '{count} running').replace('{count}', String(fleetVitals.running))}
           </span>
         )}
-        {fleetVitals.needsYou > 0 && (
+        {!onFleetPage && needsYouCount > 0 && (
           <button
             type="button"
             data-statusbar-needs
             onClick={jumpToUrgent}
             // min-h only: the chip is text, so it is already wide enough — it
             // was the 13px line-height that put it under the pointer floor, and
-            // the 36px titlebar absorbs the extra height with no layout change.
-            className="flex items-center gap-1.5 min-h-[24px] font-semibold text-[var(--accent-red)] hover:opacity-80 transition-opacity"
+            // the 40px titlebar absorbs the extra height with no layout change.
+            // Needs you wears one colour everywhere — the attention orange: the
+            // sidebar's ring and label, the rail badge and this count.
+            className="flex items-center gap-1.5 min-h-[24px] font-semibold text-[var(--attention-text)] hover:opacity-80 transition-opacity"
             title={t('strip.needsYouTooltip') || 'Jump to the pane that needs you'}
-            {...tokenAttrs('danger', 'text')}
           >
-            <span aria-hidden="true" className="w-[6px] h-[6px] rounded-full bg-[var(--accent-red)]" />
-            {(t('strip.needsYou') || '{count} need you').replace('{count}', String(fleetVitals.needsYou))}
+            <span aria-hidden="true" className="w-[6px] h-[6px] rounded-full bg-[var(--attention)]" />
+            {(t('strip.needsYou') || '{count} need you').replace('{count}', String(needsYouCount))}
           </button>
         )}
         {/* A5: company 비용 + 사용량 위젯(시계 커서 의존) — 분리된 소형 컴포넌트. */}
-        <StatusClockUsage isCompanyMode={isCompanyMode} />
+        {!onFleetPage && <StatusClockUsage isCompanyMode={isCompanyMode} />}
         {/* Plugin status-bar widgets (B-1 ui.statusbar, right-aligned) */}
         <PluginStatusBarWidgets alignment="right" />
         <NotificationBellBadgeView unreadCount={unreadCount} onActivate={toggleNotificationPanel} />
         {/* A5: 메모리 + 시각(시계 커서 의존) — 분리된 소형 컴포넌트. */}
         <StatusClockTime />
-        <button
-          type="button"
-          data-statusbar-settings
-          onClick={toggleSettingsPanel}
-          // The gear drew a 13px icon with no box at all. Plain HIT_TARGET_24,
-          // no refund: this strip is 36px tall and right-aligned with room to
-          // spare, and a side refund here would eat half of the cluster's gap-3
-          // rhythm and reach into the clock beside it. It replaces the old
-          // `ml-1`, which the 24px box now provides on its own.
-          className={`${HIT_TARGET_24} text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors`}
-          title={t('statusBar.settingsTooltip')}
-          // `title` is not an accessible name here: the button's only child is
-          // an inline <svg> with no <title>, so a screen reader announced it as
-          // an unnamed button (a CDP sweep for /settings/i over aria-label
-          // matched nothing in the whole window).
-          aria-label={t('statusBar.settingsTooltip')}
-          data-onboarding-target="settings-button"
-        >
-          <IconGear size={13} />
-        </button>
-        {/* Deck open/close. Last in the row, past Settings: both are app-wide
-            chrome switches, and grouping them here is what let the collapsed
-            deck stop costing the terminals a 36px column (2026-08-18). */}
-        <DeckToggle />
+        {/* The titlebar's right end: Moa's button while Moa is on (the right
+            panel's only toggle), left of the Windows window controls (the
+            titlebar reserves their strip). Settings lives in the rail's More
+            menu. */}
+        <span className="flex items-center gap-1">
+          <MoaTitlebarButton />
+        </span>
       </div>
     </div>
   );

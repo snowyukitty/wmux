@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   selectWorkspaceAgentRoster,
   createWorkspaceAgentRosterSelector,
+  buildRosterChip,
+  type WorkspaceAgentRosterRow,
 } from '../workspaceAgentRoster';
 import { HOOK_RUNNING_TTL_MS } from '../fleet';
 import { BRAIN_PTY_ID_PREFIX } from '../../../../shared/constants';
@@ -31,11 +33,13 @@ interface StateOverrides {
   surfaceAgent?: Record<string, { name?: string; status: AgentStatus }>;
   surfaceAgentStatus?: Record<string, AgentStatus>;
   surfacePendingQuestion?: Record<string, string>;
+  surfaceQuestionSeen?: Record<string, string>;
   surfaceActivity?: Record<string, string>;
   surfaceActivityAt?: Record<string, number>;
   surfaceTurnOpenAt?: Record<string, number>;
   paneLabel?: Record<string, string>;
   agentClockMs?: number;
+  remoteWorkspaces?: StoreState['remoteWorkspaces'];
 }
 
 function state(overrides: StateOverrides = {}): StoreState {
@@ -45,11 +49,13 @@ function state(overrides: StateOverrides = {}): StoreState {
     surfaceAgent: {},
     surfaceAgentStatus: {},
     surfacePendingQuestion: {},
+    surfaceQuestionSeen: {},
     surfaceActivity: {},
     surfaceActivityAt: {},
     surfaceTurnOpenAt: {},
     paneLabel: {},
     agentClockMs: NOW,
+    remoteWorkspaces: [],
     ...overrides,
   } as unknown as StoreState;
 }
@@ -58,6 +64,99 @@ describe('selectWorkspaceAgentRoster', () => {
   it('returns an empty projection for an unknown workspace', () => {
     const r = selectWorkspaceAgentRoster(state(), 'nope');
     expect(r).toEqual({ rows: [], agentCount: 0, needsAttentionCount: 0, stashedCount: 0 });
+  });
+
+  // #1163 — remote-terminal surfaces carry ptyId '' by contract; when the
+  // attached mirror reports agent metadata for their session they join the
+  // roster under a synthetic key, counted like any local agent.
+  it('admits remote sessions with agent metadata under the synthetic remote key', () => {
+    const remote = {
+      id: 'rs1',
+      ptyId: '',
+      title: 'rs1',
+      shell: 'ssh',
+      cwd: '/remote',
+      surfaceType: 'remote-terminal' as const,
+      remoteHostId: 'host-1',
+      remoteSessionId: 'rsession-9',
+    };
+    const ws = workspace('ws-1', leaf('p1', [surface('s1', 'pty-1'), remote]), 'p1');
+    const r = selectWorkspaceAgentRoster(
+      state({
+        workspaces: [ws],
+        surfaceAgent: { 'pty-1': { name: 'Claude Code', status: 'running' } },
+        remoteWorkspaces: [
+          {
+            key: 'host-1:rw-1',
+            hostId: 'host-1',
+            hostLabel: 'office-mac',
+            workspaceId: 'rw-1',
+            name: 'proj',
+            panes: [
+              { sessionId: 'rsession-9', shell: 'zsh', agentName: 'Codex', agentStatus: 'awaiting_input' },
+              { sessionId: 'rsession-10', shell: 'zsh' }, // no agent → no row
+            ],
+          },
+        ],
+      }),
+      'ws-1',
+    );
+    expect(r.agentCount).toBe(2); // local + remote both count
+    const remoteRow = r.rows.find((row) => row.remote);
+    expect(remoteRow).toMatchObject({
+      ptyId: 'remote:host-1:rsession-9',
+      agentName: 'Codex',
+      status: 'awaiting_input',
+      needsAttention: true,
+      remote: { hostId: 'host-1', hostLabel: 'office-mac' },
+    });
+    // No event channel from a host snapshot: never an attention row.
+    expect(remoteRow?.hasAttention).toBe(false);
+    // A remote pane the mirror has no metadata for contributes nothing.
+    expect(r.rows.some((row) => row.ptyId.includes('rsession-10'))).toBe(false);
+  });
+
+  it('a remote surface whose host detached renders no row (no stale metadata)', () => {
+    const remote = {
+      id: 'rs1', ptyId: '', title: 'rs1', shell: 'ssh', cwd: '/r',
+      surfaceType: 'remote-terminal' as const,
+      remoteHostId: 'host-gone', remoteSessionId: 'rsession-9',
+    };
+    const ws = workspace('ws-1', leaf('p1', [remote], 'rs1'), 'p1');
+    const r = selectWorkspaceAgentRoster(
+      state({
+        workspaces: [ws],
+        remoteWorkspaces: [], // host detached / never attached
+      }),
+      'ws-1',
+    );
+    expect(r.rows).toEqual([]);
+  });
+
+  it('a STALE host contributes no row: its frozen status must not read as live', () => {
+    const remote = {
+      id: 'rs1', ptyId: '', title: 'rs1', shell: 'ssh', cwd: '/r',
+      surfaceType: 'remote-terminal' as const,
+      remoteHostId: 'host-1', remoteSessionId: 'rsession-9',
+    };
+    const ws = workspace('ws-1', leaf('p1', [remote], 'rs1'), 'p1');
+    const attached = {
+      key: 'host-1:rw-1', hostId: 'host-1', hostLabel: 'office-mac', workspaceId: 'rw-1', name: 'proj',
+      panes: [{ sessionId: 'rsession-9', agentName: 'Codex', agentStatus: 'awaiting_input' as const }],
+    };
+    const stale = selectWorkspaceAgentRoster(
+      state({ workspaces: [ws], remoteWorkspaces: [{ ...attached, stale: true }] }),
+      'ws-1',
+    );
+    expect(stale.rows).toEqual([]);
+    expect(stale.needsAttentionCount).toBe(0);
+    // Reachable again → the row comes back.
+    const live = selectWorkspaceAgentRoster(
+      state({ workspaces: [ws], remoteWorkspaces: [{ ...attached, stale: false }] }),
+      'ws-1',
+    );
+    expect(live.rows).toHaveLength(1);
+    expect(live.needsAttentionCount).toBe(1);
   });
 
   it('lists only surfaces that actually carry a detected agent', () => {
@@ -140,6 +239,40 @@ describe('selectWorkspaceAgentRoster', () => {
       expect(row.status).toBe('awaiting_input');
       expect(row.pendingQuestion).toBe('Shall I merge?');
       expect(row.needsAttention).toBe(true);
+    });
+
+    // #1176 — seen/unseen for BLOCKED agents: the dot stays red either way;
+    // only the roster's animated glow drops for a seen question.
+    it('marks a question seen only when the marker names the SAME question text', () => {
+      const seen = base({
+        surfaceAgent: { 'pty-1': { name: 'A', status: 'idle' } },
+        surfacePendingQuestion: { 'pty-1': 'Shall I merge?' },
+        surfaceQuestionSeen: { 'pty-1': 'Shall I merge?' },
+      });
+      expect(seen.questionSeen).toBe(true);
+      // Still blocked — the red dot and needsAttention are untouched.
+      expect(seen.status).toBe('awaiting_input');
+      expect(seen.needsAttention).toBe(true);
+
+      const unseen = base({
+        surfaceAgent: { 'pty-1': { name: 'A', status: 'idle' } },
+        surfacePendingQuestion: { 'pty-1': 'Delete the repo?' },
+        surfaceQuestionSeen: { 'pty-1': 'Shall I merge?' },
+      });
+      expect(unseen.questionSeen).toBe(false);
+
+      const noMarker = base({
+        surfaceAgent: { 'pty-1': { name: 'A', status: 'idle' } },
+        surfacePendingQuestion: { 'pty-1': 'Shall I merge?' },
+      });
+      expect(noMarker.questionSeen).toBe(false);
+
+      const noQuestion = base({
+        surfaceAgent: { 'pty-1': { name: 'A', status: 'idle' } },
+        surfaceQuestionSeen: { 'pty-1': 'stale marker without a question' },
+      });
+      expect(noQuestion.questionSeen).toBe(false);
+      expect(noQuestion.pendingQuestion).toBeUndefined();
     });
 
     it('an unseen attention state outranks the retained lifecycle state', () => {
@@ -329,6 +462,80 @@ describe('selectWorkspaceAgentRoster', () => {
       surfaceTitle: 'build',
       surfaceIndex: 0,
       surfaceCount: 2,
+    });
+  });
+
+  // #1326 — a global toggle to stop the roster from filling up with
+  // `w<ws>-<pane>` coordinates when several panes have no label.
+  describe('sidebarShowPaneCoordinates (#1326)', () => {
+    function pane1Workspace() {
+      return workspace('ws-1', leaf('p1', [surface('s1', 'pty-1')]), 'p1');
+    }
+
+    it('shows the auto coordinate by default (setting unset, like a fresh/older session)', () => {
+      const r = selectWorkspaceAgentRoster(
+        state({ workspaces: [pane1Workspace()], surfaceAgent: { 'pty-1': { name: 'A', status: 'idle' } } }),
+        'ws-1',
+      );
+      expect(r.rows[0].paneName).toBe('w0-0');
+    });
+
+    it('shows the auto coordinate when the setting is explicitly on', () => {
+      const r = selectWorkspaceAgentRoster(
+        state({
+          workspaces: [pane1Workspace()],
+          surfaceAgent: { 'pty-1': { name: 'A', status: 'idle' } },
+          sidebarShowPaneCoordinates: true,
+        } as StateOverrides & { sidebarShowPaneCoordinates: boolean }),
+        'ws-1',
+      );
+      expect(r.rows[0].paneName).toBe('w0-0');
+    });
+
+    it('withholds the coordinate for an unlabeled pane when the setting is off', () => {
+      const r = selectWorkspaceAgentRoster(
+        state({
+          workspaces: [pane1Workspace()],
+          surfaceAgent: { 'pty-1': { name: 'A', status: 'idle' } },
+          sidebarShowPaneCoordinates: false,
+        } as StateOverrides & { sidebarShowPaneCoordinates: boolean }),
+        'ws-1',
+      );
+      expect(r.rows[0].paneName).toBe('');
+    });
+
+    it('still shows a user-set label when the setting is off — only the auto name is withheld', () => {
+      const r = selectWorkspaceAgentRoster(
+        state({
+          workspaces: [pane1Workspace()],
+          paneLabel: { p1: 'api' },
+          surfaceAgent: { 'pty-1': { name: 'A', status: 'idle' } },
+          sidebarShowPaneCoordinates: false,
+        } as StateOverrides & { sidebarShowPaneCoordinates: boolean }),
+        'ws-1',
+      );
+      expect(r.rows[0].paneName).toBe('api');
+    });
+
+    it('withholds the coordinate for a stashed, unlabeled pane too', () => {
+      const stashedLeaf = leaf('p1', [surface('s1', 'pty-1')]);
+      const ws = {
+        ...workspace('ws-1', leaf('p2', [surface('s2', 'pty-2')]), 'p2'),
+        stashedPanes: [stashed(stashedLeaf)],
+      };
+      const r = selectWorkspaceAgentRoster(
+        state({
+          workspaces: [ws],
+          surfaceAgent: {
+            'pty-1': { name: 'A', status: 'idle' },
+            'pty-2': { name: 'B', status: 'idle' },
+          },
+          sidebarShowPaneCoordinates: false,
+        } as StateOverrides & { sidebarShowPaneCoordinates: boolean }),
+        'ws-1',
+      );
+      const stashedRow = r.rows.find((row) => row.stashed);
+      expect(stashedRow?.paneName).toBe('');
     });
   });
 });
@@ -561,5 +768,91 @@ describe('selectWorkspaceAgentRoster — stashed panes', () => {
 
     const unstashed = { ...ws, stashedPanes: [] };
     expect(select(state({ workspaces: [unstashed], activeWorkspaceId: 'ws-1' }))).not.toBe(first);
+  });
+});
+
+// #1481 — the identity glyph reads a slug off every row.
+describe('roster row slug', () => {
+  it('prefers the detector slug and falls back to the display name', () => {
+    const ws = workspace('ws-1', leaf('p1', [surface('s1', 'pty-1'), surface('s2', 'pty-2'), surface('s3', 'pty-3')]), 'p1');
+    const r = selectWorkspaceAgentRoster(
+      state({
+        workspaces: [ws],
+        surfaceAgent: {
+          'pty-1': { name: 'Claude Code', status: 'idle', slug: 'claude' } as { name: string; status: AgentStatus },
+          'pty-2': { name: 'Codex CLI', status: 'idle' },
+          'pty-3': { name: 'Some New Agent', status: 'idle' },
+        },
+      }),
+      'ws-1',
+    );
+    expect(r.rows.map((row) => row.slug)).toEqual(['claude', 'codex', undefined]);
+  });
+
+  it('derives a remote row slug from the mirror agent name', () => {
+    const remote = {
+      id: 'rs1', ptyId: '', title: 'rs1', shell: 'ssh', cwd: '/r',
+      surfaceType: 'remote-terminal' as const, remoteHostId: 'host-1', remoteSessionId: 'rsession-9',
+    };
+    const ws = workspace('ws-1', leaf('p1', [remote], 'rs1'), 'p1');
+    const r = selectWorkspaceAgentRoster(
+      state({
+        workspaces: [ws],
+        remoteWorkspaces: [{
+          key: 'host-1:rw-1', hostId: 'host-1', hostLabel: 'office', workspaceId: 'rw-1', name: 'proj',
+          panes: [{ sessionId: 'rsession-9', shell: 'zsh', agentName: 'Gemini CLI', agentStatus: 'running' }],
+        }] as unknown as StoreState['remoteWorkspaces'],
+      }),
+      'ws-1',
+    );
+    expect(r.rows[0]?.slug).toBe('gemini');
+  });
+
+  it('treats a slug change as a new projection (selector equality)', () => {
+    const ws = workspace('ws-1', leaf('p1', [surface('s1', 'pty-1')]), 'p1');
+    const select = createWorkspaceAgentRosterSelector('ws-1');
+    const first = select(state({ workspaces: [ws], surfaceAgent: { 'pty-1': { name: 'Claude Code', status: 'idle' } } }));
+    const same = select(state({ workspaces: [ws], surfaceAgent: { 'pty-1': { name: 'Claude Code', status: 'idle' } } }));
+    expect(same).toBe(first);
+    const changed = select(state({
+      workspaces: [ws],
+      surfaceAgent: { 'pty-1': { name: 'Claude Code', status: 'idle', slug: 'openclaude' } as { name: string; status: AgentStatus } },
+    }));
+    expect(changed).not.toBe(first);
+    expect(changed.rows[0]?.slug).toBe('openclaude');
+  });
+});
+
+// #1481 — the collapsed summary chip.
+describe('buildRosterChip', () => {
+  const row = (ptyId: string, status: AgentStatus, slug?: string, stashed = false) =>
+    ({ ptyId, status, slug, agentName: slug ?? 'shell', stashed } as unknown as WorkspaceAgentRosterRow);
+
+  it('lists every visible agent, most urgent first and grouped by status, so per-status counts are exact', () => {
+    const chip = buildRosterChip({
+      rows: [row('a', 'idle', 'claude'), row('b', 'running', 'codex'), row('c', 'awaiting_input', 'gemini'), row('d', 'running', 'claude'), row('e', 'idle', 'aider')],
+      agentCount: 5,
+      needsAttentionCount: 1,
+      stashedCount: 0,
+    });
+    expect(chip.agents.map((a) => `${a.status}:${a.slug}`)).toEqual(['awaiting_input:gemini', 'running:codex', 'running:claude', 'idle:claude', 'idle:aider']);
+    expect(chip.extra).toBe(0);
+  });
+
+  it('counts six running agents as six, not a capped three', () => {
+    const rows = ['a', 'b', 'c', 'd', 'e', 'f'].map((id) => row(id, 'running', 'claude'));
+    const chip = buildRosterChip({ rows, agentCount: 6, needsAttentionCount: 0, stashedCount: 0 });
+    expect(chip.agents.filter((a) => a.status === 'running')).toHaveLength(6);
+  });
+
+  it('leaves stashed rows out of the glyphs', () => {
+    const chip = buildRosterChip({
+      rows: [row('a', 'running', 'claude'), row('s', 'running', 'codex', true)],
+      agentCount: 1,
+      needsAttentionCount: 0,
+      stashedCount: 1,
+    });
+    expect(chip.agents.map((a) => a.slug)).toEqual(['claude']);
+    expect(chip.extra).toBe(0);
   });
 });
